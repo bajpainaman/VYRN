@@ -2,16 +2,20 @@
 
 Source-available exchange research and development.
 
-## License
+## License and permitted use
 
-Copyright 2026 bajpainaman.
+VYRN is published under the **VYRN Research and Education License 1.0**. See [LICENSE](./LICENSE) for its complete terms.
 
-This repository is licensed under the **PolyForm Noncommercial License 1.0.0**. See [LICENSE](./LICENSE) for the complete terms.
+**Free without prior permission:** noncommercial education, academic study, independent research, and experimentation or testing, provided the purpose is exclusively research or learning, and the user is not a restricted entity. You may study, run, modify, and redistribute the code for those permitted purposes subject to the license.
 
-You may view, study, modify, and redistribute the software **for purposes permitted by that license**, including qualifying noncommercial research and experimentation. **Commercial use is not authorized without a separate license from the copyright holder**, except where applicable law or the license terms otherwise permit it.
+**Prior written permission required:** commercial or production use; use by or for **government bodies** or **financial institutions/businesses** (including banks, exchanges, trading firms, funds, brokers, market makers, and payment companies), even for research or testing; and any other use not expressly permitted.
 
-This is **source-available**, not an OSI-approved open-source license.
+### Request permission
 
-For commercial licensing inquiries, contact the repository owner through GitHub.
+[**Open a licensing request issue**](https://github.com/bajpainaman/VYRN/issues/new) and describe who you represent, your intended use, and whether it involves production or commercial activity.
 
-> **Ownership note:** If the copyright belongs to a company or another rights holder, update the copyright notice in this README and the `Required Notice:` in LICENSE to name the correct rights holder.
+**Opening an issue does not grant permission.** You must receive an express written license from the copyright holder before starting a restricted use.
+
+This is **source-available**, not OSI-approved open source.
+
+Copyright 2026 bajpainaman. If the actual rights holder is a company, the copyright notice and permissions process must be updated accordingly.
