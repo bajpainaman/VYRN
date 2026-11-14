@@ -19,3 +19,8 @@ VYRN is published under the **VYRN Research and Education License 1.0**. See [LI
 This is **source-available**, not OSI-approved open source.
 
 Copyright 2026 bajpainaman. If the actual rights holder is a company, the copyright notice and permissions process must be updated accordingly.
+
+## Design and specification
+
+- [DESIGN.md](./DESIGN.md): the design in one document.
+- [spec/](./spec/00-index.md): the full specification, draft 0.2. Start at `00-index.md`; `01-conventions.md` is the contract every chapter follows.
