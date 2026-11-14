@@ -40,23 +40,26 @@ requirements at the same time:
 ## Master diagram
 
 ```
-                              ┌───────────────── one home region (the sun's) ─────────────────┐
-  clients (colo / cloud)      │                                                                │
-  ───────────────────────     │   facility F1                         facilities F2 … Fn       │
-  each packet sent twice ─────┼──► ┌─────────────── vyrn-seq──────────────┐                   │
-    1. to the sequencer        │   │ NICs ─► 49 lanes ─► BBO core ─► TX ──┼─► fills/acks ─────┼──► clients
-    2. to a data node          │   │          ▲   │cut      │              │                   │
-                               │   │          └─ cut core   └─► order ────┼──┐                │
-                               │   └──────────────────────────── frames ──┘  │ 2 paths        │
-                               │                                             ▼                │
-                               │   ┌── vyrn-data─┐  payloads   ┌───────vyrn-replica ×(n−1) ──┐ │
-                               └──►│ data tier   ├────────────►│ replay engine (same code)    │ │
-                                   └─────────────┘             │ Simplex: 1 ms blocks, q votes │ │
-                                                               │ state roots · market data     │ │
-                                                               └──────────────┬───────────────┘ │
-                                   finality ≤ 10 ms ◄──────── certificate ────┘                 │
-                                                                                                │
-   other homes (followers) ◄──── finalized log over WAN ─────────────────────────────────────────┘
+                              ┌── one home region (the sun's) ──────────────────────────────────────┐
+  clients (colo / cloud)      │  facility F1                                                        │
+  each packet is sent twice   │  ┌── vyrn-seq ─────────────────────────────────┐                    │
+                              │  │                                             │                    │
+    1. to the sequencer ──────┼─►│ NICs ─► 49 lanes ─► BBO core ─► TX ─────────┼─► fills/acks ──────┼──► clients
+    2. to a data node         │  │            │            ▲ │                 │                    │
+      │                       │  │            └─► cut core─┘ └─► order frames ─┼───┐                │
+      │                       │  └─────────────────────────────────────────────┘   │ 2 paths        │
+      │                       │                                                    │                │
+      │                       │  facilities F2 … Fn                                ▼                │
+      │                       │  ┌── vyrn-data ──┐              ┌── vyrn-replica ×(n−1) ──────────┐ │
+      └───────────────────────┼─►│ data tier     ├── payloads ─►│ replay engine (same code)       │ │
+                              │  └───────────────┘              │ Simplex: 1 ms blocks, q votes   ├─┼─┐
+                              │                                 │ state roots · market data       │ │ │
+                              │                                 └───────────────┬─────────────────┘ │ │
+                              │                                                 │                   │ │
+                              │         finality ≤ 10 ms ◄── certificate ───────┘                   │ │
+                              └─────────────────────────────────────────────────────────────────────┘ │
+                                                                                                      │
+   other homes (followers) ◄── finalized log over WAN ────────────────────────────────────────────────┘
    TYO ──8h──► LDN ──8h──► NYC ──8h──► TYO      handoff = certificate (e, S) + opening auction
 ```
 

@@ -500,14 +500,14 @@ ports (06 §2.3) and check both release words.
 ```
  half A: lanes 0–24 (cores 8–32)                  CCD 0
  ┌──────────────┐ R_pkt[l], R_hash8[l]           ┌──────────────────────────────────────────┐
- │ lane l       ├───────────────────────────────►│ core 4  stream-A                          │
- │  parse, MAC, │                                │  CTPIO → port A.a, port B.a; sfence       │
- │  risk,       │                                │  released[A]; LaneCut[l ∈ A]              │
- │  classify,   │                                │  block close, signer, HEADER, fence, gate │
+ │ lane l       ├───────────────────────────────►│ core 4  stream-A                         │
+ │  parse, MAC, │                                │  CTPIO → port A.a, port B.a; sfence      │
+ │  risk,       │                                │  released[A]; LaneCut[l ∈ A]             │
+ │  classify,   │                                │  block close, signer, HEADER, fence, gate│
  │  encode O,   │ half B: lanes 25–48            ├──────────────────────────────────────────┤
- │  AcctTake,   │ (cores 33–49, pool 56–62)      │ core 7  stream-B                          │
- │  hash batch  ├───────────────────────────────►│  CTPIO → port A.b, port B.b; sfence       │
- └──────┬───────┘                                │  released[B]; LaneCut[l ∈ B]; fence       │
+ │  AcctTake,   │ (cores 33–49, pool 56–62)      │ core 7  stream-B                         │
+ │  hash batch  ├───────────────────────────────►│  CTPIO → port A.b, port B.b; sfence      │
+ └──────┬───────┘                                │  released[B]; LaneCut[l ∈ B]; fence      │
         │ R_hash32[l]                            └──────▲───────────────▲───────────────────┘
         └────────────────► core 50 order hasher ◄───────┼─ frame rings  │ R_step (+ need, marks)
  ┌──────────────┐ R_step: one writer, three cursors ────┴───────────────┘

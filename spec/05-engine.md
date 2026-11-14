@@ -53,9 +53,9 @@ This chapter specifies one book on one sequencer box. It defines:
  │   improve/cross/IOC/FOK + deps: FwdRing ──┼────────┼─► core 2: BBO core                    │
  │  pass 2: apply independent joins/cancels, │        │   deadline test, step cut, matches,   │
  │   publish counter after each op           │        │   publishes snapshot                  │
- │  boundary: FillEvents ◄── FillRing[l] ◄───┼────────┼── StepLog ─┬─► cores 3/5: fill TX A/B│
- │   settle at C_f[l], responses ─► TX VI    │snapshot│            │   (taker, deps, makers)│
- │  reads LaneCut[l] ◄───────────────────────┼─line◄──┼────────────┴─► cores 4/7: stream A/B │
+ │  boundary: FillEvents ◄── FillRing[l] ◄───┼────────┼── StepLog ─┬─► cores 3/5: fill TX A/B │
+ │   settle at C_f[l], responses ─► TX VI    │snapshot│            │   (taker, deps, makers)  │
+ │  reads LaneCut[l] ◄───────────────────────┼─line◄──┼────────────┴─► cores 4/7: stream A/B  │
  │                                           │        │   frames first, then LaneCut[l]       │
  └───────────────────────────────────────────┘        └───────────────────────────────────────┘
 ```

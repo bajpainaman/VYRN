@@ -50,11 +50,11 @@ The decisions, each stated once:
      │                                        │ order stream + seq_sig per book block
      └── same packet ──► vyrn-data (op ≠ s) ──► │
                                               ▼
-            ┌──────────── committee of home H: 5 validator boxes ────────────┐
-            │ op s : replay, vote (blind on exclusions), never leader         │
+            ┌──────────── committee of home H: 5 validator boxes ──────────────┐
+            │ op s : replay, vote (blind on exclusions), never leader          │
             │ op a,b,c,d : replay, check tag_com with K_com, compute exclusion │
             │              lists, lead views in turn, vote                     │
-            └──────────────┬──────────────────────────────────────────────────┘
+            └──────────────┬───────────────────────────────────────────────────┘
                            │ certificate (4 of 5)          every 1 s: StateCommit + 4 sigs
                            ▼                                        │
          finalized chain log ──► followers in the 2 other homes      ▼

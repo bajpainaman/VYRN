@@ -57,7 +57,7 @@ statement in 01 are also listed in **Requests to 01**.
   back offices ◄── drop copy ──┤                                         │◄── GPS antenna per facility
   (TCP, final fills only)      │                                         │    (PTP grandmaster)
                                │                                         │
-  exchange operators ─────────►│  vyrn-admin: config, schedule, halts      │
+  exchange operators ─────────►│  vyrn-admin: config, schedule, halts    │
   5 validator operators (CHAIN)│                                         │
                                │                                         │
   external chain ◄────────────►│  bridge, 4-of-5 threshold (CHAIN only)  │
@@ -83,24 +83,25 @@ statement in 01 are also listed in **Requests to 01**.
 ```
  client ─(1) request ───────────────────────────────►┌───────────────── vyrn-seq────────────────┐
    │                                                 │ 42 dedicated lanes · pool of 7 · 2 cuts  │
-   │◄──── responses (lanes, fill TX), all gated ─────┤ BBO · TX A/B/C · stream A/B · hash · ctl│ 
+   │◄──── responses (lanes, fill TX), all gated ─────┤ BBO · TX A/B/C · stream A/B · hash · ctl │
    │                                                 └──┬──────────────────────────────┬────────┘
    │                              ORDER frames (lane    │ HASH, HEADER frames (A, B)   │ session
    │                              records + StepRecords │                              │ install
    │                              by cut), A and B      ▼                              │ ▲
    └─(2) same request ──►┌─ vyrn-data ─┐     ┌── voting replicas × n (vyrn-replica │ vyrn-validator) ────┐
-                         │ ingest    ├────►│ replay lanes · replay BBO (the same vyrn-engine)        │
-                         │ fan-out   │ pay-│ Simplex (vyrn-consensus) · log store · hash chain       │
-                         │ retain 5 s│ load│ state root (CHAIN) · peer-fetch · recovery svc (R2)   │
+                         │ ingest      ├────►│ replay lanes · replay BBO (the same vyrn-engine)          │
+                         │ fan-out     │ pay-│ Simplex (vyrn-consensus) · log store · hash chain         │
+                         │ retain 5 s  │ load│ state root (CHAIN) · peer-fetch · recovery svc (R2)       │
                          └─────▲─────┘     └───┬───────────────┬───────────────┬─────────────────┬─┘
-                               └─── fetch ─────┤ order stream  │ shm rings     │ certificates    │
-                                     (miss)    ▼ + data        ▼               ▼                 │
+                               └─── fetch ─────┘               │ shm rings     │ certificates    │
+                                     (miss)                    ▼               ▼                 │
                                   ┌─ observer + vyrn-md ─┐ ┌─ vyrn-dropcopy ─┐ follower homes ◄──────┘
-                                  │ non-voting replay, │ │ final fills   │ (finalized log, WAN)
-                                  │ book feed A/B      │ └──────┬────────┘   ┌─ archive node ─┐
-                                  └────┬───────────────┘        ▼            │ 7 days, per    │
-                                       ▼                   back offices      │ facility       │
-                                  subscribers                                └────────────────┘
+                                  │ ORDER frames (F4)    │ │ final fills     │ (finalized log, WAN)
+                                  │ + payloads (F7),     │ └──────┬──────────┘ ┌─ archive node ─┐
+                                  │ no votes; feed A/B   │        │            │ 7 days, per    │
+                                  └────┬─────────────────┘        ▼            │                │
+                                       ▼                   back offices        │ facility       │
+                                  subscribers                                  └────────────────┘
 
  vyrn-admin─ epoch config, lane map, session gateway (BASE) ──► vyrn-seq control core, replicas
  vyrn-sim ── every container above in one process, on a simulated NIC, network and clock
@@ -296,15 +297,15 @@ the lanes and each with one port on CA and one on CB.
         ║                                   ║
   ┌─────╨──────┐                      ┌─────╨──────┐
   │ CA client  │                      │ CB client  │      merchant-silicon leaves,
-  │ leaf       │                      │ leaf       │      PTP boundary clocks
-  └┬────┬────┬─┘                      └┬────┬────┬─┘
-   │    │    │ D-in                    │    │    │ D-in
-   │    │    └──────────┐   ┌──────────┘    │    │
- NIC0 NIC1   MD-out     ▼   ▼     MD-out  NIC2 NIC3
-   │    │    ▲     ┌──────────┐      ▲     │    │
-  ┌┴────┴────┴──┐  │ vyrn-data  │  ┌───┴─────┴────┴──┐
-  │   vyrn-seq  │  │ data box │  │ R1 replica, and │
-  │ (live, 6 NIC│  └────┬─────┘  │ observer + md   │
+  │ leaf       │◄──────────────────┐  │ leaf       │      PTP boundary clocks
+  └─┬───┬─────┬┘                   │  └─┬───┬──┬──┬┘
+    │   │     └───────┐    ┌───────┼────┘   │  │  ▲   legs, left to right:
+    │   │ ┌───────────┼────┼───────┼────────┘  │  │   CA: NIC0 NIC1 D-in
+    │   │ │ ┌─────────┼────┼───────┼───────────┘  │   CB: D-in NIC2 NIC3 MD
+    │   │ │ │         ▼D-in▼       │              │   MD-out comes from the observer
+  ┌─┴───┴─┴─┴───┐  ┌──────────┐  ┌─┴──────────────┴┐
+  │   vyrn-seq  │  │ vyrn-data│  │ R1 replica, and │
+  │ live, 6 NICs│  └────┬─────┘  │ observer + md   │
   └──┬───────┬──┘       │ D-out  └┬──────┬──────┬──┘
     RNA     RNB         ▼         │A     │B     │D (×2)
      │       │   ┌────────────┐   │      │      │
@@ -587,26 +588,26 @@ line holds 4 lanes of one CCD, so a write invalidates it in exactly one CCD.
 ### 4.5 Replica box (REF, replay mode)
 
 ```
- ┌─ CCD0 ───────────────────────────────────────────┐  NICs: 4 × X2541: A (RA), B (RB),
- │ c0 OS · PTP          c1 ORDER-IN: ORDER frames    │        D0, D1 (DX)  (01 §14.7)
- │                         from A+B, dedupe, gap NAK,│  Filters on the A and B ports:
- │                         LaneRuns → lane rings     │    (group A/B, ARC_ORDER_PORT) → c1
+ ┌─ CCD0 ──────────────────────────────────────────────┐  NICs: 4 × X2541: A (RA), B (RB),
+ │ c0 OS · PTP          c1 ORDER-IN: ORDER frames      │         D0, D1 (DX)  (01 §14.7)
+ │                         from A+B, dedupe, gap NAK,  │  Filters on the A and B ports:
+ │                         LaneRuns → lane rings       │     (group A/B, ARC_ORDER_PORT) → c1
  │ c2 BBO replay        c3 CONSENSUS (vyrn-consensus): │    (group A/B, ARC_CTRL_PORT) → c4
- │                         votes, certificates       │  Filters on the D ports:
- │ c4 BLOCK-CHECK: order_root, data_root, hash chain │    (group data, ARC_DATA_PORT_BASE + l)
- │ c5 CONTROL           c6, c7 STORE: log → NVMe     │      → lane l
- └───────────────────────────────────────────────────┘  Storage: 12 × 30.72 TB NVMe
+ │                         votes, certificates         │   Filters on the D ports:
+ │ c4 BLOCK-CHECK: order_root, data_root, hash chain   │     (group data, ARC_DATA_PORT_BASE + l)
+ │ c5 CONTROL           c6, c7 STORE: log → NVMe       │       → lane l
+ └─────────────────────────────────────────────────────┘  Storage: 12 × 30.72 TB NVMe
  ┌─ CCD1–6, CCD7 c56 ────────────────────────────────┐
- │ c8–56 replay lanes 0–48: own LaneRuns (from c1)    │
- │ + own payloads (D), apply in LaneSeq order,        │
- │ K_com MAC check (CHAIN), payload index             │
+ │ c8–56 replay lanes 0–48: own LaneRuns (from c1)   │ 
+ │ + own payloads (D), apply in LaneSeq order,       │ 
+ │ K_com MAC check (CHAIN), payload index            │ 
  └───────────────────────────────────────────────────┘
  ┌─ CCD7 c58–63 ─────────────────────────────────────┐
- │ c58–60 HASH: BLAKE3 of the data (with c4, 4 cores)  │
- │ c61 STATE ROOT: the lattice hash once per second    │
- │     (CHAIN; idle in BASE)                           │
- │ c62 recovery service (R2) · vyrn-md (observer box)    │
- │ c63 vyrn-dropcopy + peer-fetch server                 │
+ │ c58–60 HASH: BLAKE3 of the data (with c4, 4 cores)│  
+ │ c61 STATE ROOT: the lattice hash once per second  │  
+ │     (CHAIN; idle in BASE)                         │  
+ │ c62 recovery service (R2) · vyrn-md (observer box)│    
+ │ c63 vyrn-dropcopy + peer-fetch server             │    
  └───────────────────────────────────────────────────┘
 ```
 
@@ -673,12 +674,12 @@ line holds 4 lanes of one CCD, so a write invalidates it in exactly one CCD.
 
 ```
  Ryzen 9 9950X3D · 16 cores · 2 CCDs · SMT off
- ┌─ CCD0 (the CCD with 3D V-Cache) ─────────────────┐ ┌─ CCD1 ─────────────────────────┐
- │ c0 OS · IRQs · PTP · CONTROL                     │ │ c8–14 lanes 4–10 · c15 HASHER  │
- │ c1 CUT (11 lanes; one cut core suffices)  c2 BBO │ │                                │
- │ c3 FILL-TX + stream duties (frames, gate, LaneCut)│ └────────────────────────────────┘
- │ c4–7 lanes 0–3                                   │
- └──────────────────────────────────────────────────┘
+ ┌─ CCD0 (the CCD with 3D V-Cache) ───────────────────┐ ┌─ CCD1 ─────────────────────────┐
+ │ c0 OS · IRQs · PTP · CONTROL                       │ │ c8–14 lanes 4–10 · c15 HASHER  │
+ │ c1 CUT (11 lanes; one cut core suffices)  c2 BBO   │ │                                │
+ │ c3 FILL-TX + stream duties (frames, gate, LaneCut) │ └────────────────────────────────┘
+ │ c4–7 lanes 0–3                                     │
+ └────────────────────────────────────────────────────┘
  NIC: 1 × 100GbE (X2541 with ef_vi + CTPIO, or ConnectX-6 Dx with DPDK): clients + path A
       + 1 × X2522 (01 §14.7): path B, on its own switch
 ```
