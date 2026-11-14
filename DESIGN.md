@@ -7,7 +7,7 @@ BFT finality in 10 ms, a book that follows the sun, and (extra credit) all of it
 ## 0. The answer in six lines
 
 1. **One core per book is sequential, and it only sees the BBO.** Price-time priority is only
-   sequential where orders cross. Joins and cancels (~97% of a quote-driven book) go to 50 lane
+   sequential where orders cross. Joins and cancels (~97% of a quote-driven book) go to 49 lane
    cores that own accounts. Only messages that change the BBO go to one BBO core.
 2. **The cut replaces the sequencer.** No core waits to be sequenced. The BBO core reads every
    lane's counter and logs that vector. That log *is* the total order, and replicas replay it
@@ -73,12 +73,12 @@ it is ~190 Gbps.
 
 ### Lanes own accounts, and they own those accounts' orders
 
-- There are 50 lane cores. A client sends account A's packets to UDP port `lane(A)`. The NIC flow
+- There are 49 lane cores. A client sends account A's packets to UDP port `lane(A)`. The NIC flow
   filter puts each packet on that lane's RX queue. Risk is lane-local, so no risk check ever
   crosses cores. A market maker that needs more than one lane splits into sub-accounts, each with
   its own share of the credit limit.
 - Each lane keeps a FIFO of its own orders at every price level. **The book's FIFO at a level is
-  the merge of the 50 lane FIFOs, ordered by (NIC RX hardware timestamp, lane id).** No core ever
+  the merge of the 49 lane FIFOs, ordered by (NIC RX hardware timestamp, lane id).** No core ever
   appends to a shared queue.
 - Every field has one writer. The lane writes the order and its cancel tombstone. The BBO core
   writes the filled quantity, in its own array. There is no CAS and no cache line that two cores
@@ -137,14 +137,14 @@ deterministic and replayable. The race does not exist.
   4 × 100GbE (ef_vi, HW RX timestamps)
         │  UDP port = lane = account shard
         ▼
- ┌───────────────────── 50 lane cores ─────────────────────┐
- │ parse 16 B msgs · MAC · lane-local risk · classify       │
- │ own their accounts' orders + per-level FIFOs             │
- │ ack joins/cancels once a published cut includes them     │
- └─────┬─────────────────────────────────────▲──────────────┘
+ ┌───────────────────── 49 lane cores ─────────────────────┐
+ │ parse 16 B msgs · MAC · lane-local risk · classify      │
+ │ own their accounts' orders + per-level FIFOs            │
+ │ ack joins/cancels once a published cut includes them    │
+ └─────┬─────────────────────────────────────▲─────────────┘
        │ improves + crosses (SPSC per lane)  │ cut + versioned BBO
        ▼                                     │
- ┌── BBO core ──┐◄── cut core (reads 50 lane counters, publishes cut)
+ ┌── BBO core ──┐◄── cut core (reads 49 lane counters, publishes cut)
  │ merge lane   │
  │ FIFO heads   │── fill ring ──► TX core ──► CTPIO ──► wire
  │ by timestamp │                    └──► ordering frame ×2 ──► replicas

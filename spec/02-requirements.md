@@ -50,8 +50,8 @@ Terms local to this chapter:
 ```
   generator / client                                          exchange box (REF)
  ┌──────────────┐  fiber   ┌───────────────────┐  ≤ 2 m   ┌─────────────────────────┐
- │ vyrn-bench gen ├─────────►│ passive optical   ├─────────►│ NIC port p (X2541)      │
- │              │◄─────────┤ splitter, 1 per   │◄─────────┤ ef_vi RX, CTPIO TX      │
+ │ vyrn-bench   ├─────────►│ passive optical   ├─────────►│ NIC port p (X2541)      │
+ │ generator    │◄─────────┤ splitter, 1 per   │◄─────────┤ ef_vi RX, CTPIO TX      │
  └──────────────┘          │ direction         │          └─────────────────────────┘
                            └──────┬───────┬────┘
                          tap "in" │       │ tap "out"   (equal fiber lengths ± 0.2 m)

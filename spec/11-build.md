@@ -177,33 +177,25 @@ An arrow means "depends on". The graph is a DAG, and CI checks it: `tools/lint-e
 an engine crate depends on a crate outside `crates/engine/`, other than the allowlist in §2.2.
 
 ```
-                             vyrn-types
-                  ┌───────────────┼──────────────────┬───────────┐
-                  ▼               ▼                  ▼           ▼
-              vyrn-crypto       vyrn-cut           vyrn-risk   (all others)
-                  │               │  │                │
-                  ▼               │  └───────┐        │
-             vyrn-wire ◄──────────┼───────┐  │        │
-              ┌───┴─────┐         │       │  │        │
-              ▼         ▼         ▼       │  ▼        │
-           vyrn-nic  vyrn-lane ◄────┴───────┼─vyrn-bbo  │
-        (+ C shim)      ▲  ▲──────────────┼───────────┘
-              │         │                 │
-              │    vyrn-engine ◄──────────┘ (vyrn-engine → vyrn-lane, vyrn-bbo, vyrn-cut, vyrn-wire)
-              │         ▲
-              │         │                         Commonware
- vyrn-log ◄───┼─────────┼───vyrn-consensus ◄──── (consensus, p2p, runtime,
-     ▲        │         │          ▲              cryptography, storage, codec)
-     │        │         │          │
-  vyrn-data───┘      vyrn-replica──┤ ◄─libvyrn_vx_client (Vx, C ABI)
-                        ▲   ▲      │
-                        │   │ vyrn-epoch
-                   vyrn-md  │      ▲
-                            │      │
-                       vyrn-chain ─┘
+  An arrow means "depends on". Each crate depends only on crates in the layers above it.
 
-  test-only:  vyrn-sim─► everything above + libvyrn_vx_oracle (Vx, C ABI)
-            vyrn-bench ─► engine crates, vyrn-nic, vyrn-log, libvyrn_vx_oracle
+  layer 0   vyrn-types
+               ▲
+  layer 1   vyrn-crypto · vyrn-cut · vyrn-risk · vyrn-log · (all others) ──► vyrn-types
+  layer 2   vyrn-wire ──► vyrn-crypto
+            vyrn-bbo ───► vyrn-cut
+  layer 3   vyrn-nic (+ C shim) ──► vyrn-wire
+            vyrn-lane ──► vyrn-wire, vyrn-cut, vyrn-risk, vyrn-bbo
+  layer 4   vyrn-engine ──► vyrn-lane, vyrn-bbo, vyrn-cut, vyrn-wire
+            vyrn-consensus ──► vyrn-log, Commonware (consensus, p2p, runtime, cryptography, storage, codec)
+            vyrn-data ──► vyrn-log, vyrn-nic
+  layer 5   vyrn-replica ──► vyrn-engine, vyrn-consensus, libvyrn_vx_client (Vx, C ABI)
+            vyrn-epoch ──► vyrn-consensus
+  layer 6   vyrn-md ──► vyrn-replica
+            vyrn-chain ──► vyrn-replica, vyrn-epoch
+
+  test-only:  vyrn-sim ──► everything above + libvyrn_vx_oracle (Vx, C ABI)
+              vyrn-bench ──► engine crates, vyrn-nic, vyrn-log, libvyrn_vx_oracle
 ```
 
 Rules the graph encodes:
@@ -1113,23 +1105,23 @@ replication, failover and handoff protocols.
 
 ```
                   vyrn-sim (one thread, virtual time in Nanos, ChaCha8 seeded per component)
- ┌──────────────────────────────────────────────────────────────────────────────────────┐
- │  event queue (time, seq) ──► scheduler picks the next runnable item, seeded ties      │
- │                                                                                        │
- │  clients ×k ──► sim network (links: latency dist, loss, dup, reorder, partition)        │
- │     (02 workload)        │                                                              │
- │                          ▼                                                              │
+ ┌───────────────────────────────────────────────────────────────────────────────────────────┐
+ │  event queue (time, seq) ──► scheduler picks the next runnable item, seeded ties          │
+ │                                                                                           │
+ │  clients ×k ──► sim network (links: latency dist, loss, dup, reorder, partition)          │
+ │     (02 workload)        │                                                                │
+ │                          ▼                                                                │
  │  box: vyrn-seq  [vyrn-nic::sim queues, PHC model] ─► dedicated lanes + pool ─► cut A, B   │
- │                  ─► BBO ─► TX-A, TX-B, stream-A, stream-B (core map of 01 §10)         │
+ │                  ─► BBO ─► TX-A, TX-B, stream-A, stream-B (core map of 01 §10)            │
  │                  each core = Core::poll() step; vyrn-cut Visibility = Sim (seeded delay)  │
- │  box: vyrn-seq standby (F2)  warm, promoted on failover; never votes                     │
+ │  box: vyrn-seq standby (F2)  warm, promoted on failover; never votes                      │
  │  box: vyrn-replica ×n      engine = Rust replay, or Vx client through the C ABI           │
  │  box: vyrn-data ×m         payload store and fan-out                                      │
  │  consensus: vyrn-consensus on commonware-runtime::deterministic, same virtual clock       │
- │  disks: in-memory journal with a fault model; clocks: per-box offset, drift, steps      │
- │                                                                                        │
- │  checkers: invariants after every event; oracle diff per message; liveness after heal   │
- └──────────────────────────────────────────────────────────────────────────────────────┘
+ │  disks: in-memory journal with a fault model; clocks: per-box offset, drift, steps        │
+ │                                                                                           │
+ │  checkers: invariants after every event; oracle diff per message; liveness after heal     │
+ └───────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **How the real code runs inside it.**
@@ -1798,13 +1790,13 @@ export, logging and alerting.
 ```
   pinned core k (lane, cut, BBO, TX)                     control core
   ┌───────────────────────────────────┐                 ┌───────────────────────────────┐
-  │ CoreStats   (single writer, 128 B │  Relaxed loads  │ sampler, every 100 ms          │
-  │   lines, Relaxed stores)          │ ──────────────► │  diffs counters + buckets      │
-  │ Histograms  (fixed buckets)       │                 │  → per-window quantiles        │
-  │ TraceRing   (64K × 16 B, shm file)│ ─── on demand ─►│ trace freeze / dump            │
-  └───────────────────────────────────┘                 │ exporter → mgmt NIC (kernel)   │
-                                                        │ tracing logs → journald        │
-  NIC: RX hw timestamp, TX completion timestamp ───────►│ in-box latency of every packet │
+  │ CoreStats   (single writer, 128 B │  Relaxed loads  │ sampler, every 100 ms         │
+  │   lines, Relaxed stores)          │ ──────────────► │  diffs counters + buckets     │
+  │ Histograms  (fixed buckets)       │                 │  → per-window quantiles       │
+  │ TraceRing   (64K × 16 B, shm file)│ ─── on demand ─►│ trace freeze / dump           │
+  └───────────────────────────────────┘                 │ exporter → mgmt NIC (kernel)  │
+                                                        │ tracing logs → journald       │
+  NIC: RX hw timestamp, TX completion timestamp ───────►│ in-box latency of every packet│
                                                         └───────────────────────────────┘
 ```
 

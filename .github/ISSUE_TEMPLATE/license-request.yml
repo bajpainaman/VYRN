@@ -1,0 +1,39 @@
+name: License request
+description: Ask for written permission to use VYRN commercially, in production, or at a financial institution or government body.
+title: "License request: <organisation>"
+labels: ["license"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue is public. Leave out anything confidential.
+        Opening a request does not grant permission. You need an express written license before any restricted use (see the README and LICENSE).
+  - type: input
+    id: organisation
+    attributes:
+      label: Who you represent
+      description: The organisation, or "myself".
+    validations:
+      required: true
+  - type: textarea
+    id: use
+    attributes:
+      label: Intended use
+      description: What you want to do with VYRN.
+    validations:
+      required: true
+  - type: dropdown
+    id: commercial
+    attributes:
+      label: Does it involve commercial or production use?
+      options: ["Yes", "No", "Not sure"]
+    validations:
+      required: true
+  - type: dropdown
+    id: institution
+    attributes:
+      label: Are you a financial institution or business, or a government body?
+      description: For example a bank, exchange, trading firm, fund, broker, market maker or payment company.
+      options: ["Yes", "No", "Not sure"]
+    validations:
+      required: true
