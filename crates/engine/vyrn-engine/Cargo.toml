@@ -1,0 +1,18 @@
+[package]
+name = "vyrn-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "Lane, cut and BBO joined into one engine (live and replay), seal(), the sealing allocator."
+
+[dependencies]
+vyrn-types = { workspace = true }
+vyrn-lane = { workspace = true }
+vyrn-bbo = { workspace = true }
+vyrn-cut = { workspace = true }
+vyrn-wire = { workspace = true }
+
+[lints]
+workspace = true

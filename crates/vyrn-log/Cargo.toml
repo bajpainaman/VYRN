@@ -1,0 +1,17 @@
+[package]
+name = "vyrn-log"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "Order-stream encoding, block assembly, hash chain, block storage, log readers."
+
+[dependencies]
+vyrn-types = { workspace = true }
+commonware-codec = { workspace = true }
+commonware-storage = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

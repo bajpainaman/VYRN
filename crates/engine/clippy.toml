@@ -1,0 +1,27 @@
+# Engine (INV-DET) crates (spec/11-build.md §3.3). Clippy reads only the nearest clippy.toml, so
+# this repeats the workspace rules.
+disallowed-types = [
+  { path = "std::collections::HashMap",  reason = "RandomState: iteration order differs per process (01 §11.2)" },
+  { path = "std::collections::HashSet",  reason = "RandomState (01 §11.2)" },
+  { path = "std::collections::hash_map::RandomState", reason = "01 §11.2" },
+  { path = "std::time::Instant",    reason = "no clock in the engine (01 §11.3)" },
+  { path = "std::time::SystemTime", reason = "01 §11.3" },
+  { path = "std::sync::Mutex",      reason = "blocking on a pinned core" },
+  { path = "std::sync::RwLock",     reason = "blocking on a pinned core" },
+  { path = "std::sync::mpsc::Sender", reason = "allocates; use vyrn-cut rings" },
+  { path = "std::thread::JoinHandle", reason = "engine crates never spawn" },
+]
+disallowed-methods = [
+  { path = "std::thread::sleep", reason = "use a timer on the control thread" },
+  { path = "std::time::Instant::now",    reason = "01 §11.3" },
+  { path = "std::time::SystemTime::now", reason = "01 §11.3" },
+  { path = "std::thread::spawn",         reason = "threads are created by the binary" },
+  { path = "std::env::var",              reason = "config is passed in, never read" },
+  { path = "std::io::stdout",            reason = "no output on pinned cores (§8.3)" },
+  { path = "std::io::stderr",            reason = "no output on pinned cores (§8.3)" },
+]
+disallowed-macros = [
+  { path = "std::println",  reason = "§8.3" },
+  { path = "std::eprintln", reason = "§8.3" },
+  { path = "std::dbg",      reason = "§8.3" },
+]

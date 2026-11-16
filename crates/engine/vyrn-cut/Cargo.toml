@@ -1,0 +1,18 @@
+[package]
+name = "vyrn-cut"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "Cross-core primitives: counters, cut publication, SPSC rings, seqlock, pool primitives."
+
+[dependencies]
+vyrn-types = { workspace = true }
+zerocopy = { workspace = true }
+
+[dev-dependencies]
+loom = { workspace = true }
+
+[lints]
+workspace = true

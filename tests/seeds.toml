@@ -1,0 +1,2 @@
+# vyrn-sim seeds that once failed; each runs on every commit (spec/11-build.md §6.4).
+seeds = []

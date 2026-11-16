@@ -1,0 +1,27 @@
+[package]
+name = "vyrn-md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "Market data and drop copy from replay events."
+
+[[bin]]
+name = "vyrn-md"
+path = "src/bin/vyrn-md.rs"
+
+[[bin]]
+name = "vyrn-dropcopy"
+path = "src/bin/vyrn-dropcopy.rs"
+
+[dependencies]
+vyrn-types = { workspace = true }
+vyrn-replica = { workspace = true }
+vyrn-nic = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

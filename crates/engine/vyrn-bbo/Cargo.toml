@@ -1,0 +1,15 @@
+[package]
+name = "vyrn-bbo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "The BBO core: steps of 01 §14.10, FIFO merge, snapshot publication, auction uncross."
+
+[dependencies]
+vyrn-types = { workspace = true }
+vyrn-cut = { workspace = true }
+
+[lints]
+workspace = true

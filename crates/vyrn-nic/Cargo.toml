@@ -1,0 +1,21 @@
+[package]
+name = "vyrn-nic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "NIC backends: efvi, dpdk (Linux, C shim), kernel_udp, sim; platform calls in sys."
+build = "build.rs"
+links = "vyrn_nic_shim"
+
+[dependencies]
+vyrn-types = { workspace = true }
+vyrn-wire = { workspace = true }
+libc = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
+
+[lints]
+workspace = true

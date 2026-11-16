@@ -1,0 +1,27 @@
+[package]
+name = "vyrn-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "Benchmark harness: generator, echo server, microbenchmarks, histograms, report signing."
+
+[dependencies]
+vyrn-types = { workspace = true }
+vyrn-crypto = { workspace = true }
+vyrn-wire = { workspace = true }
+vyrn-cut = { workspace = true }
+vyrn-risk = { workspace = true }
+vyrn-bbo = { workspace = true }
+vyrn-lane = { workspace = true }
+vyrn-engine = { workspace = true }
+vyrn-nic = { workspace = true }
+vyrn-log = { workspace = true }
+hdrhistogram = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true

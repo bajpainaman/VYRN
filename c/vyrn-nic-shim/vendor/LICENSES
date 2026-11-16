@@ -1,0 +1,2 @@
+Vendored C headers, reviewed by hand (spec/11-build.md §2.6). One directory per vendor release:
+vendor/efvi-<release>/ and vendor/dpdk-<release>/. None vendored yet.

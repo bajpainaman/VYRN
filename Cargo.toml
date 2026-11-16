@@ -1,0 +1,85 @@
+# VYRN workspace (spec/11-build.md §1). Every external dependency is on the §2.2 allowlist and
+# pinned with "=x.y.z" (§2.6); crates name it with `workspace = true` and never a version.
+[workspace]
+resolver = "3"
+members = ["crates/engine/*", "crates/vyrn-*", "bin/*", "tools/*"]
+# fuzz/ is a cargo-fuzz package outside the workspace (§6.6).
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.100"
+license-file = "LICENSE"
+
+[workspace.dependencies]
+# Internal crates (§1.3, graph §1.4).
+vyrn-types = { path = "crates/engine/vyrn-types" }
+vyrn-crypto = { path = "crates/engine/vyrn-crypto" }
+vyrn-wire = { path = "crates/engine/vyrn-wire" }
+vyrn-cut = { path = "crates/engine/vyrn-cut" }
+vyrn-risk = { path = "crates/engine/vyrn-risk" }
+vyrn-bbo = { path = "crates/engine/vyrn-bbo" }
+vyrn-lane = { path = "crates/engine/vyrn-lane" }
+vyrn-engine = { path = "crates/engine/vyrn-engine" }
+vyrn-nic = { path = "crates/vyrn-nic" }
+vyrn-log = { path = "crates/vyrn-log" }
+vyrn-data = { path = "crates/vyrn-data" }
+vyrn-consensus = { path = "crates/vyrn-consensus" }
+vyrn-epoch = { path = "crates/vyrn-epoch" }
+vyrn-replica = { path = "crates/vyrn-replica" }
+vyrn-chain = { path = "crates/vyrn-chain" }
+vyrn-md = { path = "crates/vyrn-md" }
+
+# Tier E: engine crates may use these.
+blake3 = "=1.8.7"
+zerocopy = { version = "=0.8.63", features = ["derive"] }
+
+# Tier S: other production crates.
+curve25519-dalek = "=5.0.0"
+ed25519-dalek = "=3.0.0"
+x25519-dalek = "=3.0.0"
+k256 = "=0.14.0"
+# All commonware-* crates move together on one release tag (§2.6).
+commonware-consensus = "=2026.10.0"
+commonware-p2p = "=2026.10.0"
+commonware-runtime = "=2026.10.0"
+commonware-cryptography = "=2026.10.0"
+commonware-codec = "=2026.10.0"
+commonware-storage = "=2026.10.0"
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+libc = "=0.2.191"
+cc = "=1.11.2"
+serde = { version = "=1.0.229", features = ["derive"] }
+toml = "=1.2.1"
+clap = { version = "=4.6.7", features = ["derive"] }
+prometheus-client = "=0.26.0"
+tracing = "=0.1.44"
+tracing-subscriber = "=0.3.23"
+thiserror = "=2.0.21"
+# default-features off drops the "sync" feature and its crossbeam-channel dependency (§2.2 ban).
+hdrhistogram = { version = "=7.6.0", default-features = false }
+
+# Tier T: tests, vyrn-sim, vyrn-bench, fuzz/ and tools/ only.
+proptest = "=1.12.0"
+loom = "=0.7.3"
+rand = "=0.10.4"
+rand_chacha = "=0.10.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+# §3.4: overflow checks in every profile, abort on panic, one codegen unit.
+[profile.release]
+opt-level = 3
+codegen-units = 1
+debug = "line-tables-only"
+overflow-checks = true
+panic = "abort"
+incremental = false
+
+[profile.bench]
+inherits = "release"

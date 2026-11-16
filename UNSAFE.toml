@@ -1,0 +1,36 @@
+# The only modules allowed to contain `unsafe` (spec/11-build.md §3.2). tools/unsafe-audit
+# enforces the list and the line budgets.
+[[module]]
+path = "vyrn-cut::ring"
+file = "crates/engine/vyrn-cut/src/ring.rs"
+max_lines = 250
+
+[[module]]
+path = "vyrn-lane::arena"
+file = "crates/engine/vyrn-lane/src/arena.rs"
+max_lines = 300
+
+[[module]]
+path = "vyrn-nic::ffi"
+file = "crates/vyrn-nic/src/ffi.rs"
+max_lines = 200
+
+[[module]]
+path = "vyrn-nic::sys"
+file = "crates/vyrn-nic/src/sys.rs"
+max_lines = 250
+
+[[module]]
+path = "vyrn-engine::alloc"
+file = "crates/engine/vyrn-engine/src/alloc.rs"
+max_lines = 80
+
+[[module]]
+path = "vyrn-replica::vx"
+file = "crates/vyrn-replica/src/vx.rs"
+max_lines = 150
+
+[[module]]
+path = "vyrn-sim::oracle"
+file = "crates/vyrn-sim/src/oracle.rs"
+max_lines = 100

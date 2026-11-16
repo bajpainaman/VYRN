@@ -1,0 +1,9 @@
+# Workspace rules for every crate (spec/11-build.md §3.3).
+disallowed-types = [
+  { path = "std::collections::HashMap",  reason = "RandomState: iteration order differs per process (01 §11.2)" },
+  { path = "std::collections::HashSet",  reason = "RandomState (01 §11.2)" },
+  { path = "std::collections::hash_map::RandomState", reason = "01 §11.2" },
+]
+disallowed-methods = [
+  { path = "std::thread::sleep", reason = "use a timer on the control thread" },
+]

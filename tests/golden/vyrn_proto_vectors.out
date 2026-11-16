@@ -1,0 +1,125 @@
+siphash24(00..0f, 00..0e) = 0xa129ca6149be45e5  reference vector OK (also len 0, 8)
+
+V1 req  A: New buy Day 5 @ 100000, STP 1 (48 B)
+  000: 07 30 10 00 01 00 00 00 01 00 e8 03 01 00 00 00
+  010: 01 10 00 00 a0 86 01 00 05 00 00 00 11 11 11 11
+  020: ce a6 ae 0c 10 82 13 8e 00 00 00 00 00 00 00 00
+  tag_seq=0x8e1382100caea6ce  tag_com=0x0000000000000000
+
+V2 resp A: Ack (lane, L-packet) (40 B)
+  000: 07 30 10 00 01 00 00 00 01 00 e8 03 01 00 00 00
+  010: 81 00 00 00 2a 00 00 01 a0 86 01 00 11 11 11 11
+  020: 7b 0a dd 3a 35 20 db 3c
+  tag=0x3cdb20353add0a7b
+
+V3 req  A: Cancel A1, Reduce A2 by 2, Replace A3 -> buy 8 @ 100001 (80 B)
+  000: 07 30 10 00 02 00 00 00 03 00 e8 03 01 00 00 00
+  010: 02 00 00 00 2a 00 00 01 00 00 00 00 22 22 22 22
+  020: 03 00 00 00 2b 00 00 01 02 00 00 00 33 33 33 33
+  030: 04 10 00 00 2c 00 00 01 a1 86 01 00 08 00 00 00
+  040: 21 7c cc dc 1c 1c 91 3a 00 00 00 00 00 00 00 00
+  tag_seq=0x3a911c1cdccc7c21  tag_com=0x0000000000000000
+
+V4 resp A: CancelAck, CancelAck, CancelAck(old) + Ack(new), stored tag 0x44444444 (88 B)
+  000: 07 30 10 00 02 00 00 00 04 00 e8 03 02 00 00 00
+  010: 84 00 00 00 2a 00 00 01 05 00 00 00 22 22 22 22
+  020: 84 01 00 00 2b 00 00 01 02 00 00 00 33 33 33 33
+  030: 84 02 00 00 2c 00 00 01 04 00 00 00 44 44 44 44
+  040: 81 02 00 00 2d 00 00 01 a1 86 01 00 44 44 44 44
+  050: 17 d2 51 0e 46 ae 13 4a
+  tag=0x4a13ae460e51d217
+
+V5 req  B: New sell IOC 10 @ 100000 (48 B)
+  000: 09 50 10 00 01 00 00 00 01 00 e8 03 01 00 00 00
+  010: 01 03 00 00 a0 86 01 00 0a 00 00 00 55 55 55 55
+  020: 23 7b 64 e3 77 6d 4d 3f 00 00 00 00 00 00 00 00
+  tag_seq=0x3f4d6d77e3647b23  tag_com=0x0000000000000000
+
+V6 resp B: B-packet Fill 8 @ 100001, Fill 1 @ 100000, Out IOC_REMAINDER 1 (72 B)
+  000: 09 50 10 00 01 00 00 00 03 00 e8 03 01 00 00 00
+  010: 82 00 01 00 07 00 00 03 a1 86 01 00 08 00 00 00
+  020: 82 00 01 00 07 00 00 03 a0 86 01 00 01 00 00 00
+  030: 85 00 01 00 07 00 00 03 01 00 00 00 55 55 55 55
+  040: 42 85 5c 79 88 cf e3 f2
+  tag=0xf2e3cf88795c8542
+
+V7 resp A: maker Fill of A4 from the TX core, maker range (echo_pkt 0) (40 B)
+  000: 07 30 10 00 03 00 00 00 01 00 e8 03 00 00 00 00
+  010: 82 ff 00 00 2d 00 00 01 a1 86 01 00 08 00 00 00
+  020: b6 25 c0 08 da 1d e7 d1
+  tag=0xd1e71dda08c025b6
+
+V8 req  A: Heartbeat (48 B)
+  000: 07 30 10 00 03 00 00 00 01 00 e8 03 01 00 00 00
+  010: 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  020: 15 e1 48 48 1e f2 ba bf 00 00 00 00 00 00 00 00
+  tag_seq=0xbfbaf21e4848e115  tag_com=0x0000000000000000
+
+V9 resp A: EpochNotice (answer): next 1001, LDN box 1, 3600 s (40 B)
+  000: 07 30 10 00 04 00 00 00 01 00 e8 03 03 00 00 00
+  010: 86 00 00 00 e9 03 00 00 02 01 00 00 10 0e 00 00
+  020: 4d f2 47 1a ea 6b 28 80
+  tag=0x80286bea1a47f24d
+
+V10 req C: CHAIN mode, New sell post-only 3 @ 100002 (48 B)
+  000: 02 00 40 00 01 00 00 00 01 00 e8 03 01 00 00 00
+  010: 01 09 00 00 a2 86 01 00 03 00 00 00 66 66 66 66
+  020: 2f 67 e7 30 b4 b6 e4 b2 9c a5 89 aa 10 23 6a 3a
+  tag_seq=0xb2e4b6b430e7672f  tag_com=0x3a6a2310aa89a59c
+
+V11 resp A: out-of-stream Reject EPOCH_MISMATCH, detail 1000 (40 B)
+  000: 07 30 10 00 00 00 00 00 01 00 e8 03 04 00 00 00
+  010: 83 ff 0f 00 e8 03 00 00 00 00 00 00 00 00 00 00
+  020: 2d f4 0f bc 51 46 ce 1a
+  tag=0x1ace4651bc0ff42d
+
+V12 req A: ResendReq(1, 1) (48 B)
+  000: 07 30 10 00 04 00 00 00 01 00 e8 03 01 00 00 00
+  010: 11 00 00 00 01 00 00 00 01 00 00 00 00 00 00 00
+  020: 44 52 2e b1 e1 40 0c 9c 00 00 00 00 00 00 00 00
+  tag_seq=0x9c0c40e1b12e5244  tag_com=0x0000000000000000
+
+V13 resp A: resend of V2 (flags bit0, same resp_seq, new tag) (40 B)
+  000: 07 30 10 00 01 00 00 00 01 01 e8 03 01 00 00 00
+  010: 81 00 00 00 2a 00 00 01 a0 86 01 00 11 11 11 11
+  020: cb 0a 1c 2c f0 0b 2f 66
+  tag=0x662f0bf02c1c0acb
+
+V14 req A: CancelAll (48 B)
+  000: 07 30 10 00 05 00 00 00 01 00 e8 03 01 00 00 00
+  010: 12 00 00 00 00 00 00 00 00 00 00 00 77 77 77 77
+  020: c4 17 c2 a9 56 95 1a ee 00 00 00 00 00 00 00 00
+  tag_seq=0xee1a9556a9c217c4  tag_com=0x0000000000000000
+
+V15 resp A: CancelAck x2, summary CancelAck(HANDLE_ALL, 2) (72 B)
+  000: 07 30 10 00 06 00 00 00 03 00 e8 03 05 00 00 00
+  010: 84 00 00 00 2b 00 00 01 03 00 00 00 77 77 77 77
+  020: 84 00 00 00 2e 00 00 01 06 00 00 00 77 77 77 77
+  030: 84 00 00 00 ff ff ff ff 02 00 00 00 77 77 77 77
+  040: f5 85 d4 43 dd fd c5 b5
+  tag=0xb5c5fddd43d485f5
+
+V16 req A: New buy IOC 2 @ 100000 (arrives in overload) (48 B)
+  000: 07 30 10 00 06 00 00 00 01 00 e8 03 01 00 00 00
+  010: 01 02 00 00 a0 86 01 00 02 00 00 00 88 88 88 88
+  020: fd 45 e4 3b dc 2a da 03 00 00 00 00 00 00 00 00
+  tag_seq=0x03da2adc3be445fd  tag_com=0x0000000000000000
+
+V17 resp A: out-of-stream Reject BUSY (lane shed), index 0xFF, detail = expected 6 (40 B)
+  000: 07 30 10 00 00 00 00 00 01 00 e8 03 06 00 00 00
+  010: 83 ff 18 00 06 00 00 00 00 00 00 00 00 00 00 00
+  020: 70 0e fd 35 ea 4e de dc
+  tag=0xdcde4eea35fd0e70
+
+V18 req A: resend of V16, same pkt_seq and content, bit0 = 1 (48 B)
+  000: 07 30 10 00 06 00 00 00 01 01 e8 03 01 00 00 00
+  010: 01 02 00 00 a0 86 01 00 02 00 00 00 88 88 88 88
+  020: 37 e2 a3 17 d7 27 2c 64 00 00 00 00 00 00 00 00
+  tag_seq=0x642c27d717a3e237  tag_com=0x0000000000000000
+check OK: V1 verifies with K_SEQ
+check OK: V1 fails with K_OUT
+check OK: V1 with one tag bit flipped fails (bound source: close session)
+check OK: V10 tag_com = SipHash(K_COM, bytes 0..32)
+check OK: V13 tag differs from V2 tag
+check OK: V17 is out of stream (resp_seq 0), reason BUSY 24, echo_pkt 6
+check OK: V18 has V16's logical content (D3) and verifies

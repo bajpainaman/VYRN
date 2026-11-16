@@ -1,0 +1,18 @@
+[package]
+name = "vyrn-lane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "One lane: admission, sessions, MAC, risk, classify/dispatch, FIFO arena."
+
+[dependencies]
+vyrn-types = { workspace = true }
+vyrn-wire = { workspace = true }
+vyrn-cut = { workspace = true }
+vyrn-risk = { workspace = true }
+vyrn-bbo = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "vyrn-consensus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "Simplex on Commonware: proposal, votes, certificates, view changes, silence detection."
+
+[dependencies]
+vyrn-types = { workspace = true }
+vyrn-crypto = { workspace = true }
+vyrn-log = { workspace = true }
+commonware-consensus = { workspace = true }
+commonware-p2p = { workspace = true }
+commonware-runtime = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
+commonware-storage = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

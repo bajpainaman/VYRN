@@ -1,0 +1,36 @@
+[package]
+name = "vyrn-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "Deterministic whole-cluster simulator, oracle binding, invariant checkers. Test-only."
+
+[dependencies]
+vyrn-types = { workspace = true }
+vyrn-crypto = { workspace = true }
+vyrn-wire = { workspace = true }
+vyrn-cut = { workspace = true }
+vyrn-risk = { workspace = true }
+vyrn-bbo = { workspace = true }
+vyrn-lane = { workspace = true }
+vyrn-engine = { workspace = true }
+vyrn-nic = { workspace = true }
+vyrn-log = { workspace = true }
+vyrn-data = { workspace = true }
+vyrn-consensus = { workspace = true }
+vyrn-replica = { workspace = true }
+vyrn-epoch = { workspace = true }
+vyrn-chain = { workspace = true }
+vyrn-md = { workspace = true }
+commonware-runtime = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

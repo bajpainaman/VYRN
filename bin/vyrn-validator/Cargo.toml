@@ -1,0 +1,16 @@
+[package]
+name = "vyrn-validator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "The validator binary: vyrn-replica plus vyrn-chain."
+
+[dependencies]
+vyrn-replica = { workspace = true }
+vyrn-chain = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,38 @@
+# cargo-deny (spec/11-build.md §2.2, §2.6).
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  # Unmaintained proc-macro, pulled in only by commonware-codec (the §2.6 Commonware pin).
+  { id = "RUSTSEC-2024-0436", reason = "transitive via commonware-codec 2026.10.0" },
+]
+
+[licenses]
+version = 2
+allow = ["Apache-2.0", "Apache-2.0 WITH LLVM-exception", "MIT", "BSD-2-Clause", "BSD-3-Clause",
+         "ISC", "Unicode-3.0", "CC0-1.0"]
+private = { ignore = true }
+# Written exceptions (§2.6: anything outside the allow list needs one here).
+exceptions = [
+  { name = "foldhash", allow = ["Zlib"] },  # via hashbrown, under commonware-runtime
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal crates are path dependencies without a version.
+allow-wildcard-paths = true
+deny = [
+  { name = "openssl", reason = "one crypto stack (§2.2)" },
+  { name = "openssl-sys", reason = "one crypto stack (§2.2)" },
+  { name = "ring", reason = "one crypto stack (§2.2)" },
+  { name = "crossbeam", reason = "the rings are ours and loom-checked (§2.2)" },
+  { name = "crossbeam-channel", reason = "§2.2" },
+  { name = "crossbeam-queue", reason = "§2.2", wrappers = ["commonware-actor"] },
+  { name = "async-std", reason = "tokio is the only async runtime (§2.2)" },
+  { name = "smol", reason = "tokio is the only async runtime (§2.2)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

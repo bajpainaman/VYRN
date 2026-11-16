@@ -1,0 +1,13 @@
+[package]
+name = "vyrn-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "Newtypes of 01 §3, constants of 01 §5, record structs of 01 §6.6. No dependencies."
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,6 @@
+# ref defaults (spec/11-build.md §10.1). Core map: deploy/coremaps/ref.toml.
+schema   = 3
+protocol = 1
+
+[nic]
+backend  = "efvi"

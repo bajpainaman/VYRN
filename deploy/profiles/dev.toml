@@ -1,0 +1,17 @@
+# DEV defaults (spec/11-build.md §10.1): sim or kernel_udp, no pinning, no huge pages.
+schema    = 3
+protocol  = 1
+role      = "replica"
+mode      = "BASE"
+home      = "DEV"
+facility  = "F1"
+books     = [1]
+
+[engine]
+client    = "rust"
+dedicated = 4
+pooled    = 0
+
+[nic]
+backend   = "sim"
+ports     = []

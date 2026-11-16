@@ -1,0 +1,6 @@
+# spec/11-build.md §1.2, §5.4. The spec's 3a89e3c7 is the annotated v0.0.4 tag object; it points
+# at commit c6dffec7. vxc_blake3 is the hash of the vxc binary; fill it in from the pinned build.
+vxc_version = "v0.0.4"
+vxc_tag_object = "3a89e3c761b60270f257521277c174c9e9a784c3"
+vxc_commit = "c6dffec704182d98c271c93afefba1c38ba18d21"
+vxc_blake3 = ""

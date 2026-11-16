@@ -1,0 +1,16 @@
+[package]
+name = "vyrn-epoch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "Epoch schedule, HandoffRecord, fencing, auction phase control, EpochNotice."
+
+[dependencies]
+vyrn-types = { workspace = true }
+vyrn-consensus = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

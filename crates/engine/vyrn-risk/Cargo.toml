@@ -1,0 +1,14 @@
+[package]
+name = "vyrn-risk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "Lane-local accounts, reservations (01 §12.1), rate limits, fees, positions."
+
+[dependencies]
+vyrn-types = { workspace = true }
+
+[lints]
+workspace = true

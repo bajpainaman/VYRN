@@ -1,0 +1,6 @@
+# Pinned rustc (spec/11-build.md §1.2). Miri, TSan/ASan and cargo-fuzz run on nightly
+# (`cargo +nightly ...`); B4 build C uses the release before this one (§7.7).
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy", "rust-src", "llvm-tools"]
+profile = "minimal"

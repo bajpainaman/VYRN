@@ -1,0 +1,12 @@
+# spec/11-build.md §3.9: owners for UNSAFE.toml modules, c/, vx/ and supply-chain/.
+/UNSAFE.toml                              @bajpainaman
+/crates/engine/vyrn-cut/src/ring.rs       @bajpainaman
+/crates/engine/vyrn-lane/src/arena.rs     @bajpainaman
+/crates/engine/vyrn-engine/src/alloc.rs   @bajpainaman
+/crates/vyrn-nic/src/ffi.rs               @bajpainaman
+/crates/vyrn-nic/src/sys.rs               @bajpainaman
+/crates/vyrn-replica/src/vx.rs            @bajpainaman
+/crates/vyrn-sim/src/oracle.rs            @bajpainaman
+/c/                                       @bajpainaman
+/vx/                                      @bajpainaman
+/supply-chain/                            @bajpainaman

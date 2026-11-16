@@ -1,0 +1,19 @@
+[package]
+name = "vyrn-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "Packets and records of 01 §6.1-6.5, and the RxRing/TxRing traits."
+
+[dependencies]
+vyrn-types = { workspace = true }
+vyrn-crypto = { workspace = true }
+zerocopy = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

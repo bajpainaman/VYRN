@@ -1,0 +1,80 @@
+# cargo-fuzz package, outside the workspace (spec/11-build.md §6.6). Run with
+# `cargo +nightly fuzz run <target>`.
+[package]
+name = "vyrn-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+arbitrary = { version = "=1.5.0", features = ["derive"] }
+
+[[bin]]
+name = "fz_req_packet"
+path = "fuzz_targets/fz_req_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fz_resp_roundtrip"
+path = "fuzz_targets/fz_resp_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fz_order_stream"
+path = "fuzz_targets/fz_order_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fz_engine_ops"
+path = "fuzz_targets/fz_engine_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fz_replay_cuts"
+path = "fuzz_targets/fz_replay_cuts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fz_consensus_msg"
+path = "fuzz_targets/fz_consensus_msg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fz_handoff"
+path = "fuzz_targets/fz_handoff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fz_session_open"
+path = "fuzz_targets/fz_session_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fz_config"
+path = "fuzz_targets/fz_config.rs"
+test = false
+doc = false
+bench = false

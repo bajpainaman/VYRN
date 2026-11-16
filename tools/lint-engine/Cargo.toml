@@ -1,0 +1,13 @@
+[package]
+name = "lint-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "CI gate tool (spec/11-build.md)."
+
+[dependencies]
+
+[lints]
+workspace = true
