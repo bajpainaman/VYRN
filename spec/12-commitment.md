@@ -38,11 +38,17 @@ exhaustive list of causes. This chapter adds the evidence and the cost for each.
 
 | Case (07 §9.6) | Faults needed | Evidence that authorizes it | Expected rate (budget, 07 §9.6) | Who bears the loss |
 |---|---|---|---|---|
-| (a) frame lost on both paths, then sequencer death within `W` | 2 | The seal (07 §9.4): `F* < f(s)` signed by Q voters | ≈ 2 × 10⁻¹⁴ events/yr | open (§5, question 2) |
-| (b) both paths cut at a live sequencer, until the self-fence | 2 | The seal; the sequencer's self-fence record | ≈ 0.19 fills/yr at average load | open (§5, question 2) |
-| (c) in-box power loss while `lead < 0` | 1 power loss inside a ≤ 100 ns window | The seal | ≈ 2 × 10⁻⁴ /yr | open (§5, question 2) |
+| (a) frame lost on both paths, then sequencer death within `W` | 2 | The seal (07 §9.4): `F* < f(s)` signed by Q voters | ≈ 2 × 10⁻¹⁴ events/yr | nobody: the trade is void (01 §14.19 B item 4) |
+| (b) both paths cut at a live sequencer, until the self-fence | 2 | The seal; the sequencer's self-fence record | ≈ 0.19 fills/yr at average load | nobody: the trade is void (01 §14.19 B item 4) |
+| (c) in-box power loss while `lead < 0` | 1 power loss inside a ≤ 100 ns window | The seal | ≈ 2 × 10⁻⁴ /yr | nobody: the trade is void (01 §14.19 B item 4) |
 | (d) a packet the step depends on is unavailable | client equivocation or withholding, plus a dead sequencer | The seal's unavailable list (07 §9.4) and the voters' missing reports (13 §3) | by design; bounded by 13 §4 | the withholding session, through 13 §5 |
 | (e) a tail conflict truncates the prefix | a Byzantine sequencer | `TailConflict` evidence (07 §10) | not a crash case | the sequencer operator (CHAIN: slashed bond, 09) |
+
+**A revert voids the trade (01 §14.19 B item 4).** A reverted execution never happened. No balance
+moved and no fee is charged, and the orders involved are wherever the canonical replay puts them.
+No one is compensated in cases (a)–(c). In case (d) the misbehaving session keeps its own losses,
+and in case (e) the sequencer operator is slashed (CHAIN, 09). A client that acted on a fill before
+`FINAL` carries that risk, at the rates above.
 
 **Notification.** Every reverted execution gets a `DC_REVERT` and an `MD_TRADE_BUST` before the
 `DC_FINAL` that covers its step (10 §8.2). A client that received the `Fill` and no `DC_REVERT`
@@ -75,7 +81,7 @@ effect and refund both fees (09 §5.9).
 
 | A client that holds | May treat the execution as |
 |---|---|
-| `EXECUTED` only | Executed and very likely to survive. It may hedge, but it must reconcile against `DC_FINAL`. |
+| `EXECUTED` only | Executed and very likely to survive. It may hedge, but it must reconcile against `DC_FINAL`: if the fill reverts, the trade is void and nobody compensates the hedge. |
 | `DURABLE` | Lost only through a misbehaving party (cases (d), (e), or a bust). |
 | `FINAL` in BASE | Irreversible. |
 | `FINAL` in CHAIN | Irreversible, unless a `Bust` names it, and that `Bust` arrives before the `DC_FINAL` (§3). After the `DC_FINAL` with no `Bust`, irreversible. |
@@ -116,12 +122,12 @@ publishes exactly this table and never the shorter claim.
 
 1. 04 §7.5 defines level 1 `DURABLE` as "at least `F + 1` replicas hold the records"; 07 §6.9
    defines `DUR_QUORUM` as Q voters. Pick one. This chapter uses 07's (Q), which is the stronger.
-2. Name the case-(c) exception in §14.19 B's text, as §2 here does.
+
+Resolved: the case-(c) exception and void reverts are in 01 §14.19 B items 4 and 6.
 
 ## Open questions
 
 | # | Question | Owner | Settled by |
 |---|---|---|---|
 | 1 | Can a TX-side fence or a different frame-gate order make `P(lead < 0)` zero, so case (c) disappears? | 07, 06 | B-REP-2W |
-| 2 | Who pays for a revert in cases (a)–(c), where no party misbehaved: the operator, an insurance fund, or nobody (the trade is simply void)? | 10, 09 | policy decision; cost model from 07 §9.6 rates |
-| 3 | Should BASE mode also expose a `Bust`-style compensating reversal for operator error, or stay strictly log-defined? | 10 | policy decision |
+| 2 | Should BASE mode also expose a `Bust`-style compensating reversal for operator error, or stay strictly log-defined? | 10 | policy decision |

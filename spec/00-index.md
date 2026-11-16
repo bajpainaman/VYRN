@@ -42,7 +42,8 @@ requirements at the same time:
 
 **Draft 0.3 rulings** (01 §14.19): REQ-LAT-1 covers every received packet and ingress loss is
 bounded apart from `BUSY` (REQ-LAT-14); a fill is undone only by a 07 §9.6 revert before finality
-or by a CHAIN bust whose verdict is final with it.
+or by a CHAIN bust whose verdict is final with it; a reverted trade is void and nobody is
+compensated; withheld data copies are attributed and contained by DAV-1 to DAV-4.
 
 ## Master diagram
 

@@ -436,7 +436,7 @@ Core 1 reads lanes 0–24 and core 6 reads lanes 25–48. Each writes its own ha
 
 ### 14.10 New codes
 
-- **Reject reasons:** 21 `ACCOUNT_KILLED`, 22 `RESEND_GONE`, 23 `BAD_BOOK`, 24 `BUSY`.
+- **Reject reasons:** 21 `ACCOUNT_KILLED`, 22 `RESEND_GONE`, 23 `BAD_BOOK`, 24 `BUSY`, 26 `DATA_MISSING` (draft 0.3, §14.19 C).
 - **`StepKind` adds:** `Shed`, `Control`, `Seal`, `Uncross`.
 - **Response record:** 0x87 `Bust` (CHAIN, 09).
 - `Fill.liq` = 2 means an auction fill.
@@ -654,8 +654,31 @@ settlement. The rule is:
    still executes later as lane ops; its `DC_REVERT` is sent before the `DC_FINAL` that covers the
    fill's step (10 §8.2). Settlement never undoes a final fill. A failure to settle is an
    operational incident handled by 09's custody rules, not a `Bust`.
-4. **Who pays** for a bust: the busted session's bond, then the insurance fund (09 §5.9). Who pays
-   for a revert in cases (a)–(c) is not yet decided (12 open question 2).
+4. **A revert voids the trade.** A reverted execution never happened: no balance moved, no fee is
+   charged, and both parties' orders are as if the packet carried no such fill (the canonical
+   replay decides what rests). Nobody pays compensation in cases (a)–(c), where no party
+   misbehaved. In case (d) the withholding or equivocating session's losses stay its own, and in
+   case (e) the sequencer operator is slashed in CHAIN (09). A client that hedged on a fill that
+   later reverts carries that risk; 12 §4 says what a client may rely on before `FINAL`.
+5. **Who pays** for a bust: the busted session's bond, then the insurance fund (09 §5.9).
+6. **One fault can revert, in one case.** Every revert needs two independent faults, a Byzantine
+   sequencer or a misbehaving client, except case (c): an in-box power loss while `lead < 0`, a
+   window of ≤ 100 ns per response (12 §2, B-REP-2W).
+
+**C. Withheld data copies are attributed and contained (13 §5).** DAV-1 to DAV-4 are binding:
+
+1. **DAV-1.** Each voter counts, per session, records it resolved only from the sequencer
+   (07 §5.5 source 3). Over `DAV_MISS_MAX` = 16 in any `DAV_WINDOW_MS` = 10 ms window, it signs
+   `DataMissing{session, window, count}`. Q such reports close the session through the control op
+   of 07 §5.6, with reject reason 26 `DATA_MISSING` (25 is reserved for `RESEND_RECOVERY`, 03 Request 10).
+2. **DAV-2.** The sequencer serves source-3 repairs for one session at ≤ `DAV_SESSION_REPAIR_PPS`
+   = 2,000 packets/s.
+3. **DAV-3.** The leader may mark a DAV-1-reported session's unrepaired packets unavailable while
+   the sequencer lives (extends 07 §9.4), so one client cannot trip the finality gate. Their
+   executions revert as case (d).
+4. **DAV-4.** The service contract publishes `DAV_TOLERANCE` (1.3 × 10⁻³ of a block's packets,
+   all misbehaving sessions together) and states that no session can delay another session's
+   finality.
 
 12 (`12-commitment.md`) states the whole lifecycle. 13 and 14 hold the data-availability model and
 the workload envelope.

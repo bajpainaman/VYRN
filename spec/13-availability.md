@@ -1,6 +1,6 @@
 # 13. Data availability and the fault model
 
-Draft 0.3, 2026-11-16. Normative where it says "decision"; the rest is analysis on draft 0.2
+Draft 0.3, 2026-11-16. §5 is normative (01 §14.19 C); the rest is analysis on draft 0.2
 budgets. Local names use the prefix `DAV_`. This chapter follows `01-conventions.md`. It owns no
 mechanism that 07 already owns; it states what 07's mechanisms guarantee, finds where they stop,
 and proposes the rules that close the gap.
@@ -14,7 +14,7 @@ sequencer has the bytes a client withheld from the data tier, and it serves them
 packets/s (02 §5.2), 2,910 times more. Draft 0.2 closes a session whose two copies **differ**
 (07 §5.6), but nothing closes a session whose second copy is **absent**. So one client that sends
 only to the sequencer can stall every block it touches, and the finality gate (07 §6.8) then halts
-the book. This chapter bounds that case and proposes the rule that closes it (§5).
+the book. This chapter bounds that case, and §5 gives the rules that close it (01 §14.19 C).
 
 ## 1. Fault model
 
@@ -79,7 +79,7 @@ The seal lists them unavailable, and every execution of a step that depends on t
   the finality gate (≤ ~9 ms of fills, 07 §6.8). The reverted fills include its honest
   counterparties' fills.
 
-## 5. Proposed rules (decisions for draft 0.3 review)
+## 5. Rules (binding, 01 §14.19 C, decided 2026-11-16)
 
 1. **DAV-1. Missing copies are attributed per session.** Each voter counts, per session, records
    it had to resolve from the sequencer (source 3) because no data box had them. When the count in
@@ -94,8 +94,8 @@ The seal lists them unavailable, and every execution of a step that depends on t
 3. **DAV-3. Unavailable before halt.** If a block's vote is still pending only on source-3 payloads
    of sessions already reported by DAV-1, the leader may propose those packets unavailable while
    the sequencer lives (07 §9.4's rule, extended), so the gate does not trip for one client's
-   behaviour. Their fills revert (case (d)) and the session's bond (CHAIN) or account (BASE) bears
-   the cost.
+   behaviour. Their fills revert (case (d)) and the trades are void (01 §14.19 B item 4); the
+   withholding session keeps its own losses and nobody is compensated.
 4. **DAV-4. Publish the tolerance.** The service contract states the §3 figure: with DAV-1 to
    DAV-3, misbehaving sessions together may withhold ≤ `DAV_TOLERANCE` of packets per block before
    finality is affected, and no single session can affect another session's finality.
@@ -116,10 +116,10 @@ That needs checking against 07 §6.6's margins (Open question 1).
 
 | Chapter | Consumes from 13 | Provides to 13 |
 |---|---|---|
-| 07 | DAV-1 to DAV-3 if accepted: a new evidence type, a quota on `SeqDataReq`, an extended unavailable rule | §5 fetch order, §5.6, §6.4, §6.8, §9.4 |
-| 04 | a session-close reason for DAV-1 | the control op of 07 §5.6 |
+| 07 | DAV-1 to DAV-3: a new evidence type, a quota on `SeqDataReq`, an extended unavailable rule | §5 fetch order, §5.6, §6.4, §6.8, §9.4 |
+| 04 | reject reason 26 `DATA_MISSING` for a DAV-1 close | the control op of 07 §5.6 |
 | 05 | `REP_SEQ_PKT_RETAIN_MS` sizing against §3 | lane packet retention |
-| 09 | bond liability for DAV-3 reverts | §5.9 |
+| 09 | case (e) slashing; no bond payout for case (d), since reverted trades are void | §5.9 |
 | 12 | case (d) bound | lifecycle |
 | 14 | `DAV_TOLERANCE` as a published envelope term | the workload envelope |
 
@@ -129,18 +129,18 @@ That needs checking against 07 §6.6's margins (Open question 1).
 |---|---|---|
 | `DAV_REPAIR_PER_BLOCK` | 185 packets | computed: source-3 repairs that fit before `REP_VERIFY_WAIT_MS` |
 | `DAV_TOLERANCE` | 1.3 × 10⁻³ | computed: fraction of a block's packets that may lack a data-tier copy |
-| `DAV_WINDOW_MS`, `DAV_MISS_MAX` | 10, 16 | proposed: DAV-1 attribution window and threshold |
-| `DAV_SESSION_REPAIR_PPS` | 2,000 | proposed: DAV-2 per-session source-3 quota |
+| `DAV_WINDOW_MS`, `DAV_MISS_MAX` | 10, 16 | DAV-1 attribution window and threshold |
+| `DAV_SESSION_REPAIR_PPS` | 2,000 | DAV-2 per-session source-3 quota |
 
 ## Requests to 01
 
-1. Add DAV-1 to DAV-3 to §14 once accepted, and a 01 §6.5 reject reason for a DAV-1 session close.
+Resolved: DAV-1 to DAV-4 are 01 §14.19 C, and reject reason 26 `DATA_MISSING` is in 01 §14.10.
 
 ## Open questions
 
 | # | Question | Owner | Settled by |
 |---|---|---|---|
 | 1 | Does DAV-1 close a withholding session before the gate's 8 blocks trip, with 07 §6.6's margins and one voter down? | 07 | `vyrn-sim` DAV-T1 timing |
-| 2 | Is 16 packets per 10 ms low enough to stop abuse and high enough that honest packet loss on the data path never triggers it? Needs the measured per-session loss on copy 2. | 07, 06 | B10 per-session loss counters |
+| 2 | The thresholds are binding but budgets: is 16 packets per 10 ms low enough to stop abuse and high enough that honest packet loss on the data path never triggers it? Needs the measured per-session loss on copy 2. | 07, 06 | B10 per-session loss counters |
 | 3 | Should `REP_SEQ_DATA_MAX_PPS` rise? Core 51 also runs control and the finality listener (07 §6.8). | 07, 05 | core-51 load measurement |
 | 4 | On AWS (no tap), how are DAV-1 reports checked (10 open question 4)? | 07, 10 | `vyrn-sim` with withheld copies |

@@ -1319,6 +1319,7 @@ out-of-stream (`resp_seq` 0, not accepted, the client resends the same logical c
 | 22 | `RESEND_GONE` | in (lane `ResendReq`); out (recovery) | §6.7, §5.4 | the oldest `resp_seq` either store holds | rebuild order state from the drop copy |
 | 23 | `BAD_BOOK` | in | V9 | the packet's `book` | client bug: the session may not trade that book |
 | 24 | `BUSY` | out (lane shed, index 0xFF); in (BBO shed, message index) | test D (§3.5) | `expected` (lane); 0 (BBO) | lane: resend from detail, same `pkt_seq`; BBO: resend the message in a new packet |
+| 26 | `DATA_MISSING` | in (index 0xFF, final record) | 01 §14.19 C (DAV-1) | 0 | the session is closed: Q voters reported its data-tier copies missing; send copy 2 of every packet to the data home |
 
 ## 9. Rate limits and fee classes
 
