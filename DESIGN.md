@@ -13,7 +13,8 @@ BFT finality in 10 ms, a book that follows the sun, and (extra credit) all of it
    lane's counter and logs that vector. That log *is* the total order, and replicas replay it
    bit for bit.
 3. **The fill goes out before consensus and almost never reverts.** The ordering frame leaves the
-   NIC on two paths before the fill does, so no single fault can revert a fill. A revert needs two
+   NIC on two paths before the fill does, so no single fault can revert a fill, except a power loss
+   inside a ≤ 100 ns window (spec 12 §2). A revert otherwise needs two
    faults, such as the leader dying *and* both paths dropping the same frame inside the same
    0.5 ms. Spec 07 §9.6 lists every such case, and none can happen after the fill is final
    (spec 01 §14.19 B). In CHAIN mode a fill against a packet with a bad `K_com` MAC is busted (§7):

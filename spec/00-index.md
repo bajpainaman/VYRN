@@ -36,6 +36,13 @@ requirements at the same time:
 | 09 | [`09-chain.md`](09-chain.md) | On-chain mode: validators, custody, bridge, authentication, commitments, slashing | 2,026 |
 | 10 | [`10-accounts-risk-md.md`](10-accounts-risk-md.md) | Accounts, risk, positions, fees, market data, drop copy, surveillance | 1,738 |
 | 11 | [`11-build.md`](11-build.md) | Repo, crates, coding rules, Vx client, tests, benchmarks, observability, ops, milestones | 2,381 |
+| 12 | [`12-commitment.md`](12-commitment.md) | Draft 0.3: execution lifecycle, what can undo a fill at each stage, evidence and who pays | — |
+| 13 | [`13-availability.md`](13-availability.md) | Draft 0.3: data-availability and fault model, the repair-capacity gap, proposed rules DAV-1 to DAV-4 | — |
+| 14 | [`14-envelope.md`](14-envelope.md) | Draft 0.3: throughput envelope, five reported rates, packet-fill ceiling, regimes R1–R6 | — |
+
+**Draft 0.3 rulings** (01 §14.19): REQ-LAT-1 covers every received packet and ingress loss is
+bounded apart from `BUSY` (REQ-LAT-14); a fill is undone only by a 07 §9.6 revert before finality
+or by a CHAIN bust whose verdict is final with it.
 
 ## Master diagram
 
