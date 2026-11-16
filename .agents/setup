@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# Prepares an Amp orb for VYRN. The inventory comes from DESIGN.md and spec/ (mainly
+# 11-build.md, 06-platform.md, 04-protocol.md §vectors, 09-chain.md). The repository is a spec
+# today; once Cargo.toml, rust-toolchain.toml and vx/ land, this script also installs the pinned
+# toolchain and warms the workspace. Production-only hardware (ef_vi/Onload NICs, PTP, 1 GiB
+# huge pages, isolcpus, NVMe arrays, L1 nodes, HSMs) is out of scope: DEV uses the sim and
+# kernel_udp backends (06 §DEV, 11 L140).
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+# vxc pin: 11-build.md L95 and L908 (vx/TOOLCHAIN). vxc v0.0.4 links against LLVM/MLIR 22.
+VX_TAG="v0.0.4"
+# The spec's 3a89e3c7 is the annotated tag object; it points at this commit.
+VX_TAG_OBJECT="3a89e3c761b60270f257521277c174c9e9a784c3"
+VX_COMMIT="c6dffec704182d98c271c93afefba1c38ba18d21"
+VX_LLVM=22
+VX_SRC="$HOME/.local/src/vx"
+LOCAL_BIN="$HOME/.local/bin"
+
+step() {
+  local name="$1"
+  shift
+  local start=$SECONDS
+  echo "==> $name"
+  "$@"
+  echo "<== $name ($((SECONDS - start))s)"
+}
+
+apt_install_missing() {
+  local missing=()
+  for pkg in "$@"; do
+    dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+  done
+  if ((${#missing[@]})); then
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}"
+  fi
+}
+
+apt_base() {
+  # C shim and general build tools; python3 runs the protocol vectors (04 §vectors, `python3 -I`);
+  # meson/ninja/pyelftools/libnuma/ibverbs headers build vendored DPDK for the net_ring test
+  # (06 L1216, 11 L740); z3 and the libs below are vxc's build dependencies.
+  apt_install_missing build-essential cmake pkg-config git curl ca-certificates gnupg \
+    python3 meson ninja-build python3-pyelftools libnuma-dev libibverbs-dev \
+    libffi-dev libz3-dev z3 zlib1g-dev libzstd-dev libedit-dev libxml2-dev
+}
+
+rustup_install() {
+  if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+      sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+  fi
+}
+
+toolchains() {
+  # Stable is the default until rust-toolchain.toml lands; then rustup also installs the pin.
+  rustup toolchain install stable --profile minimal \
+    --component rustfmt,clippy,rust-src,llvm-tools-preview
+  rustup default stable >/dev/null
+  # Miri, TSan/ASan (-Zsanitizer) and cargo-fuzz need nightly (11 L608, L901, L1935).
+  rustup toolchain install nightly --profile minimal --component miri,rust-src,llvm-tools-preview
+  # B4 build C uses the previous rustc release (11 L1546).
+  local minor
+  minor="$(rustc +stable --version | sed -E 's/^rustc 1\.([0-9]+).*/\1/')"
+  rustup toolchain install "1.$((minor - 1))" --profile minimal
+  if [[ -f rust-toolchain.toml || -f rust-toolchain ]]; then
+    rustup toolchain install
+  fi
+  cargo +nightly miri setup >/dev/null
+}
+
+llvm_repo() {
+  local version="$1" codename
+  codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+  local list="/etc/apt/sources.list.d/llvm-${version}.list"
+  [[ -f "$list" ]] && return 0
+  if [[ ! -f /usr/share/keyrings/llvm-snapshot.gpg ]]; then
+    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
+      sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
+  fi
+  echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-${version} main" |
+    sudo tee "$list" >/dev/null
+  # Force apt_install_missing to refresh the index for the new repository.
+  sudo apt-get update -qq
+}
+
+llvm_for_rust() {
+  # Cross-language LTO needs clang/lld from the same LLVM major as rustc (11 L627-631); CI also
+  # runs clang-tidy, clang-format, llvm-objdump and nm (11 L716, L736, L765, L1929).
+  local major
+  major="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
+  llvm_repo "$major"
+  apt_install_missing "clang-$major" "lld-$major" "llvm-$major" "clang-tidy-$major" "clang-format-$major"
+  local bin="/usr/lib/llvm-$major/bin"
+  for tool in clang clang++ lld ld.lld clang-tidy clang-format llvm-objdump llvm-nm llvm-ar llvm-config; do
+    if [[ "$(readlink "/usr/local/bin/$tool" 2>/dev/null)" != "$bin/$tool" ]]; then
+      sudo ln -sfn "$bin/$tool" "/usr/local/bin/$tool"
+    fi
+  done
+}
+
+llvm_for_vx() {
+  llvm_repo "$VX_LLVM"
+  apt_install_missing "llvm-$VX_LLVM" "llvm-$VX_LLVM-dev" "llvm-$VX_LLVM-tools" "clang-$VX_LLVM" \
+    "lld-$VX_LLVM" "libmlir-$VX_LLVM-dev" "mlir-$VX_LLVM-tools" "libpolly-$VX_LLVM-dev"
+}
+
+vxc_build() {
+  # No aarch64 Linux release exists for v0.0.4, so build it from the pinned tag on every arch.
+  mkdir -p "$LOCAL_BIN" "$(dirname "$VX_SRC")"
+  if [[ ! -d "$VX_SRC/.git" ]]; then
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$VX_TAG" \
+      https://github.com/vx-lang/Vx.git "$VX_SRC"
+  fi
+  if [[ "$(git -C "$VX_SRC" rev-parse HEAD)" != "$VX_COMMIT" ||
+    "$(git -C "$VX_SRC" rev-parse "refs/tags/$VX_TAG")" != "$VX_TAG_OBJECT" ]]; then
+    echo "vx checkout does not match $VX_TAG ($VX_TAG_OBJECT -> $VX_COMMIT)" >&2
+    return 1
+  fi
+  (
+    cd "$VX_SRC"
+    [[ -f config.local ]] || LLVM_VERSION="$VX_LLVM" ./setup.sh >/dev/null
+    # shellcheck disable=SC1091
+    source config.local
+    cargo build --release --locked --quiet
+  )
+  ln -sfn "$VX_SRC/target/release/vxc" "$LOCAL_BIN/vxc"
+}
+
+cargo_tools() {
+  if ! command -v cargo-binstall >/dev/null; then
+    curl -L --proto '=https' --tlsv1.2 -sSf \
+      https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+  fi
+  # deny/vet/fuzz/show-asm are named by 11 (L54, L58, L102, L613); nextest is a faster runner for
+  # the unit tier; cyclonedx writes the release SBOM (11 L316).
+  local tools=() tool
+  for tool in cargo-deny cargo-vet cargo-fuzz cargo-show-asm:cargo-asm cargo-nextest cargo-cyclonedx; do
+    command -v "${tool#*:}" >/dev/null || tools+=("${tool%%:*}")
+  done
+  if ((${#tools[@]})); then
+    cargo binstall --no-confirm --disable-telemetry "${tools[@]}"
+  fi
+}
+
+foundry_install() {
+  # Bridge contract work and the B-CHN-4 gas report (09 L1113, L2020).
+  if [[ ! -x "$HOME/.foundry/bin/forge" ]]; then
+    curl -fsSL https://foundry.paradigm.xyz | bash >/dev/null
+    "$HOME/.foundry/bin/foundryup" --install stable >/dev/null
+  fi
+}
+
+shell_profile() {
+  # ~/.bash_profile exists in orbs, so login shells skip ~/.profile; add the tool paths here.
+  local marker="# VYRN toolchain paths"
+  if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+    cat >>"$HOME/.bash_profile" <<'EOF'
+
+# VYRN toolchain paths
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
+case ":$PATH:" in *":$HOME/.foundry/bin:"*) ;; *) export PATH="$PATH:$HOME/.foundry/bin" ;; esac
+EOF
+  fi
+}
+
+agent_guidance() {
+  local file="$HOME/.config/amp/AGENTS.md" marker="<!-- VYRN orb notes -->"
+  mkdir -p "$(dirname "$file")"
+  grep -Fqx "$marker" "$file" 2>/dev/null && return 0
+  cat >>"$file" <<'EOF'
+
+<!-- VYRN orb notes -->
+# VYRN orb notes
+
+- This orb is aarch64 Linux. Build natively for `aarch64-unknown-linux-gnu`; x86-64-v3 builds
+  and AVX-512 paths need an x86 runner.
+- `clang`, `lld`, `clang-tidy`, `clang-format` and `llvm-objdump` in /usr/local/bin match
+  rustc's LLVM major, as cross-language LTO requires. LLVM/MLIR 22 under /usr/lib/llvm-22 is
+  only for building vxc.
+- `vxc` v0.0.4 (tag 3a89e3c7, commit c6dffec7) is built from source in ~/.local/src/vx and
+  linked into ~/.local/bin, on orbs with at least 4 GiB of memory only. Pass
+  `-fweak-relaxed-atomics` on aarch64.
+- Toolchains: stable (default), nightly (miri, sanitizers, cargo-fuzz), and the previous stable
+  release for B4 build C. Foundry (`forge`, `anvil`) is in ~/.foundry/bin.
+- Use the `sim` or `kernel_udp` NIC backends. ef_vi, DPDK on hardware, PTP, 1 GiB huge pages
+  and core pinning are unavailable here; never report DEV numbers as latency results.
+EOF
+}
+
+warm_workspace() {
+  if [[ -x vx/build.sh ]]; then
+    # 11 L919: vx/build.sh runs before the Rust build.
+    vx/build.sh
+  fi
+  if [[ -f Cargo.toml ]]; then
+    if [[ -f Cargo.lock ]]; then
+      cargo fetch --locked
+      cargo build --locked --workspace --all-targets
+    else
+      cargo build --workspace --all-targets
+    fi
+  else
+    echo "No Cargo.toml yet; skipping workspace build."
+  fi
+  if [[ -f deny.toml ]]; then
+    cargo deny fetch
+  fi
+}
+
+step "apt base packages" apt_base
+step "rustup" rustup_install
+# The installer cannot update this running script's environment.
+# shellcheck disable=SC1091
+source "$HOME/.cargo/env"
+export PATH="$LOCAL_BIN:$HOME/.foundry/bin:$PATH"
+step "rust toolchains" toolchains
+step "LLVM matching rustc" llvm_for_rust
+# Compiling vxc's MLIR lowering needs more than 1.4 GB in one clang++ process; small orbs
+# (1.5 GiB cgroup, no swap) OOM-kill it, so skip vxc and its LLVM 22 there.
+mem_limit="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)"
+if [[ "$mem_limit" == max ]]; then
+  mem_limit=$(($(awk '/^MemTotal/ {print $2}' /proc/meminfo) * 1024))
+fi
+if [[ -x "$LOCAL_BIN/vxc" ]] || ((mem_limit >= 4 * 1024 * 1024 * 1024)); then
+  step "LLVM/MLIR $VX_LLVM for vxc" llvm_for_vx
+  step "vxc $VX_TAG" vxc_build
+else
+  echo "==> vxc $VX_TAG skipped: orb memory limit $((mem_limit >> 20)) MiB < 4096 MiB"
+fi
+step "cargo tools" cargo_tools
+step "foundry" foundry_install
+step "shell profile" shell_profile
+step "agent guidance" agent_guidance
+step "warm workspace" warm_workspace
