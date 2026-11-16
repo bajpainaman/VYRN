@@ -5,13 +5,16 @@ does not change them. This chapter gives their semantics, the state machines on 
 order of checks, and the test vectors. Local names use the prefix `PROTO_`. 01 §14 is binding
 here: where this chapter and 01 §14 differ, 01 §14 wins.
 
-**The latency contract, from the client's side (01 §14.0, REQ-LAT-1).** Every accepted packet of
-1 to 10 messages gets the first record of every message, at every index 0–9 and of every type,
-within `LAT_MAX_NS` = 1 µs from its first bit in. This is a maximum, not a percentile, and it has
-no rate, size or position condition. A packet that the exchange cannot serve in time gets
-`Reject BUSY` within the same 1 µs (§3.5). A packet that is the session's next valid packet has no
-third outcome. The only window without a 1 µs answer is the handoff window of 01 §14.0 item 2
-(H6). On AWS the 1 µs is measured inside the instance (01 §14.0 item 1).
+**The latency contract, from the client's side (01 §14.0, §14.19 A, REQ-LAT-1).** Every received
+packet of 1 to 10 messages gets the first record of every message, at every index 0–9 and of every
+type, within `LAT_MAX_NS` = 1 µs from its first bit in. A received packet is one that passed the
+edge filters E1–E4 (§3.4) and reached the sequencer's NIC. This is a maximum, not a percentile, and
+it has no rate, size or position condition. A packet that the exchange cannot serve in time gets
+`Reject BUSY` within the same 1 µs (§3.5). A received packet that is the session's next valid
+packet has no third outcome. A packet that a policer drops, or that the network loses, was never
+received: it gets no response, the client's timer resends it, and REQ-LAT-14 bounds how often that
+happens. The only window without a 1 µs answer is the handoff window of 01 §14.0 item 2 (H6). On
+AWS the 1 µs is measured inside the instance (01 §14.0 item 1).
 
 ## 0. Scope and constraints
 
@@ -1212,7 +1215,7 @@ Rules:
 | `CancelAck` 0x84 | A `Cancel`, `Reduce`, reduction `Replace`, priority-loss `Replace` (old order), or `CancelAll` takes effect. | index; `handle` or `PROTO_HANDLE_ALL`; `canceled qty`, or the order count for the summary; `client_tag`. |
 | `Out` 0x85 | The exchange ends an order, or the rest of one. | index = the message index if it answers a message, else 0xFF; cause (below); `handle`; `qty out`; `client_tag` = the order's stored tag. |
 | `EpochNotice` 0x86 | §7.4 | — |
-| `Bust` 0x87 | CHAIN only: a fill that cannot settle is reversed (01 §14.10, `09-chain.md`). | layout in 09 |
+| `Bust` 0x87 | CHAIN only: a fill against a packet that failed `tag_com` is reversed by compensating transfers; the fill stays in the final log (01 §14.19 B, 09 §5.9). | layout in 09 |
 | `Attest` 0x88 (01 §14.10) | Out of stream: a cumulative durability, finality or settlement point for the session (§7.5). | §7.5 |
 
 `Reject` versus `Out`: `Reject` means the message had no effect on the book. `Out` means an order
@@ -1260,7 +1263,7 @@ into one "confirmed" flag, and a client must not either.
 | 0 `EXECUTED` | The sequencer executed the op. Volatile. | The in-stream record leaves (≤ `LAT_MAX_NS`). By R-FIRST its frames had left on both paths, so a sequencer crash alone cannot void it. | The record itself: `Fill`, `Ack`, `CancelAck`, `Out`, `Reject`. |
 | 1 `DURABLE` | At least `F + 1` replicas hold the records, so no single fault can lose them. | The replicas' frame acknowledgements (`07-replication.md`). | `Attest` level 1; the drop copy. |
 | 2 `FINAL` | The block that holds the records has a certificate (`INV-QUORUM`). | ≤ `FINALITY_MAX_MS` = 10 ms for every accepted order (01 §14.9). | `Attest` level 2; the drop copy, which is authoritative. |
-| 3 `SETTLED` | CHAIN only: the fill is settled on the ledger or the bridge. | `09-chain.md`. | `Attest` level 3; the drop copy; a `Bust` 0x87 if it cannot settle. |
+| 3 `SETTLED` | CHAIN only: the fill is settled on the ledger or the bridge. | `09-chain.md`. | `Attest` level 3; the drop copy. Settlement never undoes a final fill (01 §14.19 B). |
 
 **`Attest` (0x88, 01 §14.10).** An out-of-stream response packet (`resp_seq` 0,
 `echo_pkt` 0) with one record:
@@ -1281,8 +1284,9 @@ off size field
 - A client that wants it sets `attest` at open (`OpenSessionReq`, §4.4). Every client can get
   the same facts per fill from the drop copy, which labels each level separately (10).
 - A record at level 1 or above is never voided by the rewind rule (§5.6): a void record is one
-  whose frames no replica holds. A level-2 record is irreversible. In CHAIN only a `Bust` can
-  undo a final fill, and only as settlement fails (09).
+  whose frames no replica holds. A level-1 record can still be excluded before finality, but only
+  in 07 §9.6 cases (d) and (e). A level-2 record's fate is fixed: it is never reverted, and in
+  CHAIN it is busted only if its `Bust` verdict was already final with it (01 §14.19 B, 09 §5.9).
 
 ## 8. Reject reasons
 

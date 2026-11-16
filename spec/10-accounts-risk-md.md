@@ -1395,8 +1395,9 @@ bits are dropped: a slot reappears only after a `MD_DELETE` or a full `MD_EXEC` 
 `MD_DELETE` causes: 1 cancel, 2 replace, 3 STP, 4 account kill, 5 session kill or
 cancel-on-disconnect, 6 allocation shrink, 7 epoch end, 8 halt purge, 9 `MBO-W` window exit. A
 `Replace` that loses priority is `MD_DELETE(cause 2)` then `MD_ADD`. `TOB` uses `MD_LEVEL` level 0.
-The bust records exist for `CHAIN` reverts (DESIGN §7) and the base-mode double fault (DESIGN §0
-point 3): when the final log differs from what was published, the observer busts the execution.
+The bust records exist for `CHAIN` busts (DESIGN §7) and for reverts in either mode (07 §9.6,
+01 §14.19 B): when the final log, or a final bust verdict, differs from what was published, the
+observer busts the execution.
 
 **Four facts, labeled separately** (01 §14.13 item 3). The feed never folds them into one
 "confirmed" flag. *Execution* is the `MD_STEP`/`MD_EXEC` itself, and the client's own `Fill` is its
@@ -1514,8 +1515,10 @@ reverted execution by `(step, ordinal)`.
 
 The stage of a record is therefore (record, newest `DC_FINAL`, newest `DC_SETTLED`), and no record
 is ever re-sent to change stage. A fill that the final log excludes gets a `DC_REVERT` before the
-`DC_FINAL` that covers its step. That happens only in `CHAIN` mode (bad `K_com`) and in the
-base-mode double fault; a revert is possible only between durability and finality, never after.
+`DC_FINAL` that covers its step. That happens for a revert (07 §9.6 cases (a)–(e), in either mode)
+and for a `CHAIN` bust (bad `K_com`, 09 §5.9). A busted fill stays in the final log, but its bust
+verdict is final no later than its own block, so its `DC_REVERT` still precedes that `DC_FINAL`.
+Neither is possible after finality (01 §14.19 B).
 
 ### 8.3 Delivery and reconciliation
 
