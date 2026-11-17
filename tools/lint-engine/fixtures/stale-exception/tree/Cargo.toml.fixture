@@ -1,0 +1,3 @@
+[workspace]
+resolver = "3"
+members = ["crates/vyrn-epoch", "crates/vyrn-replica"]

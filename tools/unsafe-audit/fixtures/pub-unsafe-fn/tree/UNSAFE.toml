@@ -1,0 +1,4 @@
+[[module]]
+path = "vyrn-cut::ring"
+file = "crates/engine/vyrn-cut/src/ring.rs"
+max_lines = 20

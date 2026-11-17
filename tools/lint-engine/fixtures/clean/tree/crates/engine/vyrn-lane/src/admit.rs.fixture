@@ -1,0 +1,3 @@
+pub fn deadline(c: &Clock) -> bool {
+    c.now() > 5
+}

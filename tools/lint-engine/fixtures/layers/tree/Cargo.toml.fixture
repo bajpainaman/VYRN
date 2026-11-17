@@ -1,0 +1,3 @@
+[workspace]
+resolver = "3"
+members = ["crates/engine/vyrn-crypto", "crates/engine/vyrn-cut", "crates/engine/vyrn-engine", "crates/engine/vyrn-risk", "crates/engine/vyrn-types", "crates/engine/vyrn-wire", "crates/vyrn-log", "crates/vyrn-mystery", "tools/gate"]

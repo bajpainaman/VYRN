@@ -1,0 +1,81 @@
+# lint-engine rules, version 1 (spec/11-build.md §1.4, §2.2, §2.3, §3.1, §3.3, §8.3).
+# This file is data, not code: another implementation of the gate can read it unchanged.
+# Crate names are cargo package names.
+schema = 1
+
+# §1.4: a crate may depend only on crates in strictly earlier layers (normal, build and dev
+# dependencies alike). Layers follow the §1.4 diagram. `bin/*` packages sit above layer 6 and
+# the test-only crates above those, so nothing in production links `vyrn-sim` or `vyrn-bench`.
+# Packages under `tools/` are not in the graph: they need no layer, and nothing may depend on one.
+[[layer]]
+index = 0
+crates = ["vyrn-types"]
+
+[[layer]]
+index = 1
+crates = ["vyrn-crypto", "vyrn-cut", "vyrn-risk", "vyrn-log"]
+
+[[layer]]
+index = 2
+crates = ["vyrn-wire", "vyrn-bbo"]
+
+[[layer]]
+index = 3
+crates = ["vyrn-nic", "vyrn-lane"]
+
+[[layer]]
+index = 4
+crates = ["vyrn-engine", "vyrn-consensus", "vyrn-data"]
+
+[[layer]]
+index = 5
+crates = ["vyrn-replica", "vyrn-epoch"]
+
+[[layer]]
+index = 6
+crates = ["vyrn-md", "vyrn-chain"]
+
+[[layer]]
+index = 7
+crates = ["vyrn-seq", "vyrn-validator", "vyrn-admin"]
+
+[[layer]]
+index = 8
+crates = ["vyrn-sim", "vyrn-bench"]
+
+# A named exception to the layer rule. It is reported on every run. It is an error if the edge
+# no longer exists, so an exception cannot outlive the disagreement it records.
+[[exception]]
+from = "vyrn-replica"
+to = "vyrn-epoch"
+reason = "11 §1.3 (binary table) says vyrn-replica links vyrn-epoch; the §1.4 diagram draws both in layer 5 and has no such arrow"
+
+# §2.2 "Used by" column: the external crates an engine crate (under crates/engine/) may depend on
+# in [dependencies] and [build-dependencies]. Any other external crate is a violation.
+[engine.allow]
+vyrn-crypto = ["blake3", "curve25519-dalek", "ed25519-dalek", "x25519-dalek"]
+vyrn-wire = ["zerocopy"]
+vyrn-cut = ["zerocopy"]
+
+# [dev-dependencies] may also name these (tier T, "tests"); `any` applies to every engine crate.
+[engine.allow_dev]
+any = ["proptest"]
+vyrn-cut = ["loom"]
+
+# §2.3, §3.3, §8.3: names that no source file of an engine crate may use. Matching is on tokens, so
+# comments and strings never count. A crate name matches when it starts a path (`rand::x`), or
+# follows `use` or `extern crate`.
+[source]
+banned_crates = ["tokio", "rand", "rand_chacha", "tracing", "log"]
+# Path prefixes, also found inside `use std::{thread, env}` groups.
+banned_paths = [["std", "thread"], ["std", "env"]]
+
+# §3.1: a clock read (`.now()` or `::now()`) is allowed only in these files or directories
+# (a trailing `/` marks a directory): `vyrn-lane::admit` and `vyrn-bbo::admit`.
+[deadline_clock]
+allowed_in = [
+  "crates/engine/vyrn-lane/src/admit.rs",
+  "crates/engine/vyrn-lane/src/admit/",
+  "crates/engine/vyrn-bbo/src/admit.rs",
+  "crates/engine/vyrn-bbo/src/admit/",
+]

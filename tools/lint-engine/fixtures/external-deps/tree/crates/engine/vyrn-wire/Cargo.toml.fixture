@@ -1,0 +1,12 @@
+[package]
+name = "vyrn-wire"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+zerocopy = "0.8"
+tokio = "1"
+
+[dev-dependencies]
+proptest = "1"
+loom = "0.7"

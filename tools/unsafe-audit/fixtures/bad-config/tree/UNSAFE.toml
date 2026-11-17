@@ -1,0 +1,14 @@
+[[module]]
+path = "vyrn-cut::ring"
+file = "crates/engine/vyrn-cut/src/ring.rs"
+max_lines = 10
+
+[[module]]
+path = "vyrn-lane::arena"
+file = "crates/engine/vyrn-cut/src/arena.rs"
+max_lines = 10
+
+[[module]]
+path = "vyrn-nic::sys"
+file = "../outside.rs"
+max_lines = 10

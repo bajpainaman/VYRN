@@ -1,0 +1,11 @@
+//! `vyrn-cut::ring` fixture.
+pub unsafe fn a() {}
+pub(crate) const unsafe fn b() {}
+pub(self) unsafe fn private() {}
+unsafe fn also_private() {}
+pub unsafe trait T {}
+unsafe extern "C" {
+    pub fn c();
+    pub safe fn d();
+    fn e();
+}

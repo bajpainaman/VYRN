@@ -1910,6 +1910,12 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "lint-engine"
 version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "serde",
+ "serde_json",
+ "toml",
+]
 
 [[package]]
 name = "linux-raw-sys"
@@ -3425,6 +3431,11 @@ dependencies = [
 [[package]]
 name = "unsafe-audit"
 version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "serde",
+ "toml",
+]
 
 [[package]]
 name = "untrusted"

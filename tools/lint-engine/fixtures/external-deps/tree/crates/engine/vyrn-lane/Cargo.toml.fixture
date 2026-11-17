@@ -1,0 +1,9 @@
+[package]
+name = "vyrn-lane"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+loom = "0.7"

@@ -1,0 +1,9 @@
+[package]
+name = "vyrn-risk"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+vyrn-engine = { path = "../vyrn-engine" }

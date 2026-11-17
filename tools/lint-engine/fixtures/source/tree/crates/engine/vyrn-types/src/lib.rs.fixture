@@ -1,0 +1,23 @@
+use std::thread;
+use std::{io, env::var};
+pub fn a(x: f64) -> f32 {
+    let y = 1.5;
+    let z = 2e3;
+    let w = 1f32;
+    y
+}
+pub async fn b() {
+    c().await;
+}
+pub fn d() {
+    tokio::spawn(x);
+    let r = rand::random();
+    tracing::info!("x");
+    log::warn!("y");
+    std::env::var("A");
+    let t = std::time::Instant::now();
+    clock.now();
+}
+macro_rules! m {
+    () => { 0.5 };
+}

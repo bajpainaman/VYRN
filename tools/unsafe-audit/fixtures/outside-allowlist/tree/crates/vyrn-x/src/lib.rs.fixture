@@ -1,0 +1,9 @@
+//! A crate that is not listed.
+pub fn f() {
+    unsafe { g() }
+}
+macro_rules! m {
+    () => { unsafe { g() } };
+}
+#[unsafe(no_mangle)]
+pub fn h() {}

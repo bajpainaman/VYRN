@@ -1,0 +1,13 @@
+//! `vyrn-cut::ring` fixture.
+pub fn a() -> usize {
+    // a plain comment is not a SAFETY comment
+    unsafe { read() }
+}
+
+// SAFETY: separated from the code by a blank line.
+
+unsafe impl Send for Ring {}
+
+pub fn b() -> usize {
+    unsafe { read() } // SAFETY: a trailing comment does not count either
+}
