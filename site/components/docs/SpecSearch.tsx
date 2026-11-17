@@ -2,26 +2,12 @@
 
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { track } from "@vercel/analytics";
+import { rank, type SearchEntry } from "@/lib/search-rank";
 
-export type SearchEntry = { text: string; href: string; where: string; kind: "section" | "id" };
+export { rank, type SearchEntry };
+
 type Status = "idle" | "loading" | "ready" | "error";
-
-const MAX_RESULTS = 10;
-
-/** Every query word must appear; exact matches first, then prefix matches, then the shortest text. */
-export function rank(entries: readonly SearchEntry[], query: string): SearchEntry[] {
-  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
-  if (words.length === 0) return [];
-  const scored: { entry: SearchEntry; score: number }[] = [];
-  for (const entry of entries) {
-    const text = entry.text.toLowerCase();
-    if (!words.every((w) => text.includes(w))) continue;
-    // Exact IDs and section numbers first, then matches at the start, then the shortest headings.
-    const score = (text === query.toLowerCase() ? 0 : 100) + (text.startsWith(words[0]!) ? 0 : 50) + text.length / 100;
-    scored.push({ entry, score });
-  }
-  return scored.sort((a, b) => a.score - b.score).slice(0, MAX_RESULTS).map((s) => s.entry);
-}
 
 /** Find a section or a spec ID anywhere in the spec. "/" focuses it from anywhere on a docs page. */
 export function SpecSearch({ className = "" }: { className?: string }) {
@@ -66,6 +52,7 @@ export function SpecSearch({ className = "" }: { className?: string }) {
 
   const go = (entry: SearchEntry | undefined) => {
     if (!entry) return;
+    track("docs_search", { kind: entry.kind, where: entry.where, words: query.trim().split(/\s+/).length });
     setQuery("");
     input.current?.blur();
     router.push(entry.href);
