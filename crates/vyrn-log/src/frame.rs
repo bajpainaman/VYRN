@@ -165,12 +165,17 @@ pub struct Ident {
     pub sender: u8,
 }
 
-/// Frames one substream (the stream core's side).
+/// Frames one substream (the stream core's side). Encoding advances the shared state as it
+/// goes, so an [`encode`](Self::encode) that fails part-way leaves state the decoder never
+/// saw. The encoder therefore fails closed, like the decoder: after any error every later call
+/// returns `RepErr::Poisoned`, including [`next_tenure`](Self::next_tenure); a failover rebuilds
+/// the state from the final prefix.
 #[derive(Clone, Debug)]
 pub struct StreamEncoder {
     state: SubstreamState,
     ident: Ident,
     next_seq: u64,
+    poisoned: bool,
 }
 
 impl StreamEncoder {
@@ -179,6 +184,7 @@ impl StreamEncoder {
             state: SubstreamState::new(layout, stream)?,
             ident,
             next_seq: 1,
+            poisoned: false,
         })
     }
 
@@ -193,6 +199,9 @@ impl StreamEncoder {
     /// The encoder side of [`StreamDecoder::next_tenure`]: `ident` is a later tenure of the same
     /// epoch, `frame_seq` restarts at 1, and session slots carry over.
     pub fn next_tenure(&mut self, ident: Ident) -> Result<(), RepErr> {
+        if self.poisoned {
+            return Err(RepErr::Poisoned);
+        }
         if ident.epoch != self.ident.epoch || ident.tenure <= self.ident.tenure {
             return Err(RepErr::Tenure);
         }
@@ -203,6 +212,17 @@ impl StreamEncoder {
 
     /// Encodes the next frame, path A copy (`flags` = 0). [`with_flags`] makes the other copies.
     pub fn encode(&mut self, body: &Body) -> Result<Vec<u8>, RepErr> {
+        if self.poisoned {
+            return Err(RepErr::Poisoned);
+        }
+        let out = self.encode_frame(body);
+        if out.is_err() {
+            self.poisoned = true;
+        }
+        out
+    }
+
+    fn encode_frame(&mut self, body: &Body) -> Result<Vec<u8>, RepErr> {
         let first = self.next_seq == 1;
         let (kind, bytes) = match body {
             Body::Order {

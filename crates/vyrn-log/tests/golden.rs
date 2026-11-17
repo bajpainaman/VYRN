@@ -513,3 +513,29 @@ fn a_new_tenure_keeps_the_epochs_session_slots() {
     let f0 = old.encode(&a[0]).unwrap();
     assert_eq!(back.decode(&f0), Err(RepErr::Tenure));
 }
+
+#[test]
+fn a_failed_encode_poisons_the_encoder() {
+    let g = golden();
+    let (a, _, _) = bodies(&g);
+    let mut enc = StreamEncoder::new(layout4(), 0, ident(0)).unwrap();
+    enc.encode(&a[0]).unwrap();
+    // A Control step whose payload pushes the body past body_len's u16.
+    let big = Body::Order {
+        tenure_start: None,
+        sections: vec![Section::StepRun(vec![StepHalf {
+            step: StepId(3),
+            kind: StepKind::Control,
+            other: false,
+            home: Some(Home {
+                src_lane: LaneId(0xFF),
+                src_lane_seq: LaneSeq(0),
+                payload: vec![0; 70_000],
+            }),
+            cut: vec![LaneSeq(4), LaneSeq(0)],
+        }])],
+    };
+    assert_eq!(enc.encode(&big), Err(RepErr::Header));
+    assert_eq!(enc.encode(&a[1]), Err(RepErr::Poisoned));
+    assert_eq!(enc.next_tenure(ident(1)), Err(RepErr::Poisoned));
+}
