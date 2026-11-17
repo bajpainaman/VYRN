@@ -14,13 +14,20 @@ const OPTIONS: { value: Theme; label: string; note: string }[] = [
   { value: "system", label: "System", note: "Follows your device" },
 ];
 
-function read(): Theme {
+/** The saved choice, or System when there is none or storage is blocked. */
+function saved(): Theme {
   try {
-    const saved = localStorage.getItem(KEY);
-    return saved === "light" || saved === "dark" ? saved : "system";
+    const value = localStorage.getItem(KEY);
+    return value === "light" || value === "dark" ? value : "system";
   } catch {
     return "system";
   }
+}
+
+/** The applied theme is the root's data-theme, so the menu matches the page even when storage is blocked. */
+function read(): Theme {
+  const theme = document.documentElement.dataset.theme;
+  return theme === "light" || theme === "dark" ? theme : "system";
 }
 
 /** "system" leaves data-theme unset, so the root's `color-scheme: light dark` follows the OS. */
@@ -45,7 +52,7 @@ function subscribe(onChange: () => void) {
   // A choice made in another tab arrives as a storage event; apply it here too.
   const onStorage = (event: StorageEvent) => {
     if (event.key !== KEY && event.key !== null) return;
-    apply(read());
+    apply(saved());
     onChange();
   };
   window.addEventListener("storage", onStorage);
