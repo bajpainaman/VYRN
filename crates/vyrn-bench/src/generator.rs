@@ -1142,10 +1142,11 @@ impl Iterator for Generator {
             self.msgs.push(m);
         }
         let header = ReqHeader::new(s.id, s.pkt_seq, self.epoch16, self.book, false);
-        let seq_ok = s.advance_seq(self.seed, self.mode);
         let mut bytes = [0u8; MAX_REQ_PAYLOAD];
-        // None only for a message count outside 1..=10, which validation rules out.
+        // None only for a message count outside 1..=10, which validation rules out. The packet is
+        // built with the keys of the session id in its header; only then does the session roll over.
         let len = encode_request(&mut bytes, header, &self.msgs, &s.k_seq, s.k_com.as_ref())?;
+        let seq_ok = s.advance_seq(self.seed, self.mode);
         let send_ns = t_ps / PS_PER_NS;
         self.stats.packets += 1;
         self.stats.msgs += u64::from(n);
