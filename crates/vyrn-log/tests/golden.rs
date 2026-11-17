@@ -539,3 +539,58 @@ fn a_failed_encode_poisons_the_encoder() {
     assert_eq!(enc.encode(&a[1]), Err(RepErr::Poisoned));
     assert_eq!(enc.next_tenure(ident(1)), Err(RepErr::Poisoned));
 }
+
+#[test]
+fn next_tenure_compares_the_full_epoch() {
+    let g = golden();
+    let (a, _, _) = bodies(&g);
+    let mut enc = StreamEncoder::new(layout4(), 0, ident(0)).unwrap();
+    let mut dec = StreamDecoder::new(layout4(), 0).unwrap();
+    dec.decode(&enc.encode(&a[0]).unwrap()).unwrap();
+    dec.next_tenure().unwrap();
+    // Epoch 1000 + 65536 has the same epoch16 (0x03e8) as epoch 1000.
+    let far = Ident {
+        epoch: Epoch(1000 + 65_536),
+        tenure: 1,
+        ..ident(1)
+    };
+    let mut ts = tenure_start();
+    ts.epoch = far.epoch;
+    ts.tenure = 1;
+    let mut other = StreamEncoder::new(layout4(), 0, far).unwrap();
+    let f = other
+        .encode(&Body::Order {
+            tenure_start: Some(ts),
+            sections: vec![],
+        })
+        .unwrap();
+    assert_eq!(f[6..8], 0x03e8u16.to_le_bytes(), "same epoch16 on the wire");
+    assert_eq!(dec.decode(&f), Err(RepErr::Tenure));
+}
+
+#[test]
+fn a_failed_frame_closes_no_block() {
+    let g = golden();
+    let (a, _, _) = bodies(&g);
+    let mut enc = StreamEncoder::new(layout4(), 0, ident(0)).unwrap();
+    // Frame 1 closes height 100 and is emitted.
+    enc.encode(&a[0]).unwrap();
+    // A mark for height 101, then padding past body_len's u16: the frame fails.
+    let bad = Body::Order {
+        tenure_start: None,
+        sections: vec![
+            Section::BlockMark(BlockMark {
+                height: Height(101),
+                last_step: StepId(2),
+                lane_bounds: vec![LaneSeq(4), LaneSeq(0)],
+            }),
+            Section::Pad(70_000),
+        ],
+    };
+    assert_eq!(enc.encode(&bad), Err(RepErr::Header));
+    let closed = enc.take_closed();
+    assert_eq!(
+        closed.iter().map(|h| h.height).collect::<Vec<_>>(),
+        vec![Height(100)]
+    );
+}

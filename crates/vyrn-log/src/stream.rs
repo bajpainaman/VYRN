@@ -422,6 +422,16 @@ impl SubstreamState {
         core::mem::take(&mut self.closed)
     }
 
+    /// Closed blocks not yet taken.
+    pub(crate) fn closed_len(&self) -> usize {
+        self.closed.len()
+    }
+
+    /// Drops closed blocks after the first `n`: those of a frame that was never emitted.
+    pub(crate) fn truncate_closed(&mut self, n: usize) {
+        self.closed.truncate(n);
+    }
+
     fn lane_index(&self, lane: u8) -> Result<usize, RepErr> {
         if !self.layout.half(self.stream).contains(&lane) {
             return Err(RepErr::Half);

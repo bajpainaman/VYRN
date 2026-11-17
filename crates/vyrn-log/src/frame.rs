@@ -215,8 +215,11 @@ impl StreamEncoder {
         if self.poisoned {
             return Err(RepErr::Poisoned);
         }
+        let closed = self.state.closed_len();
         let out = self.encode_frame(body);
         if out.is_err() {
+            // Blocks this frame closed never reached the wire, so they must not reach a caller.
+            self.state.truncate_closed(closed);
             self.poisoned = true;
         }
         out
@@ -304,8 +307,11 @@ pub struct StreamDecoder {
     state: SubstreamState,
     next_seq: u64,
     ident: Option<(BookId, u16, u8, u8)>,
-    /// `(epoch16, tenure)` of the tenure before [`next_tenure`](Self::next_tenure).
-    prior: Option<(u16, u8)>,
+    /// The full epoch of the current tenure, from its `TenureStart`.
+    epoch: Option<Epoch>,
+    /// `(epoch, tenure)` of the tenure before [`next_tenure`](Self::next_tenure). The full
+    /// epoch, not `epoch16`: epochs 1 and 65537 share their low 16 bits.
+    prior: Option<(Epoch, u8)>,
     poisoned: bool,
 }
 
@@ -315,6 +321,7 @@ impl StreamDecoder {
             state: SubstreamState::new(layout, stream)?,
             next_seq: 1,
             ident: None,
+            epoch: None,
             prior: None,
             poisoned: false,
         })
@@ -330,8 +337,9 @@ impl StreamDecoder {
         if self.poisoned {
             return Err(RepErr::Poisoned);
         }
-        let (_, epoch16, tenure, _) = self.ident.ok_or(RepErr::Tenure)?;
-        self.prior = Some((epoch16, tenure));
+        let (_, _, tenure, _) = self.ident.ok_or(RepErr::Tenure)?;
+        let epoch = self.epoch.ok_or(RepErr::Tenure)?;
+        self.prior = Some((epoch, tenure));
         self.ident = None;
         self.next_seq = 1;
         Ok(())
@@ -387,7 +395,7 @@ impl StreamDecoder {
                     let ts = self.state.decode_tenure_start(&mut r)?;
                     let later = self
                         .prior
-                        .is_none_or(|(e, t)| e == header.epoch16 && ts.tenure > t);
+                        .is_none_or(|(e, t)| e == ts.epoch && ts.tenure > t);
                     if ts.epoch.low16() != header.epoch16
                         || ts.tenure != header.tenure
                         || ts.sender != header.sender
@@ -396,6 +404,7 @@ impl StreamDecoder {
                         return Err(RepErr::Tenure);
                     }
                     self.ident = Some(id);
+                    self.epoch = Some(ts.epoch);
                     Some(ts)
                 } else {
                     None
