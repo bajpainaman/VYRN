@@ -1,4 +1,4 @@
-//! Packets and records of 01 §6.1-6.5, and the RxRing/TxRing traits.
+//! Packets and records of 01 §6.1-6.5, and the RxRing/TxRing traits of 06 §6.1.
 //!
 //! Parsing uses `zerocopy` layouts, so it needs no `unsafe`. Every parse returns a `Result` whose
 //! error is a 01 §6.5 reason with its 04 §11 detail. Nothing here panics on input bytes.
@@ -17,6 +17,7 @@ mod msg;
 mod packet;
 mod raw;
 mod record;
+pub mod ring;
 mod session;
 
 pub use msg::{Msg, OrderFlags, Side, Stp, Tif};
@@ -26,6 +27,7 @@ pub use packet::{
 };
 pub use raw::RawRec;
 pub use record::{AttestLevel, Liq, OutCause, Record};
+pub use ring::{NicCounters, RX_BURST, RxFlags, RxPkt, RxRing, TsSource, TxFull, TxRing};
 pub use session::{session_generation, session_id, session_lane, session_slot};
 
 use vyrn_types::RejectReason;
