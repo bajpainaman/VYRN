@@ -1,0 +1,131 @@
+# WL-AUCTION: orders arriving in an auction phase: join distances around the last trade, both sides, 30% through the reference price.
+# Schema and formats: bench/workloads/FORMAT.md. Numbers: spec/02-requirements.md §6.
+version = 1
+id = "WL-AUCTION"
+mode = "base"
+book = 0
+epoch16 = 0
+rate_msgs_per_s = 10_000_000
+
+# 02 §6.2: the model book. No vyrn-md feed offline, so the BBO is fixed: bid 999,999, ask 1,000,001.
+[book_model]
+mid_tick = 1_000_000
+spread_ticks = 2
+depth_lots = 50
+
+# 02 §6.9: 20 bursts/s of 100 µs at 2x for MM and TK; base rates divided by 1.002.
+[burst]
+rate_per_s = 20
+window_ns = 100_000
+mult_ppm = 2_000_000
+base_scale_ppm = 998_004
+
+# 02 §6.7: order lifetimes, log-uniform per row; 11.5% of join-class messages are a Replace.
+[lifetimes]
+replace_ppm = 115_000
+
+[[lifetimes.row]]
+ppm = 600_000
+lo_ns = 5_000
+hi_ns = 100_000
+
+[[lifetimes.row]]
+ppm = 300_000
+lo_ns = 100_000
+hi_ns = 1_000_000
+
+[[lifetimes.row]]
+ppm = 99950
+lo_ns = 1_000_000
+hi_ns = 100_000_000
+
+[[lifetimes.row]]
+ppm = 50
+lo_ns = 100_000_000
+hi_ns = 28_800_000_000_000
+
+# 02 §6.5: join distance d behind the own best.
+[[join_distance]]
+kind = "fixed"
+ppm = 400_000
+d = 0
+
+[[join_distance]]
+kind = "fixed"
+ppm = 200_000
+d = 1
+
+[[join_distance]]
+kind = "geometric"
+ppm = 300_000
+base = 2
+cap = 7
+p_ppm = 250_000
+
+[[join_distance]]
+kind = "log_uniform"
+ppm = 90_000
+lo = 10
+hi = 4_096
+
+[[join_distance]]
+kind = "uniform"
+ppm = 10_000
+base = 4_096
+span = 60_000
+
+# 02 §6.5: levels k swept by a cross.
+[[cross_levels]]
+ppm = 800_000
+lo = 1
+hi = 1
+
+[[cross_levels]]
+ppm = 120_000
+lo = 2
+hi = 2
+
+[[cross_levels]]
+ppm = 60_000
+lo = 3
+hi = 5
+
+[[cross_levels]]
+ppm = 19_000
+lo = 6
+hi = 20
+
+[[cross_levels]]
+ppm = 1_000
+lo = 21
+hi = 200
+
+[cross]
+ioc_ppm = 700_000
+day_ppm = 250_000
+fok_ppm = 50_000
+through_ppm = 4_000
+through_qty_pct = 120
+
+# 02 §6.3: the pool is lanes 42-48.
+[pool]
+first_lane = 42
+lanes = 7
+
+[auction]
+through_ppm = 300_000
+
+# 1 s at 10^7 msgs/s holds well over 10^6 orders
+[[phase]]
+duration_ns = 1_000_000_000
+rate_ppm = 1_000_000
+
+# One class of single-order packets; every order is AUCTION_ONLY (see [auction]). Run with
+# `--packets 1000`, `100000` or `1000000` for the three sizes of 02 §6.1.
+[[class]]
+kind = "rt"
+placement = { kind = "pooled", sessions = 1000 }
+skew = { kind = "equal" }
+mix = { join = 1_000_000, cancel = 0, reduce = 0, improve = 0, cross = 0 }
+qty_p_ppm = 200_000
+packets = { kind = "single", two_ppm = 0 }

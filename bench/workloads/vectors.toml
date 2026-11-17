@@ -1,0 +1,64 @@
+# Conformance vectors for `vyrn-bench gen` (bench/workloads/FORMAT.md §Conformance).
+# For each entry: `vyrn-bench gen --config bench/workloads/<config> --seed <seed> --packets <packets> --stats --out /dev/null`
+# must print `blake3 <hash>`. Any build, any target.
+version = 1
+
+[[vector]]
+config = "wl-auction.toml"
+seed = "0xC0FFEE"
+packets = 20000
+blake3 = "f219c723ffceede827366e3fca27f27df70f1cd083e2bcc9807b45221ee2afd1"
+
+[[vector]]
+config = "wl-aws.toml"
+seed = "0xC0FFEE"
+packets = 20000
+blake3 = "dd09aa17b3107d83679b83635c38f22741e7a574ef5d7c684e1ee77d0ee4b03b"
+
+[[vector]]
+config = "wl-deep.toml"
+seed = "0xC0FFEE"
+packets = 20000
+blake3 = "71033a5680a16e0d2acdd9ea74b9ce8798011aa6c398165163ac5bfda5a10b3b"
+
+[[vector]]
+config = "wl-diurnal.toml"
+seed = "0xC0FFEE"
+packets = 20000
+blake3 = "97e229718437c05d2c12eb788161cfc36939c7a92fa33407fe1abe5d0c45a7cb"
+
+[[vector]]
+config = "wl-lane.toml"
+seed = "0xC0FFEE"
+packets = 20000
+blake3 = "d36b9a134dabc980bd6874bb2e77074bc5e9727e874df7d57f0bbe2ac4dde95a"
+
+[[vector]]
+config = "wl-low.toml"
+seed = "0xC0FFEE"
+packets = 20000
+blake3 = "224f4a9fc5c19a9acd8fdc43eaab28308d482ddb511ad03f87db7e9917d27757"
+
+[[vector]]
+config = "wl-pool.toml"
+seed = "0xC0FFEE"
+packets = 20000
+blake3 = "f1dae4ffa80ff92271b48fadbaa777ea840d35e5e9ead7bdbe5b2861b09e341e"
+
+[[vector]]
+config = "wl-ref.toml"
+seed = "0xC0FFEE"
+packets = 20000
+blake3 = "8f1b9798237b470c8c82dda9e74d6f01bfd0a9288c54caab8a9a0af7f46cf51c"
+
+[[vector]]
+config = "wl-sess.toml"
+seed = "0xC0FFEE"
+packets = 20000
+blake3 = "e88b8ddc727aa13807840be26a660c2bfb333ffd51290cb467da11e1db53abba"
+
+[[vector]]
+config = "wl-xsweep.toml"
+seed = "0xC0FFEE"
+packets = 20000
+blake3 = "88287656dcd5ca887af8be7b925d468ddac6a35fbb95b710dae4ffe3baf857b9"

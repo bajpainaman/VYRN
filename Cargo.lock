@@ -3514,10 +3514,14 @@ dependencies = [
 name = "vyrn-bench"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "clap",
  "hdrhistogram",
  "rand 0.10.4",
  "rand_chacha 0.10.0",
+ "serde",
+ "thiserror",
+ "toml",
  "vyrn-bbo",
  "vyrn-crypto",
  "vyrn-cut",

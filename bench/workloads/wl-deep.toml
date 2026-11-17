@@ -1,0 +1,154 @@
+# WL-DEEP: WL-REF with lifetime row 4 raised from 50 to 250 ppm so that about 3x10^8 orders rest. Little's law: 522.5M entries/s x mean T = 3x10^8 gives mean T = 0.574 s; row 4 has mean 2,291 s, so row 4 weight = 0.574 s / 2,291 s = 250 ppm (computed, checked by the rig at run time).
+# Schema and formats: bench/workloads/FORMAT.md. Numbers: spec/02-requirements.md §6.
+version = 1
+id = "WL-DEEP"
+mode = "base"
+book = 0
+epoch16 = 0
+rate_msgs_per_s = 1_000_000_000
+
+# 02 §6.2: the model book. No vyrn-md feed offline, so the BBO is fixed: bid 999,999, ask 1,000,001.
+[book_model]
+mid_tick = 1_000_000
+spread_ticks = 2
+depth_lots = 50
+
+# 02 §6.9: 20 bursts/s of 100 µs at 2x for MM and TK; base rates divided by 1.002.
+[burst]
+rate_per_s = 20
+window_ns = 100_000
+mult_ppm = 2_000_000
+base_scale_ppm = 998_004
+
+# 02 §6.7: order lifetimes, log-uniform per row; 11.5% of join-class messages are a Replace.
+[lifetimes]
+replace_ppm = 115_000
+
+[[lifetimes.row]]
+ppm = 600_000
+lo_ns = 5_000
+hi_ns = 100_000
+
+[[lifetimes.row]]
+ppm = 300_000
+lo_ns = 100_000
+hi_ns = 1_000_000
+
+[[lifetimes.row]]
+ppm = 99750
+lo_ns = 1_000_000
+hi_ns = 100_000_000
+
+[[lifetimes.row]]
+ppm = 250
+lo_ns = 100_000_000
+hi_ns = 28_800_000_000_000
+
+# 02 §6.5: join distance d behind the own best.
+[[join_distance]]
+kind = "fixed"
+ppm = 400_000
+d = 0
+
+[[join_distance]]
+kind = "fixed"
+ppm = 200_000
+d = 1
+
+[[join_distance]]
+kind = "geometric"
+ppm = 300_000
+base = 2
+cap = 7
+p_ppm = 250_000
+
+[[join_distance]]
+kind = "log_uniform"
+ppm = 90_000
+lo = 10
+hi = 4_096
+
+[[join_distance]]
+kind = "uniform"
+ppm = 10_000
+base = 4_096
+span = 60_000
+
+# 02 §6.5: levels k swept by a cross.
+[[cross_levels]]
+ppm = 800_000
+lo = 1
+hi = 1
+
+[[cross_levels]]
+ppm = 120_000
+lo = 2
+hi = 2
+
+[[cross_levels]]
+ppm = 60_000
+lo = 3
+hi = 5
+
+[[cross_levels]]
+ppm = 19_000
+lo = 6
+hi = 20
+
+[[cross_levels]]
+ppm = 1_000
+lo = 21
+hi = 200
+
+[cross]
+ioc_ppm = 700_000
+day_ppm = 250_000
+fok_ppm = 50_000
+through_ppm = 4_000
+through_qty_pct = 120
+
+# 02 §6.3: the pool is lanes 42-48.
+[pool]
+first_lane = 42
+lanes = 7
+
+# warm-up, discarded by the rig (11 §7.1 rule 5)
+[[phase]]
+duration_ns = 60_000_000_000
+rate_ppm = 1_000_000
+
+# measured interval
+[[phase]]
+duration_ns = 600_000_000_000
+rate_ppm = 1_000_000
+
+# 02 §6.3, §6.4: MM, the top 17 firms on dedicated lanes 0-41, 6 sessions per lane.
+[[class]]
+kind = "mm"
+enabled = true
+placement = { kind = "dedicated", lane_first = 0, lane_count = 42, sessions_per_lane = 6 }
+skew = { kind = "equal" }
+mix = { join = 490_000, cancel = 442_000, reduce = 20_000, improve = 15_500, cross = 2_500 }
+qty_p_ppm = 200_000
+stp_cancel_newest = true
+bursty = true
+packets = { kind = "bundled", bundle_size = 10, urgent_cancel_ppm = 50_000, urgent_two_ppm = 500_000 }
+
+# TK: active takers, Zipf(s = 0.5), pooled.
+[[class]]
+kind = "tk"
+placement = { kind = "pooled", sessions = 4000 }
+skew = { kind = "zipf", s_milli = 500 }
+mix = { join = 8_000, cancel = 6_500, reduce = 0, improve = 4_000, cross = 6_500 }
+qty_p_ppm = 200_000
+bursty = true
+packets = { kind = "single", two_ppm = 200_000 }
+
+# RT: retail and slow clients, uniform, pooled.
+[[class]]
+kind = "rt"
+placement = { kind = "pooled", sessions = 24000 }
+skew = { kind = "equal" }
+mix = { join = 2_000, cancel = 1_500, reduce = 0, improve = 500, cross = 1_000 }
+qty_p_ppm = 500_000
+packets = { kind = "single", two_ppm = 0 }
