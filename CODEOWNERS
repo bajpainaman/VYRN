@@ -1,4 +1,6 @@
-# spec/11-build.md §3.9: owners for UNSAFE.toml modules, c/, vx/ and supply-chain/.
+# spec/11-build.md §3.9: owners for UNSAFE.toml modules, c/, vx/ and supply-chain/, and for the two
+# CI gates that enforce §1.4, §2.2, §3.2 and §3.3, so neither rules.toml nor a gate's code can be
+# loosened without an owner's review.
 /UNSAFE.toml                              @bajpainaman
 /crates/engine/vyrn-cut/src/ring.rs       @bajpainaman
 /crates/engine/vyrn-lane/src/arena.rs     @bajpainaman
@@ -10,3 +12,5 @@
 /c/                                       @bajpainaman
 /vx/                                      @bajpainaman
 /supply-chain/                            @bajpainaman
+/tools/unsafe-audit/                      @bajpainaman
+/tools/lint-engine/                       @bajpainaman
