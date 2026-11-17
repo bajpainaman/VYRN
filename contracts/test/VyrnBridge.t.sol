@@ -223,6 +223,21 @@ contract VyrnBridgeTest is BridgeBase {
         bridge.claim(1, w, proof);
     }
 
+    /// A fully backed withdrawal settles completely even as the balance falls below 10 base units, where a
+    /// rounded-down 10% cap would be 0 (Codex review 2).
+    function test_dailyCap_settlesDust() public {
+        _deposit(USDC, 1_000_000); // exactly withdrawal 0
+        _propose(_wdPost(1), FOUR);
+        vm.warp(block.timestamp + 3_600);
+        (IVyrnBridge.Withdrawal memory w, bytes32[] memory proof) = _wd(0);
+        for (uint256 i = 0; i < 300 && bridge.wdPaid(w.wdId) < w.amount; ++i) {
+            bridge.claim(1, w, proof);
+            vm.warp(block.timestamp + 25 hours);
+        }
+        assertEq(bridge.wdPaid(w.wdId), w.amount);
+        assertEq(MockERC20(USDC).balanceOf(address(bridge)), 0);
+    }
+
     function test_dailyCap_windowRolls() public {
         _deposit(USDC, 10_000_000);
         _propose(_wdPost(1), FOUR);

@@ -473,7 +473,9 @@ contract VyrnBridge is IVyrnBridge {
             used += _outflow[idx][h - i];
         }
         // The cap is 10% of the balance at the start of the window: the balance now plus what left in it.
-        cap = (IERC20Min(_assets[idx]).balanceOf(address(this)) + used) * CHN_BRIDGE_DAILY_CAP_BPS / 10_000;
+        // Rounded up, so a balance below 10 base units can still leave (Codex review 2).
+        cap = ((IERC20Min(_assets[idx]).balanceOf(address(this)) + used) * CHN_BRIDGE_DAILY_CAP_BPS + 9_999)
+            / 10_000;
     }
 
     // ---------------------------------------------------------------- internals

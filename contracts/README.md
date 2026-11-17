@@ -132,5 +132,5 @@ anyone opens escape after 14 days and users exit against the last posted root
    good after the bridge is dead.
 5. The SMT verifier is a separate stateless contract (`SMT()`), because the bridge with BLAKE3
    inlined is 33.5 kB, over the EIP-170 limit of 24,576 bytes.
-6. The 24 h cap uses 25 hourly buckets, and the cap is 10% of (balance now + outflow in the window).
+6. The 24 h cap uses 25 hourly buckets, and the cap is 10% of (balance now + outflow in the window), rounded up so the last base units can leave.
    With this rounding the cap lets out up to one extra hour of outflow, which is conservative toward liveness.
