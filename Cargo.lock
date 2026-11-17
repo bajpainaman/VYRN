@@ -3546,17 +3546,18 @@ dependencies = [
 name = "vyrn-consensus"
 version = "0.0.0"
 dependencies = [
+ "commonware-actor",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-p2p",
+ "commonware-parallel",
  "commonware-runtime",
- "commonware-storage",
+ "commonware-utils",
  "thiserror",
  "tokio",
  "tracing",
  "vyrn-crypto",
- "vyrn-log",
  "vyrn-types",
 ]
 

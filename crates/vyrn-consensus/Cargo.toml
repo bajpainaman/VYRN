@@ -7,16 +7,19 @@ license-file.workspace = true
 publish = false
 description = "Simplex on Commonware: proposal, votes, certificates, view changes, silence detection."
 
+# vyrn-log is not a dependency yet: blocks arrive through the `BlockSource` trait (src/source.rs),
+# which vyrn-log implements once it lands (spec/11-build.md §1.4).
 [dependencies]
 vyrn-types = { workspace = true }
 vyrn-crypto = { workspace = true }
-vyrn-log = { workspace = true }
 commonware-consensus = { workspace = true }
 commonware-p2p = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
-commonware-storage = { workspace = true }
+commonware-utils = { workspace = true }
+commonware-parallel = { workspace = true }
+commonware-actor = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
