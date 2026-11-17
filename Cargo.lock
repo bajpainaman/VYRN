@@ -3576,8 +3576,8 @@ name = "vyrn-cut"
 version = "0.0.0"
 dependencies = [
  "loom",
+ "proptest",
  "vyrn-types",
- "zerocopy",
 ]
 
 [[package]]
