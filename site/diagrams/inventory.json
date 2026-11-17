@@ -294,31 +294,31 @@
   {
    "asciiIndex": 4,
    "heading": "4.4 BASE mode: open over the admin channel",
-   "line": 599,
+   "line": 632,
    "ascii": " client                    vyrn-admin                      sequencer lane      replicas\n   │── TLS 1.3 (mTLS) ───────►│                                   │                 │\n   │── OpenSessionReq ───────►│ pick slot, gen+1, derive keys     │                 │\n   │                          │── SessionOpen control record ────►│ OPENING→ACTIVE  │\n   │                          │                                   │── PacketRecord ►│\n   │                          │◄───────────────── block with the record is final ───│\n   │◄─ OpenSessionResp ───────│ (keys, lane, endpoints)           │                 │\n   │── request pkt_seq 1 (UDP) ──────────────────────────────────►│                 │"
   },
   {
    "asciiIndex": 6,
    "heading": "5.1 Request direction: gapless pkt_seq, go-back-N",
-   "line": 751,
+   "line": 784,
    "ascii": " client                                        lane (expected = 7)\n   │── 7 ──────────────────────────────────────►│ accept, expected = 8\n   │── 8 ────────────────────X (lost)           │\n   │── 9 ──────────────────────────────────────►│ gap: drop, out-of-stream BAD_SEQ(8)\n   │── 10 ─────────────────────────────────────►│ gap: drop (holdoff, counted only)\n   │◄── resp(echo 7) ───────────────────────────│\n   │◄── BAD_SEQ, detail 8 (resp_seq 0) ─────────│\n   │── 8 (bit0) ── 9 (bit0) ── 10 (bit0) ──────►│ accept 8, 9, 10"
   },
   {
    "asciiIndex": 8,
    "heading": "5.7 Epoch handoff",
-   "line": 895,
+   "line": 928,
    "ascii": " old home (epoch e)                      client                        new home (epoch e+1)\n  │── EpochNotice T−600 … T−1 s ────────►│                                  │\n  │   last step S at T; then drops all   │── from T: epoch16 = e+1 ────────►│ stages packets\n  │   packets                            │   new K_seq, new endpoints       │ (08-epochs.md)\n  │── finalize S, cert(e, S), log tail ─────────────────────────────────────►│ state at S\n  │                                      │◄── EpochNotice (epoch start) ────│ starts at S+1\n  │                                      │◄── answers to staged packets ────│ auction phase\n  │                                      │◄── uncross fills (liq 2) ────────│ then continuous"
   },
   {
    "asciiIndex": 9,
    "heading": "7.1 Producers and the resp_seq allocator",
-   "line": 1144,
+   "line": 1177,
    "ascii": " request pkt p:  [0] Cancel h1   [1] New cross   [2] New join\n                      │               │               │\n lane:                │  reserve r ───┼──► BBO ring   │\n                      ▼               │               ▼\n                 L-packet r+1: CancelAck(0), Ack(2)   (after a cut includes them)\n BBO core → TX core:  └────────────► B-packet r: Fill(1) … Ack(1)   (≤ 1 µs path)"
   },
   {
    "asciiIndex": 11,
    "heading": "10.1 Client state machine",
-   "line": 1392,
+   "line": 1447,
    "ascii": "                    send New (pkt_seq p, index i)\n                                │\n                                ▼\n                         ┌─────────────┐ no answer: resend p with bit0 = 1 (§5.1)\n                         │   SENT      │◄──────────────┐\n                         └──────┬──────┘───────────────┘\n        Reject ─────────────────┼────────────────────────────────────► REJECTED\n        Fill… with open = 0 ────┼────────────────────────────────────► FILLED\n        Fill… then Out ─────────┼────────────────────────────────────► OUT\n        Fill… then Ack, or Ack  │\n                                ▼\n                         ┌─────────────┐  maker Fill: open −= qty; open = 0 ──► FILLED\n                         │    LIVE     │  Out (STP, POST_ONLY, EXPIRED, DISCONNECT,\n                         │  (handle h) │       LANE_MOVED, ADMIN, AUCTION_UNFILLED) ──► OUT\n                         └──┬───┬───┬──┘\n              send Cancel   │   │   │ send Replace\n                            ▼   │   ▼\n                 ┌──────────────┐ │ ┌────────────────┐\n                 │CANCEL_PENDING│ │ │REPLACE_PENDING │ Reject (not TOO_LATE): back to LIVE, h kept\n                 └──────┬───────┘ │ └───────┬────────┘ CancelAck(h), no new handle: LIVE (reduced)\n     CancelAck: CANCELED│         │         │          CancelAck(h) + records of h': h ends\n     TOO_LATE: the fills│  send   │         │          (CANCELED), h' starts in SENT-like\n     before it ended it │  Reduce ▼         │          state with its records\n     (FILLED or OUT)    │  REDUCE_PENDING: CancelAck: open −= qty; open = 0 ──► CANCELED\n                        ▼                   otherwise back to LIVE\n             CANCELED / FILLED / OUT (terminal)"
   }
  ],
@@ -332,13 +332,13 @@
   {
    "asciiIndex": 23,
    "heading": "7.7 Latency of a local ack (a maximum)",
-   "line": 1636,
+   "line": 1654,
    "ascii": "op applied, counter published ─► its cut core reads it          ≤ 100 ns (CUT_REFRESH_NS)\n  ─► the BBO core finishes the step in progress                  ≤ ENG_STEP_MAX_NS = 15\n  ─► the next step takes that half-cut and finishes              ≤ 15\n  ─► order-stream core queues the step's frame, writes LaneCut[l] ≤ 40\n  ─► lane polls LaneCut within ENG_UNIT_NS, even inside another packet (§6.1)   ≤ 20\n  ─► frame-gate check, B1–B3 with the pre-built response, lane TX doorbell     ≤ 10 + 20"
   },
   {
    "asciiIndex": 26,
    "heading": "8.8 Auction mode (engine side; 08-epochs.md owns the rule)",
-   "line": 2034,
+   "line": 2052,
    "ascii": "Continuous ──Control(Auction)──► Auction ──Control(Frozen)──► Frozen ──Uncross × m──► Continuous\n     │                              ▲\n     └──Control(Halted)──► Halted ──┘ (Control(Auction); a halt ends by auction)"
   }
  ],
@@ -364,19 +364,19 @@
   {
    "asciiIndex": 9,
    "heading": "7.4 Build and link",
-   "line": 1213,
+   "line": 1219,
    "ascii": "c/vyrn-nic-shim/shim.c─clang -flto=thin -march=x86-64-v3──► shim.bc ─┐\nvendored libciul (ef_vi), built with clang -flto=thin ────► .bc  ────┤\nvendored DPDK static libs + mlx5/ena PMDs (meson, clang, b_lto) ──────┤\nrustc -C linker-plugin-lto -C target-cpu=x86-64-v3 ───────► .rlib ────┴─► lld + LLVM LTO ─► vyrn-seq"
   },
   {
    "asciiIndex": 10,
    "heading": "8.1 What time is for",
-   "line": 1251,
+   "line": 1257,
    "ascii": "        GNSS                                             facility\n          │\n   GM-1 ──┤ leaf A (PTP BC) ── NIC0 PHC ◄── ptp4l (client, hardware stamps)\n   GM-2 ──┘ leaf B (PTP BC)      │\n                                 ├──► phc2sys ──► NIC1 PHC\n                                 ├──► phc2sys ──► NIC2 PHC\n                                 ├──► phc2sys ──► NIC3 PHC\n                                 ├──► phc2sys ──► NIC4, NIC5 PHC (replication; rx_ts unused)\n                                 └──► phc2sys ──► CLOCK_REALTIME / CLOCK_TAI ──► TAI map (§8.4)\n vyrn-timemon: two-way timestamped probes NIC0 ⇄ NICk through the leaves → measured skew\n vyrn-timemon: PTM cross-timestamp TSC ⇄ PHC of each client card, 100 Hz → TSC↔PHC lines (§8.4)"
   },
   {
    "asciiIndex": 12,
    "heading": "8.6 Time state and eligibility",
-   "line": 1451,
+   "line": 1457,
    "ascii": "             ptp4l s2 and |GM offset| < 100 ns for 60 s and skew < 50 ns\n   UNSYNC ──────────────────────────────────────────────────────────────► LOCKED\n     ▲  ▲                                                                   │  ▲\n     │  │ holdover > PLT_HOLDOVER_MAX_S (300 s)        GM lost / ptp4l ≠ s2 │  │ GM back,\n     │  └──────────────────────────── HOLDOVER ◄────────────────────────────┘  │ offset ok\n     │                                   └─────────────────────────────────────┘\n     │ skew > 100 ns for 1 s (from any state)\n   SKEWED ── skew back < 50 ns for 60 s ──► UNSYNC\n     │ any client card: map err0 > 20 ns or line > 50 ms old (from any state)\n   MAPERR ── every line err0 < 10 ns for 60 s ──► UNSYNC\n   FREERUN: lab and standalone CONSUMER only; never in a facility"
   }
  ],
@@ -498,13 +498,13 @@
   {
    "asciiIndex": 1,
    "heading": "2.3 The allocation state machine",
-   "line": 315,
+   "line": 319,
    "ascii": "             AllocTx finalized on the ledger\n             (ledger.avail −= x, ledger.in_flight += x)\n   LEDGER ───────────────────────────────────────────► IN_FLIGHT_IN\n     ▲                                                      │ control core injects CtlAllocCredit\n     │                                                      │ into the account's lane (a logged op)\n     │                                                      ▼\n     │                                                 ┌─────────┐ New/fill/cancel move value\n     │                                                 │ ESCROW  │ between free and reserved\n     │                                                 │ (lane)  │ inside the lane only\n     │                                                 └────┬────┘\n     │                                                      │ ShrinkTx finalized on the ledger\n     │                                                      │ → CtlAllocDebit(mode) into the lane\n     │                                                      ▼\n     │                                                  SHRINKING ── FREE_ONLY: debit min(x, free)\n     │                                                      │      ── CANCEL_SIDE: cancel the side's\n     │                                                      │         orders, wait for their acks,\n     │                                                      │         then debit min(x, free)\n     │                                                      ▼\n     │       block holding AllocDebited is final        IN_FLIGHT_OUT  (lane emitted AllocDebited\n     └────── (ledger.avail += debited) ◄────────────────  with the amount actually debited)"
   },
   {
    "asciiIndex": 8,
    "heading": "7.4 MBO structure: lane channels, a step channel, and the merge rule",
-   "line": 1355,
+   "line": 1428,
    "ascii": " lane channel k:  ADD ADD SYNC(T) DEL ADD ... │ header.step_base = W_k (watermark)\n step channel:    STEP(T) EXEC EXEC ... STEP(T+3) EXEC ...\n\n SYNC(T): the lane-op records after it (up to the next SYNC) are ordered after step T and\n          before step T+1. Emitted lazily, only before the first record after a new step.\n W_k:     every record of channel k ordered before step W_k + 1 is in this packet or earlier.\n\n Subscriber rule: apply step T only when W_k ≥ T − 1 for every k. Before step T, apply every\n pending lane-op record whose SYNC position is < T, in any order across channels."
   }
  ],
@@ -530,31 +530,31 @@
   {
    "asciiIndex": 4,
    "heading": "6.4 vyrn-sim: the deterministic simulator",
-   "line": 1107,
+   "line": 1112,
    "ascii": "                  vyrn-sim (one thread, virtual time in Nanos, ChaCha8 seeded per component)\n ┌───────────────────────────────────────────────────────────────────────────────────────────┐\n │  event queue (time, seq) ──► scheduler picks the next runnable item, seeded ties          │\n │                                                                                           │\n │  clients ×k ──► sim network (links: latency dist, loss, dup, reorder, partition)          │\n │     (02 workload)        │                                                                │\n │                          ▼                                                                │\n │  box: vyrn-seq  [vyrn-nic::sim queues, PHC model] ─► dedicated lanes + pool ─► cut A, B   │\n │                  ─► BBO ─► TX-A, TX-B, stream-A, stream-B (core map of 01 §10)            │\n │                  each core = Core::poll() step; vyrn-cut Visibility = Sim (seeded delay)  │\n │  box: vyrn-seq standby (F2)  warm, promoted on failover; never votes                      │\n │  box: vyrn-replica ×n      engine = Rust replay, or Vx client through the C ABI           │\n │  box: vyrn-data ×m         payload store and fan-out                                      │\n │  consensus: vyrn-consensus on commonware-runtime::deterministic, same virtual clock       │\n │  disks: in-memory journal with a fault model; clocks: per-box offset, drift, steps        │\n │                                                                                           │\n │  checkers: invariants after every event; oracle diff per message; liveness after heal     │\n └───────────────────────────────────────────────────────────────────────────────────────────┘"
   },
   {
    "asciiIndex": 5,
    "heading": "7.2 Rigs",
-   "line": 1407,
+   "line": 1425,
    "ascii": "  generator boxes                        SUT (vyrn-seq on REF)\n  (vyrn-bench gen, ef_vi TX)\n   G1..G4 ──── fiber ────► [ passive tap ]────────────► port p RX\n                                │ 10% copy\n                                ▼\n                        capture NIC port A ─┐  one NIC, one PHC:\n                                            │  no clock error between A and B\n   G1..G4 ◄─── fiber ───── [ passive tap ]◄─┼──────────── port p TX\n                                │ 10% copy  │\n                                ▼           │\n                        capture NIC port B ─┘ ──► capture host: match request ↔ response\n                                                   by (session, pkt_seq / echo_pkt)"
   },
   {
    "asciiIndex": 6,
    "heading": "8.1 Decision",
-   "line": 1791,
+   "line": 1809,
    "ascii": "  pinned core k (lane, cut, BBO, TX)                     control core\n  ┌───────────────────────────────────┐                 ┌───────────────────────────────┐\n  │ CoreStats   (single writer, 128 B │  Relaxed loads  │ sampler, every 100 ms         │\n  │   lines, Relaxed stores)          │ ──────────────► │  diffs counters + buckets     │\n  │ Histograms  (fixed buckets)       │                 │  → per-window quantiles       │\n  │ TraceRing   (64K × 16 B, shm file)│ ─── on demand ─►│ trace freeze / dump           │\n  └───────────────────────────────────┘                 │ exporter → mgmt NIC (kernel)  │\n                                                        │ tracing logs → journald       │\n  NIC: RX hw timestamp, TX completion timestamp ───────►│ in-box latency of every packet│\n                                                        └───────────────────────────────┘"
   },
   {
    "asciiIndex": 8,
    "heading": "9.1 Stages",
-   "line": 1918,
+   "line": 1936,
    "ascii": " PR opened ─► S1 fast (≤ 15 min) ─► S2 full (≤ 60 min) ─► S3 perf gate (≤ 45 min) ─► merge\n                                                                                     │\n main ─► nightly: S4 long (8 h: fuzz, swarm, B1/B3/B5/B9–B11/B19, chaos) ◄───────────┤\n      ─► weekly:  S5 cluster (B13, B16, B17, B20)                                    │\n tag  ─► S6 release: reproducible builds ×2 ─► compare ─► sign 2-of-3 ─► publish ◄────┘"
   },
   {
    "asciiIndex": 9,
    "heading": "10.3 Rollouts only at epoch boundaries",
-   "line": 2061,
+   "line": 2079,
    "ascii": "  epoch:      TYO active        LDN active        NYC active        TYO active\n  UTC:        00:00 ─────────── 08:00 ─────────── 16:00 ─────────── 00:00\n  LDN boxes:  stage + restart   ◄── runs new ───►\n              as followers      release as home\n              (replay, shadow)\n  NYC boxes:  stage ────────── restart as followers ── runs new as home ──►\n  TYO boxes:  (old release)     stage ──────────── restart as followers ── new as home ──►"
   }
  ],

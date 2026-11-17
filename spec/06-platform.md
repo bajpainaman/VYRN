@@ -887,7 +887,13 @@ Contract rules that every backend meets and the `sim` backend's tests check:
 1. `poll` returns frames of one queue in arrival order. `rx_ts` is non-decreasing within one
    queue: a backend that sees a smaller hardware stamp than the previous one returns the previous
    value and increments `rx_ts_regress`. (A regression means the PHC stepped, which §8.2 forbids;
-   the counter is an alarm.)
+   the counter is an alarm.) `rx_ts_regress` is not a field of `NicCounters` or of shim.h's
+   `vyns_counters`, whose layout is the ring ABI (§7.2). It lives in the per-queue `ExtCounters`
+   that `vyrn-nic` keeps beside them, reached through the `ExtCounted` trait that every backend's
+   `Rx` and `Tx` types implement (`NicBackend::Rx: RxRing + ExtCounted`,
+   `crates/vyrn-nic/src/lib.rs`). It has the same single-writer rule as `NicCounters` and is not
+   fatal. A backend built on the shim gets raw stamps from C and clamps them in Rust, so the
+   counter stays on the Rust side.
 2. Hot-path errors never return as `Err`. They are counters. Two of them are fatal:
    `evq_overflow` (events were lost, so frames may be lost silently) and `fatal_hw`. The lane
    checks `counters().fatal()` once per poll and fail-stops (abort) if it is set.

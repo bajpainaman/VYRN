@@ -175,11 +175,18 @@ off size field
 | Code | Name | 0 | 1 | 2–3 | 4–7 | 8–11 | 12–15 |
 |---|---|---|---|---|---|---|---|
 | 0x81 | `Ack` (resting) | type | index | 0 | handle | tick | client_tag |
-| 0x82 | `Fill` | type | index (0xFF = maker fill) | liq (0 maker, 1 taker) | handle | tick | qty |
+| 0x82 | `Fill` | type | index (0xFF = maker or auction fill) | liq (0 maker, 1 taker, 2 auction) | handle | tick | qty |
 | 0x83 | `Reject` | type | index | reason u16 | detail u32 | 0 | client_tag |
 | 0x84 | `CancelAck` | type | index | 0 | handle | canceled qty | client_tag |
-| 0x85 | `Out` | type | index | cause u16 (IOC rest, FOK, STP, auction) | handle | qty out | client_tag |
+| 0x85 | `Out` | type | index | cause u16 (1–8, §14.10, 04 §7.3) | handle | qty out | client_tag |
 | 0x86 | `EpochNotice` | type | 0 | 0 | next epoch | next home code | seconds to boundary |
+| 0x87 | `Bust` (CHAIN only) | type | 0xFF | liq (as `Fill`) | handle | tick | reversed qty |
+| 0x88 | `Attest` (out of stream) | type | level (1 `DURABLE`, 2 `FINAL`, 3 `SETTLED`) | 0 | upto (`resp_seq`) | low 32 bits of the block height | 0 |
+
+`Out` causes (§14.10): 1 IOC remainder, 2 STP, 3 auction unfilled, 4 expired, 5 post-only,
+6 lane moved, 7 disconnect, 8 admin. No cause means FOK: an unfillable `FOK` is
+`Reject FOK_UNFILLABLE`. `Bust` is defined in 09 §17.2 and `Attest` in 04 §7.5; `vyrn-wire`
+(`crates/engine/vyrn-wire/src/record.rs`) encodes and decodes all eight records.
 
 A taker gets one `Fill` per price level it trades at. A maker gets one `Fill` per order of its
 own that is hit. A fill's execution ID is `(StepId, ordinal in step)`. The fill does not carry it;
