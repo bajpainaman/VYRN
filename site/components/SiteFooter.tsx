@@ -7,7 +7,7 @@ export function SiteFooter() {
         <span className="font-black tracking-[0.03em] [font-stretch:125%]">VYRN</span>
         <span className="text-ink-soft">
           {SPEC_DRAFT}, {SPEC_DATE} · © 2026 bajpainaman ·{" "}
-          <a href={LICENSE_URL}>VYRN Research and Education License 1.0</a> · <a href={REPO_URL}>Source on GitHub</a>
+          <a href={LICENSE_URL}>VYRN Research and Education License 1.0</a> · <a href={REPO_URL}>Source on GitHub</a> · <a href="/privacy">Privacy</a> · <a href="/llms.txt">llms.txt</a>
         </span>
       </div>
     </footer>

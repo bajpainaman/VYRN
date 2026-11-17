@@ -4,15 +4,9 @@ import { cacheLife } from "next/cache";
 import type { RootContent as MdNode } from "mdast";
 import { getDocs, getIdIndex, plainText } from "./spec";
 
-/** One searchable target: a section heading or a spec ID, with the page and anchor it lives at. */
-export type SearchEntry = {
-  /** What the reader types against: "6.8 Shedding before acceptance", "INV-WRITER". */
-  text: string;
-  href: string;
-  /** Where it lives, shown beside the result: "05 Engine", "DESIGN". */
-  where: string;
-  kind: "section" | "id";
-};
+import type { SearchEntry } from "./search-rank";
+
+export type { SearchEntry };
 
 export async function getSearchIndex(): Promise<SearchEntry[]> {
   "use cache";

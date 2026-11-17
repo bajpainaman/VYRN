@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { track } from "@vercel/analytics";
 import { formatDuration, homeAt, HOMES, type HomeState } from "@/lib/home";
 import { LICENSE_REQUEST_URL, REPO_URL } from "@/lib/site";
 import { Arrow } from "./Arrow";
@@ -128,7 +129,7 @@ export function Ticket() {
 
             {/* .routebox sets display itself, so the breakpoint lives on a wrapper. */}
             <div className="mt-5 lg:hidden">
-              <Link href="/docs/design" className="routebox primary border-2 border-ink">
+              <Link href="/docs/design" className="routebox primary border-2 border-ink" onClick={() => track("route_click", { to: "design", from: "hero" })}>
                 <span className="box"><Arrow /></span>
                 <span>Read the design<small>The answer in one document</small></span>
               </Link>
@@ -186,6 +187,7 @@ export function Ticket() {
                 type="button"
                 onClick={() => {
                   run(nextOrder(order));
+                  track("stamp_order");
                   // On narrow screens the stamps sit above the button; bring them into view to watch them land.
                   const box = pad.current?.getBoundingClientRect();
                   if (box && box.height > 0 && (box.top < 64 || box.bottom > window.innerHeight)) {
@@ -219,20 +221,20 @@ export function Ticket() {
 
         <nav aria-label="Where to go next" className="grid gap-[2px] border-t-2 border-ink bg-ink sm:grid-cols-3 lg:grid-cols-[1.35fr_1fr_1fr_1fr]">
           <div className="hidden lg:grid">
-            <Link href="/docs/design" className="routebox primary">
+            <Link href="/docs/design" className="routebox primary" onClick={() => track("route_click", { to: "design", from: "hero" })}>
               <span className="box"><Arrow /></span>
               <span>Read the design<small>The answer in one document</small></span>
             </Link>
           </div>
-          <Link href="/docs/00-index" className="routebox bg-canary">
+          <Link href="/docs/00-index" className="routebox bg-canary" onClick={() => track("route_click", { to: "spec", from: "hero" })}>
             <span className="box"><Arrow /></span>
             <span>Read the spec<small>Chapters 00–11</small></span>
           </Link>
-          <a href={REPO_URL} className="routebox bg-canary">
+          <a href={REPO_URL} className="routebox bg-canary" onClick={() => track("route_click", { to: "github", from: "hero" })}>
             <span className="box"><Arrow /></span>
             <span>GitHub<small>bajpainaman/VYRN</small></span>
           </a>
-          <a href={LICENSE_REQUEST_URL} className="routebox bg-canary">
+          <a href={LICENSE_REQUEST_URL} className="routebox bg-canary" onClick={() => track("route_click", { to: "license_request", from: "hero" })}>
             <span className="box"><Arrow /></span>
             <span>Request a license<small>Firms need written permission</small></span>
           </a>
