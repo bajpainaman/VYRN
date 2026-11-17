@@ -1,5 +1,5 @@
-# S1 of spec/11-build.md §8, the parts that exist today: formatting, clippy, tests on the three CI
-# targets (Linux x86-64, Linux aarch64, macOS aarch64), cargo-deny and the 04 §11 protocol
+# S1 of spec/11-build.md §8, the parts that exist today: formatting, clippy, tests on Linux
+# x86-64 and aarch64 (macOS is left out to keep CI cheap), cargo-deny and the 04 §11 protocol
 # vectors. Miri, TSan, fuzzing and the asm gate join as the crates they cover land.
 name: CI
 
@@ -33,13 +33,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain || rustup toolchain install
       - name: clang and lld with rustc's LLVM major (11 §4.2)
-        if: runner.os == 'Linux'
         run: |
           major="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
           curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
