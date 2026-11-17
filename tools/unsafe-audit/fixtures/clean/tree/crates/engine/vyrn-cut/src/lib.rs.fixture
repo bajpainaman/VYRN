@@ -1,0 +1,8 @@
+//! No unsafe code: unsafe only appears in text. unsafe { }
+#![deny(unsafe_code)]
+/* unsafe { block comment } */
+const A: &str = "unsafe { string }";
+const B: &str = r#"unsafe fn raw string"#;
+#[allow(unsafe_code)]
+pub mod ring;
+fn r#unsafe() {}

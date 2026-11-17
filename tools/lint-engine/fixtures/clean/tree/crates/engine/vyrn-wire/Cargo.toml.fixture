@@ -1,0 +1,12 @@
+[package]
+name = "vyrn-wire"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+vyrn-types = { path = "../vyrn-types" }
+vyrn-crypto = { path = "../vyrn-crypto" }
+zerocopy = "0.8"
+
+[dev-dependencies]
+proptest = "1"

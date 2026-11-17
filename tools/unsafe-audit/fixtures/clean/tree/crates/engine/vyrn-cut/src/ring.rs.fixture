@@ -1,0 +1,13 @@
+//! `vyrn-cut::ring` fixture.
+pub fn ring_len() -> usize {
+    // SAFETY: the pointer is valid for reads.
+    unsafe { read() }
+}
+
+// SAFETY: the type owns its slots.
+#[allow(clippy::something)]
+unsafe impl Send for Ring {}
+
+unsafe fn read() -> usize {
+    0
+}

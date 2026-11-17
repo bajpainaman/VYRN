@@ -1,0 +1,7 @@
+[package]
+name = "vyrn-types"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+vyrn-log = { path = "../../vyrn-log" }

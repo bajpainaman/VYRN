@@ -1,0 +1,8 @@
+[package]
+name = "vyrn-consensus"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+vyrn-log = { path = "../vyrn-log" }
+tokio = "1"

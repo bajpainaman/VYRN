@@ -1,0 +1,6 @@
+//! Clean code: f64 1.0 async tokio std::thread in comments are ignored.
+const A: &str = "f64 1.5 async .await tokio::x std::thread::spawn";
+pub fn f(t: ((u8, u8), u8), log: u8, rand: u8) -> u8 {
+    t.0.1 + log + rand + 0x1e3 + 1usize as u8
+}
+

@@ -1,6 +1,7 @@
 # S1 of spec/11-build.md §8, the parts that exist today: formatting, clippy, tests on Linux
-# x86-64 and aarch64 (macOS is left out to keep CI cheap), cargo-deny and the 04 §11 protocol
-# vectors. Miri, TSan, fuzzing and the asm gate join as the crates they cover land.
+# x86-64 and aarch64 (macOS is left out to keep CI cheap), cargo-deny, the 04 §11 protocol
+# vectors, and the unsafe-audit and lint-engine gates (Linux only, §9.2 S1). Miri, TSan, fuzzing
+# and the asm gate join as the crates they cover land.
 name: CI
 
 on:
@@ -52,6 +53,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+
+  gates:
+    name: gates (unsafe-audit, lint-engine)
+    runs-on: ubuntu-24.04
+    env:
+      # These two tools need no clang or lld, so build them with the runner's cc and without the
+      # workspace's linker-plugin-lto rustflags (.cargo/config.toml, §4.3). RUSTFLAGS in the
+      # environment replaces the config's rustflags.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: unsafe only in the modules of UNSAFE.toml (11 §3.2, REQ-SEC-10)
+        run: cargo run --locked --quiet -p unsafe-audit
+      - name: engine crates keep to the dependency DAG and the engine source rules (11 §1.4, §2.3, §3.3)
+        run: cargo run --locked --quiet -p lint-engine
 
   deny:
     runs-on: ubuntu-24.04

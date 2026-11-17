@@ -1,0 +1,6 @@
+crates/engine/vyrn-bbo/Cargo.toml:7: engine-external-dependency
+crates/engine/vyrn-crypto/Cargo.toml:8: engine-external-dependency
+crates/engine/vyrn-lane/Cargo.toml:9: engine-external-dependency
+crates/engine/vyrn-risk/Cargo.toml:7: engine-external-dependency
+crates/engine/vyrn-wire/Cargo.toml:8: engine-external-dependency
+crates/engine/vyrn-wire/Cargo.toml:12: engine-external-dependency

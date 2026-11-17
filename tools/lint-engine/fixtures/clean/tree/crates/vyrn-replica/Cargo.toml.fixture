@@ -1,0 +1,8 @@
+[package]
+name = "vyrn-replica"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+vyrn-epoch = { path = "../vyrn-epoch" }
+vyrn-lane = { path = "../engine/vyrn-lane" }
