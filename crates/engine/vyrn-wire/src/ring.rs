@@ -40,16 +40,18 @@ impl RxFlags {
 
 /// One received frame. Same layout as `vyns_rx` in shim.h, so the shim fills it directly. The
 /// bytes are reached through `RxRing::bytes`, which owns the buffer.
+///
+/// The fields are read-only, so safe code cannot lengthen or redirect a descriptor it was given.
+/// Safe code can still build one with `new`; that is why `RxRing::bytes` validates descriptors
+/// against the ring's own storage instead of trusting `data` and `len`.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct RxPkt {
     data: NonNull<u8>,
-    /// Frame length without FCS.
-    pub len: u16,
-    pub flags: RxFlags,
-    pub buf_id: u32,
-    /// TAI ns; the source is `RxRing::ts_source()`.
-    pub rx_ts: Nanos,
+    len: u16,
+    flags: RxFlags,
+    buf_id: u32,
+    rx_ts: Nanos,
 }
 const _: () = assert!(size_of::<RxPkt>() == 24 && core::mem::offset_of!(RxPkt, rx_ts) == 16);
 
@@ -82,9 +84,32 @@ impl RxPkt {
         }
     }
 
-    /// For backends that resolve `bytes` from the pointer.
+    /// The pointer the backend stored. Only the backend that produced this descriptor may
+    /// dereference it, after checking `buf_id` and `len` against its own buffers.
     pub const fn data(&self) -> NonNull<u8> {
         self.data
+    }
+
+    /// Frame length without FCS.
+    pub const fn len(&self) -> u16 {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn flags(&self) -> RxFlags {
+        self.flags
+    }
+
+    pub const fn buf_id(&self) -> u32 {
+        self.buf_id
+    }
+
+    /// TAI ns; the source is `RxRing::ts_source()`.
+    pub const fn rx_ts(&self) -> Nanos {
+        self.rx_ts
     }
 }
 
@@ -162,6 +187,11 @@ pub trait RxRing: Send {
     /// Gives back the oldest `n` frames not yet released, in poll order.
     fn release(&mut self, n: usize);
     /// A frame's bytes. The borrow ends before the next `release`.
+    ///
+    /// `p` is untrusted: safe code can build any `RxPkt`. The backend resolves it against storage
+    /// it owns (by `buf_id`) and bounds-checks `len` against that buffer, and returns an empty
+    /// slice for a descriptor it did not produce or has already released. It never dereferences
+    /// `p.data()` without that check, so this method is sound for every input.
     fn bytes<'a>(&'a self, p: &'a RxPkt) -> &'a [u8];
     fn ts_source(&self) -> TsSource;
     fn counters(&self) -> &NicCounters;
