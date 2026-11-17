@@ -264,6 +264,11 @@ pub trait BlockStore {
     /// [`next_height`](Self::next_height) unless the store is empty.
     fn put(&mut self, b: &Block) -> Result<(), StoreError>;
     fn get(&self, height: Height) -> Result<Option<Block>, StoreError>;
+    /// The header at `height` without its block's order bytes or payloads, for readers that
+    /// need only headers (consensus, 11 §1.4).
+    fn header(&self, height: Height) -> Result<Option<BlockHeader>, StoreError> {
+        Ok(self.get(height)?.map(|b| b.header))
+    }
     /// The lowest and highest stored heights.
     fn range(&self) -> Option<(Height, Height)>;
 
@@ -315,6 +320,10 @@ impl BlockStore for MemStore {
 
     fn get(&self, height: Height) -> Result<Option<Block>, StoreError> {
         Ok(self.blocks.get(&height.0).cloned())
+    }
+
+    fn header(&self, height: Height) -> Result<Option<BlockHeader>, StoreError> {
+        Ok(self.blocks.get(&height.0).map(|b| b.header))
     }
 
     fn range(&self) -> Option<(Height, Height)> {
@@ -435,6 +444,12 @@ impl FileStore {
             index: kept.into_iter().map(|(_, d, off, n)| (d, off, n)).collect(),
             drives,
         })
+    }
+
+    /// (drive, offset, length) of the record at `height`.
+    fn locate(&self, height: Height) -> Option<(usize, u64, u64)> {
+        let i = usize::try_from(height.0.checked_sub(self.first)?).ok()?;
+        self.index.get(i).copied()
     }
 
     /// The drive directories' files, for tests and tools.
@@ -579,10 +594,7 @@ impl BlockStore for FileStore {
     }
 
     fn get(&self, height: Height) -> Result<Option<Block>, StoreError> {
-        let Some(i) = height.0.checked_sub(self.first) else {
-            return Ok(None);
-        };
-        let Some(&(d, off, n)) = usize::try_from(i).ok().and_then(|i| self.index.get(i)) else {
+        let Some((d, off, n)) = self.locate(height) else {
             return Ok(None);
         };
         let drive = self.drives.get(d).ok_or(StoreError::Corrupt)?;
@@ -593,6 +605,31 @@ impl BlockStore for FileStore {
             return Err(StoreError::Corrupt);
         }
         Ok(Some(b))
+    }
+
+    /// Reads only the record's 256-byte head. The whole record was checked when it was written
+    /// or recovered; this read checks the magic, the height and the epoch.
+    fn header(&self, height: Height) -> Result<Option<BlockHeader>, StoreError> {
+        let Some((d, off, _)) = self.locate(height) else {
+            return Ok(None);
+        };
+        let drive = self.drives.get(d).ok_or(StoreError::Corrupt)?;
+        let mut head = [0u8; RECORD_HEAD_BYTES];
+        read_at(&drive.file, &mut head, off)?;
+        let mut r = Reader::new(&head);
+        let e = |_| StoreError::Corrupt;
+        let magic: [u8; 8] = r.array().map_err(e)?;
+        let (h, ep) = (r.u64().map_err(e)?, r.u32().map_err(e)?);
+        r.bytes(4).map_err(e)?;
+        let header = decode_header(&r.array().map_err(e)?);
+        if &magic != RECORD_MAGIC
+            || h != height.0
+            || header.height != height
+            || ep != header.epoch.0
+        {
+            return Err(StoreError::Corrupt);
+        }
+        Ok(Some(header))
     }
 
     fn range(&self) -> Option<(Height, Height)> {

@@ -6,7 +6,7 @@
 //!
 //! | Contract | Type | Spec |
 //! |---|---|---|
-//! | What the block source hands in | [`BlockSource`], [`Verdict`] | 07 §6.4 |
+//! | What the block source hands in | [`BlockSource`], [`Verdict`]; [`LogSource`] over `vyrn-log` | 07 §6.4, §8.2 |
 //! | What a proposal commits to | [`Proposal`] (`REP_Proposal`, 85 bytes) | 07 §6.3 |
 //! | Who may vote | [`Committee`] (the voters of `REP_Membership`) | 07 §13.1, 01 §14.4 |
 //! | What a certificate proves, checked offline | [`FinalityCert`], [`verify_finality_cert`] | 07 §6.5 |
@@ -18,7 +18,6 @@
 #![forbid(unsafe_code)]
 
 pub mod cert;
-pub mod header;
 pub mod membership;
 pub mod proposal;
 pub mod silence;
@@ -28,7 +27,7 @@ pub mod voter;
 pub use cert::{CertErr, FinalityCert, NAMESPACE, verify_finality_cert};
 pub use membership::{Committee, CommitteeErr};
 pub use proposal::{Proposal, ProposalErr, ProposalKind};
-pub use source::{BlockSource, Genesis, Verdict};
+pub use source::{BlockSource, Genesis, LogSource, Verdict};
 
 #[cfg(test)]
 mod conformance;

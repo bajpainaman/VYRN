@@ -4,7 +4,6 @@
 //! them. Every certificate a voter reports is re-checked with [`verify_finality_cert`].
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use crate::header::{header_hash, seq_sign};
 use crate::source::mem::MemSource;
 use crate::voter::{Timeouts, VoterConfig, config};
 use crate::{Committee, FinalityCert, Genesis, verify_finality_cert};
@@ -15,6 +14,7 @@ use commonware_runtime::{Clock, Handle, Quota, Runner, Spawner, Supervisor, dete
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
+use vyrn_log::block::{header_hash, sign_header};
 use vyrn_types::{BLOCK_NS, BlockHeader, BookId, Epoch, Hash, Height, Mode, StepId};
 
 const SEQ_SEED: [u8; 32] = [0x99; 32];
@@ -44,7 +44,7 @@ fn sequencer(ctx: deterministic::Context, source: MemSource) -> Handle<()> {
         let mut prev = genesis_header();
         loop {
             ctx.sleep(Duration::from_nanos(BLOCK_NS)).await;
-            let mut h = BlockHeader {
+            let h = BlockHeader {
                 height: Height(prev.height.0 + 1),
                 first_step: StepId(prev.last_step.0 + 1),
                 last_step: StepId(prev.last_step.0 + 2),
@@ -53,7 +53,7 @@ fn sequencer(ctx: deterministic::Context, source: MemSource) -> Handle<()> {
                 data_root: Hash([8; 32]),
                 ..prev
             };
-            h.seq_sig = seq_sign(&SEQ_SEED, &h);
+            let h = sign_header(&h, &SEQ_SEED);
             source.insert(h);
             prev = h;
         }
