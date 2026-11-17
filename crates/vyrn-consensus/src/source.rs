@@ -12,7 +12,7 @@
 //! - items 2–5 (order bytes, payloads, tags, fences) are [`BlockSource::check_body`].
 
 use crate::header::{header_hash, verify_seq_sig};
-use crate::proposal::{MAX_HDRS_PER_PROPOSAL, Proposal, ProposalKind};
+use crate::proposal::{Proposal, ProposalKind};
 use vyrn_types::{BlockHeader, Epoch, Hash, Height, PubKey, StepId};
 
 /// Answer of the source about a block range (07 §6.4).
@@ -66,17 +66,18 @@ impl From<Genesis> for Tip {
     }
 }
 
-/// The longest run (≤ 16) of held headers after `tip` that pass item 1 under `seq_key`, as
-/// candidate last headers in ascending order.
+/// The longest run (≤ `limit`) of held headers after `tip` that pass item 1 under `seq_key`, in
+/// ascending order. With `limit` = 16 these are the candidate last headers of a proposal.
 pub(crate) fn chain_after<S: BlockSource>(
     source: &S,
     epoch: Epoch,
     seq_key: &PubKey,
     tip: Tip,
+    limit: usize,
 ) -> Vec<BlockHeader> {
     let mut out = Vec::new();
     let (mut prev_hash, mut prev_step, mut height) = (tip.hash, tip.last_step, tip.height);
-    while (out.len() as u64) < MAX_HDRS_PER_PROPOSAL {
+    while out.len() < limit {
         let Some(next) = height.0.checked_add(1).map(Height) else {
             break;
         };
@@ -111,7 +112,16 @@ pub(crate) fn proposal_for<S: BlockSource>(
     tip: Tip,
     last: &BlockHeader,
 ) -> Proposal {
-    let first = Height(tip.height.0.saturating_add(1));
+    proposal_range(source, epoch, Height(tip.height.0.saturating_add(1)), last)
+}
+
+/// The kind-0 proposal covering `first ..= last.height`.
+pub(crate) fn proposal_range<S: BlockSource>(
+    source: &S,
+    epoch: Epoch,
+    first: Height,
+    last: &BlockHeader,
+) -> Proposal {
     Proposal {
         kind: ProposalKind::Headers,
         epoch,
@@ -203,12 +213,12 @@ mod tests {
             prev = next(&prev);
             src.insert(prev);
         }
-        assert_eq!(chain_after(&src, Epoch(1), &key, tip).len(), 16);
+        assert_eq!(chain_after(&src, Epoch(1), &key, tip, 16).len(), 16);
         // A header whose seq_sig is not the sequencer's ends the run before it.
         let mut bad = src.header(Height(14)).unwrap_or(base);
         bad.seq_sig = seq_sign(&[0x52; 32], &bad);
         src.insert(bad);
-        let run = chain_after(&src, Epoch(1), &key, tip);
+        let run = chain_after(&src, Epoch(1), &key, tip, 16);
         assert_eq!(run.last().map(|h| h.height), Some(Height(13)));
         let p = proposal_for(&src, Epoch(1), tip, &run[2]);
         assert_eq!((p.first_height, p.last_height), (Height(11), Height(13)));
