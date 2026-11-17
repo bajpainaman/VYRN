@@ -197,6 +197,8 @@ fn kernel_udp_poll_is_bounded_by_dropped_datagrams_too() {
     );
 }
 
+/// Elsewhere than Linux there is no `IP_PKTINFO` path, so a wildcard bind is still refused.
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn kernel_udp_refuses_a_wildcard_bind() {
     let mut nic = KernelUdp::open(&cfg(BackendKind::Kernel)).unwrap();
@@ -377,4 +379,37 @@ fn kernel_udp_send_burst_resumes_after_a_partial_send() {
         peer.recv_from(&mut buf).is_err(),
         "an extra datagram arrived"
     );
+}
+
+/// A queue bound to `0.0.0.0` gives each frame the destination address its datagram was sent
+/// to. Each case's destination differs from its sender's address and from `0.0.0.0`, so a frame
+/// built from either fails; the broadcast case also fails `ipi_spec_dst`, which is 127.0.0.1
+/// there, in place of `ipi_addr`.
+#[cfg(target_os = "linux")]
+#[test]
+fn kernel_udp_wildcard_bind_frames_carry_each_datagrams_destination() {
+    let mut nic = KernelUdp::open(&cfg(BackendKind::Kernel)).unwrap();
+    let mut b = bind(0);
+    b.ip = Ipv4Addr::UNSPECIFIED;
+    let mut rx = nic.rx_ring(&b).unwrap();
+    assert_eq!(*rx.local_addr().ip(), Ipv4Addr::UNSPECIFIED);
+    let port = rx.local_addr().port();
+    for (from, to) in [
+        ([127, 0, 0, 2], [127, 0, 0, 1]),
+        ([127, 0, 0, 1], [127, 0, 0, 2]),
+        ([127, 0, 0, 1], [127, 255, 255, 255]),
+    ] {
+        let (from, to) = (Ipv4Addr::from(from), Ipv4Addr::from(to));
+        let peer = UdpSocket::bind((from, 0)).unwrap();
+        peer.set_broadcast(true).unwrap();
+        peer.send_to(b"wild", (to, port)).unwrap();
+        let p = poll_one(&mut rx);
+        let f = frame::parse(rx.bytes(&p)).unwrap();
+        assert_eq!(f.payload, b"wild");
+        let peer_port = peer.local_addr().unwrap().port();
+        assert_eq!((f.hdr.src.ip, f.hdr.src.port), (from, peer_port), "to {to}");
+        assert_eq!((f.hdr.dst.ip, f.hdr.dst.port), (to, port), "from {from}");
+        rx.release(1);
+    }
+    assert_eq!(ExtCounters::get(&rx.counters().rx_discard), 0);
 }

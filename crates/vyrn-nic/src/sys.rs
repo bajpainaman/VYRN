@@ -3,6 +3,7 @@
 //! Linux `recvmmsg`/`sendmmsg` for `kernel_udp` (06 §6.6): one syscall per burst of up to `BATCH`
 //! IPv4 datagrams. The message headers live on the caller's stack for the one call, so nothing
 //! here holds a raw pointer past its return. Other targets use std's sockets and need none of it.
+//! `set_pktinfo` and `Recvd::dst` let a wildcard-bound socket learn each datagram's destination.
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::*;
@@ -14,13 +15,16 @@ mod linux {
     use std::io;
     use std::os::fd::RawFd;
 
+    const PKTINFO_BYTES: u32 = mem::size_of::<libc::in_pktinfo>() as u32;
+
     /// The most datagrams one call moves: `RX_BURST`, the most frames one `poll` returns.
     pub(crate) const BATCH: usize = vyrn_wire::RX_BURST;
 
-    /// Bytes of ancillary data each received message has room for. Nothing asks for any yet, so
-    /// `msg_controllen` is 0; a socket option that adds a control message (IP_PKTINFO, say) sets
-    /// this, and `recv_batch` reads it out of `ctrl` into `Recvd`.
-    const CTRL_BYTES: usize = 0;
+    /// Bytes of ancillary data each received message has room for: one `IP_PKTINFO` message,
+    /// the only one a socket of this crate asks for (`set_pktinfo`). Sockets that do not ask get
+    /// none and leave it unused.
+    // SAFETY: CMSG_SPACE is arithmetic on its argument and touches no memory.
+    const CTRL_BYTES: usize = unsafe { libc::CMSG_SPACE(PKTINFO_BYTES) } as usize;
 
     /// One message's control buffer, aligned for `cmsghdr`.
     #[repr(C, align(8))]
@@ -36,6 +40,54 @@ mod linux {
         pub(crate) trunc: bool,
         /// The sender, or `None` when the kernel named no IPv4 address.
         pub(crate) src: Option<SocketAddrV4>,
+        /// `in_pktinfo.ipi_addr`, the destination address in the datagram's IP header, or `None`
+        /// when its `IP_PKTINFO` message is missing or cut short (`MSG_CTRUNC`).
+        pub(crate) dst: Option<Ipv4Addr>,
+    }
+
+    /// Asks the kernel for an `IP_PKTINFO` control message on every datagram `fd` receives.
+    pub(crate) fn set_pktinfo(fd: RawFd) -> io::Result<()> {
+        let on: libc::c_int = 1;
+        let len = mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let opt = (&raw const on).cast();
+        // SAFETY: `opt` points at a live c_int and `len` is its size, so the kernel reads only it.
+        let rc = unsafe { libc::setsockopt(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, opt, len) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// `ipi_addr` of the `IP_PKTINFO` message `recvmmsg` left in `m`'s control buffer.
+    fn pktinfo_dst(m: &libc::msghdr) -> Option<Ipv4Addr> {
+        if m.msg_flags & libc::MSG_CTRUNC != 0 {
+            return None;
+        }
+        // SAFETY: CMSG_LEN is arithmetic on its argument and touches no memory.
+        let need = unsafe { libc::CMSG_LEN(PKTINFO_BYTES) } as usize;
+        // SAFETY: `m`'s control buffer is live (its `Ctrl` outlives this call) and the kernel set
+        // `msg_controllen` to the bytes it wrote there; CMSG_FIRSTHDR checks it.
+        let mut c = unsafe { libc::CMSG_FIRSTHDR(m) };
+        while !c.is_null() {
+            // SAFETY: CMSG_FIRSTHDR/CMSG_NXTHDR give null or a header inside the buffer, which
+            // `Ctrl` aligns for cmsghdr.
+            let h = unsafe { &*c };
+            if (h.cmsg_level, h.cmsg_type) == (libc::IPPROTO_IP, libc::IP_PKTINFO)
+                && h.cmsg_len as usize >= need
+            {
+                // SAFETY: without MSG_CTRUNC, cmsg_len covers a whole in_pktinfo after the header.
+                let p = unsafe {
+                    libc::CMSG_DATA(c)
+                        .cast::<libc::in_pktinfo>()
+                        .read_unaligned()
+                };
+                return Some(Ipv4Addr::from(u32::from_be(p.ipi_addr.s_addr)));
+            }
+            // SAFETY: as above; CMSG_NXTHDR returns null past the end of the buffer.
+            c = unsafe { libc::CMSG_NXTHDR(m, c) };
+        }
+        None
     }
 
     fn to_sockaddr(a: SocketAddrV4) -> libc::sockaddr_in {
@@ -127,6 +179,7 @@ mod linux {
                 len: h.msg_len as usize,
                 trunc: h.msg_hdr.msg_flags & libc::MSG_TRUNC != 0,
                 src: from_sockaddr(name, h.msg_hdr.msg_namelen),
+                dst: pktinfo_dst(&h.msg_hdr),
             };
         }
         Ok(got)
