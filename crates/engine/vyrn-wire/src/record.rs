@@ -1,6 +1,6 @@
 //! Response records (01 §6.4, §14.10; 04 §7; 09 §17.2).
 
-use vyrn_types::{Epoch, Handle, Qty, RejectReason, Tick};
+use vyrn_types::{Epoch, Handle, MAX_MSGS_PER_PKT, Qty, RejectReason, Tick};
 
 use crate::raw::RawRec;
 use crate::{INDEX_NONE, PROTO_D_RESERVED, PROTO_D_UNKNOWN_TYPE, WireError};
@@ -170,6 +170,13 @@ impl Record {
         let (i, w, a, b, c) = (r.b1, r.w.get(), r.a.get(), r.b.get(), r.c.get());
         let reserved = || WireError::bad_type(PROTO_D_RESERVED);
         let need = |ok: bool| if ok { Ok(()) } else { Err(reserved()) };
+        // Records that answer a message carry its index 0–9, or INDEX_NONE (04 §7).
+        if matches!(
+            r.kind,
+            Self::ACK | Self::FILL | Self::REJECT | Self::CANCEL_ACK | Self::OUT
+        ) {
+            need(i < MAX_MSGS_PER_PKT || i == INDEX_NONE)?;
+        }
         Ok(match r.kind {
             Self::ACK => {
                 need(w == 0)?;
@@ -304,6 +311,28 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_index_is_0_to_9_or_none() {
+        let ack = |index| {
+            Record::Ack {
+                index,
+                handle: Handle(1),
+                tick: Tick(2),
+                client_tag: 3,
+            }
+            .encode()
+        };
+        for ok in [0u8, 9, INDEX_NONE] {
+            assert!(Record::decode(&ack(ok)).is_ok());
+        }
+        for bad in [10u8, 0x80, 0xFE] {
+            assert_eq!(
+                Record::decode(&ack(bad)),
+                Err(WireError::bad_type(PROTO_D_RESERVED))
+            );
+        }
+    }
 
     #[test]
     fn epoch_notice_home_word_bytes_10_11_are_reserved() {
