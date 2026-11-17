@@ -1,0 +1,915 @@
+// vyrn-vx-oracle: the sequential reference book (spec/05-engine.md §2, spec/11-build.md §5.2).
+//
+// One book, one event at a time, linear scans only. Every C struct of vx/abi/pbv.h is read and
+// written by byte offset, so the ABI never depends on how vxc lays out a struct. The record
+// rules are in pbv.h; the spec choices are in tests/golden/scenarios/README.md.
+
+import core::ptr;
+import core::num;
+import std::alloc;
+
+// ---- constants ---------------------------------------------------------------------------
+// VX-WORKAROUND W-12 (issue to file): no hex integer literals, so every constant is decimal.
+
+const ABI_VERSION : u64 = 1;
+const U32_MAX : u64 = 4294967295;
+const PPM : u64 = 1000000;
+const SLOT_MAX : u64 = 16777214;        // 2^24 - 2; slot 2^24 - 1 is never allocated (04 §6.1)
+const HANDLE_ALL : u64 = 4294967295;    // PROTO_HANDLE_ALL
+
+const E_CAP : u32 = 4294967295;
+const E_EVENT : u32 = 4294967294;
+const E_FULL : u32 = 4294967293;
+const E_FAULT : u32 = 4294967292;
+
+// Phases (pbv.h PBO_PHASE_*; 1-3 are also the AUCTION_PHASE detail, 04 §6.9).
+const CONT : u64 = 1;
+const AUCT : u64 = 2;
+const HALT : u64 = 3;
+const FROZ : u64 = 4;
+
+// Record types (01 §6.4) and reject reasons (01 §6.5, §14.10).
+const R_ACK : u64 = 129;
+const R_FILL : u64 = 130;
+const R_REJECT : u64 = 131;
+const R_CXL : u64 = 132;
+const R_OUT : u64 = 133;
+const BAD_TYPE : u64 = 3;
+const BAD_TICK : u64 = 4;
+const BAD_QTY : u64 = 5;
+const RISK_CREDIT : u64 = 6;
+const RISK_ORDER_COUNT : u64 = 8;
+const POST_ONLY_WOULD_CROSS : u64 = 10;
+const FOK_UNFILLABLE : u64 = 11;
+const UNKNOWN_HANDLE : u64 = 12;
+const TOO_LATE : u64 = 13;
+const BOOK_HALTED : u64 = 14;
+const STP : u64 = 16;
+const AUCTION_PHASE : u64 = 19;
+const SIDE_MISMATCH : u64 = 20;
+const BUSY : u64 = 24;
+const D_UNKNOWN_TYPE : u64 = 1;
+const D_RESERVED : u64 = 2;
+const D_FLAGS : u64 = 3;
+const D_NO_CHANGE : u64 = 4294967294;
+
+// Out causes (01 §14.10) and how an order ended (TOO_LATE detail, 04 §6.3).
+const OUT_IOC : u64 = 1;
+const OUT_STP : u64 = 2;
+const OUT_AUCTION : u64 = 3;
+const END_FILLED : u64 = 1;
+const END_CANCELED : u64 = 2;
+const END_OUT : u64 = 3;
+
+// Order states.
+const LIVE : u64 = 0;
+const ENDED : u64 = 1;
+const TAKING : u64 = 2;
+
+// ---- state -------------------------------------------------------------------------------
+
+struct Ord {
+  handle : u64, acct : i64, session : u64, rank : u64,
+  side : u64, tif : u64, post : u64, stp : u64, flags : u64,
+  tick : u64, total : u64, filled : u64, tag : u64,
+  rx : u64, seq : u64, state : u64, cause : u64,
+}
+
+struct Acct {
+  id : u64, lane : u64, maker : i64, taker : i64, auction : i64,
+  base_free : u64, base_resv : u64, quote_free : u64, quote_resv : u64, open : u64,
+}
+
+struct Sess { id : u64, acct : i64 }
+
+struct Book {
+  band_lo : u64, band_hi : u64, qptl : u64, max_fee : u64, min_qty : u64, max_qty : u64,
+  max_open : u64, max_orders : i64, phase : u64, step : u64, last_step : u64, fault : u64,
+  orders : *mut Ord, n_orders : i64,
+  accts : *mut Acct, n_accts : i64,
+  sess : *mut Sess, n_sess : i64,
+  rank : *mut u64, next_h : *mut u64, fee_acc : *mut i64,
+  out : *mut u8, out_cap : i64, out_n : i64, out_session : u64,
+}
+
+// ---- bytes -------------------------------------------------------------------------------
+
+fn rd8(p : *const u8, o : i64) -> u64 {
+  let v : u8 = unsafe { p[o] };
+  return v as u64;
+}
+fn rd16(p : *const u8, o : i64) -> u64 { return rd8(p, o) | (rd8(p, o + 1i64) << 8u64); }
+fn rd32(p : *const u8, o : i64) -> u64 { return rd16(p, o) | (rd16(p, o + 2i64) << 16u64); }
+fn rd64(p : *const u8, o : i64) -> u64 { return rd32(p, o) | (rd32(p, o + 4i64) << 32u64); }
+fn rds32(p : *const u8, o : i64) -> i64 {
+  let v = rd32(p, o);
+  if v >= 2147483648u64 { return (v as i64) - 4294967296i64; }
+  return v as i64;
+}
+fn wr8(p : *mut u8, o : i64, v : u64) -> void { unsafe { p[o] = (v & 255u64) as u8; } }
+fn wr16(p : *mut u8, o : i64, v : u64) -> void { wr8(p, o, v); wr8(p, o + 1i64, v >> 8u64); }
+fn wr32(p : *mut u8, o : i64, v : u64) -> void { wr16(p, o, v); wr16(p, o + 2i64, v >> 16u64); }
+fn wr64(p : *mut u8, o : i64, v : u64) -> void { wr32(p, o, v); wr32(p, o + 4i64, v >> 32u64); }
+fn zero(p : *const u8, from : i64, to : i64) -> bool {
+  for i in from..to { if rd8(p, i) != 0u64 { return false; } }
+  return true;
+}
+
+// ---- checked arithmetic (01 §11.4); an overflow after entry sets the fault flag --------------
+// VX-WORKAROUND W-11 (issue to file): `+`, `-` and `*` wrap silently, so every ledger amount
+// goes through these.
+
+fn mul(b : *mut Book, x : u64, y : u64) -> u64 {
+  let (v, o) = x.overflowing_mul(y);
+  if o { unsafe { (*b).fault = 1u64; } }
+  return v;
+}
+fn add(b : *mut Book, x : u64, y : u64) -> u64 {
+  let (v, o) = x.overflowing_add(y);
+  if o { unsafe { (*b).fault = 1u64; } }
+  return v;
+}
+fn sub(b : *mut Book, x : u64, y : u64) -> u64 {
+  let (v, o) = x.overflowing_sub(y);
+  if o { unsafe { (*b).fault = 1u64; } }
+  return v;
+}
+fn min(x : u64, y : u64) -> u64 { if x < y { return x; } return y; }
+fn cap32(x : u64) -> u64 { return min(x, U32_MAX); }
+
+// ceil(n * ppm / 10^6) and floor(n * ppm / 10^6) without a 128-bit product: n = q * 10^6 + r.
+fn fee_ceil(b : *mut Book, n : u64, ppm : u64) -> u64 {
+  return add(b, mul(b, n / PPM, ppm), (mul(b, n % PPM, ppm) + PPM - 1u64) / PPM);
+}
+fn fee_floor(b : *mut Book, n : u64, ppm : u64) -> u64 {
+  return add(b, mul(b, n / PPM, ppm), mul(b, n % PPM, ppm) / PPM);
+}
+
+// 05 §2.6 with 10 §5's units: px(t) quote units per lot, rpl(t) the buy reservation per lot.
+fn px(b : *mut Book, t : u64) -> u64 { unsafe { return mul(b, t, (*b).qptl); } }
+fn rpl(b : *mut Book, t : u64) -> u64 {
+  let p = px(b, t);
+  unsafe { return add(b, p, fee_ceil(b, p, (*b).max_fee)); }
+}
+
+// ---- access ------------------------------------------------------------------------------
+
+// VX-WORKAROUND W-13 (issue to file): `(*b).orders[i].f = x` is an internal compiler error, so
+// element writes go through a pointer from here.
+fn ord(b : *mut Book, i : i64) -> *mut Ord { unsafe { return offset_mut((*b).orders, i); } }
+fn acct(b : *mut Book, i : i64) -> *mut Acct { unsafe { return offset_mut((*b).accts, i); } }
+fn open(b : *mut Book, i : i64) -> u64 {
+  let o = ord(b, i);
+  unsafe { return (*o).total - (*o).filled; }
+}
+fn session_acct(b : *mut Book, s : u64) -> i64 {
+  unsafe {
+    for i in 0i64..(*b).n_sess {
+      let e : *mut Sess = offset_mut((*b).sess, i);
+      if (*e).id == s { return (*e).acct; }
+    }
+  }
+  return -1i64;
+}
+// The order an op names: same handle and same account (04 §6.1).
+fn find(b : *mut Book, a : i64, h : u64) -> i64 {
+  unsafe {
+    for i in 0i64..(*b).n_orders {
+      let o = ord(b, i);
+      if (*o).handle == h && (*o).acct == a { return i; }
+    }
+  }
+  return -1i64;
+}
+
+// ---- records -----------------------------------------------------------------------------
+
+fn emit(b : *mut Book, s : u64, typ : u64, idx : u64, w2 : u64, w4 : u64, w8 : u64, w12 : u64) -> void {
+  unsafe {
+    let k = (*b).out_n;
+    if k < (*b).out_cap {
+      let r : *mut u8 = offset_mut((*b).out, k * 32i64);
+      wr32(r, 0i64, s);
+      wr32(r, 4i64, 0u64);
+      wr64(r, 8i64, (*b).step);
+      wr8(r, 16i64, typ);
+      wr8(r, 17i64, idx);
+      wr16(r, 18i64, w2);
+      wr32(r, 20i64, w4);
+      wr32(r, 24i64, w8);
+      wr32(r, 28i64, w12);
+    }
+    (*b).out_n = k + 1i64;
+  }
+}
+fn reject(b : *mut Book, idx : u64, reason : u64, detail : u64, tag : u64) -> void {
+  unsafe { emit(b, (*b).out_session, R_REJECT, idx, reason, detail, 0u64, tag); }
+}
+
+// ---- ordering ----------------------------------------------------------------------------
+
+// PrioKey order (05 §3.2): (rx_ts, rank_e(lane), lane_seq).
+fn key_lt(b : *mut Book, i : i64, j : i64) -> bool {
+  let x = ord(b, i);
+  let y = ord(b, j);
+  unsafe {
+    if (*x).rx != (*y).rx { return (*x).rx < (*y).rx; }
+    if (*x).rank != (*y).rank { return (*x).rank < (*y).rank; }
+    return (*x).seq < (*y).seq;
+  }
+}
+// mode 0: priority on one side (best price, then key). 1: canonical (buy first, tick, key).
+// 2: handle.
+fn before(b : *mut Book, mode : u64, i : i64, j : i64) -> bool {
+  let x = ord(b, i);
+  let y = ord(b, j);
+  unsafe {
+    if mode == 2u64 { return (*x).handle < (*y).handle; }
+    if mode == 1u64 && (*x).side != (*y).side { return (*x).side < (*y).side; }
+    if (*x).tick != (*y).tick {
+      if mode == 0u64 && (*x).side == 0u64 { return (*x).tick > (*y).tick; }
+      return (*x).tick < (*y).tick;
+    }
+  }
+  return key_lt(b, i, j);
+}
+// The first live order after `cur` (-1: from the start) in `mode` order. Mode 0 takes orders of
+// `side` with a tick in [lo, hi], auction-only ones only when `ao`. Mode 2 takes `session`'s.
+fn next(b : *mut Book, mode : u64, side : u64, lo : u64, hi : u64, ao : bool, session : u64,
+        cur : i64) -> i64 {
+  let mut best = -1i64;
+  unsafe {
+    for i in 0i64..(*b).n_orders {
+      let o = ord(b, i);
+      let mut ok = (*o).state == LIVE;
+      if mode == 0u64 {
+        ok = ok && (*o).side == side && (*o).tick >= lo && (*o).tick <= hi;
+        ok = ok && (ao || (*o).tif != 3u64);
+      }
+      if mode == 2u64 { ok = ok && (*o).session == session; }
+      if ok && (cur < 0i64 || before(b, mode, cur, i)) && (best < 0i64 || before(b, mode, i, best)) {
+        best = i;
+      }
+    }
+  }
+  return best;
+}
+// Makers a taker at `tick` on `side` can trade with: opposite side, at its limit or better.
+fn maker_after(b : *mut Book, side : u64, tick : u64, cur : i64) -> i64 {
+  if side == 0u64 { return next(b, 0u64, 1u64, 0u64, tick, false, 0u64, cur); }
+  return next(b, 0u64, 0u64, tick, U32_MAX, false, 0u64, cur);
+}
+
+// ---- ledger (05 §2.6) --------------------------------------------------------------------
+
+fn release(b : *mut Book, i : i64, q : u64) -> void {
+  let o = ord(b, i);
+  unsafe {
+    let a = acct(b, (*o).acct);
+    if (*o).side == 0u64 {
+      let amt = mul(b, q, rpl(b, (*o).tick));
+      (*a).quote_resv = sub(b, (*a).quote_resv, amt);
+      (*a).quote_free = add(b, (*a).quote_free, amt);
+    } else {
+      (*a).base_resv = sub(b, (*a).base_resv, q);
+      (*a).base_free = add(b, (*a).base_free, q);
+    }
+  }
+}
+fn end(b : *mut Book, i : i64, cause : u64) -> void {
+  let o = ord(b, i);
+  unsafe {
+    (*o).state = ENDED;
+    (*o).cause = cause;
+    let a = acct(b, (*o).acct);
+    (*a).open = sub(b, (*a).open, 1u64);
+  }
+}
+// Ends an order with `open` lots left: releases them first.
+fn kill(b : *mut Book, i : i64, cause : u64) -> void {
+  release(b, i, open(b, i));
+  end(b, i, cause);
+}
+// One side of a fill of q lots at tick f, with fee rate ppm (negative = rebate).
+fn settle(b : *mut Book, i : i64, q : u64, f : u64, ppm : i64) -> void {
+  let o = ord(b, i);
+  unsafe {
+    let a = acct(b, (*o).acct);
+    let n = mul(b, q, px(b, f));
+    let mut fee = 0u64;
+    let mut rebate = 0u64;
+    if ppm >= 0i64 { fee = fee_ceil(b, n, ppm as u64); } else { rebate = fee_floor(b, n, (0i64 - ppm) as u64); }
+    if (*o).side == 0u64 {
+      let rel = mul(b, q, rpl(b, (*o).tick));
+      (*a).quote_resv = sub(b, (*a).quote_resv, rel);
+      (*a).quote_free = add(b, (*a).quote_free, sub(b, sub(b, rel, n), fee));
+      (*a).base_free = add(b, (*a).base_free, q);
+    } else {
+      (*a).base_resv = sub(b, (*a).base_resv, q);
+      (*a).quote_free = add(b, (*a).quote_free, sub(b, n, fee));
+    }
+    (*a).quote_free = add(b, (*a).quote_free, rebate);
+    let acc : *mut i64 = offset_mut((*b).fee_acc, (*a).lane as i64);
+    *acc = *acc + (fee as i64) - (rebate as i64);
+    (*o).filled = (*o).filled + q;
+  }
+}
+// Reserves q lots of a new order at tick t on side; false when the balance is short.
+fn reserve(b : *mut Book, a : i64, side : u64, t : u64, q : u64, idx : u64, tag : u64) -> bool {
+  let ac = acct(b, a);
+  unsafe {
+    (*b).fault = 0u64;
+    if side == 0u64 {
+      let amt = mul(b, q, rpl(b, t));
+      if (*b).fault != 0u64 || amt > (*ac).quote_free {
+        let short = if (*b).fault != 0u64 { U32_MAX } else { amt - (*ac).quote_free };
+        (*b).fault = 0u64;
+        reject(b, idx, RISK_CREDIT, cap32(short), tag);
+        return false;
+      }
+      (*ac).quote_free = (*ac).quote_free - amt;
+      (*ac).quote_resv = (*ac).quote_resv + amt;
+    } else {
+      if q > (*ac).base_free {
+        reject(b, idx, RISK_CREDIT, cap32(q - (*ac).base_free), tag);
+        return false;
+      }
+      (*ac).base_free = (*ac).base_free - q;
+      (*ac).base_resv = (*ac).base_resv + q;
+    }
+  }
+  return true;
+}
+
+// ---- matching on entry (05 §2.4, 04 §6.2, §6.8) --------------------------------------------
+
+fn flush(b : *mut Book, t : i64, idx : u64, lvl : u64, q : u64) -> void {
+  let o = ord(b, t);
+  if q > 0u64 { unsafe { emit(b, (*o).session, R_FILL, idx, 1u64, (*o).handle, lvl, q); } }
+}
+// The taker ends on STP: Reject before any fill of this entry, Out after one (04 §6.8).
+fn stp_end(b : *mut Book, t : i64, idx : u64, maker_h : u64, traded : bool) -> void {
+  let o = ord(b, t);
+  unsafe {
+    if traded { emit(b, (*o).session, R_OUT, idx, OUT_STP, (*o).handle, open(b, t), (*o).tag); }
+    else { reject(b, idx, STP, maker_h, (*o).tag); }
+  }
+  kill(b, t, END_OUT);
+}
+fn stp_remove_maker(b : *mut Book, m : i64) -> void {
+  let o = ord(b, m);
+  unsafe { emit(b, (*o).session, R_OUT, 255u64, OUT_STP, (*o).handle, open(b, m), (*o).tag); }
+  kill(b, m, END_OUT);
+}
+
+fn match_on_entry(b : *mut Book, t : i64, idx : u64) -> void {
+  let o = ord(b, t);
+  unsafe {
+    let side = (*o).side;
+    let tick = (*o).tick;
+    let ta = (*o).acct;
+    let first = maker_after(b, side, tick, -1i64);
+    if (*o).post == 1u64 && first >= 0i64 {
+      reject(b, idx, POST_ONLY_WOULD_CROSS, (*ord(b, first)).tick, (*o).tag);
+      kill(b, t, END_OUT);
+      return;
+    }
+    if (*o).tif == 2u64 {
+      // fillable(): the same walk without changes (05 §2.4).
+      let mut sum = 0u64;
+      let mut cur = -1i64;
+      loop {
+        let m = maker_after(b, side, tick, cur);
+        if m < 0i64 || sum >= open(b, t) { break; }
+        cur = m;
+        if (*ord(b, m)).acct == ta && (*o).stp != 0u64 {
+          if (*o).stp == 2u64 { continue; }
+          break;
+        }
+        sum = sum + open(b, m);
+      }
+      if sum < open(b, t) {
+        reject(b, idx, FOK_UNFILLABLE, cap32(sum), (*o).tag);
+        kill(b, t, END_OUT);
+        return;
+      }
+    }
+    let mut traded = false;
+    let mut lvl = 0u64;
+    let mut lq = 0u64;
+    while open(b, t) > 0u64 {
+      let m = maker_after(b, side, tick, -1i64);
+      if m < 0i64 { break; }
+      let mo = ord(b, m);
+      if (*mo).acct == ta && (*o).stp != 0u64 {
+        if (*o).stp == 2u64 { stp_remove_maker(b, m); continue; }
+        flush(b, t, idx, lvl, lq);
+        if (*o).stp == 3u64 { stp_remove_maker(b, m); }
+        stp_end(b, t, idx, (*mo).handle, traded);
+        return;
+      }
+      let q = min(open(b, t), open(b, m));
+      let f = (*mo).tick;
+      if f != lvl { flush(b, t, idx, lvl, lq); lvl = f; lq = 0u64; }
+      settle(b, t, q, f, (*acct(b, ta)).taker);
+      settle(b, m, q, f, (*acct(b, (*mo).acct)).maker);
+      emit(b, (*mo).session, R_FILL, 255u64, 0u64, (*mo).handle, f, q);
+      if open(b, m) == 0u64 { end(b, m, END_FILLED); }
+      lq = lq + q;
+      traded = true;
+    }
+    flush(b, t, idx, lvl, lq);
+    if open(b, t) == 0u64 { end(b, t, END_FILLED); return; }
+    if (*o).tif == 1u64 || (*o).tif == 2u64 {
+      emit(b, (*o).session, R_OUT, idx, OUT_IOC, (*o).handle, open(b, t), (*o).tag);
+      kill(b, t, END_OUT);
+      return;
+    }
+    rest(b, t, idx);
+  }
+}
+fn rest(b : *mut Book, t : i64, idx : u64) -> void {
+  let o = ord(b, t);
+  unsafe {
+    (*o).state = LIVE;
+    emit(b, (*o).session, R_ACK, idx, 0u64, (*o).handle, (*o).tick, (*o).tag);
+  }
+}
+
+// ---- ops (05 §2.3, 04 §6) ----------------------------------------------------------------
+
+struct Ev { kind : u64, lane : u64, idx : u64, arg : u64, session : u64, rx : u64, step : u64, seq : u64 }
+
+// Order flags (01 §6.2): 0 when valid, else the BAD_TYPE detail.
+fn flags_bad(f : u64) -> u64 {
+  if f >= 64u64 { return D_RESERVED; }
+  let tif = (f >> 1u64) & 3u64;
+  if (f & 8u64) != 0u64 && tif != 0u64 { return D_FLAGS; }
+  return 0u64;
+}
+fn phase_code(p : u64) -> u64 { if p == FROZ { return AUCT; } return p; }
+// Phase, TIF and band checks for a new order (05 §2.3, 04 §6.9). True when it passes.
+fn entry_ok(b : *mut Book, f : u64, tick : u64, idx : u64, tag : u64) -> bool {
+  unsafe {
+    let ph = (*b).phase;
+    let tif = (f >> 1u64) & 3u64;
+    if ph == HALT { reject(b, idx, BOOK_HALTED, 0u64, tag); return false; }
+    let bad_phase = ph == FROZ || (tif == 3u64 && ph != AUCT) || ((tif == 1u64 || tif == 2u64) && ph != CONT);
+    if bad_phase { reject(b, idx, AUCTION_PHASE, phase_code(ph), tag); return false; }
+    if tick < (*b).band_lo { reject(b, idx, BAD_TICK, (*b).band_lo, tag); return false; }
+    if tick > (*b).band_hi { reject(b, idx, BAD_TICK, (*b).band_hi, tag); return false; }
+  }
+  return true;
+}
+fn alloc_handle(b : *mut Book, a : i64) -> u64 {
+  unsafe {
+    let p : *mut u64 = offset_mut((*b).next_h, (*acct(b, a)).lane as i64);
+    let h = *p;
+    if (h & 16777215u64) > SLOT_MAX { (*b).fault = 1u64; }
+    *p = h + 1u64;
+    return h;
+  }
+}
+// Appends an order and runs it: matching in Continuous, rest otherwise (05 §2.3).
+fn enter(b : *mut Book, ev : &Ev, a : i64, f : u64, tick : u64, total : u64, filled : u64,
+         tag : u64) -> void {
+  unsafe {
+    let i = (*b).n_orders;
+    let h = alloc_handle(b, a);
+    let rk : *mut u64 = offset_mut((*b).rank, ev.lane as i64);
+    *ord(b, i) = Ord {
+      handle : h, acct : a, session : ev.session, rank : *rk,
+      side : f & 1u64, tif : (f >> 1u64) & 3u64, post : (f >> 3u64) & 1u64,
+      stp : (f >> 4u64) & 3u64, flags : f,
+      tick : tick, total : total, filled : filled, tag : tag,
+      rx : ev.rx, seq : ev.seq, state : TAKING, cause : 0u64,
+    };
+    (*b).n_orders = i + 1i64;
+    let ac = acct(b, a);
+    (*ac).open = (*ac).open + 1u64;
+    if (*b).phase == CONT { match_on_entry(b, i, ev.idx); } else { rest(b, i, ev.idx); }
+  }
+}
+
+fn op_new(b : *mut Book, ev : &Ev, a : i64, m : *const u8) -> void {
+  let f = rd8(m, 1i64);
+  let tick = rd32(m, 4i64);
+  let qty = rd32(m, 8i64);
+  let tag = rd32(m, 12i64);
+  let idx = ev.idx;
+  if rd16(m, 2i64) != 0u64 { reject(b, idx, BAD_TYPE, D_RESERVED, tag); return; }
+  let fb = flags_bad(f);
+  if fb != 0u64 { reject(b, idx, BAD_TYPE, fb, tag); return; }
+  if !entry_ok(b, f, tick, idx, tag) { return; }
+  unsafe {
+    if qty < (*b).min_qty || qty > (*b).max_qty { reject(b, idx, BAD_QTY, (*b).max_qty, tag); return; }
+    if (*acct(b, a)).open >= (*b).max_open {
+      reject(b, idx, RISK_ORDER_COUNT, (*b).max_open, tag);
+      return;
+    }
+  }
+  if !reserve(b, a, f & 1u64, tick, qty, idx, tag) { return; }
+  enter(b, ev, a, f, tick, qty, 0u64, tag);
+}
+
+// Cancel, Reduce and Replace look up the handle the same way (04 §6.3). -1: answered.
+fn target(b : *mut Book, a : i64, h : u64, idx : u64, tag : u64) -> i64 {
+  let i = find(b, a, h);
+  if i < 0i64 { reject(b, idx, UNKNOWN_HANDLE, 0u64, tag); return -1i64; }
+  let o = ord(b, i);
+  unsafe {
+    if (*o).state != LIVE { reject(b, idx, TOO_LATE, (*o).cause, tag); return -1i64; }
+  }
+  return i;
+}
+// Removes r lots from a live order: all of it ends the order (04 §6.4).
+fn reduce_by(b : *mut Book, i : i64, r : u64, idx : u64, tag : u64) -> void {
+  let o = ord(b, i);
+  let op = open(b, i);
+  unsafe {
+    if r >= op {
+      emit(b, (*o).session, R_CXL, idx, 0u64, (*o).handle, op, tag);
+      kill(b, i, END_CANCELED);
+    } else {
+      emit(b, (*o).session, R_CXL, idx, 0u64, (*o).handle, r, tag);
+      release(b, i, r);
+      (*o).total = (*o).total - r;
+    }
+  }
+}
+
+fn op_cancel(b : *mut Book, ev : &Ev, a : i64, m : *const u8, is_reduce : bool) -> void {
+  let tag = rd32(m, 12i64);
+  let r = rd32(m, 8i64);
+  let idx = ev.idx;
+  if rd8(m, 1i64) != 0u64 || rd16(m, 2i64) != 0u64 || (!is_reduce && r != 0u64) {
+    reject(b, idx, BAD_TYPE, D_RESERVED, tag);
+    return;
+  }
+  unsafe { if (*b).phase == FROZ { reject(b, idx, AUCTION_PHASE, AUCT, tag); return; } }
+  if is_reduce && r == 0u64 { reject(b, idx, BAD_QTY, 0u64, tag); return; }
+  let i = target(b, a, rd32(m, 4i64), idx, tag);
+  if i < 0i64 { return; }
+  if is_reduce { reduce_by(b, i, r, idx, tag); } else { reduce_by(b, i, open(b, i), idx, tag); }
+}
+
+fn op_replace(b : *mut Book, ev : &Ev, a : i64, m : *const u8) -> void {
+  let f = rd8(m, 1i64);
+  let tick = rd32(m, 8i64);
+  let qty = rd32(m, 12i64);
+  let idx = ev.idx;
+  let found = find(b, a, rd32(m, 4i64));
+  let mut tag = 0u64;
+  if found >= 0i64 { unsafe { tag = (*ord(b, found)).tag; } }
+  if rd16(m, 2i64) != 0u64 || f >= 64u64 { reject(b, idx, BAD_TYPE, D_RESERVED, tag); return; }
+  let i = target(b, a, rd32(m, 4i64), idx, tag);
+  if i < 0i64 { return; }
+  let o = ord(b, i);
+  unsafe {
+    if (*o).side != (f & 1u64) { reject(b, idx, SIDE_MISMATCH, 0u64, tag); return; }
+    if !entry_ok(b, f, tick, idx, tag) { return; }
+    if qty == 0u64 || qty > (*b).max_qty { reject(b, idx, BAD_QTY, (*b).max_qty, tag); return; }
+    let same = tick == (*o).tick && f == (*o).flags;
+    if same && qty == (*o).total { reject(b, idx, BAD_QTY, D_NO_CHANGE, tag); return; }
+    let fb = flags_bad(f);
+    if fb != 0u64 { reject(b, idx, BAD_TYPE, fb, tag); return; }
+    if same && qty < (*o).total { reduce_by(b, i, (*o).total - qty, idx, tag); return; }
+    // Priority loss (04 §6.5): the new reservation, net of the old one.
+    let filled = (*o).filled;
+    let left = if qty > filled { qty - filled } else { 0u64 };
+    let ac = acct(b, a);
+    (*b).fault = 0u64;
+    let mut need = left;
+    let mut have = open(b, i);
+    let mut free = (*ac).base_free;
+    if (*o).side == 0u64 {
+      need = mul(b, left, rpl(b, tick));
+      have = mul(b, have, rpl(b, (*o).tick));
+      free = (*ac).quote_free;
+    }
+    if (*b).fault != 0u64 { (*b).fault = 0u64; reject(b, idx, RISK_CREDIT, U32_MAX, tag); return; }
+    if need > have && need - have > free { reject(b, idx, RISK_CREDIT, cap32(need - have - free), tag); return; }
+    if left > 0u64 && (*b).n_orders >= (*b).max_orders { (*b).fault = 2u64; return; }
+    emit(b, (*o).session, R_CXL, idx, 0u64, (*o).handle, open(b, i), tag);
+    kill(b, i, END_CANCELED);
+    if left == 0u64 { return; }
+    let _reserved = reserve(b, a, f & 1u64, tick, left, idx, tag);
+    enter(b, ev, a, f, tick, qty, filled, tag);
+  }
+}
+
+// CancelAll (04 §6.6, vector V15): every live order of the session, ascending handle, then the
+// summary.
+fn op_cancel_all(b : *mut Book, ev : &Ev, m : *const u8) -> void {
+  let tag = rd32(m, 12i64);
+  let idx = ev.idx;
+  if !zero(m, 1i64, 12i64) { reject(b, idx, BAD_TYPE, D_RESERVED, tag); return; }
+  unsafe { if (*b).phase == FROZ { reject(b, idx, AUCTION_PHASE, AUCT, tag); return; } }
+  let mut n = 0u64;
+  loop {
+    let i = next(b, 2u64, 0u64, 0u64, 0u64, true, ev.session, -1i64);
+    if i < 0i64 { break; }
+    reduce_by(b, i, open(b, i), idx, tag);
+    n = n + 1u64;
+  }
+  emit(b, ev.session, R_CXL, idx, 0u64, HANDLE_ALL, n, tag);
+}
+
+fn op_msg(b : *mut Book, ev : &Ev, a : i64, m : *const u8) -> void {
+  let t = rd8(m, 0i64);
+  if t == 1u64 { op_new(b, ev, a, m); return; }
+  if t == 2u64 { op_cancel(b, ev, a, m, false); return; }
+  if t == 3u64 { op_cancel(b, ev, a, m, true); return; }
+  if t == 4u64 { op_replace(b, ev, a, m); return; }
+  if t == 18u64 { op_cancel_all(b, ev, m); return; }
+  if t == 16u64 || t == 17u64 { return; }                   // Heartbeat, ResendReq: the lane's
+  reject(b, ev.idx, BAD_TYPE, D_UNKNOWN_TYPE, 0u64);
+}
+
+// ---- the opening auction uncross (08 §7.6) -------------------------------------------------
+
+fn depth(b : *mut Book, side : u64, t : u64) -> u64 {
+  let mut s = 0u64;
+  unsafe {
+    for i in 0i64..(*b).n_orders {
+      let o = ord(b, i);
+      let ok = if side == 0u64 { (*o).tick >= t } else { (*o).tick <= t };
+      if (*o).state == LIVE && (*o).side == side && ok { s = add(b, s, open(b, i)); }
+    }
+  }
+  return s;
+}
+fn absdiff(x : u64, y : u64) -> u64 { if x > y { return x - y; } return y - x; }
+// Rule 1-4 key of tick t; true when t beats the best so far.
+fn uncross_better(v : u64, imb : u64, dist : u64, t : u64, bv : u64, bimb : u64, bdist : u64,
+                  bt : u64) -> bool {
+  if v != bv { return v > bv; }
+  if imb != bimb { return imb < bimb; }
+  if dist != bdist { return dist < bdist; }
+  return t < bt;
+}
+// Gives v lots to `side`'s orders at p or better, in price-time priority, at tick p.
+fn allocate(b : *mut Book, side : u64, p : u64, v : u64) -> void {
+  let mut left = v;
+  let mut cur = -1i64;
+  while left > 0u64 {
+    let i = if side == 0u64 { next(b, 0u64, 0u64, p, U32_MAX, true, 0u64, cur) }
+            else { next(b, 0u64, 1u64, 0u64, p, true, 0u64, cur) };
+    if i < 0i64 { return; }
+    cur = i;
+    let q = min(left, open(b, i));
+    let o = ord(b, i);
+    unsafe {
+      settle(b, i, q, p, (*acct(b, (*o).acct)).auction);
+      emit(b, (*o).session, R_FILL, 255u64, 2u64, (*o).handle, p, q);
+    }
+    if open(b, i) == 0u64 { end(b, i, END_FILLED); }
+    left = left - q;
+  }
+}
+fn uncross(b : *mut Book, ref_in : u64) -> void {
+  unsafe {
+    let r = if ref_in < (*b).band_lo { (*b).band_lo } else { min(ref_in, (*b).band_hi) };
+    let mut bt = r;
+    let mut bv = 0u64;
+    let mut bimb = 0u64;
+    let mut bdist = 0u64;
+    let mut have = false;
+    // Every tick where D or S steps, the reference, and the band edges (08 §7.6 Lemma 1, 2).
+    for k in -3i64..(*b).n_orders {
+      let mut t = r;
+      if k == -2i64 { t = (*b).band_lo; }
+      if k == -1i64 { t = (*b).band_hi; }
+      if k >= 0i64 { t = (*ord(b, k)).tick; }
+      let d = depth(b, 0u64, t);
+      let s = depth(b, 1u64, t);
+      let v = min(d, s);
+      let imb = absdiff(d, s);
+      if !have || uncross_better(v, imb, absdiff(t, r), t, bv, bimb, bdist, bt) {
+        have = true; bv = v; bimb = imb; bdist = absdiff(t, r); bt = t;
+      }
+    }
+    if bv > 0u64 {
+      allocate(b, 0u64, bt, bv);
+      allocate(b, 1u64, bt, bv);
+    }
+    // Auction-only remainders die at the uncross (05 §2.5 P2).
+    for i in 0i64..(*b).n_orders {
+      let o = ord(b, i);
+      if (*o).state == LIVE && (*o).tif == 3u64 {
+        emit(b, (*o).session, R_OUT, 255u64, OUT_AUCTION, (*o).handle, open(b, i), (*o).tag);
+        kill(b, i, END_OUT);
+      }
+    }
+    (*b).phase = CONT;
+  }
+}
+
+// ---- exports (pbv.h) ---------------------------------------------------------------------
+
+pub fn pbo_abi_version() -> u32 { return ABI_VERSION as u32; }
+
+pub fn pbo_new(cfg : *const u8, accts : *const u8, n_accts : u32, sess : *const u8,
+               n_sess : u32) -> *mut Book {
+  let nul : *mut Book = null_mut();
+  if is_null(cfg) || (n_accts > 0u32 && is_null(accts)) || (n_sess > 0u32 && is_null(sess)) { return nul; }
+  if rd32(cfg, 0i64) != ABI_VERSION || rd32(cfg, 4i64) != 400u64 || !zero(cfg, 45i64, 80i64) { return nul; }
+  let lo = rd32(cfg, 8i64);
+  let hi = rd32(cfg, 12i64);
+  let max_fee = rd32(cfg, 24i64);
+  let min_qty = rd32(cfg, 28i64);
+  let max_qty = rd32(cfg, 32i64);
+  let max_orders = rd32(cfg, 40i64) as i64;
+  let phase = rd8(cfg, 44i64);
+  if lo == 0u64 || lo > hi || max_fee >= PPM || min_qty == 0u64 || max_qty < min_qty { return nul; }
+  if max_qty > 2147483647u64 || phase == 0u64 || phase > FROZ || max_orders == 0i64 { return nul; }
+  for l in 0i64..64i64 {
+    let s = rd32(cfg, 144i64 + 4i64 * l) & 16777215u64;
+    if s == 0u64 || s > SLOT_MAX { return nul; }
+  }
+  let na = n_accts as i64;
+  let ns = n_sess as i64;
+  for i in 0i64..na {
+    let p : *const u8 = offset(accts, 40i64 * i);
+    if rd8(p, 4i64) >= 64u64 || !zero(p, 5i64, 8i64) || !zero(p, 20i64, 24i64) { return nul; }
+    if i > 0i64 && rd32(p, 0i64) <= rd32(offset(accts, 40i64 * (i - 1i64)), 0i64) { return nul; }
+    for k in 0i64..3i64 {
+      let rate = rds32(p, 8i64 + 4i64 * k);
+      if rate > (max_fee as i64) || 0i64 - rate > (max_fee as i64) { return nul; }
+    }
+  }
+  let b : *mut Book = alloc(sizeof<Book>(), 16i64);
+  let os : *mut Ord = alloc(sizeof<Ord>() * max_orders, 16i64);
+  let ac : *mut Acct = alloc(sizeof<Acct>() * (na + 1i64), 16i64);
+  let ss : *mut Sess = alloc(sizeof<Sess>() * (ns + 1i64), 16i64);
+  let rk : *mut u64 = alloc(512i64, 16i64);
+  let nh : *mut u64 = alloc(512i64, 16i64);
+  let fa : *mut i64 = alloc(512i64, 16i64);
+  if is_null_mut(b) || is_null_mut(os) || is_null_mut(ac) || is_null_mut(ss) || is_null_mut(rk)
+     || is_null_mut(nh) || is_null_mut(fa) {
+    return nul;
+  }
+  unsafe {
+    *b = Book {
+      band_lo : lo, band_hi : hi, qptl : rd64(cfg, 16i64), max_fee : max_fee, min_qty : min_qty,
+      max_qty : max_qty, max_open : rd32(cfg, 36i64), max_orders : max_orders, phase : phase,
+      step : 0u64, last_step : 0u64, fault : 0u64,
+      orders : os, n_orders : 0i64, accts : ac, n_accts : na, sess : ss, n_sess : 0i64,
+      rank : rk, next_h : nh, fee_acc : fa,
+      out : null_mut(), out_cap : 0i64, out_n : 0i64, out_session : 0u64,
+    };
+    for l in 0i64..64i64 {
+      rk[l] = rd8(cfg, 80i64 + l);
+      nh[l] = rd32(cfg, 144i64 + 4i64 * l);
+      fa[l] = 0i64;
+    }
+    for i in 0i64..na {
+      let p : *const u8 = offset(accts, 40i64 * i);
+      *acct(b, i) = Acct {
+        id : rd32(p, 0i64), lane : rd8(p, 4i64), maker : rds32(p, 8i64), taker : rds32(p, 12i64),
+        auction : rds32(p, 16i64), base_free : rd64(p, 24i64), base_resv : 0u64,
+        quote_free : rd64(p, 32i64), quote_resv : 0u64, open : 0u64,
+      };
+    }
+  }
+  for i in 0i64..ns {
+    let p : *const u8 = offset(sess, 8i64 * i);
+    let id = rd32(p, 0i64);
+    let mut a = -1i64;
+    for k in 0i64..na { unsafe { if (*acct(b, k)).id == rd32(p, 4i64) { a = k; } } }
+    if a < 0i64 || session_acct(b, id) >= 0i64 { pbo_free(b); return null_mut(); }
+    unsafe {
+      let e : *mut Sess = offset_mut(ss, i);
+      *e = Sess { id : id, acct : a };
+      (*b).n_sess = i + 1i64;
+    }
+  }
+  return b;
+}
+
+pub fn pbo_apply(b : *mut Book, evp : *const u8, out : *mut u8, out_cap : u32) -> u32 {
+  if is_null_mut(b) || is_null(evp) { return E_EVENT; }
+  let ev = Ev {
+    kind : rd8(evp, 0i64), lane : rd8(evp, 1i64), idx : rd8(evp, 2i64), arg : rd8(evp, 3i64),
+    session : rd32(evp, 4i64), rx : rd64(evp, 16i64), step : rd64(evp, 24i64), seq : rd64(evp, 32i64),
+  };
+  let m : *const u8 = offset(evp, 40i64);
+  if rd32(evp, 12i64) != 0u64 || ev.lane >= 64u64 || ev.idx > 9u64 { return E_EVENT; }
+  let a = session_acct(b, ev.session);
+  let shed = ev.kind == 2u64 && ev.arg == 6u64;
+  if (ev.kind == 1u64 || shed) && a < 0i64 { return E_EVENT; }
+  unsafe {
+    if ev.kind == 1u64 && (rd8(m, 0i64) == 1u64 || rd8(m, 0i64) == 4u64) && (*b).n_orders >= (*b).max_orders {
+      return E_FULL;
+    }
+    (*b).out = out;
+    (*b).out_cap = out_cap as i64;
+    (*b).out_n = 0i64;
+    (*b).out_session = ev.session;
+    (*b).step = ev.step;
+    (*b).fault = 0u64;
+    if ev.step > (*b).last_step { (*b).last_step = ev.step; }
+    if ev.kind == 1u64 {
+      op_msg(b, &ev, a, m);
+    } else if shed {
+      let t = rd8(m, 0i64);
+      let mut tag = 0u64;
+      if t == 1u64 || t == 2u64 || t == 3u64 || t == 18u64 { tag = rd32(m, 12i64); }
+      if t == 4u64 {
+        let i = find(b, a, rd32(m, 4i64));
+        if i >= 0i64 { tag = (*ord(b, i)).tag; }
+      }
+      reject(b, ev.idx, BUSY, 0u64, tag);
+    } else if ev.kind == 2u64 && (ev.arg == 3u64 || ev.arg == 4u64 || ev.arg == 5u64 || ev.arg == 8u64) {
+      // Rescan, Depletion, Idle and Seal are no-ops in the sequential specification (05 §2.3).
+    } else if ev.kind == 3u64 && ev.arg >= CONT && ev.arg <= FROZ {
+      (*b).phase = ev.arg;
+    } else if ev.kind == 4u64 && (*b).phase == AUCT {
+      uncross(b, rd32(m, 0i64));
+    } else {
+      return E_EVENT;
+    }
+    if (*b).fault == 2u64 { return E_FULL; }
+    if (*b).fault != 0u64 { return E_FAULT; }
+    if (*b).out_n > (*b).out_cap { return E_CAP; }
+    return (*b).out_n as u32;
+  }
+}
+
+// Canonical state bytes, version 1 (layout in pbv.h).
+// Takes `*mut` because the helpers do; it writes nothing in the book (pbv.h says const).
+pub fn pbo_state_bytes(b : *mut Book, out : *mut u8, cap : u64) -> u64 {
+  if is_null_mut(b) { return 0u64; }
+  unsafe {
+    let mut n = 0i64;
+    for i in 0i64..(*b).n_orders { if (*ord(b, i)).state == LIVE { n = n + 1i64; } }
+    let size = 32i64 + 48i64 * n + 48i64 * (*b).n_accts + 512i64;
+    if is_null_mut(out) || cap < (size as u64) { return size as u64; }
+    for i in 0i64..size { out[i] = 0u8; }
+    wr32(out, 0i64, 827540048u64);     // "PBS1" little-endian
+    wr16(out, 4i64, 1u64);
+    wr8(out, 6i64, (*b).phase);
+    wr32(out, 8i64, (*b).band_lo);
+    wr32(out, 12i64, (*b).band_hi);
+    wr64(out, 16i64, (*b).last_step);
+    wr32(out, 24i64, n as u64);
+    wr32(out, 28i64, (*b).n_accts as u64);
+    let mut at = 32i64;
+    let mut cur = -1i64;
+    loop {
+      let i = next(b, 1u64, 0u64, 0u64, 0u64, true, 0u64, cur);
+      if i < 0i64 { break; }
+      cur = i;
+      let o = ord(b, i);
+      let r : *mut u8 = offset_mut(out, at);
+      wr32(r, 0i64, (*o).handle);
+      wr32(r, 4i64, (*acct(b, (*o).acct)).id);
+      wr32(r, 8i64, (*o).session);
+      wr8(r, 12i64, (*o).flags);
+      wr8(r, 13i64, 0u64);
+      wr8(r, 14i64, (*o).rank);
+      wr32(r, 16i64, (*o).tick);
+      wr32(r, 20i64, (*o).total);
+      wr32(r, 24i64, (*o).filled);
+      wr32(r, 28i64, (*o).tag);
+      wr64(r, 32i64, (*o).rx);
+      wr64(r, 40i64, (*o).seq);
+      at = at + 48i64;
+    }
+    for k in 0i64..(*b).n_accts {
+      let a = acct(b, k);
+      let r : *mut u8 = offset_mut(out, at);
+      wr32(r, 0i64, (*a).id);
+      wr32(r, 4i64, (*a).open);
+      wr64(r, 8i64, (*a).base_free);
+      wr64(r, 16i64, (*a).base_resv);
+      wr64(r, 24i64, (*a).quote_free);
+      wr64(r, 32i64, (*a).quote_resv);
+      at = at + 48i64;
+    }
+    for l in 0i64..64i64 { wr64(out, at + 8i64 * l, (*b).fee_acc[l] as u64); }
+    return size as u64;
+  }
+}
+
+pub fn pbo_free(b : *mut Book) -> void {
+  if is_null_mut(b) { return; }
+  // VX-WORKAROUND W-14 (issue to file): `p as *mut i8` is not a cast vxc accepts between
+  // pointer types, so each pointer is retyped by a typed `let`.
+  unsafe {
+    let os : *mut i8 = (*b).orders;
+    let ac : *mut i8 = (*b).accts;
+    let ss : *mut i8 = (*b).sess;
+    let rk : *mut i8 = (*b).rank;
+    let nh : *mut i8 = (*b).next_h;
+    let fa : *mut i8 = (*b).fee_acc;
+    dealloc(os, 16i64);
+    dealloc(ac, 16i64);
+    dealloc(ss, 16i64);
+    dealloc(rk, 16i64);
+    dealloc(nh, 16i64);
+    dealloc(fa, 16i64);
+  }
+  let bb : *mut i8 = b;
+  dealloc(bb, 16i64);
+}

@@ -1,0 +1,63 @@
+# The 04 §11 scenario, completed into a full trace. Records marked `vector Vn i` are record i of
+# response packet Vn in tests/golden/vyrn_proto_vectors.out, byte for byte. The orders 04 §11
+# leaves out (A2, A3, the 1 lot @ 100000, A5 = handle 46) are filled in so that its stated book
+# holds: "before V5 the only bids at or above 100000 are A4 (8 @ 100001) and 1 lot @ 100000".
+# Balances follow 05 §2.6 with no fees: px(t) = t, so a buy reserves qty × t.
+
+book band=99990..100010 qptl=1 max_fee_ppm=0 max_qty=1000
+lane 1 rank=1 first=0x01000001
+lane 3 rank=3 first=0x0100002a      # A1 = hdl(42, 1)
+lane 5 rank=5 first=0x03000007      # B1 = hdl(7, 3)
+account 1 lane=3 quote=10000000     # A
+account 2 lane=5 base=10            # B, another account
+account 3 lane=1 quote=100000       # X, the 1 lot @ 100000
+session 0x00103007 account=1        # A = sid(7, 3, 1)
+session 0x00105009 account=2        # B = sid(9, 5, 1)
+session 0x00101001 account=3        # X
+
+# V1 -> V2
+msg 3 0x00103007 0 rx=1 seq=1 : new buy day stp=1 100000 5 0x11111111
+=> 0x00103007 vector V2 0
+msg 3 0x00103007 0 rx=2 seq=2 : new buy day stp=1 99999 5 0x2b2b2b2b
+=> 0x00103007 ack 0 0x0100002b 99999 0x2b2b2b2b
+msg 3 0x00103007 0 rx=3 seq=3 : new buy day stp=1 99998 4 0x44444444
+=> 0x00103007 ack 0 0x0100002c 99998 0x44444444
+msg 1 0x00101001 0 rx=4 seq=1 : new buy day 100000 1 0x99999999
+=> 0x00101001 ack 0 0x01000001 100000 0x99999999
+
+# V3 -> V4: Cancel A1, Reduce A2 by 2, Replace A3 -> buy 8 @ 100001 (loses priority: new handle A4)
+msg 3 0x00103007 0 rx=5 seq=4 : cancel 0x0100002a 0x22222222
+=> 0x00103007 vector V4 0
+msg 3 0x00103007 1 rx=5 seq=5 : reduce 0x0100002b 2 0x33333333
+=> 0x00103007 vector V4 1
+msg 3 0x00103007 2 rx=5 seq=6 step=1 : replace buy day stp=1 0x0100002c 100001 8
+=> 0x00103007 vector V4 2
+=> 0x00103007 vector V4 3
+check account 1 open=2 quote_resv=1100005 quote_free=8899995
+
+# V5 -> V6 (B's taker records) and V7 (A's maker fill); X gets its own maker fill.
+msg 5 0x00105009 0 rx=6 seq=1 step=2 : new sell ioc 100000 10 0x55555555
+=> 0x00105009 vector V6 0
+=> 0x00105009 vector V6 1
+=> 0x00105009 vector V6 2
+=> 0x00103007 vector V7 0
+=> 0x00101001 fill maker 0 0x01000001 100000 1
+
+# A5 = handle 46, then V14 -> V15: CancelAll in ascending handle order, then the summary.
+msg 3 0x00103007 0 rx=7 seq=7 : new buy day 99997 6 0x5a5a5a5a
+=> 0x00103007 ack 0 0x0100002e 99997 0x5a5a5a5a
+check resting 0x0100002e 0x0100002b
+msg 3 0x00103007 0 rx=8 seq=8 : cancel_all 0x77777777
+=> 0x00103007 vector V15 0
+=> 0x00103007 vector V15 1
+=> 0x00103007 vector V15 2
+
+# V16 at the BBO core in a Shed step: Reject BUSY and nothing else (05 §2.3). (V17 is the
+# lane's out-of-stream form of the same decision and is not an oracle record.)
+shed 3 0x00103007 0 step=3 : new buy ioc 100000 2 0x88888888
+=> 0x00103007 reject 0 BUSY 0 0x88888888
+
+check resting
+check account 1 open=0 base_free=8 base_resv=0 quote_free=9199992 quote_resv=0
+check account 2 open=0 base_free=1 base_resv=0 quote_free=900008 quote_resv=0
+check account 3 open=0 base_free=1 base_resv=0 quote_free=0 quote_resv=0

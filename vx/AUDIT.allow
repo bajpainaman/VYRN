@@ -1,0 +1,2 @@
+# Facts that `vxc --audit` prints and vx/build.sh accepts (spec/11-build.md §5.4 step 3).
+# One exact audit line per entry. The oracle has none: no `assume`, no pointer `requires`.

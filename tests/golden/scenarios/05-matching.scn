@@ -1,0 +1,75 @@
+# Matching on entry (05 §2.4): best price, then the smallest PrioKey (rx_ts, rank_e(lane),
+# lane_seq), not arrival order; the maker's price; one taker Fill per level, one maker Fill per
+# order; IOC, FOK and post-only outcomes (04 §6.2). No fees: px(t) = t.
+
+book band=90..110 qptl=1 max_qty=1000
+lane 1 rank=1 first=0x01000100
+lane 2 rank=0 first=0x01000200      # lane 2 wins ties on rx_ts
+lane 4 rank=4 first=0x01000400
+account 1 lane=1 base=100 quote=100000
+account 2 lane=2 base=100 quote=100000
+account 4 lane=4 base=100 quote=100000
+session 0x101 account=1
+session 0x202 account=2
+session 0x404 account=4
+
+# A sell that arrives later in L but has the earlier rx_ts has priority.
+msg 2 0x202 0 rx=20 seq=1 : new sell day 100 5 0x2001
+=> 0x202 ack 0 0x01000200 100 0x2001
+msg 1 0x101 0 rx=10 seq=1 : new sell day 100 3 0x1001
+=> 0x101 ack 0 0x01000100 100 0x1001
+msg 1 0x101 0 rx=30 seq=2 : new sell day 101 4 0x1002
+=> 0x101 ack 0 0x01000101 101 0x1002
+check resting 0x01000100 0x01000200 0x01000101
+
+# A buy for 10 @ 101 takes 3 then 5 at 100 (key order), then 2 at 101: one taker Fill per level.
+msg 4 0x404 0 rx=40 seq=1 step=1 : new buy day 101 10 0x4001
+=> 0x404 fill 0 1 0x01000400 100 8
+=> 0x404 fill 0 1 0x01000400 101 2
+=> 0x101 fill maker 0 0x01000100 100 3
+=> 0x101 fill maker 0 0x01000101 101 2
+=> 0x202 fill maker 0 0x01000200 100 5
+
+# Equal rx_ts: rank_e decides, and lane 2 has rank 0.
+msg 1 0x101 0 rx=50 seq=3 : new buy day 95 1 0x1003
+=> 0x101 ack 0 0x01000102 95 0x1003
+msg 2 0x202 0 rx=50 seq=2 : new buy day 95 1 0x2002
+=> 0x202 ack 0 0x01000201 95 0x2002
+msg 4 0x404 0 rx=60 seq=2 step=2 : new sell ioc 95 1 0x4002
+=> 0x404 fill 0 1 0x01000401 95 1
+=> 0x202 fill maker 0 0x01000201 95 1
+
+# IOC: what is left after the fills is Out IOC_REMAINDER (04 §6.2).
+msg 4 0x404 0 rx=61 seq=3 step=3 : new sell ioc 95 3 0x4003
+=> 0x404 fill 0 1 0x01000402 95 1
+=> 0x404 out 0 ioc 0x01000402 2 0x4003
+=> 0x101 fill maker 0 0x01000102 95 1
+
+# FOK: unfillable is Reject FOK_UNFILLABLE with the quantity available at or better than the
+# limit; the order still took a handle. Fillable fills in full.
+msg 1 0x101 0 rx=62 seq=4 : new sell day 100 2 0x1004
+=> 0x101 ack 0 0x01000103 100 0x1004
+msg 4 0x404 0 rx=63 seq=4 step=4 : new buy fok 100 5 0x4004
+=> 0x404 reject 0 FOK_UNFILLABLE 2 0x4004
+msg 4 0x404 0 rx=64 seq=5 step=5 : new buy fok 101 3 0x4005
+=> 0x404 fill 0 1 0x01000404 100 2
+=> 0x404 fill 0 1 0x01000404 101 1
+=> 0x101 fill maker 0 0x01000103 100 2
+=> 0x101 fill maker 0 0x01000101 101 1
+
+# Post-only: crossing is Reject POST_ONLY_WOULD_CROSS with the opposite best tick; else it rests.
+msg 4 0x404 0 rx=65 seq=6 step=6 : new buy day post 101 1 0x4006
+=> 0x404 reject 0 POST_ONLY_WOULD_CROSS 101 0x4006
+msg 4 0x404 0 rx=66 seq=7 : new buy day post 99 1 0x4007
+=> 0x404 ack 0 0x01000406 99 0x4007
+
+# A Day order that fills in part rests at its own limit, and its Ack follows its Fills.
+msg 4 0x404 0 rx=67 seq=8 step=7 : new buy day 101 3 0x4008
+=> 0x404 fill 0 1 0x01000407 101 1
+=> 0x404 ack 0 0x01000407 101 0x4008
+=> 0x101 fill maker 0 0x01000101 101 1
+
+# Canonical order: buys first, then by tick, then by key.
+check resting 0x01000406 0x01000407
+check account 4 open=2 base_free=112 base_resv=0
+check account 1 open=0 base_free=92 base_resv=0 quote_free=100809 quote_resv=0

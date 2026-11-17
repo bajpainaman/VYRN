@@ -1,0 +1,61 @@
+# Cancel, Reduce and Replace (05 §2.3, 04 §6.3-6.5). Two accounts share lane 1, so they share its
+# handle sequence. No fees: px(t) = t.
+
+book band=90..110 qptl=1 max_qty=100
+lane 1 first=0x01000010
+account 1 lane=1 base=50 quote=10000
+account 2 lane=1 base=50 quote=10000
+session 0x11 account=1
+session 0x12 account=2
+
+msg 1 0x11 0 rx=1 seq=1 : new sell day 100 10 0xa1
+=> 0x11 ack 0 0x01000010 100 0xa1
+msg 1 0x11 0 rx=2 seq=2 : reduce 0x01000010 0 0xa2
+=> 0x11 reject 0 BAD_QTY 0 0xa2
+msg 1 0x11 0 rx=3 seq=3 : reduce 0x01000010 3 0xa3
+=> 0x11 cancel_ack 0 0x01000010 3 0xa3
+check account 1 open=1 base_free=43 base_resv=7
+
+# Another account's handle, and a wrong generation, are both UNKNOWN_HANDLE (04 §6.1).
+msg 1 0x12 0 rx=4 seq=4 : cancel 0x01000010 0xb1
+=> 0x12 reject 0 UNKNOWN_HANDLE 0 0xb1
+msg 1 0x11 0 rx=5 seq=5 : cancel 0x02000010 0xa4
+=> 0x11 reject 0 UNKNOWN_HANDLE 0 0xa4
+
+# Replace carries the order's stored tag. Same tick, flags and total: NO_CHANGE. Side differs:
+# SIDE_MISMATCH. Same tick, smaller total: a Reduce that keeps the handle.
+msg 1 0x11 0 rx=6 seq=6 : replace sell day 0x01000010 100 7
+=> 0x11 reject 0 BAD_QTY 0xfffffffe 0xa1
+msg 1 0x11 0 rx=7 seq=7 : replace buy day 0x01000010 100 5
+=> 0x11 reject 0 SIDE_MISMATCH 0 0xa1
+msg 1 0x11 0 rx=8 seq=8 : replace sell day 0x01000010 100 5
+=> 0x11 cancel_ack 0 0x01000010 2 0xa1
+check account 1 open=1 base_free=45 base_resv=5
+
+# A new tick loses priority: CancelAck of the old handle, then the new order's Ack, new handle.
+msg 1 0x11 0 rx=9 seq=9 : replace sell day 0x01000010 101 8
+=> 0x11 cancel_ack 0 0x01000010 5 0xa1
+=> 0x11 ack 0 0x01000011 101 0xa1
+check account 1 open=1 base_free=42 base_resv=8
+msg 1 0x11 0 rx=10 seq=10 : cancel 0x01000010 0xa5
+=> 0x11 reject 0 TOO_LATE 2 0xa5
+
+# A fill, then a same-tick Replace below the filled total ends the order (Reduce of total - qty).
+msg 1 0x12 0 rx=11 seq=11 step=1 : new buy ioc 101 3 0xb2
+=> 0x12 fill 0 1 0x01000012 101 3
+=> 0x11 fill maker 0 0x01000011 101 3
+msg 1 0x11 0 rx=12 seq=12 : replace sell day 0x01000011 101 3
+=> 0x11 cancel_ack 0 0x01000011 5 0xa1
+
+# Priority loss with qty <= filled: the old order ends and no new order enters (04 §6.5).
+msg 1 0x11 0 rx=13 seq=13 : new sell day 100 4 0xa6
+=> 0x11 ack 0 0x01000013 100 0xa6
+msg 1 0x12 0 rx=14 seq=14 step=2 : new buy ioc 100 1 0xb3
+=> 0x12 fill 0 1 0x01000014 100 1
+=> 0x11 fill maker 0 0x01000013 100 1
+msg 1 0x11 0 rx=15 seq=15 : replace sell day 0x01000013 99 1
+=> 0x11 cancel_ack 0 0x01000013 3 0xa6
+
+check resting
+check account 1 open=0 base_free=46 base_resv=0 quote_free=10403 quote_resv=0
+check account 2 open=0 base_free=54 base_resv=0 quote_free=9597 quote_resv=0

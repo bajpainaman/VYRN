@@ -1,0 +1,39 @@
+# The opening auction uncross (08 §7.6) with auction fees in ppm (10 §5): ceil for a charge,
+# floor for a rebate. qptl=10, max_fee_ppm=1000, so rpl(t) = 10t + ceil(10t / 1000).
+#
+# Buys: b1 5 @ 100, b2 3 @ 102, b3 auction-only 1 @ 90. Sells: s1 4 @ 99, s2 6 @ 101. ref 100.
+# V(99) = V(100) = 4 with |I| = 4 at both; 100 is nearest the reference, so p* = 100. Buys are
+# rationed: b2 fills 3, then b1 fills 1; s1 fills 4. b3 is out; b1 and s2 rest on.
+
+book band=90..110 qptl=10 max_fee_ppm=1000 max_qty=100 phase=auction
+lane 1 first=0x01000001
+lane 2 first=0x01000101
+account 1 lane=1 quote=100000 auction=1000
+account 2 lane=2 base=100 auction=-500
+session 0x11 account=1
+session 0x22 account=2
+
+msg 1 0x11 0 rx=1 seq=1 : new buy day 100 5 0xb1
+=> 0x11 ack 0 0x01000001 100 0xb1
+msg 1 0x11 0 rx=2 seq=2 : new buy day 102 3 0xb2
+=> 0x11 ack 0 0x01000002 102 0xb2
+msg 1 0x11 0 rx=3 seq=3 : new buy auction 90 1 0xb3
+=> 0x11 ack 0 0x01000003 90 0xb3
+msg 2 0x22 0 rx=4 seq=1 : new sell day 99 4 0x51
+=> 0x22 ack 0 0x01000101 99 0x51
+msg 2 0x22 0 rx=5 seq=2 : new sell day 101 6 0x52
+=> 0x22 ack 0 0x01000102 101 0x52
+check account 1 quote_free=91028 quote_resv=8972
+
+uncross 100 step=1
+=> 0x11 fill maker 2 0x01000002 100 3
+=> 0x11 fill maker 2 0x01000001 100 1
+=> 0x11 out maker auction 0x01000003 1 0xb3
+=> 0x22 fill maker 2 0x01000101 100 4
+
+check phase continuous
+check resting 0x01000001 0x01000102
+check account 1 open=1 base_free=4 quote_free=91992 quote_resv=4004
+check account 2 open=1 base_free=90 base_resv=6 quote_free=4002
+check fee_acc 1 4
+check fee_acc 2 -2

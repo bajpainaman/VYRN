@@ -4,3 +4,5 @@
 // Listed in UNSAFE.toml; the only module of this crate allowed to contain `unsafe`.
 #[allow(unsafe_code)]
 pub mod oracle;
+pub mod oracle_abi;
+pub mod scenario;
