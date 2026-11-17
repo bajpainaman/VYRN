@@ -122,7 +122,7 @@ async function SixLines() {
           <ul className="flex flex-wrap content-start gap-2 md:flex-col md:items-start" aria-label="Worked out in">
             {sources[i]?.map((s) => (
               <li key={s.label}>
-                <Link href={s.href} className="caption inline-block border-2 border-ink px-2.5 py-1.5 no-underline hover:bg-ink hover:text-canary">
+                <Link href={s.href} className="caption inline-block border-2 border-ink px-2.5 py-1.5 no-underline hover:bg-slab hover:text-on-slab">
                   {s.label}
                 </Link>
               </li>
@@ -349,18 +349,18 @@ async function Grilling() {
 /** The routing slip that closes the ticket: one inked action, three plain ones, and the license terms. */
 function Close() {
   return (
-    <section id="license" aria-labelledby="license-title" data-surface="ink" className="border-2 border-ink bg-ink text-canary">
+    <section id="license" aria-labelledby="license-title" data-surface="ink" className="border-2 border-ink bg-well text-on-well">
       <div className="grid grid-cols-1 items-start gap-8 px-5 py-8 sm:px-8 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
         <div>
           <h2 id="license-title" className="display text-[clamp(1.8rem,3.2vw,2.6rem)]">
             Source-available. Read it freely.
           </h2>
-          <p className="mt-3 max-w-[56ch] text-[15.5px] leading-[1.55] text-canary/90">
+          <p className="mt-3 max-w-[56ch] text-[15.5px] leading-[1.55] text-on-well/90">
             Research and education are free. Commercial or production use, and any use by a financial institution or a government
             body, needs written permission first, even for testing. <a href={LICENSE_URL}>Read the license</a> for its complete
             terms.
           </p>
-          <p className="mt-3 max-w-[56ch] text-[14px] leading-[1.5] text-canary/80">
+          <p className="mt-3 max-w-[56ch] text-[14px] leading-[1.5] text-on-well/80">
             License requests are public GitHub issues: leave out anything confidential. Opening one does not grant permission.
             {CONTACT_EMAIL && (
               <>
@@ -369,7 +369,7 @@ function Close() {
             )}
           </p>
         </div>
-        <nav aria-label="Next steps" className="grid grid-cols-1 gap-[2px] border-2 border-canary bg-canary sm:grid-cols-2">
+        <nav aria-label="Next steps" className="grid grid-cols-1 gap-[2px] border-2 border-on-well bg-on-well sm:grid-cols-2">
           <TrackedLink href="/docs/design" event="route_click" eventProps={{ to: "design", from: "close" }} className="routebox inverse primary sm:col-span-2">
             <span className="box"><Arrow /></span>
             <span>Read the design<small>DESIGN.md, the answer in one document</small></span>

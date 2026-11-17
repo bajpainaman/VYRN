@@ -46,3 +46,6 @@ next-env.d.ts
 /.impeccable/critique/
 /.impeccable/live/
 /.impeccable/hook.cache.json
+
+# dark-theme diagram copies, written by scripts/sync-diagrams.mjs
+/public/diagrams/*-dark.svg

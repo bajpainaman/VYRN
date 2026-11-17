@@ -71,7 +71,9 @@ function figureNode(figure: Figure, pre: Element): Element {
   const src = `/diagrams/${figure.file}.svg`;
   return el("figure", { className: ["diagram"] }, [
     el("div", { className: ["diagram-scroll"], tabIndex: 0, role: "region", ariaLabel: "Diagram" }, [
-      el("img", { src, width: figure.width, height: figure.height, alt: figure.alt, loading: "lazy", decoding: "async", style: `--fig-w:${figure.width}` }),
+      // One drawing per theme; CSS hides the other, and a hidden lazy image is never fetched.
+      el("img", { src, width: figure.width, height: figure.height, alt: figure.alt, loading: "lazy", decoding: "async", className: ["fig-light"], style: `--fig-w:${figure.width}` }),
+      el("img", { src: `/diagrams/${figure.file}-dark.svg`, width: figure.width, height: figure.height, alt: figure.alt, loading: "lazy", decoding: "async", className: ["fig-dark"], style: `--fig-w:${figure.width}` }),
     ]),
     el("figcaption", {}, [
       txt("Drawn from the ASCII original below. "),

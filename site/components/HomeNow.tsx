@@ -22,7 +22,7 @@ export function HomeNow() {
         {HOMES.map((home, i) => {
           const live = state?.home === home;
           return (
-            <li key={home} className={`px-3 py-3 sm:px-4 ${live ? "bg-ink text-canary" : "bg-canary"}`}>
+            <li key={home} className={`px-3 py-3 sm:px-4 ${live ? "bg-slab text-on-slab" : "bg-canary"}`}>
               <span className="block text-[36px] font-black leading-none [font-stretch:110%] sm:text-[46px]">
                 {home}
               </span>

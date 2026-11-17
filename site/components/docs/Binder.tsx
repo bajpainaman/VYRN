@@ -19,10 +19,10 @@ export function Binder({ docs, current }: { docs: Tab[]; current: string }) {
                 href={`/docs/${doc.slug}`}
                 aria-current={active ? "page" : undefined}
                 className={`flex items-baseline gap-3 whitespace-nowrap border-r-2 border-ink px-4 py-2.5 text-[15px] font-bold no-underline [font-stretch:105%] lg:border-r-0 lg:border-y-0 lg:px-5 lg:py-2 ${
-                  active ? "bg-ink text-canary" : "hover:bg-canary-shade"
+                  active ? "bg-slab text-on-slab" : "hover:bg-canary-shade"
                 }`}
               >
-                <span className={`data w-7 text-[12px] font-semibold ${active ? "text-canary" : "text-ink-soft"}`}>
+                <span className={`data w-7 text-[12px] font-semibold ${active ? "text-on-slab" : "text-ink-soft"}`}>
                   {doc.number === "D" ? "DS" : doc.number}
                 </span>
                 {doc.short}

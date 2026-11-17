@@ -54,6 +54,7 @@ describe("renderNodes: diagrams", () => {
   it("places the drawn figure over its ASCII original, keyed by the block's position", async () => {
     const { html } = await render("```\n┌──┐\n└──┘\n```", "00-index", 0);
     expect(html).toContain('src="/diagrams/00-index-00.svg"');
+    expect(html).toContain('src="/diagrams/00-index-00-dark.svg"');
     expect(html).toContain('<details class="diagram-ascii">');
     expect(html).toContain('<pre class="ascii">');
   });

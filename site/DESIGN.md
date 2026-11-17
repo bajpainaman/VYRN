@@ -15,6 +15,10 @@ colors:
   stamp: "#5a2d91"
   stamp-wash: "#ede5f6"
   code-text: "#eceaf2"
+  slab: "#191b26"
+  on-slab: "#f2d447"
+  well: "#191b26"
+  on-well: "#f2d447"
 typography:
   display:
     fontFamily: "Archivo, sans-serif"
@@ -219,6 +223,30 @@ A three-ply carbon form in ink, with one ribbon colour and two colours reserved 
 
 **The Ply Rule.** A part sits on canary, pink or white because of what it is: canary for the hot path and the argument, pink for the copy and the data tier, white for reading and definitions. Do not pick a ply for variety.
 
+### Dark theme: the Carbon Sheet
+The same form printed in reverse on carbon paper. The site follows the reader's OS (`prefers-color-scheme`) unless they pick Light, Dark or System from the theme cell in the header; the choice is saved in `localStorage` (`vyrn-theme`) and applied by the layout's inline script before first paint. Every colour token is a `light-dark()` pair in `app/globals.css`, so components carry no `dark:` variants.
+
+| Token | Light | Dark | Role in the dark |
+|---|---|---|---|
+| canary | #f2d447 | #1f1d13 | the sheet: warm near-black, still a canary ply |
+| canary-shade | #e6c534 | #2d2a1b | hover fill |
+| pink | #f4b7c2 | #2e1d23 | the carbon copy, a dark rose ply |
+| ply | #fcfcf9 | #18191f | the reading ply, cool and a step apart from the sheet |
+| figure | #ffffff | #121318 | table, ASCII and drawing frames |
+| ink | #191b26 | #ebe6d2 | text and every rule, now pale |
+| ink-soft | #4a4318 | #c9bd85 | secondary text on the sheet, tinted toward canary |
+| ink-mute | #565a6b | #a3a7b7 | secondary text on the reading ply |
+| buy | #1e4db7 | #8aa9ff | BUY |
+| sell | #a3161d | #ff8a80 | SELL |
+| stamp | #5a2d91 | #c4a6f7 | the ribbon |
+| stamp-wash | #ede5f6 | #2e2542 | targeted ID row |
+| slab / on-slab | ink / canary | canary / ink | inked controls: primary route, active tab, live home, plain-button hover |
+| well / on-well | ink / canary | #0e0f14 / canary | inked surfaces: the license slip and code blocks |
+
+Canary stops being the ground and becomes the accent: it fills only the slabs and inks the well. Violet, blue and red keep their meanings, lightened to hold at least 7:1 on every dark ply. Drawn figures use a palette-swapped copy that `scripts/sync-diagrams.mjs` writes at build time (canary fill #534509, pink fill #5a2836, white fill #1c1d24, ink #ebe6d2, violet #c4a6f7, muted #b8bccb); the build fails on a colour with no dark mapping. The share image (`og.png`) has one look, the light one.
+
+**The Carbon Rule.** Ink inverts; plies keep their hue. A dark surface is a dark canary, pink or white ply, never a neutral grey, and anything inked in the light (a slab or a well) stays the strongest mark in the dark.
+
 ## Typography
 
 **Display Font:** Archivo (variable, `wdth` axis), with sans-serif fallback
@@ -295,7 +323,7 @@ The ticket's routing slip: a labelled destination, not a checkbox.
 - **Search:** 2px ink border on the white ply, 14px text, ink-mute placeholder, 0 radius. Focus drops the default outline for a 2px violet outline. Results open in a white sheet with a 2px border and the results-sheet shadow; ID results print in violet Martian Mono.
 
 ### Navigation
-- **Site header:** canary, 56px, 2px bottom rule. Wordmark in Archivo 900 at width 125%; nav items are full-height cells with a 2px left rule, 15px bold at width 112%, hover canary-shade.
+- **Site header:** canary, 56px, 2px bottom rule. Wordmark in Archivo 900 at width 125%; nav items are full-height cells with a 2px left rule, 15px bold at width 112% (14px below `sm`), hover canary-shade. The last cell is the theme cell: an icon for the current choice that opens a white-ply menu of Light, Dark and System, hung from the header rule.
 - **Binder:** chapter tabs on canary, a Martian Mono number in ink-soft before each title; the active tab is inked (ink fill, canary text).
 - **On this sheet:** 13.5px list; h2 entries bold, h3 entries ink-soft and indented; the section under the reading line turns violet.
 
@@ -328,7 +356,7 @@ The wire format printed as form fields: a label caption with its byte range in M
 - **Do** build every region from cells: 2px ink rules outside, a 2px gap on ink inside.
 - **Do** keep each number's kind (budget, measured, vendor) printed beside it.
 - **Do** link every spec ID and § reference, in violet with the dotted underline.
-- **Do** use a 2px violet focus ring at 3px offset on light plies, and switch it to canary on ink surfaces (violet is 1.8:1 on ink; canary is 11.6:1).
+- **Do** use a 2px violet focus ring at 3px offset on the plies (light violet on the dark sheet), and switch it to canary on ink surfaces and the well (violet is 1.8:1 on ink; canary is 11.6:1, 13:1 on the dark well).
 - **Do** give each stamp its own hand-set angle and strike it with the overshoot easing; show its end state under reduced motion.
 - **Do** show the ASCII original under every drawn figure, one click away.
 - **Do** separate ticket parts with the perforated tear and give each part the punched binding edge.
