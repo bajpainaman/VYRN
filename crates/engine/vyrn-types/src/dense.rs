@@ -14,10 +14,12 @@ impl DenseId for LaneId {
     }
 }
 
+/// A session indexes its lane's session table by slot, bits 0–11 (04 §4.1); the lane and
+/// generation checks belong to the caller (04 §3.1 V2).
 impl DenseId for SessionId {
     #[inline(always)]
     fn raw(self) -> u64 {
-        u64::from(self.0)
+        u64::from(self.0 & 0xFFF)
     }
 }
 
@@ -107,5 +109,12 @@ mod tests {
         let d = Dense::<u8, 8>::new([0, 1, 2, 3, 4, 5, 6, 7]);
         let h = Handle::new(5, 200).unwrap_or_default();
         assert_eq!(d.get(h), Some(&5));
+    }
+
+    #[test]
+    fn session_indexes_by_slot_not_lane_or_generation() {
+        let d = Dense::<u8, 8>::new([0, 1, 2, 3, 4, 5, 6, 7]);
+        // Slot 7, lane 3, generation 1 (04 §4.1).
+        assert_eq!(d.get(SessionId(7 | 3 << 12 | 1 << 20)), Some(&7));
     }
 }
