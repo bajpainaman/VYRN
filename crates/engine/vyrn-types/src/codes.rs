@@ -22,6 +22,8 @@ macro_rules! coded {
                 }
             }
 
+            /// `None` for a code that v1 does not define. A receiver treats that as a protocol
+            /// error rather than guessing a meaning, so a later version can assign it (04 §12).
             #[inline(always)]
             pub const fn from_code(code: $repr) -> Option<Self> {
                 match code {

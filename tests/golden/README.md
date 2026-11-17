@@ -1,0 +1,80 @@
+# Golden vectors
+
+These files let anyone check an implementation of the VYRN client protocol (spec/04-protocol.md,
+version 1) or of its crypto, in any language. You don't need this repository's code. Python 3 is
+enough to regenerate the protocol files.
+
+| File | What it checks | Source |
+|---|---|---|
+| `vyrn_proto_vectors.py`, `.out` | 18 request and response packets that a conforming implementation must build byte for byte and accept (04 §11) | the script is the one printed in 04 §11; `.out` is its output |
+| `vyrn_reject_vectors.py`, `.out` | 45 validly tagged packets whose layout v1 must refuse, each with its verdict (04 §3.1 V1/V9, §3.3 M2/M3, §6.1, §12 VR1/VR3) | written for this repository from those tables |
+| `siphash.txt` | SipHash-2-4, 64 lengths (the packet MAC, 01 §4) | [veorq/SipHash](https://github.com/veorq/SipHash) `vectors.h` at `32d0676`, `vectors_sip64` |
+| `blake3_test_vectors.json` | BLAKE3 hash, keyed hash and `derive_key` (01 §4) | [BLAKE3-team/BLAKE3](https://github.com/BLAKE3-team/BLAKE3) `test_vectors/test_vectors.json` at `657284b`, byte for byte |
+| `ed25519-edge.txt` | Ed25519 edge cases with ZIP-215 verdicts (spec/11-build.md §2.5) | [novifinancial/ed25519-speccheck](https://github.com/novifinancial/ed25519-speccheck) `cases.json` at `6551933`; verdicts from the Zebra row of its README |
+
+The upstream rows were last compared with those commits on 2026-11-17. The NIC frame vectors
+(06 §6.2) live with their backend, in `crates/vyrn-nic/tests/frame_vectors.txt`.
+
+## Check that the files are what the scripts print
+
+Run the scripts from a directory outside the repository with `python3 -I`, so that nothing in
+your environment or working directory changes what they import:
+
+```sh
+cd /tmp
+python3 -I "$REPO/tests/golden/vyrn_proto_vectors.py"  | diff - "$REPO/tests/golden/vyrn_proto_vectors.out"
+python3 -I "$REPO/tests/golden/vyrn_reject_vectors.py" | diff - "$REPO/tests/golden/vyrn_reject_vectors.out"
+```
+
+Both commands print nothing when the files match. CI runs them on every pull request.
+
+## Check an independent implementation
+
+The test keys are `K_seq` = bytes `00..0f`, `K_out` = `10..1f` and `K_com` = `20..2f`. They are
+for testing only. Every multi-byte field is little-endian (01 §6).
+
+**Acceptance (`vyrn_proto_vectors.out`).** Each vector is a block:
+
+```text
+V1 req  A: New buy Day 5 @ 100000, STP 1 (48 B)
+  000: 07 30 10 00 01 00 00 00 01 00 e8 03 01 00 00 00
+  ...
+  tag_seq=0x8e1382100caea6ce  tag_com=0x0000000000000000
+```
+
+The first word is the vector ID, `req` or `resp` gives the direction, and the number in
+parentheses is the packet length. Each indented row is a hex offset followed by up to 16 bytes.
+The tag line repeats the trailing tags as integers. 04 §11 gives the scenario: the sessions,
+handles and epoch behind each packet. An implementation passes when, for every vector, it:
+
+1. builds the same bytes from the scenario's fields and the test keys;
+2. parses the bytes back to the same fields, and verifies `tag_seq` with `K_seq` (and `tag_com`
+   with `K_com` for V10), or a response's `tag` with `K_out`;
+3. holds the `check OK:` lines at the end of the file, such as "V1 with one tag bit flipped fails".
+
+**Refusal (`vyrn_reject_vectors.out`).** Lines starting with `#` describe the vector below them.
+Each vector is one line: `<id> <req|resp> <verdict> <hex>`. The tags are valid, so a refusal comes
+from the layout alone. The verdicts are:
+
+| Verdict | Meaning |
+|---|---|
+| `req drop` | Check V1 fails: the receiver drops the packet and sends nothing. |
+| `req msgs a,b,…` | The packet is accepted. Each entry is one message, in index order: `ok`, or the `Reject` it gets as `reason/detail`. For example `3/2` is `BAD_TYPE` with `PROTO_D_RESERVED`. A header failure (V9) rejects every message with `3/4`. |
+| `resp drop` | The client discards the whole response as a protocol error (VR3). |
+| `resp recs a,b,…` | Each entry is one record: `ok`, or `bad`, a protocol error (VR3). |
+
+An implementation that accepts any of these packets reads a reserved field that a later version
+may give a meaning (VR1, VR2). It would then misread that version's traffic.
+
+**Crypto.** Each of `siphash.txt` and `ed25519-edge.txt` explains its columns in its header
+comment. `blake3_test_vectors.json` explains its format in its `_comment` field.
+
+In this repository, `crates/engine/vyrn-wire/tests/vectors.rs` and
+`crates/engine/vyrn-crypto/tests/golden.rs` run these checks against `vyrn-wire` and
+`vyrn-crypto`.
+
+## Versioning
+
+All vectors are for protocol version 1. The wire has no version field. A session fixes its version
+when it opens (04 §12). Vector IDs are stable. A new vector gets the next free ID, and an existing
+vector never changes its bytes or its meaning. A later protocol version gets its own files.

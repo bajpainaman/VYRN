@@ -455,30 +455,51 @@ fn the_scripts_checks_hold() {
     assert!(v18.verify_seq(&K_SEQ));
 }
 
+/// `tests/golden/vyrn_reject_vectors.out`: validly tagged packets whose layout a v1 codec must
+/// refuse (04 §3.1 V1 and V9, §3.3 M2 and M3, §12 VR1 and VR3), each with its expected verdict.
 #[test]
-fn wrong_lengths_and_header_bits_are_refused() {
-    let g = golden();
-    let v1 = &g["V1"];
-    // One byte short, one byte long, and a count that disagrees with the length.
-    assert!(Request::parse(&v1[..v1.len() - 1]).is_err());
-    assert!(Request::parse(&[v1.as_slice(), &[0]].concat()).is_err());
-    let mut two = v1.clone();
-    two[8] = 2;
-    assert!(Request::parse(&two).is_err());
-    // count 0 with a 32-byte packet.
-    let mut zero = v1[..16].to_vec();
-    zero[8] = 0;
-    zero.extend([0u8; 16]);
-    assert!(Request::parse(&zero).is_err());
-    // V9: flags bit 1 and `reserved` parse, but fail the header check.
-    let mut flag = v1.clone();
-    flag[9] = 0x02;
-    assert!(Request::parse(&flag).unwrap().check_header().is_err());
-    let mut res = v1.clone();
-    res[14] = 1;
-    assert!(Request::parse(&res).unwrap().check_header().is_err());
-    // Responses: a flags bit other than resend.
-    let mut r = g["V2"].clone();
-    r[9] = 0x80;
-    assert!(Response::parse(&r).is_err());
+fn reject_vectors_get_their_verdicts() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../tests/golden/vyrn_reject_vectors.out"
+    );
+    let text = std::fs::read_to_string(path).expect("reject vectors");
+    let verdict = |e: vyrn_wire::WireError| format!("{}/{}", e.reason.code(), e.detail);
+    let mut n = 0;
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let (id, dir, want, hex) = match f[..] {
+            [id, dir, "drop", hex] => (id, dir, None, hex),
+            [id, dir, _, list, hex] => (id, dir, Some(list), hex),
+            _ => panic!("bad line: {line}"),
+        };
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let got = if dir == "req" {
+            Request::parse(&bytes).ok().map(|p| {
+                assert!(p.verify_seq(&K_SEQ), "{id} tag_seq");
+                let hdr = p.check_header().err();
+                p.msgs()
+                    .map(|m| match (hdr, m) {
+                        (Some(e), _) | (None, Err(e)) => verdict(e),
+                        (None, Ok(_)) => "ok".to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        } else {
+            Response::parse(&bytes).ok().map(|p| {
+                assert!(p.verify(&K_OUT), "{id} tag");
+                p.records()
+                    .map(|r| if r.is_ok() { "ok" } else { "bad" })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        };
+        assert_eq!(got.as_deref(), want, "{id}");
+        n += 1;
+    }
+    assert_eq!(n, 45);
 }

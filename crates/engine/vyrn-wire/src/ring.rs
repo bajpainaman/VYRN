@@ -1,12 +1,22 @@
 //! The per-queue contract every NIC backend implements (06 §6.1). The engine sees only these
 //! traits, so it never depends on a NIC (11 §1.4).
 //!
-//! Contract rules, checked by the `sim` backend's tests:
-//! 1. `poll` returns one queue's frames in arrival order, with `rx_ts` non-decreasing.
+//! Contract rules, checked against every backend by `vyrn_nic::conformance`:
+//! 1. `poll` returns one queue's frames in arrival order, with `rx_ts` non-decreasing. A backend
+//!    that sees a smaller stamp delivers the previous one and counts it in `rx_ts_regress`, which
+//!    `NicCounters` has no field for, so it lives in the backend crate (`vyrn_nic::ExtCounters`).
 //! 2. Hot-path errors are counters, never `Err`. `evq_overflow` and `fatal_hw` are fatal: the
 //!    lane checks `counters().fatal()` once per poll and fail-stops.
 //! 3. `send` sends the whole frame or returns `TxFull`, never part of one.
 //! 4. Queues are opened before `seal()`, each by its owner thread.
+//!
+//! # Versioning
+//!
+//! The traits are a Rust contract, monomorphised per backend (06 §6.1), so they carry no version
+//! at run time and cost nothing per call. `RxPkt`, `RxFlags` and `NicCounters` are also a C ABI:
+//! their layouts must equal `vyns_rx`, `VYNS_RX_*` and `vyns_counters` of shim ABI version
+//! `RING_ABI_VERSION` (06 §7.2). Changing a layout or a rule above means bumping that version on
+//! both sides. The backend checks `vyns_abi_version()` once at start (06 §7.5).
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +25,10 @@ use vyrn_types::Nanos;
 
 /// `PLT_RX_BURST`: the most frames one `poll` returns.
 pub const RX_BURST: usize = 16;
+
+/// `VYNS_ABI_VERSION` (06 §7.2): the shim ABI whose layouts `RxPkt`, `RxFlags` and `NicCounters`
+/// match. A backend on the shim refuses a shim that reports another version.
+pub const RING_ABI_VERSION: u32 = 1;
 
 /// `VYNS_RX_*` flags of one received frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
