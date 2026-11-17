@@ -1,0 +1,89 @@
+# Phases (05 §2.5, 04 §6.9), lane rejects (04 §6.1-6.2) and malformed events (pbv.h).
+
+book band=90..110 qptl=1 max_qty=100 max_open=2
+lane 1 first=0x01000001
+account 1 lane=1 base=50 quote=1000
+session 0x11 account=1
+
+phase halted
+=> none
+msg 1 0x11 0 rx=1 seq=1 : new buy day 100 1 0xa1
+=> 0x11 reject 0 BOOK_HALTED 0 0xa1
+msg 1 0x11 0 rx=2 seq=2 : cancel 0x01000001 0xa2
+=> 0x11 reject 0 UNKNOWN_HANDLE 0 0xa2
+
+# Auction: Day and auction-only rest without matching; IOC and FOK get AUCTION_PHASE (detail 2).
+phase auction
+=> none
+msg 1 0x11 0 rx=3 seq=3 : new buy ioc 100 1 0xa3
+=> 0x11 reject 0 AUCTION_PHASE 2 0xa3
+msg 1 0x11 0 rx=4 seq=4 : new buy auction 95 1 0xa4
+=> 0x11 ack 0 0x01000001 95 0xa4
+msg 1 0x11 0 rx=5 seq=5 : new sell day 99 2 0xa5
+=> 0x11 ack 0 0x01000002 99 0xa5
+
+# Frozen (P4): every book op is AUCTION_PHASE.
+phase frozen
+=> none
+msg 1 0x11 0 rx=6 seq=6 : new buy day 100 1 0xa6
+=> 0x11 reject 0 AUCTION_PHASE 2 0xa6
+msg 1 0x11 0 rx=7 seq=7 : cancel 0x01000001 0xa7
+=> 0x11 reject 0 AUCTION_PHASE 2 0xa7
+msg 1 0x11 0 rx=8 seq=8 : cancel_all 0xa8
+=> 0x11 reject 0 AUCTION_PHASE 2 0xa8
+
+# An uncross with nothing to cross: the auction-only order dies, the Day order rests on.
+phase auction
+=> none
+uncross 100
+=> 0x11 out maker auction 0x01000001 1 0xa4
+check phase continuous
+check resting 0x01000002
+
+# Rescan, Depletion, Idle and Seal steps are no-ops.
+step rescan
+=> none
+step idle
+=> none
+
+# Lane rejects in continuous trading.
+msg 1 0x11 0 rx=9 seq=9 : new buy auction 95 1 0xa9
+=> 0x11 reject 0 AUCTION_PHASE 1 0xa9
+msg 1 0x11 0 rx=10 seq=10 : new buy day 111 1 0xaa
+=> 0x11 reject 0 BAD_TICK 110 0xaa
+msg 1 0x11 0 rx=11 seq=11 : new buy day 89 1 0xab
+=> 0x11 reject 0 BAD_TICK 90 0xab
+msg 1 0x11 0 rx=12 seq=12 : new buy day 95 0 0xac
+=> 0x11 reject 0 BAD_QTY 100 0xac
+msg 1 0x11 0 rx=13 seq=13 : new buy ioc post 95 1 0xad
+=> 0x11 reject 0 BAD_TYPE 3 0xad
+msg 1 0x11 0 rx=14 seq=14 : raw 07000000 00000000 00000000 00000000
+=> 0x11 reject 0 BAD_TYPE 1 0
+msg 1 0x11 0 rx=15 seq=15 : new buy day 95 101 0xae
+=> 0x11 reject 0 BAD_QTY 100 0xae
+msg 1 0x11 0 rx=16 seq=16 : new buy day 100 100 0xaf
+=> 0x11 reject 0 RISK_CREDIT 9000 0xaf
+msg 1 0x11 0 rx=17 seq=17 : new buy day 98 100 0xb0
+=> 0x11 reject 0 RISK_CREDIT 8800 0xb0
+msg 1 0x11 0 rx=18 seq=18 : new buy day 98 1 0xb1
+=> 0x11 ack 0 0x01000003 98 0xb1
+msg 1 0x11 0 rx=19 seq=19 : new buy day 97 1 0xb2
+=> 0x11 reject 0 RISK_ORDER_COUNT 2 0xb2
+
+# Malformed events change nothing and return PBO_E_EVENT.
+msg 1 0x11 0 rx=20 seq=20 reserved=1 : heartbeat
+=> error event
+msg 1 0x99 0 rx=21 seq=21 : heartbeat
+=> error event
+msg 1 0x11 0 rx=22 seq=22 : heartbeat
+=> none
+
+# Replace: qty 0 is BAD_QTY with detail 0 (04 §6.5); a bad flag combination is BAD_TYPE before
+# any handle lookup, so an unknown handle still gets BAD_TYPE (as vyrn-wire's decoder does).
+msg 1 0x11 0 rx=23 seq=23 : replace buy day 0x01000003 98 0
+=> 0x11 reject 0 BAD_QTY 0 0xb1
+msg 1 0x11 0 rx=24 seq=24 : replace buy ioc post 0x0100abcd 98 1
+=> 0x11 reject 0 BAD_TYPE 3 0
+
+check resting 0x01000003 0x01000002
+check account 1 open=2 base_free=48 base_resv=2 quote_free=902 quote_resv=98

@@ -28,6 +28,8 @@ commonware-runtime = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 clap = { workspace = true }
+# dlopen of libvyrn_vx_oracle (11 §5.2).
+libc = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

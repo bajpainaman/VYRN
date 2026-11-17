@@ -1,0 +1,26 @@
+# The order table (pbv.h max_orders) and the canonical last StepId. A full table refuses only
+# ops that add an order; a malformed event changes nothing, the last StepId included.
+
+book band=90..110 qptl=1 max_qty=100 max_orders=1
+lane 1 first=0x01000001
+account 1 lane=1 base=50
+session 0x11 account=1
+
+msg 1 0x11 0 rx=1 seq=1 step=3 : new sell day 100 5 0xa1
+=> 0x11 ack 0 0x01000001 100 0xa1
+check last_step 3
+
+# The table is full. A same-tick Reduce by Replace adds nothing and runs; a New is refused.
+msg 1 0x11 0 rx=2 seq=2 : replace sell day 0x01000001 100 3
+=> 0x11 cancel_ack 0 0x01000001 2 0xa1
+msg 1 0x11 0 rx=3 seq=3 : new sell day 101 1 0xa2
+=> error full
+check account 1 open=1 base_free=47 base_resv=3
+
+# An unknown step kind is malformed: E_EVENT, and the last StepId stays 3.
+step 99 step=100
+=> error event
+check last_step 3
+step idle step=7
+=> none
+check last_step 7

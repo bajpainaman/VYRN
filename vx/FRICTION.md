@@ -1,6 +1,17 @@
 # Vx friction log
 
-Every Vx workaround, each naming its vx-lang/Vx issue (spec/11-build.md §5.6).
+Every Vx workaround and every Vx feature we looked for and did not find, each naming its
+vx-lang/Vx issue (spec/11-build.md §5.6). Code sites carry `// VX-WORKAROUND W-nn (...)` or
+`# VX-WORKAROUND W-nn (...)`. All entries below were found with vxc v0.0.4 (c6dffec7) on x86_64
+Linux while writing `vyrn-vx-oracle`. Their upstream issues are not filed yet: §5.5 needs a
+maintainer-facing minimal reproduction and a CLA-signed author, so each is `open, issue to file`.
 
-| Workaround | Where | vx-lang/Vx issue |
-|---|---|---|
+| ID | What we wanted | Workaround | Files with the marker | Cost | Removed when | Status |
+|---|---|---|---|---|---|---|
+| W-09 | `pub fn` as the only exported symbols of an object. vxc also exports every private function (`_mlir_*`, helpers, monomorphs) as a global `T` symbol, so a shared library exports them and fails the §5.1 `nm -D` allowlist. | `vx/build.sh` links with a version script (`{ global: pbo_*; local: *; }`, or `-exported_symbols_list` on macOS) and then checks `nm -D`. | `vx/build.sh` | none measured | vxc gives non-`pub` functions hidden visibility in `emit-obj` output, as docs/lang/abi.md §4 says it should | open, issue to file |
+| W-10 | A vxc release binary for Linux, so `vx/TOOLCHAIN`'s `vxc_blake3` names one artifact. There is none for v0.0.4, so the pin is the hash of a local build (x86_64, Debian 13, rustc 1.100.0, LLVM/MLIR 22). Whether another host reproduces it is not checked; if not, each host needs its own hash. | `vx/TOOLCHAIN` pins one hash per host kind (`vxc_blake3.x86_64-linux`); `vx/build.sh` refuses a mismatch and skips a host with no pin unless `VYRN_REQUIRE_VX=1`. | `vx/TOOLCHAIN`, `vx/build.sh` | aarch64 and macOS hosts skip the oracle until their hash is added | a release artifact per target, or a reproducible build | open, issue to file |
+| W-11 | Checked integer arithmetic (01 §11.4), as Rust's `overflow-checks`. `+`, `-` and `*` on `u64` wrap silently at `-O 2` (`(2^40)·(2^40)` gives 0). | Every ledger amount goes through `add`/`sub`/`mul` built on `core::num`'s `overflowing_*`; an overflow sets a flag that `pbo_apply` returns as `PBO_E_FAULT`. | `vx/vyrn-vx-oracle/oracle.vx` | not measured | a checked-arithmetic mode or a trapping operator | open, issue to file |
+| W-12 | Hex integer literals. `0x01000000u32` is a parse error ("Unknown element type"). | Every constant is written in decimal. | `vx/vyrn-vx-oracle/oracle.vx` | none | the lexer accepts `0x` literals | open, issue to file |
+| W-13 | Assignment to a field of an indexed element through a raw pointer: `(*b).orders[i].qty = 0` panics the compiler ("Complex struct assignment lhs not supported", src/codegen/lower/stmt.rs:1477). | Element writes take `offset_mut(p, i)` and write `(*e).f`. | `vx/vyrn-vx-oracle/oracle.vx` | none | the lowering handles the lvalue | open, issue to file |
+| W-14 | A cast between raw pointer types (`p as *mut u8` for `p : *mut Book` is "Unsupported cast"). A typed `let` converts the same pointer without a cast. | Each pointer is retyped with `let q : *mut i8 = p;`. | `vx/vyrn-vx-oracle/oracle.vx` | none | `as` accepts pointer-to-pointer casts, or the coercion is documented | open, issue to file |
+| W-15 | vxc finding its own LLVM. It runs the first `llvm-config` on PATH to find `libmlir_*runner_utils`; on a host whose `llvm-config` is rustc's LLVM (11 §4.2) it prints "Failed to create MemoryBuffer" and still writes an object. | `vx/build.sh` sets `LLVM_CONFIG_PATH=/usr/lib/llvm-22/bin/llvm-config` when unset. | `vx/build.sh` | none | vxc records the LLVM it was built with | open, issue to file |

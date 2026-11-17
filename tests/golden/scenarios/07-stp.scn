@@ -1,0 +1,46 @@
+# Self-trade prevention (05 §2.4, 04 §6.8). Only the taker's mode counts. Sessions 0x11 and 0x13
+# belong to account 1, so STP applies across them; 0x12 is account 2.
+
+book band=90..110 qptl=1 max_qty=100
+lane 1 first=0x01000001
+account 1 lane=1 base=50 quote=10000
+account 2 lane=1 base=50
+session 0x11 account=1
+session 0x12 account=2
+session 0x13 account=1
+
+msg 1 0x11 0 rx=1 seq=1 : new sell day 100 2 0xa1
+=> 0x11 ack 0 0x01000001 100 0xa1
+msg 1 0x12 0 rx=2 seq=2 : new sell day 100 2 0xb1
+=> 0x12 ack 0 0x01000002 100 0xb1
+
+# Cancel newest before any fill: Reject STP, detail = the resting handle; the maker stays.
+msg 1 0x13 0 rx=3 seq=3 step=1 : new buy day stp=1 100 3 0xc1
+=> 0x13 reject 0 STP 0x01000001 0xc1
+check resting 0x01000001 0x01000002
+
+# Cancel oldest: the own maker gets an unsolicited Out STP; matching continues.
+msg 1 0x13 0 rx=4 seq=4 step=2 : new buy day stp=2 100 3 0xc2
+=> 0x11 out maker stp 0x01000001 2 0xa1
+=> 0x12 fill maker 0 0x01000002 100 2
+=> 0x13 fill 0 1 0x01000004 100 2
+=> 0x13 ack 0 0x01000004 100 0xc2
+
+# STP none trades with anyone; the fill is at the maker's tick.
+msg 1 0x12 0 rx=5 seq=5 step=3 : new sell day 99 3 0xb2
+=> 0x12 fill 0 1 0x01000005 100 1
+=> 0x12 ack 0 0x01000005 99 0xb2
+=> 0x13 fill maker 0 0x01000004 100 1
+
+# Cancel both after a fill: the level's Fill, the maker's Out STP, then the taker's Out STP.
+msg 1 0x11 0 rx=6 seq=6 : new sell day 99 2 0xa2
+=> 0x11 ack 0 0x01000006 99 0xa2
+msg 1 0x13 0 rx=7 seq=7 step=4 : new buy day stp=3 99 5 0xc3
+=> 0x12 fill maker 0 0x01000005 99 2
+=> 0x13 fill 0 1 0x01000007 99 2
+=> 0x11 out maker stp 0x01000006 2 0xa2
+=> 0x13 out 0 stp 0x01000007 3 0xc3
+
+check resting
+check account 1 open=0 base_free=55 base_resv=0 quote_free=9502 quote_resv=0
+check account 2 open=0 base_free=45 base_resv=0 quote_free=498 quote_resv=0

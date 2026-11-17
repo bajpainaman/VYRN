@@ -1,0 +1,33 @@
+# The uncross picks the tick nearest the reference inside C2, which need not be an order's tick
+# (08 §7.6 Lemma 2), and it runs after Control(Frozen) (05 §2.5 P4). qptl=1, no fees.
+#
+# Buys 1 @ 100 and 1 @ 110, sell 1 @ 90, reference 90. V(t) = 1 on 90..110; |I| = 1 up to 100
+# and 0 on 101..110, so C2 = [101, 110] and p* = 101. I(101) = 0: the buy at 110 and the sell
+# fill in full at 101; the buy at 100 rests.
+
+book band=90..110 qptl=1 max_qty=100 phase=auction
+lane 1 first=0x01000001
+lane 2 first=0x01000101
+account 1 lane=1 quote=1000
+account 2 lane=2 base=10
+session 0x11 account=1
+session 0x22 account=2
+
+msg 1 0x11 0 rx=1 seq=1 : new buy day 100 1 0xb1
+=> 0x11 ack 0 0x01000001 100 0xb1
+msg 1 0x11 0 rx=2 seq=2 : new buy day 110 1 0xb2
+=> 0x11 ack 0 0x01000002 110 0xb2
+msg 2 0x22 0 rx=3 seq=1 : new sell day 90 1 0x51
+=> 0x22 ack 0 0x01000101 90 0x51
+
+phase frozen
+=> none
+uncross 90 step=1
+=> 0x11 fill maker 2 0x01000002 101 1
+=> 0x22 fill maker 2 0x01000101 101 1
+
+check phase continuous
+check resting 0x01000001
+check lane 0x01000001 1
+check account 1 open=1 base_free=1 quote_free=799 quote_resv=100
+check account 2 open=0 base_free=9 base_resv=0 quote_free=101
