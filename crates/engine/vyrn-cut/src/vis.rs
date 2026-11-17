@@ -14,9 +14,12 @@
 //!   and publications become visible **in the order they were made, across all lines of one
 //!   `Sim`**. So readers see stale cuts, snapshots and ring tails, but never a later store
 //!   without an earlier one: the staleness is what hardware can show, and no causality break is
-//!   invented. When a line has `SIM_PENDING` publications in flight, the newest is replaced, so
-//!   a reader skips that intermediate value, as a slow reader on hardware can. `Sim` lines are
-//!   `!Sync`: the simulator runs every core on one thread.
+//!   invented. Deadlines are non-decreasing in publication order, so the visible publications
+//!   are always those with a deadline ≤ `max(now, floor)`: a prefix of the global order. When a
+//!   line has `SIM_PENDING` publications in flight, `floor` rises to that line's oldest deadline,
+//!   which shortens the delay of every publication up to it on every line, and so keeps the
+//!   prefix (no value is dropped or reordered). `Sim` lines are `!Sync`: the simulator runs every
+//!   core on one thread.
 //!
 //! The trait is sealed. The ring's `unsafe` relies on `publish`/`try_read` ordering the slot
 //! writes before the reads (ring.rs), so no other implementation may exist.
@@ -109,6 +112,8 @@ pub const SIM_PENDING: usize = 8;
 #[derive(Debug)]
 pub struct Sim {
     now: Cell<u64>,
+    /// Publications with a deadline ≤ `floor` are visible even before `now` reaches it.
+    floor: Cell<u64>,
     last_vis: Cell<u64>,
     rng: Cell<u64>,
     max_delay_ns: u64,
@@ -134,6 +139,7 @@ impl Sim {
     pub fn new(seed: u64, max_delay_ns: u64) -> Self {
         Self {
             now: Cell::new(0),
+            floor: Cell::new(0),
             last_vis: Cell::new(0),
             rng: Cell::new(seed),
             max_delay_ns,
@@ -160,7 +166,7 @@ impl Sim {
     }
 
     fn drain<const W: usize>(&self, st: &mut SimState<W>) {
-        let now = self.now.get();
+        let now = self.now.get().max(self.floor.get());
         let due = st
             .pending
             .iter()
@@ -204,11 +210,18 @@ impl Visibility for Sim {
         self.last_vis.set(at);
         let mut st = line.st.get();
         self.drain(&mut st);
-        let ix = st.len.min(SIM_PENDING.saturating_sub(1));
-        if let Some(e) = st.pending.get_mut(ix) {
-            *e = (at, words);
+        if st.len >= SIM_PENDING {
+            // Full: make this line's oldest publication, and everything published before it on
+            // any line, visible now. Its deadline is ≤ every later one, so the drain frees a slot.
+            if let Some((oldest, _)) = st.pending.first() {
+                self.floor.set(self.floor.get().max(*oldest));
+            }
+            self.drain(&mut st);
         }
-        st.len = ix.saturating_add(1);
+        if let Some(e) = st.pending.get_mut(st.len) {
+            *e = (at, words);
+            st.len = st.len.saturating_add(1);
+        }
         line.st.set(st);
     }
 

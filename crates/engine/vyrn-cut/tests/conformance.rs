@@ -260,3 +260,32 @@ fn half_cut_ring_reads_newest_and_rejects_going_back() {
         "not published"
     );
 }
+
+/// Codex review of #17: a full pending queue must not let a later publication on another line
+/// become visible before an earlier one (A=8 was published before B=8).
+#[test]
+fn sim_full_queue_keeps_cross_line_order() {
+    for seed in 0..if cfg!(miri) { 2 } else { 64 } {
+        let sim = Sim::new(seed, 1_000);
+        let a: Published<u64, 1, Sim> = Published::new(&sim, &0);
+        let b: Published<u64, 1, Sim> = Published::new(&sim, &0);
+        for k in 1..=8 {
+            a.publish(&sim, &k);
+        }
+        b.publish(&sim, &8);
+        a.publish(&sim, &9);
+        for t in 0..=2_000 {
+            sim.advance_to(t);
+            let (rb, ra) = (b.try_read(&sim).unwrap(), a.try_read(&sim).unwrap());
+            assert!(
+                rb < 8 || ra >= 8,
+                "seed {seed} t {t}: B={rb} visible with A={ra}"
+            );
+            assert!(
+                ra < 9 || rb == 8,
+                "seed {seed} t {t}: A={ra} visible with B={rb}"
+            );
+        }
+        assert_eq!((a.try_read(&sim), b.try_read(&sim)), (Some(9), Some(8)));
+    }
+}

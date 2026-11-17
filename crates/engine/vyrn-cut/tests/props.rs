@@ -138,6 +138,28 @@ proptest! {
         }
     }
 
+    /// Publications on several lines, any number in flight: what a reader sees is always a prefix
+    /// of the global publication order (each line's value is its newest publication in the prefix).
+    #[test]
+    fn sim_visibility_is_a_global_prefix(seed: u64, max in 0u64..3_000,
+                                         ops in prop::collection::vec((0usize..3, 0u64..400), 1..120)) {
+        let sim = Sim::new(seed, max);
+        let lines: [Published<u64, 1, Sim>; 3] = core::array::from_fn(|_| Published::new(&sim, &0));
+        // Value = global publication index, from 1.
+        let mut log: Vec<usize> = Vec::new();
+        for (g, (l, dt)) in (1u64..).zip(&ops) {
+            lines[*l].publish(&sim, &g);
+            log.push(*l);
+            sim.advance_to(sim.virtual_ns() + dt);
+            let seen: Vec<u64> = lines.iter().map(|x| x.try_read(&sim).unwrap()).collect();
+            let p = *seen.iter().max().unwrap();
+            for (i, v) in seen.iter().enumerate() {
+                let want = (1..=p).rev().find(|k| log[(*k - 1) as usize] == i).unwrap_or(0);
+                prop_assert_eq!(*v, want, "line {} not the prefix {}", i, p);
+            }
+        }
+    }
+
     /// `CutWriter` publishes exactly the pointwise-monotone sequences.
     #[test]
     fn cut_writer_rejects_exactly_the_non_monotone(seqs in prop::collection::vec(0u64..4, 1..20)) {
