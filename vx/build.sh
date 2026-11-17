@@ -9,14 +9,23 @@ if ! find vyrn-vx-oracle vyrn-vx-client -name '*.vx' -print -quit | grep -q .; t
   exit 0
 fi
 die() { echo "vx/build.sh: $*" >&2; exit 1; }
+# Without vxc, or without a pinned hash for this host, there is nothing to build: say so and
+# stop, so .agents/setup works on small orbs. VYRN_REQUIRE_VX=1 (CI that runs the oracle) makes
+# both an error. A vxc whose hash differs from the pin is always an error.
+skip() {
+  [[ "${VYRN_REQUIRE_VX:-0}" == 1 ]] && die "$*"
+  echo "vx/build.sh: skipped: $*" >&2
+  exit 0
+}
 
-# Step 1: the vxc on PATH must be the pinned build (vx/TOOLCHAIN).
-vxc_path="$(command -v vxc)" || die "vxc not on PATH"
+# Step 1: the vxc on PATH must be the pinned build for this host (vx/TOOLCHAIN).
+vxc_path="$(command -v vxc)" || skip "vxc not on PATH"
 command -v b3sum >/dev/null || die "b3sum not on PATH (cargo install --locked b3sum)"
-want="$(sed -n 's/^vxc_blake3 = "\(.*\)"/\1/p' TOOLCHAIN)"
-[[ -n "$want" ]] || die "vx/TOOLCHAIN has no vxc_blake3"
+host="$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')"
+want="$(sed -n "s/^vxc_blake3\.$host = \"\(.*\)\"/\1/p" TOOLCHAIN)"
+[[ -n "$want" ]] || skip "vx/TOOLCHAIN has no vxc_blake3.$host (FRICTION.md W-10)"
 have="$(b3sum --no-names "$vxc_path")"
-[[ "$have" == "$want" ]] || die "vxc hash $have != $want (vx/TOOLCHAIN)"
+[[ "$have" == "$want" ]] || die "vxc hash $have != $want (vx/TOOLCHAIN vxc_blake3.$host)"
 
 # VX-WORKAROUND W-15 (issue to file): vxc asks the llvm-config on PATH for its runtime
 # libraries. That one matches rustc's LLVM, not vxc's LLVM 22 (11 §4.2), so point vxc at its own.
