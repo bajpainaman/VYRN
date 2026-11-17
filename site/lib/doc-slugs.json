@@ -11,5 +11,8 @@
   "08-epochs",
   "09-chain",
   "10-accounts-risk-md",
-  "11-build"
+  "11-build",
+  "12-commitment",
+  "13-availability",
+  "14-envelope"
 ]

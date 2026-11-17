@@ -31,7 +31,8 @@ Terms local to this chapter:
 
 | Term | Meaning |
 |---|---|
-| received packet | A request packet that reaches the NIC of the live sequencer of the active home. |
+| received packet | A request packet that passed the edge filters E1–E4 (04 §3.4) and reached the NIC of the live sequencer of the active home (01 §14.19 A). |
+| ingress loss | A request packet that was sent but never received: dropped by a policer, lost on the wire, or sent to a crashed box. It gets no response (REQ-LAT-14). |
 | accepted packet | A received packet that is not answered `BUSY`. It may still get rejects (`RATE_LIMIT`, `BOOK_HALTED`, …); those are outcomes, not exemptions. |
 | shed packet | A received packet that deadline admission (01 §14.1) answers with `Reject BUSY` and does not apply. |
 | first record | The first response record that carries a message's outcome: its `index`, or for a maker fill its handle. |
@@ -106,10 +107,12 @@ Terms local to this chapter:
 
 ### 3.1 The envelope
 
-REQ-LAT-1 has no envelope. It holds for every received packet at any load and under any client
-behaviour: overload is answered `BUSY`, a session over its buckets gets `RATE_LIMIT`, a halted
-book answers `BOOK_HALTED`, and each of these is a first record within `LAT_MAX_NS`. Its only
-preconditions are the target: `REF`, tuned per 06, with B1, B17 and B18 passed on that box.
+REQ-LAT-1 has no load envelope. Its scope is the ingress contract: it holds for every received
+packet (§1) at any load and under any client behaviour. Overload is answered `BUSY`, a session over
+its buckets gets `RATE_LIMIT`, a halted book answers `BOOK_HALTED`, and each of these is a first
+record within `LAT_MAX_NS`. Packets the edge drops are ingress loss, bounded separately by
+REQ-LAT-14 and never counted as answered (01 §14.19 A). REQ-LAT-1's only preconditions are the
+target: `REF`, tuned per 06, with B1, B17 and B18 passed on that box.
 
 The rate requirements (REQ-LAT-5, REQ-THR-1) hold under all of these conditions:
 
@@ -130,7 +133,8 @@ maximum.**
 - Mechanism: deadline admission (01 §14.1, REQ-LAT-3). It is what makes the bound a maximum.
 - Test: B3 (full `WL-REF`, full capture), B9 (every type at 10%, 60% and 100% load), B32. One
   sample above `LAT_MAX_NS` fails the run. A run with zero samples of some (type, index) cell of
-  §3.3 is invalid.
+  §3.3 is invalid. A run is also invalid unless its counters reconcile: per port, `sent =
+  received + policed + wire loss`, and every received packet was answered (01 §14.19 A).
 
 **REQ-LAT-2. Every stage stays inside its row of §4.1.**
 - Point: `M-STAGE`. Bound: the max of each stage over the run is ≤ its row. A stage before the
@@ -262,6 +266,16 @@ bit out → first bit of the drop-copy record. Owner: 10. Test: B35.
 start and after the opening uncross meet REQ-LAT-1, with zero `BUSY` in the first 100 ms. The
 warm standby `vyrn-seq` in F2 (01 §14.4) warms its caches by replay as a follower before it takes
 over. Test: B19, B13 (every packet in the first 100 ms).
+
+**REQ-LAT-14. Ingress loss is bounded and reported apart from `BUSY`.** (Draft 0.3, 01 §14.19 A.)
+- Statement: under `WL-REF`, with every session within its buckets, the edge policers E2 and E4
+  drop ≤ `REQ_INGRESS_LOSS_MAX` (10⁻⁶) of sent request packets (04 Q8). A dequeue-age drop never
+  happens. Every resend of a lost packet is a received packet with its own REQ-LAT-1 bound.
+- Point: generator send counts, switch policer counters per port and per lane, the lane's
+  dequeue-drop counter, NIC RX counters. They are published next to the `BUSY` curves of
+  REQ-LAT-5 and never summed with them.
+- Test: B3, B21, B32. One dequeue-age drop fails the run.
+- Reason: without it, a design could meet REQ-LAT-1 by dropping packets it could not answer.
 
 ### 3.5 Physical facts and outcomes
 
@@ -401,7 +415,8 @@ Consequences (computed):
 4. **Session order costs no slack:** a packet behind its own session's packet waits ≤ 101 ns for
    the token. Each take is logged as `AcctTake` (01 §14.17.4), so replay is exact.
 5. **`BUSY` stays on time:** a shed (20 ns) is cheaper than service. Dequeue age > 500 ns happens
-   only above `LANE_POLICE_*`; such a packet is dropped and counted with `BUSY` (B21).
+   only if the E4 policer fails. Such a packet is ingress loss (REQ-LAT-14), not `BUSY`, and it
+   fails B21 (01 §14.16, §14.19 A).
 
 #### 4.4.3 BBO core
 
@@ -787,9 +802,13 @@ the final log, because every response is frame-gated (01 §14.5), unless all thr
 
 - Test: B5 compares a full 2 s capture of fills with the replayed final log (≥ 100 kills). B25
   forces each case of the condition and checks that a revert happens only when all three hold.
+- The three conditions above are case (a) of 07 §9.6. That list, cases (a)–(e), is the exhaustive
+  set of revert causes (01 §14.19 B). Every revert happens before the fill's block is final; none
+  happens after.
 - In CHAIN mode, one more case exists and is not a revert of the log: a packet whose `tag_com`
-  fails at the committee is busted (09 §1, decision 6). Its fills are reversed at a boundary and
-  the session bond pays the counterparties (REQ-CHN-4).
+  fails at the committee is busted (09 §1, decision 6). The fill stays in the final log, its
+  balance effects are reversed at a boundary, and the session bond pays the counterparties
+  (REQ-CHN-4). The verdict is final no later than the fill's own block.
 
 **REQ-FIN-4. Expected reverted fills ≤ 10⁻⁶ per year.**
 - Budget inputs: frame loss per path ≤ 10⁻⁹, independent between paths; sequencer stops ≤ 1 per
@@ -1302,6 +1321,7 @@ v1 is fully collateralized spot (01 §12.1). These are out of v1:
 | `REQ_BUSY_DED_MAX` | 0 | Lane-stage `BUSY` on a paced dedicated lane (REQ-LAT-5, 01 §14.17.2) |
 | `REQ_BUSY_DED_FULL`, `REQ_BUSY_DED_LOW` | 10⁻⁵, 10⁻⁸ | Total dedicated `BUSY` (shared BBO, TX and stream stages; crosses and improves only) at full book load and at ≤ `REQ_POOL_LOW_LOAD` |
 | `REQ_BUSY_POOL_FULL`, `REQ_BUSY_POOL_LOW` | 10⁻³, 10⁻⁶ | Pooled `BUSY` per pooled packet at full book load, and at ≤ `REQ_POOL_LOW_LOAD` (REQ-LAT-5) |
+| `REQ_INGRESS_LOSS_MAX` | 10⁻⁶ | Edge-policer drops per sent packet for sessions within their buckets (REQ-LAT-14) |
 | `REQ_POOL_LOW_LOAD` | 0.20 | Book load below which the low bounds of both classes apply |
 | `REQ_POOL_TOKEN_NS` | 20 | Account-token CAS inside CCD 7's L3, on every pooled path (01 §14.15) |
 | `REQ_BUSY_WAIT_MAX_NS` | 180 | Lane wait at which a `BUSY` still meets the bound: 1,000 − 20 − 800 (REQ-LAT-3; dequeue age 500) |

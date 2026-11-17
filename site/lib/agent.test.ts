@@ -18,6 +18,7 @@ describe("chapter summaries and details", () => {
     expect(chapters.map((c) => c.slug)).toEqual([
       "design", "00-index", "01-conventions", "02-requirements", "03-architecture", "04-protocol",
       "05-engine", "06-platform", "07-replication", "08-epochs", "09-chain", "10-accounts-risk-md", "11-build",
+      "12-commitment", "13-availability", "14-envelope",
     ]);
     const engine = chapters.find((c) => c.slug === "05-engine")!;
     expect(engine).toMatchObject({ number: "05", url: `${SITE_ORIGIN}/docs/05-engine`, markdown_url: `${SITE_ORIGIN}/docs/05-engine.md` });

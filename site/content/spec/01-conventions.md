@@ -436,7 +436,7 @@ Core 1 reads lanes 0–24 and core 6 reads lanes 25–48. Each writes its own ha
 
 ### 14.10 New codes
 
-- **Reject reasons:** 21 `ACCOUNT_KILLED`, 22 `RESEND_GONE`, 23 `BAD_BOOK`, 24 `BUSY`.
+- **Reject reasons:** 21 `ACCOUNT_KILLED`, 22 `RESEND_GONE`, 23 `BAD_BOOK`, 24 `BUSY`, 26 `DATA_MISSING` (draft 0.3, §14.19 C).
 - **`StepKind` adds:** `Shed`, `Control`, `Seal`, `Uncross`.
 - **Response record:** 0x87 `Bust` (CHAIN, 09).
 - `Fill.liq` = 2 means an auction fill.
@@ -557,9 +557,11 @@ accepted.
   replication.
 - **The frame gate is defined as** "written to both replication TX queues and, by B-REP-2W, on the
   wire no later than the dependent response". The wording "leave on both paths" is replaced.
-- **A packet older than its BUSY deadline at dequeue** (≥ 520 ns, which only happens when overload
-  exceeds `LANE_POLICE_*`) is not accepted. It is dropped like a wire loss and counted with BUSY
-  in B3 (03).
+- **A packet older than its BUSY deadline at dequeue** (past the 500 ns age at which a `BUSY` can
+  still leave in time, 04 §3.5) cannot occur while the E4 policer (04 §3.4) holds the lane's
+  backlog. If it occurs, E4 has failed: the lane drops the packet without a response and counts
+  it as ingress loss, not as `BUSY` (§14.19 A). The run fails B3 and B21. *(Amended in draft 0.3;
+  draft 0.2 counted it with `BUSY`, which hid a dropped packet inside the 1 µs contract.)*
 - **TX ≤ 240 ns** is a qualification maximum of its own, next to RX + TX ≤ 560 (06).
 - **A maker fill is ≤ `LAT_MAX_NS` from the taker packet's first bit (§14.14).** 03's
   `ARC_MAKER_FILL_MAX_NS` = 1250 is replaced.
@@ -605,3 +607,78 @@ Each item has an owner chapter and a benchmark that settles it.
 | O5 | 09 counts closed blocks for the finality gate (limit 9.00 ms, margin 0.89 ms), the same way 07 does. Both use `FIN_GATE_BLOCKS` = 8 closed blocks | 07, 09 | B-CHN-3 |
 | O6 | The 5 ns/msg pass-1 budget and the 15 ns BBO step are budgets, not measurements | 05 | B2, B6 |
 | O7 | PTM cross-timestamping on the X2541 / SP5 combination is unconfirmed. If it is missing, the X2541 fails qualification | 06 | PLT-B-PTM |
+
+### 14.19 Draft 0.3 rulings (decided 2026-11-16)
+
+These close two contradictions in draft 0.2. They override any chapter, including §14.0's
+wording where they refine it.
+
+**A. The 1 µs contract has an ingress scope, and drops are not responses.**
+
+Draft 0.2 said both that a session's next valid packet has "no third outcome" (04 §0) and that a
+packet past its deadline at dequeue is dropped without a response (§14.16). Both cannot hold.
+
+1. **REQ-LAT-1 covers every received packet.** A *received packet* is one that passed the edge
+   ACLs and policers E1–E4 (04 §3.4) and reached the live sequencer's NIC. For each one, VYRN
+   sends the first record of every message, or an explicit reject (`BUSY` included), within
+   `LAT_MAX_NS`, first bit in to first bit out at `M-WIRE`. There is no third outcome for a
+   received packet. The handoff window of §14.0 item 2 is unchanged.
+2. **Ingress loss is a separate fact with its own bound.** A packet that a policer drops, that the
+   network loses, or that reaches a crashed box was never received. It gets no response, and the
+   client's timer resends it by `pkt_seq` (04). 02 bounds it as REQ-LAT-14, with counters that are
+   reported next to `BUSY` and never merged into it.
+3. **A dequeue-age drop is an E4 failure.** 04 §3.5 proves that with E4 working, every pending
+   packet can still be shed in time. A drop at dequeue therefore means the policer failed. It is
+   counted as ingress loss and fails the run (§14.16).
+4. **No benchmark may count a drop as a met deadline.** B3, B9, B21 and B32 reconcile
+   `sent = received + policed + wire loss` per port, and `received = answered`.
+
+**B. A fill has exactly two ways to be undone, and both end at finality.**
+
+Draft 0.2's DESIGN §0 said a fill "does not revert" except after a double drop, while 07 §9.6
+listed five revert cases, 09 busts fills in CHAIN, and 04 said a `Bust` follows a failed
+settlement. The rule is:
+
+1. **Revert (log exclusion).** The final log does not contain the execution. This is possible only
+   before the block that holds it is final, and only in the cases (a)–(e) of 07 §9.6: double path
+   loss plus sequencer death, dual-path isolation of a live sequencer, in-box power loss while
+   `lead < 0`, an unavailable or excluded packet, and a Byzantine sequencer's truncated tail. 07
+   §9.6 is the exhaustive list. Clients learn it from `DC_REVERT` and `MD_TRADE_BUST`.
+2. **Bust (CHAIN only, compensating reversal).** The execution stays in the final log, and
+   matching replays exactly as it ran. Lane ops at the next boundary reverse its balance effects
+   and the session bond pays (09 §5.9). A fill is busted only when one side's packet failed
+   `tag_com`. That verdict is in the exclusion list of the block that holds the bad packet, which
+   is final no later than the fill's own block.
+3. **`FINAL` fixes an execution's fate.** After the block that holds an execution is final, nothing
+   reverts it, and no new bust verdict can apply to it. A bust whose verdict was already final
+   still executes later as lane ops; its `DC_REVERT` is sent before the `DC_FINAL` that covers the
+   fill's step (10 §8.2). Settlement never undoes a final fill. A failure to settle is an
+   operational incident handled by 09's custody rules, not a `Bust`.
+4. **A revert voids the trade.** A reverted execution never happened: no balance moved, no fee is
+   charged, and both parties' orders are as if the packet carried no such fill (the canonical
+   replay decides what rests). Nobody pays compensation in cases (a)–(c), where no party
+   misbehaved. In case (d) the withholding or equivocating session's losses stay its own, and in
+   case (e) the sequencer operator is slashed in CHAIN (09). A client that hedged on a fill that
+   later reverts carries that risk; 12 §4 says what a client may rely on before `FINAL`.
+5. **Who pays** for a bust: the busted session's bond, then the insurance fund (09 §5.9).
+6. **One fault can revert, in one case.** Every revert needs two independent faults, a Byzantine
+   sequencer or a misbehaving client, except case (c): an in-box power loss while `lead < 0`, a
+   window of ≤ 100 ns per response (12 §2, B-REP-2W).
+
+**C. Withheld data copies are attributed and contained (13 §5).** DAV-1 to DAV-4 are binding:
+
+1. **DAV-1.** Each voter counts, per session, records it resolved only from the sequencer
+   (07 §5.5 source 3). Over `DAV_MISS_MAX` = 16 in any `DAV_WINDOW_MS` = 10 ms window, it signs
+   `DataMissing{session, window, count}`. Q such reports close the session through the control op
+   of 07 §5.6, with reject reason 26 `DATA_MISSING` (25 is reserved for `RESEND_RECOVERY`, 03 Request 10).
+2. **DAV-2.** The sequencer serves source-3 repairs for one session at ≤ `DAV_SESSION_REPAIR_PPS`
+   = 2,000 packets/s.
+3. **DAV-3.** The leader may mark a DAV-1-reported session's unrepaired packets unavailable while
+   the sequencer lives (extends 07 §9.4), so one client cannot trip the finality gate. Their
+   executions revert as case (d).
+4. **DAV-4.** The service contract publishes `DAV_TOLERANCE` (1.3 × 10⁻³ of a block's packets,
+   all misbehaving sessions together) and states that no session can delay another session's
+   finality.
+
+12 (`12-commitment.md`) states the whole lifecycle. 13 and 14 hold the data-availability model and
+the workload envelope.

@@ -20,7 +20,7 @@ export default function DevelopersPage() {
       </p>
       <h2 id="endpoints">Endpoints</h2>
       <ul>
-        <li><code>GET /api/v1/chapters</code>: DESIGN.md and chapters 00–11, with HTML and Markdown URLs.</li>
+        <li><code>GET /api/v1/chapters</code>: DESIGN.md and chapters 00–14, with HTML and Markdown URLs.</li>
         <li><code>GET /api/v1/chapters/{"{slug}"}</code>: one chapter&apos;s numbered sections and its full Markdown.</li>
         <li><code>GET /api/v1/search?q=&#123;words&#125;&amp;limit=&#123;1–50&#125;</code>: sections and spec IDs containing every word.</li>
         <li><code>GET /api/v1/ids/{"{id}"}</code>: where a spec ID such as <code>INV-WRITER</code> is defined.</li>

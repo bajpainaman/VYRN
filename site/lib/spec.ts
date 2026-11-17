@@ -62,6 +62,9 @@ const SHORT_LABELS: Record<string, string> = {
   "09-chain": "Chain",
   "10-accounts-risk-md": "Accounts & risk",
   "11-build": "Build",
+  "12-commitment": "Commitment",
+  "13-availability": "Availability",
+  "14-envelope": "Envelope",
 };
 
 async function loadDoc(file: string, slug: string, number: string): Promise<Doc> {

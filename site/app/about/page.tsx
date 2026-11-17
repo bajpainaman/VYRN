@@ -26,8 +26,8 @@ export default function AboutPage() {
       </p>
       <h2>What this site holds</h2>
       <p>
-        <Link href="/docs/design">DESIGN.md</Link>, the design in one document, and the twelve spec chapters from{" "}
-        <Link href="/docs/00-index">00 Index</Link> to <Link href="/docs/11-build">11 Build</Link>. The site renders them from
+        <Link href="/docs/design">DESIGN.md</Link>, the design in one document, and the fifteen spec chapters from{" "}
+        <Link href="/docs/00-index">00 Index</Link> to <Link href="/docs/14-envelope">14 Envelope</Link>. The site renders them from
         the same Markdown that lives in the <a href={REPO_URL}>source repository</a>, so the two cannot drift. Agents can read
         the same content as Markdown or through the <Link href="/developers">read-only API</Link>.
       </p>

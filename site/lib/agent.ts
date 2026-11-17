@@ -144,7 +144,7 @@ Do not use it for live market data, trading or order entry: none exist.
 - Find a section or spec ID: GET ${SITE_ORIGIN}/api/v1/search?q=<words> (JSON), then fetch its url.
 - Read a whole chapter: GET ${SITE_ORIGIN}/docs/<slug>.md, or send Accept: text/markdown to the HTML URL.
 - Resolve a spec ID: GET ${SITE_ORIGIN}/api/v1/ids/<ID>.
-- DESIGN.md is the design in one document; chapters 00–11 are normative, and 01 §14 overrides any chapter.
+- DESIGN.md is the design in one document; chapters 00–14 are normative, and 01 §14 overrides any chapter.
 - API guide, errors and versioning policy: ${SITE_ORIGIN}/developers
 
 ## Docs

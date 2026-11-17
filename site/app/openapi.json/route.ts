@@ -20,7 +20,7 @@ const spec = {
     "/api/v1/chapters": {
       get: {
         operationId: "listChapters",
-        summary: "List DESIGN.md and spec chapters 00–11",
+        summary: "List DESIGN.md and spec chapters 00–14",
         description: "Use first, to find a chapter's slug.",
         responses: { "200": { description: "Chapters", content: { "application/json": { schema: { type: "object", required: ["chapters"], properties: { chapters: { type: "array", items: { $ref: "#/components/schemas/ChapterSummary" } } } } } } } },
       },

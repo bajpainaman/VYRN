@@ -8,7 +8,7 @@ export default function NotFound() {
         <div className="relative px-5 pb-10 pt-8 sm:px-8">
           <h1 className="display max-w-[14ch] text-[clamp(2.6rem,6vw,5rem)]">No ticket at this address.</h1>
           <p className="mt-4 max-w-[52ch] text-[18px]">
-            The page does not exist. The design and the twelve spec chapters are below.
+            The page does not exist. The design and the fifteen spec chapters are below.
           </p>
           <span className="stamp mt-6 rotate-[-4deg] text-[22px]">
             <span className="stamp-label">Reject · unknown route</span>
@@ -26,7 +26,7 @@ export default function NotFound() {
           </Link>
           <Link href="/docs/00-index" className="routebox bg-canary">
             <span className="box"><Arrow /></span>
-            <span>Read the spec<small>Chapters 00–11</small></span>
+            <span>Read the spec<small>Chapters 00–14</small></span>
           </Link>
         </nav>
       </div>

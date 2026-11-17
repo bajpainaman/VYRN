@@ -228,7 +228,7 @@ export function Ticket() {
           </div>
           <Link href="/docs/00-index" className="routebox bg-canary" onClick={() => track("route_click", { to: "spec", from: "hero" })}>
             <span className="box"><Arrow /></span>
-            <span>Read the spec<small>Chapters 00–11</small></span>
+            <span>Read the spec<small>Chapters 00–14</small></span>
           </Link>
           <a href={REPO_URL} className="routebox bg-canary" onClick={() => track("route_click", { to: "github", from: "hero" })}>
             <span className="box"><Arrow /></span>

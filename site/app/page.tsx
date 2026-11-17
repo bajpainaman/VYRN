@@ -376,7 +376,7 @@ function Close() {
           </TrackedLink>
           <TrackedLink href="/docs/00-index" event="route_click" eventProps={{ to: "spec", from: "close" }} className="routebox inverse">
             <span className="box"><Arrow /></span>
-            <span>Read the spec<small>Chapters 00–11</small></span>
+            <span>Read the spec<small>Chapters 00–14</small></span>
           </TrackedLink>
           <TrackedLink href={REPO_URL} event="route_click" eventProps={{ to: "github", from: "close" }} className="routebox inverse">
             <span className="box"><Arrow /></span>
