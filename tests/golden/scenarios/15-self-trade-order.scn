@@ -1,0 +1,19 @@
+# One session trades with itself (STP none). Its B-packet for the taker message has the resp_seq
+# reserved at the op's lane position q, and a maker packet of step s precedes a lane packet at q
+# only when cut_s[lane] < q (04 §7.1 numbering rule). The step's cut includes q, so the session
+# sees all taker records of the message first, then its maker records (also 04 §7.2 R-MAKER).
+
+book band=90..110 qptl=1 max_qty=100
+lane 1 first=0x01000001
+account 1 lane=1 base=10 quote=1000
+session 0x11 account=1
+
+msg 1 0x11 0 rx=1 seq=1 : new sell day 100 1 0xa1
+=> 0x11 ack 0 0x01000001 100 0xa1
+msg 1 0x11 0 rx=2 seq=2 step=1 : new buy day 100 2 0xa2
+=> 0x11 fill 0 1 0x01000002 100 1
+=> 0x11 ack 0 0x01000002 100 0xa2
+=> 0x11 fill maker 0 0x01000001 100 1
+
+check resting 0x01000002
+check account 1 open=1 base_free=10 base_resv=0 quote_free=900 quote_resv=100

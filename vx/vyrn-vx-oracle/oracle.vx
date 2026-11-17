@@ -656,6 +656,33 @@ fn op_msg(b : *mut Book, ev : &Ev, a : i64, m : *const u8) -> void {
   reject(b, ev.idx, BAD_TYPE, D_UNKNOWN_TYPE, 0u64);
 }
 
+// A session sees its taker records before its own maker records of the same step: the B-packet's
+// resp_seq is reserved at the op's lane position, and a maker packet of step s goes before a lane
+// packet at q only when cut_s[lane] < q (04 §7.1 numbering rule, §7.2 R-MAKER). A stable move of
+// the requester's maker records (index 0xFF) to the end gives that order; others keep theirs.
+fn taker_first(b : *mut Book) -> void {
+  unsafe {
+    let n = (*b).out_n;
+    if n < 2i64 || n > (*b).out_cap { return; }
+    let tmp : *mut u8 = alloc(n * 32i64, 16i64);
+    if is_null_mut(tmp) { return; }
+    let mut k = 0i64;
+    for pass in 0i64..2i64 {
+      for i in 0i64..n {
+        let r : *mut u8 = offset_mut((*b).out, i * 32i64);
+        let mk = rd32(r, 0i64) == (*b).out_session && rd8(r, 17i64) == 255u64;
+        if (pass == 1i64) == mk {
+          for j in 0i64..32i64 { wr8(tmp, k * 32i64 + j, rd8(r, j)); }
+          k = k + 1i64;
+        }
+      }
+    }
+    for j in 0i64..(n * 32i64) { wr8((*b).out, j, rd8(tmp, j)); }
+    let t : *mut i8 = tmp;
+    dealloc(t, 16i64);
+  }
+}
+
 // ---- the opening auction uncross (08 §7.6) -------------------------------------------------
 
 fn depth(b : *mut Book, side : u64, t : u64) -> u64 {
@@ -843,6 +870,7 @@ pub fn pbo_apply(b : *mut Book, evp : *const u8, out : *mut u8, out_cap : u32) -
     (*b).fault = 0u64;
     if ev.kind == 1u64 {
       op_msg(b, &ev, a, m);
+      taker_first(b);
     } else if shed {
       let t = rd8(m, 0i64);
       let mut tag = 0u64;

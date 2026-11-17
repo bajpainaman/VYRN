@@ -106,6 +106,8 @@ typedef struct {
  * - One record list per event. Each session's records are in the order that session's client
  *   sees them; that is the order a harness compares. Across sessions the order is: a maker's
  *   record when its fill or STP removal happens, the taker's merged Fill when its level ends.
+ * - Within the session that sent a message, all of the message's records come before that
+ *   session's own maker records of the step (04 §7.1 numbering rule, §7.2 R-MAKER).
  * - Every New and priority-losing Replace that passes the lane checks takes its account's lane's
  *   next handle, also when it never rests (IOC, FOK, STP, post-only reject at the book).
  * - CancelAll (04 §6.6, vector V15): one CancelAck per live order of the session in ascending
