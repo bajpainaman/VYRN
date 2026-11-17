@@ -17,7 +17,7 @@ const DARK = {
   "#191b26": "#ebe6d2", // ink
   "#565a6b": "#b8bccb", // muted ink
   "#5a2d91": "#c4a6f7", // violet
-  "#f2d447": "#534509", // canary fill
+  "#f2d447": "#544400", // canary fill
   "#f4b7c2": "#5a2836", // pink fill
   "#ede5f6": "#2e2542", // stamp wash
   "#ffffff": "#1c1d24", // white fill (clients, externals)

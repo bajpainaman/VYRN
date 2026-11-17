@@ -228,13 +228,13 @@ The same form printed in reverse on carbon paper. The site follows the reader's 
 
 | Token | Light | Dark | Role in the dark |
 |---|---|---|---|
-| canary | #f2d447 | #1f1d13 | the sheet: warm near-black, still a canary ply |
-| canary-shade | #e6c534 | #2d2a1b | hover fill |
+| canary | #f2d447 | #272107 | the sheet: a deep saturated canary, still a canary ply |
+| canary-shade | #e6c534 | #352c0c | hover fill |
 | pink | #f4b7c2 | #2e1d23 | the carbon copy, a dark rose ply |
 | ply | #fcfcf9 | #18191f | the reading ply, cool and a step apart from the sheet |
 | figure | #ffffff | #121318 | table, ASCII and drawing frames |
 | ink | #191b26 | #ebe6d2 | text and every rule, now pale |
-| ink-soft | #4a4318 | #c9bd85 | secondary text on the sheet, tinted toward canary |
+| ink-soft | #4a4318 | #d6c26a | secondary text on the sheet, tinted toward canary |
 | ink-mute | #565a6b | #a3a7b7 | secondary text on the reading ply |
 | buy | #1e4db7 | #8aa9ff | BUY |
 | sell | #a3161d | #ff8a80 | SELL |
@@ -243,7 +243,7 @@ The same form printed in reverse on carbon paper. The site follows the reader's 
 | slab / on-slab | ink / canary | canary / ink | inked controls: primary route, active tab, live home, plain-button hover |
 | well / on-well | ink / canary | #0e0f14 / canary | inked surfaces: the license slip and code blocks |
 
-Canary stops being the ground and becomes the accent: it fills only the slabs and inks the well. Violet, blue and red keep their meanings, lightened to hold at least 7:1 on every dark ply. Drawn figures use a palette-swapped copy that `scripts/sync-diagrams.mjs` writes at build time (canary fill #534509, pink fill #5a2836, white fill #1c1d24, ink #ebe6d2, violet #c4a6f7, muted #b8bccb); the build fails on a colour with no dark mapping. The share image (`og.png`) has one look, the light one.
+Canary stops being the ground and becomes the accent: it fills only the slabs and inks the well. Violet, blue and red keep their meanings, lightened to hold at least 7:1 on every dark ply. Drawn figures use a palette-swapped copy that `scripts/sync-diagrams.mjs` writes at build time (canary fill #544400, pink fill #5a2836, white fill #1c1d24, ink #ebe6d2, violet #c4a6f7, muted #b8bccb); the build fails on a colour with no dark mapping. The share image (`og.png`) has one look, the light one.
 
 **The Carbon Rule.** Ink inverts; plies keep their hue. A dark surface is a dark canary, pink or white ply, never a neutral grey, and anything inked in the light (a slab or a well) stays the strongest mark in the dark.
 

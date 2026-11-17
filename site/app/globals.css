@@ -9,13 +9,13 @@
    is a carbon sheet: the plies keep their hue as dark paper, ink turns pale, and canary moves
    from ground to accent (the slab). Ratios are checked against each pair's own ground. */
 @theme {
-  --color-canary: light-dark(#f2d447, #1f1d13);
-  --color-canary-shade: light-dark(#e6c534, #2d2a1b);
+  --color-canary: light-dark(#f2d447, #272107);
+  --color-canary-shade: light-dark(#e6c534, #352c0c);
   --color-pink: light-dark(#f4b7c2, #2e1d23);
   --color-ply: light-dark(#fcfcf9, #18191f);
   --color-figure: light-dark(#ffffff, #121318); /* the field inside table, ASCII and diagram frames */
   --color-ink: light-dark(#191b26, #ebe6d2);
-  --color-ink-soft: light-dark(#4a4318, #c9bd85); /* secondary text on canary: ink tinted toward the ply */
+  --color-ink-soft: light-dark(#4a4318, #d6c26a); /* secondary text on canary: ink tinted toward the ply */
   --color-ink-mute: light-dark(#565a6b, #a3a7b7); /* secondary text on the white ply */
   --color-buy: light-dark(#1e4db7, #8aa9ff);
   --color-sell: light-dark(#a3161d, #ff8a80); /* 5.3:1 on canary, 7.4:1 on the dark sheet */
