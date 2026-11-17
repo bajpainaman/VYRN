@@ -467,6 +467,8 @@ fn check(o: &mut Oracle, p: Pending) -> Result<(), String> {
 struct State {
     phase: u8,
     resting: Vec<u32>,
+    lanes: Vec<u8>,
+    last_step: u64,
     accounts: BTreeMap<u32, [u64; 6]>,
     fee_acc: Vec<i64>,
 }
@@ -492,6 +494,9 @@ impl State {
                 b.len()
             ));
         }
+        let lanes = (0..n)
+            .map(|i| b.get(32 + 48 * i + 13).copied().unwrap_or_default())
+            .collect();
         let resting = (0..n)
             .map(|i| u32_at(32 + 48 * i).unwrap_or_default())
             .collect();
@@ -519,6 +524,8 @@ impl State {
         Ok(Self {
             phase: b[6],
             resting,
+            lanes,
+            last_step: u64_at(16).unwrap_or_default(),
             accounts,
             fee_acc,
         })
@@ -539,6 +546,24 @@ impl State {
                     .collect::<Result<Vec<_>, _>>()?;
                 if self.resting != want {
                     return Err(format!("resting is {:#010x?}", self.resting));
+                }
+            }
+            Some("last_step") => {
+                let want = num(toks.get(1).copied().unwrap_or_default())?;
+                if self.last_step != want {
+                    return Err(format!("last_step is {}", self.last_step));
+                }
+            }
+            Some("lane") => {
+                let h = n32(toks.get(1).copied().unwrap_or_default())?;
+                let want = n8(toks.get(2).copied().unwrap_or_default())?;
+                let i = self
+                    .resting
+                    .iter()
+                    .position(|r| *r == h)
+                    .ok_or(format!("{h:#x} is not resting"))?;
+                if self.lanes[i] != want {
+                    return Err(format!("{h:#x} has lane {}", self.lanes[i]));
                 }
             }
             Some("fee_acc") => {

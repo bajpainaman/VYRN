@@ -21,7 +21,7 @@ One item per line; `#` starts a comment. Numbers are decimal or `0x` hex, `_` al
 | `step KIND` | `rescan`, `depletion`, `idle`, `seal`, or a number |
 | `phase P` / `uncross REF [step=]` | a `Control` step / the uncross with reference tick REF |
 | `=> SID RECORD`, `=> none`, `=> error event\|full\|cap\|fault` | the expected outcome of the event above |
-| `check resting H...` / `check account ID field=v...` / `check phase P` / `check fee_acc L v` | the canonical state bytes |
+| `check resting H...` / `check account ID field=v...` / `check phase P` / `check fee_acc L v` / `check lane H L` / `check last_step S` | the canonical state bytes |
 
 OP: `new SIDE TIF [post] [stp=N] TICK QTY TAG`, `cancel H TAG`, `reduce H BY TAG`,
 `replace SIDE TIF [post] [stp=N] H TICK QTY`, `cancel_all TAG`, `heartbeat`, `raw HEX`.

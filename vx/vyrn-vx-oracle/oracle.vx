@@ -69,7 +69,7 @@ const TAKING : u64 = 2;
 // ---- state -------------------------------------------------------------------------------
 
 struct Ord {
-  handle : u64, acct : i64, session : u64, rank : u64,
+  handle : u64, acct : i64, session : u64, lane : u64, rank : u64,
   side : u64, tif : u64, post : u64, stp : u64, flags : u64,
   tick : u64, total : u64, filled : u64, tag : u64,
   rx : u64, seq : u64, state : u64, cause : u64,
@@ -310,7 +310,12 @@ fn settle(b : *mut Book, i : i64, q : u64, f : u64, ppm : i64) -> void {
     }
     (*a).quote_free = add(b, (*a).quote_free, rebate);
     let acc : *mut i64 = offset_mut((*b).fee_acc, (*a).lane as i64);
-    *acc = *acc + (fee as i64) - (rebate as i64);
+    // Signed and checked too (W-11): an accumulator that cannot hold the fee is a fault.
+    if fee > 9223372036854775807u64 || rebate > 9223372036854775807u64 { (*b).fault = 1u64; }
+    let (x, o1) = (*acc).overflowing_add(fee as i64);
+    let (y, o2) = x.overflowing_sub(rebate as i64);
+    if o1 || o2 { (*b).fault = 1u64; }
+    *acc = y;
     (*o).filled = (*o).filled + q;
   }
 }
@@ -478,7 +483,7 @@ fn enter(b : *mut Book, ev : &Ev, a : i64, f : u64, tick : u64, total : u64, fil
     let h = alloc_handle(b, a);
     let rk : *mut u64 = offset_mut((*b).rank, ev.lane as i64);
     *ord(b, i) = Ord {
-      handle : h, acct : a, session : ev.session, rank : *rk,
+      handle : h, acct : a, session : ev.session, lane : ev.lane, rank : *rk,
       side : f & 1u64, tif : (f >> 1u64) & 3u64, post : (f >> 3u64) & 1u64,
       stp : (f >> 4u64) & 3u64, flags : f,
       tick : tick, total : total, filled : filled, tag : tag,
@@ -522,16 +527,17 @@ fn target(b : *mut Book, a : i64, h : u64, idx : u64, tag : u64) -> i64 {
   }
   return i;
 }
-// Removes r lots from a live order: all of it ends the order (04 §6.4).
+// Removes r lots from a live order: all of it ends the order (04 §6.4). The CancelAck goes to
+// the session that sent the op, which can be another session of the same account (04 §6.1).
 fn reduce_by(b : *mut Book, i : i64, r : u64, idx : u64, tag : u64) -> void {
   let o = ord(b, i);
   let op = open(b, i);
   unsafe {
     if r >= op {
-      emit(b, (*o).session, R_CXL, idx, 0u64, (*o).handle, op, tag);
+      emit(b, (*b).out_session, R_CXL, idx, 0u64, (*o).handle, op, tag);
       kill(b, i, END_CANCELED);
     } else {
-      emit(b, (*o).session, R_CXL, idx, 0u64, (*o).handle, r, tag);
+      emit(b, (*b).out_session, R_CXL, idx, 0u64, (*o).handle, r, tag);
       release(b, i, r);
       (*o).total = (*o).total - r;
     }
@@ -590,7 +596,7 @@ fn op_replace(b : *mut Book, ev : &Ev, a : i64, m : *const u8) -> void {
     if (*b).fault != 0u64 { (*b).fault = 0u64; reject(b, idx, RISK_CREDIT, U32_MAX, tag); return; }
     if need > have && need - have > free { reject(b, idx, RISK_CREDIT, cap32(need - have - free), tag); return; }
     if left > 0u64 && (*b).n_orders >= (*b).max_orders { (*b).fault = 2u64; return; }
-    emit(b, (*o).session, R_CXL, idx, 0u64, (*o).handle, open(b, i), tag);
+    emit(b, (*b).out_session, R_CXL, idx, 0u64, (*o).handle, open(b, i), tag);
     kill(b, i, END_CANCELED);
     if left == 0u64 { return; }
     let _reserved = reserve(b, a, f & 1u64, tick, left, idx, tag);
@@ -675,12 +681,14 @@ fn uncross(b : *mut Book, ref_in : u64) -> void {
     let mut bimb = 0u64;
     let mut bdist = 0u64;
     let mut have = false;
-    // Every tick where D or S steps, the reference, and the band edges (08 §7.6 Lemma 1, 2).
-    for k in -3i64..(*b).n_orders {
+    // C2 is an interval whose ends are where D or S steps: an order's tick, or one tick beside it.
+    // Its tick nearest the reference is one of those ends or the reference (08 §7.6 Lemma 1, 2).
+    for k in -3i64..(3i64 * (*b).n_orders) {
       let mut t = r;
       if k == -2i64 { t = (*b).band_lo; }
       if k == -1i64 { t = (*b).band_hi; }
-      if k >= 0i64 { t = (*ord(b, k)).tick; }
+      if k >= 0i64 { t = (*ord(b, k / 3i64)).tick + ((k % 3i64) as u64) - 1u64; }
+      if t < (*b).band_lo || t > (*b).band_hi { continue; }
       let d = depth(b, 0u64, t);
       let s = depth(b, 1u64, t);
       let v = min(d, s);
@@ -799,7 +807,8 @@ pub fn pbo_apply(b : *mut Book, evp : *const u8, out : *mut u8, out_cap : u32) -
   let shed = ev.kind == 2u64 && ev.arg == 6u64;
   if (ev.kind == 1u64 || shed) && a < 0i64 { return E_EVENT; }
   unsafe {
-    if ev.kind == 1u64 && (rd8(m, 0i64) == 1u64 || rd8(m, 0i64) == 4u64) && (*b).n_orders >= (*b).max_orders {
+    // A Replace checks capacity itself, only when it appends an order.
+    if ev.kind == 1u64 && rd8(m, 0i64) == 1u64 && (*b).n_orders >= (*b).max_orders {
       return E_FULL;
     }
     (*b).out = out;
@@ -808,7 +817,6 @@ pub fn pbo_apply(b : *mut Book, evp : *const u8, out : *mut u8, out_cap : u32) -
     (*b).out_session = ev.session;
     (*b).step = ev.step;
     (*b).fault = 0u64;
-    if ev.step > (*b).last_step { (*b).last_step = ev.step; }
     if ev.kind == 1u64 {
       op_msg(b, &ev, a, m);
     } else if shed {
@@ -824,12 +832,14 @@ pub fn pbo_apply(b : *mut Book, evp : *const u8, out : *mut u8, out_cap : u32) -
       // Rescan, Depletion, Idle and Seal are no-ops in the sequential specification (05 §2.3).
     } else if ev.kind == 3u64 && ev.arg >= CONT && ev.arg <= FROZ {
       (*b).phase = ev.arg;
-    } else if ev.kind == 4u64 && (*b).phase == AUCT {
+    } else if ev.kind == 4u64 && ((*b).phase == AUCT || (*b).phase == FROZ) {
       uncross(b, rd32(m, 0i64));
     } else {
       return E_EVENT;
     }
     if (*b).fault == 2u64 { return E_FULL; }
+    // Only an event that was applied moves the canonical last StepId.
+    if ev.step > (*b).last_step { (*b).last_step = ev.step; }
     if (*b).fault != 0u64 { return E_FAULT; }
     if (*b).out_n > (*b).out_cap { return E_CAP; }
     return (*b).out_n as u32;
@@ -866,7 +876,7 @@ pub fn pbo_state_bytes(b : *mut Book, out : *mut u8, cap : u64) -> u64 {
       wr32(r, 4i64, (*acct(b, (*o).acct)).id);
       wr32(r, 8i64, (*o).session);
       wr8(r, 12i64, (*o).flags);
-      wr8(r, 13i64, 0u64);
+      wr8(r, 13i64, (*o).lane);
       wr8(r, 14i64, (*o).rank);
       wr32(r, 16i64, (*o).tick);
       wr32(r, 20i64, (*o).total);

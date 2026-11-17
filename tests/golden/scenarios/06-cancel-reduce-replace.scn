@@ -7,6 +7,7 @@ account 1 lane=1 base=50 quote=10000
 account 2 lane=1 base=50 quote=10000
 session 0x11 account=1
 session 0x12 account=2
+session 0x13 account=1             # a second session of account 1
 
 msg 1 0x11 0 rx=1 seq=1 : new sell day 100 10 0xa1
 => 0x11 ack 0 0x01000010 100 0xa1
@@ -55,6 +56,12 @@ msg 1 0x12 0 rx=14 seq=14 step=2 : new buy ioc 100 1 0xb3
 => 0x11 fill maker 0 0x01000013 100 1
 msg 1 0x11 0 rx=15 seq=15 : replace sell day 0x01000013 99 1
 => 0x11 cancel_ack 0 0x01000013 3 0xa6
+
+# Another session of the same account may cancel; the CancelAck answers that session (04 §6.1).
+msg 1 0x11 0 rx=16 seq=16 : new sell day 105 2 0xa7
+=> 0x11 ack 0 0x01000015 105 0xa7
+msg 1 0x13 0 rx=17 seq=17 : cancel 0x01000015 0xc1
+=> 0x13 cancel_ack 0 0x01000015 2 0xc1
 
 check resting
 check account 1 open=0 base_free=46 base_resv=0 quote_free=10403 quote_resv=0

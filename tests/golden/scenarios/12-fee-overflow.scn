@@ -1,0 +1,15 @@
+# A fee accumulator that cannot hold a step's fees is an engine fault (10 §4.5), not a wrap.
+# One lane, qptl = 9e18, rates 999,999 ppm: each fee is ceil(9e18 × 999999 / 10^6) =
+# 8,999,991,000,000,000,000, which fits i64, but maker plus taker does not.
+
+book band=1..10 qptl=9000000000000000000 max_fee_ppm=999999 max_qty=1
+lane 1 first=0x01000001
+account 1 lane=1 base=1 maker=999999
+account 2 lane=1 quote=17999991000000000000 taker=999999
+session 0x11 account=1
+session 0x12 account=2
+
+msg 1 0x11 0 rx=1 seq=1 : new sell day 1 1 0xa1
+=> 0x11 ack 0 0x01000001 1 0xa1
+msg 1 0x12 0 rx=2 seq=2 step=1 : new buy day 1 1 0xb1
+=> error fault
