@@ -214,7 +214,8 @@ impl Record {
                 client_tag: c,
             },
             Self::EPOCH_NOTICE => {
-                need(i == 0 && w == 0)?;
+                // Bytes 10–11 of the home word are 0 (04 §7.4).
+                need(i == 0 && w == 0 && b >> 16 == 0)?;
                 Self::EpochNotice {
                     next: Epoch(a),
                     home: b,
@@ -297,5 +298,30 @@ impl Record {
 
     pub fn encode(self) -> [u8; 16] {
         self.raw().to_array()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoch_notice_home_word_bytes_10_11_are_reserved() {
+        let ok = Record::EpochNotice {
+            next: Epoch(1001),
+            home: 2 | 1 << 8,
+            secs: 3600,
+        }
+        .encode();
+        assert!(Record::decode(&ok).is_ok());
+        let (mut b10, mut b11) = (ok, ok);
+        b10[10] = 1;
+        b11[11] = 0x80;
+        for bad in [b10, b11] {
+            assert_eq!(
+                Record::decode(&bad),
+                Err(WireError::bad_type(PROTO_D_RESERVED))
+            );
+        }
     }
 }
