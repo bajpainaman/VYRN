@@ -1,0 +1,15 @@
+[
+  "design",
+  "00-index",
+  "01-conventions",
+  "02-requirements",
+  "03-architecture",
+  "04-protocol",
+  "05-engine",
+  "06-platform",
+  "07-replication",
+  "08-epochs",
+  "09-chain",
+  "10-accounts-risk-md",
+  "11-build"
+]

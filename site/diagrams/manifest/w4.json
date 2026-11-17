@@ -1,0 +1,98 @@
+[
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 26,
+    "file": "03-architecture-26",
+    "width": 1180,
+    "height": 950,
+    "alt": "A sequence between lane A and the BBO core for self-trade prevention with STP = cancel oldest. The lane pushes the cross; during step s the BBO core finds account a's own order h at the head of level a1, marks it closed in its own array and continues with the next head, writing no lane field. The fill ring carries (s, h, STP-out) back, the lane writes the tombstone on h, and the TX core sends Out(h, cause STP) and the taker's Fill/Out to the client in step s."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 27,
+    "file": "03-architecture-27",
+    "width": 1180,
+    "height": 840,
+    "alt": "A sequence for Replace(h, tick′, qty′) from client through NICk to lane L, the BBO core and fill TX. The lane applies the tombstone of h and the insert of h′ as one lane op at LaneSeq x, so no step sees both. A join is acked on pass 2 after LaneCut covers x; a cross or improve is pushed to the BBO core and answered by fill TX. The old part follows §6.3: CancelAck(h, rest), or Reject TOO_LATE if a step with cut[L] < x already filled h fully."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 28,
+    "file": "03-architecture-28",
+    "width": 1180,
+    "height": 1080,
+    "alt": "A sequence for ResendReq(from, to) across client, NICk, lane L, the hot ring and R2 recovery. The lane rate-checks, prefetches from the hot ring and gates the request like an ack, so the first resent packet leaves within 965 ns and the rest follow at ARC_RESEND_PKTS_PER_POLL = 4 per loop. Below a divider, a `from` older than the hot ring gets Reject RESEND_RECOVERY, and the client asks R2, which serves packets from the finalized log or Reject RESEND_GONE if both tiers dropped them."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 29,
+    "file": "03-architecture-29",
+    "width": 1180,
+    "height": 1100,
+    "alt": "A sequence from the BBO core through TX-A/B/C, the stream core and the NICs to the maker's lane L. After step s ends at t=540, the TX cores wait for released_step = s (t=600), send the taker's B-packet first at t=880 and then maker packets at 880 + 16k ns from the maker's credit of 16. A ruler shows one core's six maker packets at 896 to 976 fitting before 980 = LAT_MAX_NS, 18 across three cores. The maker's lane settles from the fill event at its next packet boundary, off the latency path."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 30,
+    "file": "03-architecture-30",
+    "width": 1180,
+    "height": 1070,
+    "alt": "A sequence for opening a BASE session across client, vyrn-admin, vyrn-seq c51, lane L and the replicas. The gateway authenticates over TLS, maps the account to lane L, draws K_seq and K_out and installs the session through the control ring; the lane applies it at LaneSeq x and logs a ControlRecord on A|B, so a replica's session table is replayable. Once LaneCut covers x the client gets SessionId, lane address and keys, all within ARC_SESSION_OPEN_MS = 5."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 31,
+    "file": "03-architecture-31",
+    "width": 1180,
+    "height": 1030,
+    "alt": "A sequence for opening a CHAIN session from a wallet through any validator, Simplex (n = 5), sequencer c51 and lane L. The open transaction is included in block h, finalized within FINALITY_MAX_MS, and its certificate lets the validators derive K_com and the sequencer derive K_seq and K_out before the lane installs the session at LaneSeq x. A budget bar splits ARC_SESSION_OPEN_CHAIN_MS = 20 into finality ≤ 10 ms and the install plus notification, and a code box shows the X25519 then BLAKE3 derive_key key derivation."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 32,
+    "file": "03-architecture-32",
+    "width": 1180,
+    "height": 1130,
+    "alt": "A sequence for one block across vyrn-seq c4/c7, replicas R1..Rn, the Simplex leader and clients. The sequencer fills the block for 1 ms, closes it with data_root and seq_sig in 0.05 ms, and four 0.5 ms hops (header, propose, notarize, finalize) give a certificate at about 3.05 ms; replicas vote once they hold the data, not after replay. A ruler shows 3.05 ms under a timely network, at most 6.05 ms with a data miss, both inside FINALITY_MAX_MS = 10."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 33,
+    "file": "03-architecture-33",
+    "width": 1180,
+    "height": 980,
+    "alt": "A sequence for sequencer failover across vyrn-seq F1, voters R1..R4, standby vyrn-seq F2 and clients. F1 goes silent at t=0; voters detect it at 2 ms, finalize the longest prefix Q replicas hold and certify S_f by 10 ms; F2 replays to S_f and goes live at S_f + 1 by 15 ms; clients re-send unacked packets and trade by 20 ms. A bar splits FAILOVER_TARGET_MS = 20 into detect 2, agree ≤ 8, go live ≤ 5 and client redirect ≤ 5, and notes stress that no voter is promoted."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 34,
+    "file": "03-architecture-34",
+    "width": 1180,
+    "height": 920,
+    "alt": "An epoch handoff between the old home (e) and the new home (e+1) across a WAN gap of 35–110 ms. The old home sends EpochNotice, stops at last step S, finalizes S within 10 ms and ships the log tail with cert(HandoffRecord e, S, state_root, log_hash, next_seq_key) in one WAN one-way; INV-FENCE rejects any epoch-e record past S. The new home, warm and taking orders in an auction-only phase from T, verifies, replays to S, opens and uncrosses the auction and runs continuous at S + 1, so the no-fill window is about finality plus one WAN one-way."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 35,
+    "file": "03-architecture-35",
+    "width": 1180,
+    "height": 920,
+    "alt": "A sequence for a data-tier miss from replica Rk to its peers and, last, vyrn-seq c51. A replica holding a PacketRecord without its payload waits ARC_DATA_WAIT_US = 200, then fetches from two peers at once, which answer in 0.5–1 ms; with no reply by ARC_DATA_FETCH_MS = 2 it asks the sequencer, which serves from the lane's RX retention. If the payload is still missing the replica does not vote, so an invented PacketRecord cannot be notarized."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 36,
+    "file": "03-architecture-36",
+    "width": 1180,
+    "height": 1100,
+    "alt": "A sequence for a BUSY shed at lane L from client and NICk to the cut, BBO and core 4 and the A|B paths. The packet waits 480 ns in the RX ring; on dequeue the lane predicts the cross at message 9 would end at 480 + 560 = 1040 > 980 and sheds it, logging PacketRecord{flags.SHED} and gating it like any packet. A ruler shows the BUSY path from dequeue, 20 + 170 + 20 + 10 + 20 + 240 = 480 ns, reaching the client at 960, which sets ARC_ADMIT_AGE_MAX_NS = 980 − 480 = 500."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 37,
+    "file": "03-architecture-37",
+    "width": 1180,
+    "height": 1270,
+    "alt": "A sequence for a Shed step at the BBO core across client, NICk, lane T, the BBO core, core 4 and fill TX. Message 9 is pushed at t=425 but other lanes' crosses put its head at t=580, and since 580 + 390 + 15 > 980 the core writes a Shed step instead of starting. The Shed event reaches the lane at t=690, the lane writes Reject BUSY into the reserved resp_seq at t=730, and the client gets it at 970; a ruler shows the 390 ns shed path plus the 15 ns ARC_BBO_TEST_NS against the 980 deadline, and the TX cores write nothing."
+  }
+]

@@ -1,0 +1,106 @@
+[
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 0,
+    "file": "03-architecture-00",
+    "width": 1200,
+    "height": 920,
+    "alt": "VYRN as one system in the middle, with the eight outside parties around it: trading clients, market-data subscribers, back offices, exchange and validator operators, GPS time, the external chain and auditors. Each arrow keeps its direction and names its transport. Trading clients send every request packet twice, one copy to vyrn-seq and one to vyrn-data, and receive fills, acks and rejects over UDP."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 1,
+    "file": "03-architecture-01",
+    "width": 1200,
+    "height": 1240,
+    "alt": "The container diagram: a client's request goes to vyrn-seq and the same bytes go to vyrn-data. vyrn-seq sends ORDER, HASH and HEADER frames, and vyrn-data sends payloads, to every voting replica and observer of the unit, where the two roads join. The replicas feed vyrn-dropcopy, follower homes (certificates, finalized log) and the archive node; the observer feeds subscribers. Every response from vyrn-seq waits for the frame gate, and vyrn-admin sends control ops to vyrn-seq and the replicas."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 2,
+    "file": "03-architecture-02",
+    "width": 1200,
+    "height": 1180,
+    "alt": "Three homes, NYC, LDN and TYO, joined by WAN links with one-way budgets of ~35, ~110 and ~80 ms. A 24-hour UTC bar shows the rotation: TYO 00:00–08:00, LDN 08:00–16:00, NYC 16:00–24:00, 8 hours each, then back to TYO. Inside one home the facilities F1–F4 (plus F5 in CHAIN) form a full mesh of dark fibre within ARC_METRO_ONEWAY_US (500 µs), each link made of three independent fibre sets: path A, path B and data."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 3,
+    "file": "03-architecture-03",
+    "width": 1200,
+    "height": 970,
+    "alt": "Roles of one BASE unit before and after the boundary T between TYO (epoch e) and LDN (epoch e+1). Before T, TYO runs the live sequencer, voting replicas R1–R4, observers and data boxes while LDN follows the log; at T the sequencer stops at S with cert(HandoffRecord e, S), and the roles swap so LDN is active from S + 1. Colour marks live, voting, data-tier and idle roles; no box changes binary, and SEQ and SBY never vote."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 4,
+    "file": "03-architecture-04",
+    "width": 1200,
+    "height": 1250,
+    "alt": "The active home's F1 as three separate networks. Clients cross-connect to both client leaves CA and CB; vyrn-seq takes NIC0–1 from CA and NIC2–3 from CB, vyrn-data takes a D-in port from each, and the R1 replica and observer send MD-out to both. vyrn-seq's RNA and RNB go to the replication switches RA and RB, the data box and R1's D ports meet on the DX data switch, and RA, RB and DX each leave on their own fibre set to F2…Fn. Two GPS grandmasters feed PTP to every switch, and a separate OOB switch carries management."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 5,
+    "file": "03-architecture-05",
+    "width": 1200,
+    "height": 1010,
+    "alt": "The vyrn-seq core map on the AMD EPYC 9575F, drawn as a floorplan. CCD0 holds only the latency-critical cores: TX-C, the two cut cores, the BBO core, TX-A, TX-B and the two stream cores. CCD1–5 and two cores of CCD6 carry the 42 dedicated lanes, CCD7 carries the 7-core pool, and CCD6 also holds the order hasher c50, the non-isolated OS core c51 and spares c52–55; a lane's hot set of at most 3 MiB lets 8 lanes share one 32 MiB L3."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 6,
+    "file": "03-architecture-06",
+    "width": 1200,
+    "height": 760,
+    "alt": "The vyrn-seq NIC and queue map. Client NICs NIC0–NIC3 hang off leaves CA and CB, each with an IP, an RX port range, one VI and CTPIO queue per lane and a TX queue for each of the TX cores c3, c5 and c0; below them the 49 lanes are drawn to scale (13, 13, 12, 4 dedicated plus 7 pooled). The replication NICs RNA and RNB on RA and RB converge on one step: c4/c7 write each frame to both, sfence, then publish released_step."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 7,
+    "file": "03-architecture-07",
+    "width": 1200,
+    "height": 880,
+    "alt": "The pool on CCD7: seven cores, c56–c62 for lanes 42–48, each with its own RX VI and LaneSeq. A core whose queue is empty takes the head packet of a sibling's queue under its consumer lock, so the seven act as one M/M/7 queue. For each packet the core CASes the account token (≈ 20 ns, inside CCD7), logs AcctTake{account, ver, lane}, and keeps the packet only if pkt_seq is the session's next expected; otherwise it puts it back and takes the next queue head."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 8,
+    "file": "03-architecture-08",
+    "width": 1200,
+    "height": 1270,
+    "alt": "The vyrn-seq memory map in 1 GiB huge pages. A to-scale bar shows lane arenas at about 248 GiB of the 253 GiB total, against a 288 GiB huge-page budget and a box with at least 384 GiB. Below, every region keeps its sizes: H hot lines in one 2 MiB page with their writers and readers, R SPSC rings (72 MiB), B BBO core (3.7 GiB), K session keys, L lane arenas, T order stream and C control."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 9,
+    "file": "03-architecture-09",
+    "width": 1200,
+    "height": 900,
+    "alt": "The replica box core map in replay mode. NIC filters on the A and B ports send ORDER frames (ARC_ORDER_PORT) to c1 and headers (ARC_CTRL_PORT) to c4, and the D0/D1 ports deliver each lane's payloads to replay lane l. CCD0 holds ORDER-IN, BBO replay, consensus, block check, control and the NVMe store; c8–56 run replay lanes 0–48; CCD7 holds hashing, the state root, the recovery service or vyrn-md, and vyrn-dropcopy with the peer-fetch server."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 10,
+    "file": "03-architecture-10",
+    "width": 1200,
+    "height": 920,
+    "alt": "Replay dependencies on one replica, where an arrow means 'must be applied first'. Lane l applies a packet at LaneSeq x only after it has the PacketRecord from c1, the payload checked by pkt_hash, and the fill events of steps up to s0. The BBO replay core applies step s from its StepRecord once every lane's counter reaches s.cut[l], then emits fill events back to the lanes and output rings to vyrn-md, vyrn-dropcopy and the state root; the loop has no cycle because fills_applied names only earlier steps."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 11,
+    "file": "03-architecture-11",
+    "width": 1200,
+    "height": 780,
+    "alt": "The data box as an assembly line for one lane: the client copy arrives through CA/CB and the ingest port into lane l's RX queue on core c(1 + l mod 16), which checks the header and rate-limits by source. The core writes the packet to a 5-second retention ring (59 GB of DRAM at ~94 Gbps per box), which the c17 fetch server reads for fetches, and re-sends it unchanged to group 239.H.U.3 on ARC_DATA_PORT_BASE + l through DX to every replica's D port. The box does no MAC check and no ordering."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 12,
+    "file": "03-architecture-12",
+    "width": 1200,
+    "height": 790,
+    "alt": "The CONSUMER box core map on a 16-core Ryzen 9 9950X3D. CCD0, the V-Cache CCD, holds the OS core, one cut core for all 11 lanes, the BBO core, the fill-TX and stream core, and lanes 0–3, whose hops to the BBO core stay on one CCD. Lanes 4–10 on CCD1 each pay one cross-CCD hop, as on REF, and c15 is the hasher. One 100GbE NIC carries clients and path A, and an X2522 gives path B its own card and switch."
+  }
+]

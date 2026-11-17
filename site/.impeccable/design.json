@@ -1,0 +1,483 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-14T05:48:35+00:00",
+  "title": "Design System: VYRN",
+  "extensions": {
+    "colorMeta": {
+      "canary": {
+        "role": "primary",
+        "displayName": "Canary Top Ply",
+        "canonical": "oklch(87.1% 0.157 96.8)",
+        "tonalRamp": [
+          "#100b00",
+          "#302400",
+          "#534000",
+          "#795f00",
+          "#a07f00",
+          "#bea428",
+          "#dcca78",
+          "#fcefb8"
+        ]
+      },
+      "ink": {
+        "role": "primary",
+        "displayName": "Carbon Ink",
+        "canonical": "oklch(22.5% 0.022 276.5)",
+        "tonalRamp": [
+          "#0a0b0e",
+          "#24252a",
+          "#40414a",
+          "#5e606d",
+          "#7e8191",
+          "#a2a4b1",
+          "#c6c8d3",
+          "#eceef5"
+        ]
+      },
+      "stamp": {
+        "role": "secondary",
+        "displayName": "Time-Clock Violet",
+        "canonical": "oklch(41.2% 0.157 300.2)",
+        "tonalRamp": [
+          "#0e061a",
+          "#2b1a44",
+          "#4c3172",
+          "#6f4aa4",
+          "#9465d7",
+          "#b390ee",
+          "#d4baff",
+          "#f6e4ff"
+        ]
+      },
+      "stamp-wash": {
+        "role": "secondary",
+        "displayName": "Stamp Wash",
+        "canonical": "oklch(93.3% 0.024 307.0)",
+        "tonalRamp": [
+          "#0c0a0d",
+          "#26242a",
+          "#444049",
+          "#645e6b",
+          "#867e8f",
+          "#a8a2b0",
+          "#ccc7d2",
+          "#f0edf4"
+        ]
+      },
+      "buy": {
+        "role": "tertiary",
+        "displayName": "Buy Blue",
+        "canonical": "oklch(45.7% 0.176 263.2)",
+        "tonalRamp": [
+          "#030a1f",
+          "#0e224e",
+          "#1d3d82",
+          "#2e5aba",
+          "#427af3",
+          "#71a2ff",
+          "#a1c9ff",
+          "#d2efff"
+        ]
+      },
+      "sell": {
+        "role": "tertiary",
+        "displayName": "Sell Red",
+        "canonical": "oklch(46.0% 0.174 25.7)",
+        "tonalRamp": [
+          "#1b0303",
+          "#460e0e",
+          "#751f1d",
+          "#a8302e",
+          "#dd4542",
+          "#f67b72",
+          "#ffaba2",
+          "#ffdbd3"
+        ]
+      },
+      "pink": {
+        "role": "neutral",
+        "displayName": "Pink Carbon",
+        "canonical": "oklch(83.8% 0.072 6.7)",
+        "tonalRamp": [
+          "#12080a",
+          "#341e22",
+          "#59373d",
+          "#81515b",
+          "#ab6e7a",
+          "#c9959e",
+          "#e6bdc4",
+          "#ffe6eb"
+        ]
+      },
+      "ply": {
+        "role": "neutral",
+        "displayName": "White Original",
+        "canonical": "oklch(99.0% 0.004 106.5)",
+        "tonalRamp": [
+          "#0b0b09",
+          "#252523",
+          "#424240",
+          "#61615f",
+          "#828280",
+          "#a5a5a2",
+          "#c9c9c6",
+          "#efefec"
+        ]
+      },
+      "figure-white": {
+        "role": "neutral",
+        "displayName": "Figure White",
+        "canonical": "oklch(100.0% 0.000 89.9)",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#252525",
+          "#424242",
+          "#616161",
+          "#828282",
+          "#a5a5a5",
+          "#c9c9c9",
+          "#eeeeee"
+        ]
+      },
+      "canary-shade": {
+        "role": "neutral",
+        "displayName": "Canary Shade",
+        "canonical": "oklch(82.8% 0.156 95.4)",
+        "tonalRamp": [
+          "#110a00",
+          "#302300",
+          "#544000",
+          "#7a5e00",
+          "#a27e00",
+          "#bfa327",
+          "#dec978",
+          "#fdefb8"
+        ]
+      },
+      "ink-soft": {
+        "role": "neutral",
+        "displayName": "Ink on Canary",
+        "canonical": "oklch(38.0% 0.062 100.1)",
+        "tonalRamp": [
+          "#0d0b04",
+          "#282514",
+          "#474327",
+          "#68623c",
+          "#8b8454",
+          "#ada67f",
+          "#cfcaac",
+          "#f3efda"
+        ]
+      },
+      "ink-mute": {
+        "role": "neutral",
+        "displayName": "Muted Ink",
+        "canonical": "oklch(47.0% 0.028 274.9)",
+        "tonalRamp": [
+          "#0a0b0e",
+          "#23252c",
+          "#3f414d",
+          "#5d6070",
+          "#7d8195",
+          "#a0a4b5",
+          "#c5c8d6",
+          "#eceef7"
+        ]
+      },
+      "code-text": {
+        "role": "neutral",
+        "displayName": "Code Text",
+        "canonical": "oklch(94.1% 0.011 297.6)",
+        "tonalRamp": [
+          "#0c0a0f",
+          "#26242a",
+          "#424147",
+          "#626067",
+          "#838188",
+          "#a6a4ab",
+          "#cac8cf",
+          "#efedf5"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "The ticket headline in the INSTRUCTIONS field only."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Ticket part titles and doc sheet titles."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Spec h2, ruled above."
+      },
+      "subtitle": {
+        "displayName": "Subtitle",
+        "purpose": "Spec h3."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Landing copy, tabular figures."
+      },
+      "body-spec": {
+        "displayName": "Body Spec",
+        "purpose": "Doc prose at a 58ch measure."
+      },
+      "route": {
+        "displayName": "Route",
+        "purpose": "Routing-box labels."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Printed field captions, expanded and tracked."
+      },
+      "data": {
+        "displayName": "Data",
+        "purpose": "Field values, bytes, hex, IDs, timestamps."
+      },
+      "grid": {
+        "displayName": "Grid",
+        "purpose": "ASCII diagrams and code on a true cell grid."
+      },
+      "stamp": {
+        "displayName": "Stamp",
+        "purpose": "Time-clock stamps and the live home only."
+      }
+    },
+    "shadows": [
+      {
+        "name": "ticket-lift",
+        "value": "0 18px 40px -28px rgba(25,27,38,0.55)",
+        "purpose": "Under the hero ticket only, lifting it off its pink copy."
+      },
+      {
+        "name": "results-sheet",
+        "value": "0 14px 30px -18px rgba(25,27,38,0.6)",
+        "purpose": "Under the spec-search results list only."
+      },
+      {
+        "name": "scroll-edge",
+        "value": "radial-gradient(farthest-side at 0 50%, rgba(25,27,38,0.22), transparent)",
+        "purpose": "Edge shade inside sideways-scrolling tables, ASCII and figures."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-strike",
+        "value": "cubic-bezier(0.2, 1.4, 0.4, 1)",
+        "purpose": "Stamp strike, 260ms, with overshoot; disabled under reduced motion (end state shown)."
+      },
+      {
+        "name": "ease-out",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Routing-box fill (160ms), arrow nudge (180ms), disclosure arrow (150ms)."
+      },
+      {
+        "name": "stamp-sequence",
+        "value": "350ms, 650ms, 650ms, 900ms",
+        "purpose": "Display pacing for RX, CUT, FILLED, FINAL; labelled as a simulation."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sm",
+        "value": "640px"
+      },
+      {
+        "name": "md",
+        "value": "768px"
+      },
+      {
+        "name": "lg",
+        "value": "1024px"
+      },
+      {
+        "name": "xl",
+        "value": "1280px"
+      },
+      {
+        "name": "container",
+        "value": "1440px"
+      }
+    ],
+    "focus": [
+      {
+        "name": "ring-light",
+        "value": "outline: 2px solid #5a2d91; outline-offset: 3px",
+        "purpose": "Every focusable on canary, pink and white plies."
+      },
+      {
+        "name": "ring-ink",
+        "value": "outline-color: #f2d447",
+        "purpose": "Inside [data-surface=ink], the inked primary routing box and code blocks (violet is 1.8:1 on ink)."
+      }
+    ],
+    "diagramPalette": {
+      "source": "/Users/namanbajpai/plankbook/.claude/skills/excalidraw-diagram/references/color-palette.md",
+      "style": "/Users/namanbajpai/plankbook/site/diagrams/STYLE.md"
+    }
+  },
+  "components": [
+    {
+      "name": "Routing Box",
+      "kind": "button",
+      "refersTo": "routebox",
+      "description": "A labelled destination on the ticket's routing slip; canary cell with an arrow box.",
+      "html": "<a class=\"ds-route\" href=\"#\"><span class=\"ds-box\"><svg width=\"18\" height=\"14\" viewBox=\"0 0 18 14\" aria-hidden=\"true\"><path d=\"M1 7h14M10 1.5 15.5 7 10 12.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.4\" stroke-linecap=\"square\"/></svg></span><span>Read the spec<small>Chapters 00–11</small></span></a>",
+      "css": ":host{--color-canary:#f2d447;--color-canary-shade:#e6c534;--color-pink:#f4b7c2;--color-ply:#fcfcf9;--color-ink:#191b26;--color-ink-soft:#4a4318;--color-ink-mute:#565a6b;--color-buy:#1e4db7;--color-sell:#a3161d;--color-stamp:#5a2d91;--color-stamp-wash:#ede5f6;--rule:2px solid var(--color-ink);--ease-strike:cubic-bezier(0.2,1.4,0.4,1);--ease-out:cubic-bezier(0.16,1,0.3,1);font-family:Archivo,sans-serif;color:var(--color-ink)} .ds-route{display:flex;align-items:center;gap:14px;padding:18px 20px;font-family:Archivo,sans-serif;font-stretch:112%;font-weight:800;font-size:19px;line-height:1.15;text-decoration:none;color:var(--color-ink);background:var(--color-canary);border:var(--rule);transition:background-color 160ms var(--ease-out),color 160ms var(--ease-out)} .ds-route .ds-box{flex:none;width:24px;height:24px;border:2.5px solid currentColor;display:grid;place-items:center} .ds-route .ds-box svg{transition:transform 180ms var(--ease-out)} .ds-route small{display:block;font-stretch:100%;font-weight:500;font-size:13px;margin-top:3px;color:var(--color-ink-soft)} .ds-route:hover{background:var(--color-canary-shade)} .ds-route:hover .ds-box svg,.ds-route:focus-visible .ds-box svg{transform:translateX(2px)} .ds-route:focus-visible{outline:2px solid var(--color-stamp);outline-offset:3px}"
+    },
+    {
+      "name": "Routing Box, Primary",
+      "kind": "button",
+      "refersTo": "routebox-primary",
+      "description": "The one inked action per slip: Read the design. Focus ring turns canary on ink.",
+      "html": "<a class=\"ds-route ds-primary\" href=\"#\"><span class=\"ds-box\"><svg width=\"18\" height=\"14\" viewBox=\"0 0 18 14\" aria-hidden=\"true\"><path d=\"M1 7h14M10 1.5 15.5 7 10 12.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.4\" stroke-linecap=\"square\"/></svg></span><span>Read the design<small>The answer in one document</small></span></a>",
+      "css": ":host{--color-canary:#f2d447;--color-canary-shade:#e6c534;--color-pink:#f4b7c2;--color-ply:#fcfcf9;--color-ink:#191b26;--color-ink-soft:#4a4318;--color-ink-mute:#565a6b;--color-buy:#1e4db7;--color-sell:#a3161d;--color-stamp:#5a2d91;--color-stamp-wash:#ede5f6;--rule:2px solid var(--color-ink);--ease-strike:cubic-bezier(0.2,1.4,0.4,1);--ease-out:cubic-bezier(0.16,1,0.3,1);font-family:Archivo,sans-serif;color:var(--color-ink)} .ds-route{display:flex;align-items:center;gap:14px;padding:18px 20px;font-family:Archivo,sans-serif;font-stretch:112%;font-weight:800;font-size:19px;line-height:1.15;text-decoration:none;color:var(--color-ink);background:var(--color-canary);border:var(--rule);transition:background-color 160ms var(--ease-out),color 160ms var(--ease-out)} .ds-route .ds-box{flex:none;width:24px;height:24px;border:2.5px solid currentColor;display:grid;place-items:center} .ds-route .ds-box svg{transition:transform 180ms var(--ease-out)} .ds-route small{display:block;font-stretch:100%;font-weight:500;font-size:13px;margin-top:3px;color:var(--color-ink-soft)} .ds-route:hover{background:var(--color-canary-shade)} .ds-route:hover .ds-box svg,.ds-route:focus-visible .ds-box svg{transform:translateX(2px)} .ds-route:focus-visible{outline:2px solid var(--color-stamp);outline-offset:3px} .ds-route.ds-primary{background:var(--color-ink);color:var(--color-canary)} .ds-route.ds-primary small{color:color-mix(in oklab,var(--color-canary) 82%,var(--color-ink))} .ds-route.ds-primary:hover{background:#000} .ds-route.ds-primary:focus-visible{outline-color:var(--color-canary)}"
+    },
+    {
+      "name": "Plain Button",
+      "kind": "button",
+      "refersTo": "button-plain",
+      "description": "Bordered canary button that inks on hover; Stamp an order, source chips.",
+      "html": "<button class=\"ds-btn\" type=\"button\">Stamp an order</button>",
+      "css": ":host{--color-canary:#f2d447;--color-canary-shade:#e6c534;--color-pink:#f4b7c2;--color-ply:#fcfcf9;--color-ink:#191b26;--color-ink-soft:#4a4318;--color-ink-mute:#565a6b;--color-buy:#1e4db7;--color-sell:#a3161d;--color-stamp:#5a2d91;--color-stamp-wash:#ede5f6;--rule:2px solid var(--color-ink);--ease-strike:cubic-bezier(0.2,1.4,0.4,1);--ease-out:cubic-bezier(0.16,1,0.3,1);font-family:Archivo,sans-serif;color:var(--color-ink)} .ds-btn{border:var(--rule);background:var(--color-canary);color:var(--color-ink);padding:8px 12px;font-family:Archivo,sans-serif;font-size:14px;font-weight:800;font-stretch:112%;border-radius:0;cursor:pointer} .ds-btn:hover{background:var(--color-ink);color:var(--color-canary)} .ds-btn:focus-visible{outline:2px solid var(--color-stamp);outline-offset:3px}"
+    },
+    {
+      "name": "Spec Search",
+      "kind": "input",
+      "refersTo": "input-search",
+      "description": "Ruled search field on the white ply with a violet focus outline.",
+      "html": "<input class=\"ds-search\" type=\"search\" placeholder=\"Find a section or ID  /\">",
+      "css": ":host{--color-canary:#f2d447;--color-canary-shade:#e6c534;--color-pink:#f4b7c2;--color-ply:#fcfcf9;--color-ink:#191b26;--color-ink-soft:#4a4318;--color-ink-mute:#565a6b;--color-buy:#1e4db7;--color-sell:#a3161d;--color-stamp:#5a2d91;--color-stamp-wash:#ede5f6;--rule:2px solid var(--color-ink);--ease-strike:cubic-bezier(0.2,1.4,0.4,1);--ease-out:cubic-bezier(0.16,1,0.3,1);font-family:Archivo,sans-serif;color:var(--color-ink)} .ds-search{width:100%;border:var(--rule);background:var(--color-ply);color:var(--color-ink);padding:8px 12px;font-family:Archivo,sans-serif;font-size:14px;border-radius:0} .ds-search::placeholder{color:var(--color-ink-mute)} .ds-search:focus{outline:none} .ds-search:focus-visible{outline:2px solid var(--color-stamp);outline-offset:2px}"
+    },
+    {
+      "name": "Site Header",
+      "kind": "nav",
+      "refersTo": "nav-cell",
+      "description": "Sticky 56px canary bar; nav items are full-height ruled cells.",
+      "html": "<header class=\"ds-head\"><a class=\"ds-mark\" href=\"#\">VYRN</a><span class=\"ds-cap\">Exchange design · draft 0.2</span><nav class=\"ds-nav\"><a href=\"#\">Design</a><a href=\"#\">Spec</a><a href=\"#\">License</a><a href=\"#\">GitHub</a></nav></header>",
+      "css": ":host{--color-canary:#f2d447;--color-canary-shade:#e6c534;--color-pink:#f4b7c2;--color-ply:#fcfcf9;--color-ink:#191b26;--color-ink-soft:#4a4318;--color-ink-mute:#565a6b;--color-buy:#1e4db7;--color-sell:#a3161d;--color-stamp:#5a2d91;--color-stamp-wash:#ede5f6;--rule:2px solid var(--color-ink);--ease-strike:cubic-bezier(0.2,1.4,0.4,1);--ease-out:cubic-bezier(0.16,1,0.3,1);font-family:Archivo,sans-serif;color:var(--color-ink)} .ds-head{display:flex;align-items:stretch;gap:12px;height:56px;background:var(--color-canary);border-bottom:var(--rule);padding-left:16px} .ds-mark{align-self:center;font-weight:900;font-stretch:125%;font-size:26px;letter-spacing:0.02em;text-decoration:none;color:inherit} .ds-cap{align-self:center;font-stretch:125%;font-weight:700;font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-ink-soft)} .ds-nav{display:flex;margin-left:auto} .ds-nav a{display:flex;align-items:center;padding:0 20px;border-left:var(--rule);font-size:15px;font-weight:700;font-stretch:112%;text-decoration:none;color:inherit} .ds-nav a:hover{background:var(--color-canary-shade)} .ds-nav a:focus-visible{outline:2px solid var(--color-stamp);outline-offset:-4px}"
+    },
+    {
+      "name": "Binder Tabs",
+      "kind": "nav",
+      "refersTo": "binder-tab",
+      "description": "Docs chapter tabs on canary; the active tab is inked.",
+      "html": "<ol class=\"ds-binder\"><li><a href=\"#\"><span>DS</span>Design</a></li><li><a href=\"#\" aria-current=\"page\"><span>03</span>Architecture</a></li><li><a href=\"#\"><span>04</span>Protocol</a></li></ol>",
+      "css": ":host{--color-canary:#f2d447;--color-canary-shade:#e6c534;--color-pink:#f4b7c2;--color-ply:#fcfcf9;--color-ink:#191b26;--color-ink-soft:#4a4318;--color-ink-mute:#565a6b;--color-buy:#1e4db7;--color-sell:#a3161d;--color-stamp:#5a2d91;--color-stamp-wash:#ede5f6;--rule:2px solid var(--color-ink);--ease-strike:cubic-bezier(0.2,1.4,0.4,1);--ease-out:cubic-bezier(0.16,1,0.3,1);font-family:Archivo,sans-serif;color:var(--color-ink)} .ds-binder{list-style:none;margin:0;padding:16px 0;background:var(--color-canary);width:232px} .ds-binder a{display:flex;gap:12px;align-items:baseline;padding:8px 20px;font-size:15px;font-weight:700;font-stretch:105%;text-decoration:none;color:var(--color-ink)} .ds-binder a span{width:28px;font-family:'Martian Mono',monospace;font-size:12px;font-weight:600;color:var(--color-ink-soft)} .ds-binder a:hover{background:var(--color-canary-shade)} .ds-binder a[aria-current]{background:var(--color-ink);color:var(--color-canary)} .ds-binder a[aria-current] span{color:var(--color-canary)}"
+    },
+    {
+      "name": "Stamp",
+      "kind": "custom",
+      "refersTo": "stamp",
+      "description": "Violet Doto time-clock stamp, struck at a hand-set angle with an overshoot; static under reduced motion.",
+      "html": "<span class=\"ds-stamp\" style=\"--rot:3deg\"><span class=\"ds-stamp-label\">Filled · Δ wire to wire</span>≤ 965 ns</span>",
+      "css": ":host{--color-canary:#f2d447;--color-canary-shade:#e6c534;--color-pink:#f4b7c2;--color-ply:#fcfcf9;--color-ink:#191b26;--color-ink-soft:#4a4318;--color-ink-mute:#565a6b;--color-buy:#1e4db7;--color-sell:#a3161d;--color-stamp:#5a2d91;--color-stamp-wash:#ede5f6;--rule:2px solid var(--color-ink);--ease-strike:cubic-bezier(0.2,1.4,0.4,1);--ease-out:cubic-bezier(0.16,1,0.3,1);font-family:Archivo,sans-serif;color:var(--color-ink)} .ds-stamp{display:inline-block;color:var(--color-stamp);border:3px solid currentColor;padding:8px 14px 9px;font-family:Doto,'Martian Mono',monospace;font-weight:800;font-size:26px;line-height:1.02;transform:rotate(var(--rot,-6deg));animation:ds-strike 260ms var(--ease-strike) both} .ds-stamp-label{display:block;font-family:Archivo,sans-serif;font-stretch:125%;font-weight:800;font-size:10px;letter-spacing:0.14em;margin-bottom:4px} @keyframes ds-strike{0%{opacity:0;transform:translateY(-14px) scale(1.18) rotate(var(--rot,-6deg))}60%{opacity:1;transform:translateY(0) scale(0.97) rotate(var(--rot,-6deg))}100%{opacity:1;transform:translateY(0) scale(1) rotate(var(--rot,-6deg))}} @media (prefers-reduced-motion:reduce){.ds-stamp{animation:none}}"
+    },
+    {
+      "name": "Field Row",
+      "kind": "card",
+      "refersTo": "field-cell",
+      "description": "Wire-format fields in a 2px gap-as-rule grid: caption, byte range, value, hex.",
+      "html": "<dl class=\"ds-fields\"><div><dt><span>Type</span><span class=\"ds-b\">b0</span></dt><dd class=\"ds-v\">New</dd><dd class=\"ds-s\">0x01</dd></div><div><dt><span>Flags</span><span class=\"ds-b\">b1</span></dt><dd class=\"ds-v ds-buy\">BUY · IOC</dd><dd class=\"ds-s\">0x02</dd></div><div><dt><span>Tick u32</span><span class=\"ds-b\">b4–7</span></dt><dd class=\"ds-v\">104,250</dd><dd class=\"ds-s\">0x0001973A</dd></div></dl>",
+      "css": ":host{--color-canary:#f2d447;--color-canary-shade:#e6c534;--color-pink:#f4b7c2;--color-ply:#fcfcf9;--color-ink:#191b26;--color-ink-soft:#4a4318;--color-ink-mute:#565a6b;--color-buy:#1e4db7;--color-sell:#a3161d;--color-stamp:#5a2d91;--color-stamp-wash:#ede5f6;--rule:2px solid var(--color-ink);--ease-strike:cubic-bezier(0.2,1.4,0.4,1);--ease-out:cubic-bezier(0.16,1,0.3,1);font-family:Archivo,sans-serif;color:var(--color-ink)} .ds-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:2px;background:var(--color-ink);border:var(--rule);margin:0} .ds-fields>div{background:var(--color-canary);padding:10px 20px} .ds-fields dt{display:flex;justify-content:space-between;font-stretch:125%;font-weight:700;font-size:11px;letter-spacing:0.1em;text-transform:uppercase} .ds-b{font-family:'Martian Mono',monospace;font-weight:400;letter-spacing:0;text-transform:none;color:var(--color-ink-soft)} .ds-fields dd{margin:0;font-family:'Martian Mono',monospace;font-variant-numeric:tabular-nums slashed-zero} .ds-v{margin-top:6px!important;font-size:22px;font-weight:600;line-height:1.25} .ds-s{font-size:12px;color:var(--color-ink-soft)} .ds-buy{color:var(--color-buy)}"
+    },
+    {
+      "name": "Perforated Tear",
+      "kind": "custom",
+      "refersTo": "tear",
+      "description": "2px dashed cut between ticket parts with a punched notch at each end.",
+      "html": "<div class=\"ds-perf\" role=\"presentation\"></div>",
+      "css": ":host{--color-canary:#f2d447;--color-canary-shade:#e6c534;--color-pink:#f4b7c2;--color-ply:#fcfcf9;--color-ink:#191b26;--color-ink-soft:#4a4318;--color-ink-mute:#565a6b;--color-buy:#1e4db7;--color-sell:#a3161d;--color-stamp:#5a2d91;--color-stamp-wash:#ede5f6;--rule:2px solid var(--color-ink);--ease-strike:cubic-bezier(0.2,1.4,0.4,1);--ease-out:cubic-bezier(0.16,1,0.3,1);font-family:Archivo,sans-serif;color:var(--color-ink)} .ds-perf{position:relative;height:0;margin:40px 0;border-top:2px dashed var(--color-ink)} .ds-perf::before,.ds-perf::after{content:'';position:absolute;top:-9px;width:16px;height:16px;border-radius:50%;background:var(--color-canary);border:var(--rule)} .ds-perf::before{left:-9px} .ds-perf::after{right:-9px}"
+    },
+    {
+      "name": "ASCII Diagram",
+      "kind": "custom",
+      "refersTo": "code-block",
+      "description": "ASCII original on a true cell grid in a ruled white frame; scrolls, never wraps.",
+      "html": "<div class=\"ds-ascii\" tabindex=\"0\"><pre>client ──► NIC ──► lane ──► BBO core\n           │\n           └──► data tier (ply 2)</pre></div>",
+      "css": ":host{--color-canary:#f2d447;--color-canary-shade:#e6c534;--color-pink:#f4b7c2;--color-ply:#fcfcf9;--color-ink:#191b26;--color-ink-soft:#4a4318;--color-ink-mute:#565a6b;--color-buy:#1e4db7;--color-sell:#a3161d;--color-stamp:#5a2d91;--color-stamp-wash:#ede5f6;--rule:2px solid var(--color-ink);--ease-strike:cubic-bezier(0.2,1.4,0.4,1);--ease-out:cubic-bezier(0.16,1,0.3,1);font-family:Archivo,sans-serif;color:var(--color-ink)} .ds-ascii{overflow-x:auto;border:var(--rule);background:#fff} .ds-ascii pre{margin:0;padding:18px 20px;font-family:'Martian Mono',monospace;font-size:13px;line-height:1.38;font-variant-ligatures:none;font-feature-settings:'liga' 0,'calt' 0;white-space:pre;tab-size:4;color:var(--color-ink)} .ds-ascii:focus-visible{outline:2px solid var(--color-stamp);outline-offset:3px}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Order Ticket",
+    "overview": "**Creative North Star: \"The Order Ticket\"**\n\nEvery surface is a multi-part paper order ticket that a time clock stamps. The canary top ply is the ground the sequencer sees; the pink carbon is the copy routed to the data tier; the white original ply is where long reading happens. The form is printed in carbon-black ink: 2px rules, labelled cells, perforated tears between parts, a punched binding edge down the left. The page does not decorate the ticket; it is the ticket, and its printed fields carry real content (the 16-byte wire format, spec IDs, budgets).\n\nDensity is that of a working form: cells packed edge to edge, separated by rules rather than whitespace, with type doing the hierarchy. Display type is Archivo pulled condensed and black; labels are the same family pulled wide; every number and byte is Martian Mono; only the time clock prints in Doto dot-matrix. Violet is the clock's ribbon and appears only where something was stamped, has a status, or is an identifier you can follow. Motion is mechanical and rare: stamps strike, plies sit offset. Nothing else moves.\n\nThe system is flat and square. Depth is the stack of plies, not shadow; corners are never rounded. Numbers always carry their kind (budget, measured, vendor) beside them, because a ticket that misstates a figure is a wrong ticket.",
+    "keyCharacteristics": [
+      "Canary / pink / white plies as the only surfaces; ink as the only stroke.",
+      "2px ink rules and 2px gap-as-rule grids carve every region into cells.",
+      "Archivo on its width axis: condensed for display, expanded for labels.",
+      "Martian Mono for every figure, byte, ID and field value; tabular, slashed zero.",
+      "Violet stamps in Doto, struck at hand-set angles, for timestamps and statuses.",
+      "Square corners, no elevation beyond the ply stack.",
+      "Spec prose on the white ply at a 58ch measure; ASCII on a true cell grid."
+    ],
+    "rules": [
+      {
+        "name": "The Side Rule",
+        "body": "Blue and red mean BUY and SELL and nothing else, on the site and in every diagram. No blue links, no red errors, no red warnings.",
+        "section": "colors"
+      },
+      {
+        "name": "The Ribbon Rule",
+        "body": "Violet marks what the clock printed or what you can follow: stamps, statuses, timings, IDs, § references. It never fills a surface larger than a stamp-wash row, and it is never decoration.",
+        "section": "colors"
+      },
+      {
+        "name": "The Ply Rule",
+        "body": "A part sits on canary, pink or white because of what it is: canary for the hot path and the argument, pink for the copy and the data tier, white for reading and definitions. Do not pick a ply for variety.",
+        "section": "colors"
+      },
+      {
+        "name": "The Width-Axis Rule",
+        "body": "Hierarchy comes from Archivo's width and weight, not from new families. Display condenses (75–88%); labels expand (112–125%). Body stays at 100%.",
+        "section": "typography"
+      },
+      {
+        "name": "The Field Face Rule",
+        "body": "Every number, byte, hex value, timestamp and spec ID is set in Martian Mono with tabular figures and a slashed zero. Prose numbers outside fields still use tabular figures.",
+        "section": "typography"
+      },
+      {
+        "name": "The Clock Head Rule",
+        "body": "Doto prints only what the time clock prints: stamps and the live home. Doto draws \"~\" like a caret, so an approximation mark inside a stamp is set in Martian Mono.",
+        "section": "typography"
+      },
+      {
+        "name": "The Gap-Is-the-Rule Rule",
+        "body": "Do not draw internal borders on grid children. Set a 2px gap on an ink background and let the children's fill reveal the rule. Outer edges take a 2px ink border.",
+        "section": "layout"
+      },
+      {
+        "name": "The 58ch Rule",
+        "body": "Doc paragraphs, lists and blockquotes stop at 58ch (about 72 Archivo characters). Tables, ASCII, code and figures may run the full sheet width and scroll sideways.",
+        "section": "layout"
+      },
+      {
+        "name": "The Ply Stack Rule",
+        "body": "A surface reads as raised only because another ply sits under it. Do not add shadows to cells, cards or buttons.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** build every region from cells: 2px ink rules outside, a 2px gap on ink inside.",
+      "**Do** keep each number's kind (budget, measured, vendor) printed beside it.",
+      "**Do** link every spec ID and § reference, in violet with the dotted underline.",
+      "**Do** use a 2px violet focus ring at 3px offset on light plies, and switch it to canary on ink surfaces (violet is 1.8:1 on ink; canary is 11.6:1).",
+      "**Do** give each stamp its own hand-set angle and strike it with the overshoot easing; show its end state under reduced motion.",
+      "**Do** show the ASCII original under every drawn figure, one click away.",
+      "**Do** separate ticket parts with the perforated tear and give each part the punched binding edge."
+    ],
+    "donts": [
+      "**Don't** use blue or red for anything but BUY and SELL.",
+      "**Don't** use violet as a fill, a heading colour or decoration; it marks stamps, statuses, IDs and § links.",
+      "**Don't** round a corner or add a shadow to a cell, card or button.",
+      "**Don't** set Doto for anything the time clock would not print.",
+      "**Don't** wrap, reflow or ligature an ASCII diagram, or replace it with a drawing.",
+      "**Don't** let doc prose run past 58ch.",
+      "**Don't** animate anything other than a stamp strike and the small state transitions on routing boxes and disclosures.",
+      "**Don't** stack a small caption above a headline as an eyebrow; captions label a field or name a source beside it."
+    ]
+  }
+}

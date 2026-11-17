@@ -1,0 +1,417 @@
+@import "tailwindcss";
+
+/* The order-ticket world. Canary is the top ply, pink the carbon copy routed to the data
+   tier, white the original ply people read from. Blue and red mean BUY and SELL and
+   nothing else; violet is the time clock's ribbon and marks every stamp, status and ID. */
+@theme {
+  --color-canary: #f2d447;
+  --color-canary-shade: #e6c534;
+  --color-pink: #f4b7c2;
+  --color-ply: #fcfcf9;
+  --color-ink: #191b26;
+  --color-ink-soft: #4a4318; /* secondary text on canary: ink tinted toward the ply */
+  --color-ink-mute: #565a6b; /* secondary text on the white ply */
+  --color-buy: #1e4db7;
+  --color-sell: #a3161d; /* 5.3:1 on canary, so SELL reads at field size */
+  --color-stamp: #5a2d91;
+  --color-stamp-wash: #ede5f6;
+
+  --font-display: var(--font-archivo), "Archivo", sans-serif;
+  --font-data: var(--font-martian), ui-monospace, monospace;
+  --font-stamp: var(--font-doto), var(--font-martian), monospace;
+}
+
+:root {
+  --rule: 2px solid var(--color-ink);
+  --hair: 1px solid color-mix(in oklab, var(--color-ink) 28%, transparent);
+  --header-h: 56px;
+  --ease-strike: cubic-bezier(0.2, 1.4, 0.4, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  color-scheme: light;
+}
+
+@layer base {
+html {
+  scroll-padding-top: calc(var(--header-h) + 16px);
+  /* Below xl the docs keep a sticky section bar under the header; anchors land below both. */
+  @media (max-width: 1279px) { scroll-padding-top: calc(var(--header-h) + 72px); }
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: var(--color-canary);
+  color: var(--color-ink);
+  font-family: var(--font-display);
+  font-size: 17px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+  caret-color: var(--color-stamp);
+  scrollbar-color: var(--color-ink) var(--color-canary-shade);
+}
+
+::selection {
+  background: var(--color-stamp);
+  color: #fff;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-stamp);
+  outline-offset: 3px;
+}
+/* Violet is 1.8:1 on ink; on dark surfaces the ring turns canary (11.6:1). */
+[data-surface="ink"] :focus-visible,
+.routebox.primary:focus-visible,
+.code-wrap:focus-visible {
+  outline-color: var(--color-canary);
+}
+
+a {
+  color: inherit;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 0.2em;
+}
+}
+
+/* ---------- Ticket form grammar ---------- */
+
+.caption {
+  font-family: var(--font-display);
+  font-stretch: 125%;
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 1.2;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.data {
+  font-family: var(--font-data);
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+
+.cell {
+  padding: 14px 18px;
+}
+
+.rule-b { border-bottom: var(--rule); }
+.rule-r { border-right: var(--rule); }
+.rule-t { border-top: var(--rule); }
+
+/* Tear-off line between parts of the form: a dashed cut with punched notches at both edges. */
+.perf {
+  position: relative;
+  height: 0;
+  border-top: 2px dashed var(--color-ink);
+  margin-inline: -1px;
+}
+.perf::before,
+.perf::after {
+  content: "";
+  position: absolute;
+  top: -9px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--color-canary);
+  border: var(--rule);
+}
+.perf::before { left: -9px; }
+.perf::after { right: -9px; }
+
+.display {
+  font-stretch: 75%;
+  font-weight: 900;
+  line-height: 0.92;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+
+.routebox {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 18px 20px;
+  font-stretch: 112%;
+  font-weight: 800;
+  font-size: 19px;
+  line-height: 1.15;
+  text-decoration: none;
+  transition: background-color 160ms var(--ease-out), color 160ms var(--ease-out);
+}
+.routebox .box {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border: 2.5px solid currentColor;
+  display: grid;
+  place-items: center;
+}
+/* The routing box carries an arrow: it says "this goes somewhere", not "tick this option". */
+.routebox .box svg { transition: transform 180ms var(--ease-out); }
+.routebox:hover .box svg,
+.routebox:focus-visible .box svg { transform: translateX(2px); }
+.routebox:hover { background: var(--color-canary-shade); }
+.routebox.primary { background: var(--color-ink); color: var(--color-canary); }
+.routebox.primary:hover { background: #000; }
+.routebox small {
+  display: block;
+  font-stretch: 100%;
+  font-weight: 500;
+  font-size: 13px;
+  margin-top: 3px;
+  color: var(--color-ink-soft);
+}
+.routebox.inverse { background: var(--color-ink); color: var(--color-canary); }
+.routebox.inverse:hover { background: #000; }
+.routebox.inverse small { color: color-mix(in oklab, var(--color-canary) 78%, var(--color-ink)); }
+.routebox.primary small { color: color-mix(in oklab, var(--color-canary) 82%, var(--color-ink)); }
+
+/* The ticket's punched binding edge. */
+.ticket::before {
+  content: "";
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: 5px;
+  width: 8px;
+  background: radial-gradient(circle, transparent 2px, var(--color-ink) 2.1px 3.3px, transparent 3.4px) center top / 8px 16px repeat-y;
+  opacity: 0.7;
+  pointer-events: none;
+  z-index: 1; /* above the rows' own backgrounds, so the holes run the full height of every ply */
+}
+
+.routebox.inverse.primary { background: var(--color-canary); color: var(--color-ink); }
+.routebox.inverse.primary:hover { background: #fff3a8; }
+.routebox.inverse.primary small { color: var(--color-ink-soft); }
+
+/* Wide diagrams and tables scroll sideways; an edge shade says there is more. */
+.ascii-wrap, .table-wrap {
+  background:
+    linear-gradient(to right, #fff 40%, rgba(255, 255, 255, 0)) left / 32px 100% no-repeat local,
+    linear-gradient(to left, #fff 40%, rgba(255, 255, 255, 0)) right / 32px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, rgba(25, 27, 38, 0.22), transparent) left / 12px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, rgba(25, 27, 38, 0.22), transparent) right / 12px 100% no-repeat scroll,
+    #fff;
+}
+
+/* ---------- Stamps ---------- */
+
+.stamp {
+  display: inline-block;
+  color: var(--color-stamp);
+  border: 3px solid currentColor;
+  padding: 8px 14px 9px;
+  font-family: var(--font-stamp);
+  font-weight: 800;
+  line-height: 1.02;
+  /* The ribbon never inks evenly. */
+}
+.stamp .stamp-label {
+  display: block;
+  font-family: var(--font-display);
+  font-stretch: 125%;
+  font-weight: 800;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  margin-bottom: 4px;
+}
+
+@keyframes strike {
+  0% { opacity: 0; transform: translateY(-14px) scale(1.18) rotate(var(--rot, -6deg)); }
+  60% { opacity: 1; transform: translateY(0) scale(0.97) rotate(var(--rot, -6deg)); }
+  100% { opacity: 1; transform: translateY(0) scale(1) rotate(var(--rot, -6deg)); }
+}
+.strike {
+  transform: rotate(var(--rot, -6deg));
+  animation: strike 260ms var(--ease-strike) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .strike { animation: none; }
+  .prose-spec .heading-anchor, [data-stamp], [data-stamp] *, .ticket li span { transition: none; }
+  .routebox, .routebox .box svg { transition: none; }
+}
+
+/* ---------- Spec prose (white ply) ---------- */
+
+.prose-spec {
+  font-size: 17px;
+  line-height: 1.62;
+  color: var(--color-ink);
+}
+/* 58ch of Archivo is about 72 characters: "ch" is the width of a zero, wider than the average letter. */
+.prose-spec > :where(p, ul, ol, blockquote) { max-width: 58ch; }
+.prose-spec :where(p, ul, ol, blockquote, .table-wrap, .ascii-wrap, .code-wrap) { margin-block: 0 1.1em; }
+.prose-spec h1 { display: none; }
+.prose-spec h2 {
+  font-stretch: 88%;
+  font-weight: 900;
+  font-size: clamp(1.6rem, 2.4vw, 2.05rem);
+  line-height: 1.05;
+  margin: 2.6em 0 0.7em;
+  padding-top: 0.55em;
+  border-top: var(--rule);
+  text-wrap: balance;
+}
+.prose-spec h3 {
+  font-stretch: 100%;
+  font-weight: 800;
+  font-size: 1.2rem;
+  line-height: 1.2;
+  margin: 2em 0 0.5em;
+}
+.prose-spec h4 { font-weight: 800; font-size: 1rem; margin: 1.6em 0 0.4em; }
+.prose-spec :where(h2, h3, h4) a { text-decoration: none; }
+.prose-spec ul { list-style: square; padding-left: 1.25em; }
+.prose-spec ol { list-style: decimal; padding-left: 1.5em; }
+.prose-spec li { margin-block: 0.3em; }
+.prose-spec li::marker { color: var(--color-ink-mute); }
+.prose-spec strong { font-weight: 750; }
+.prose-spec blockquote { border-left: 1px solid var(--color-ink); padding-left: 1em; color: var(--color-ink-mute); }
+.prose-spec hr { border: 0; border-top: 2px dashed var(--color-ink); margin: 2.5em 0; }
+
+.prose-spec :not(pre) > code {
+  font-family: var(--font-data);
+  font-size: 0.84em;
+  background: color-mix(in oklab, var(--color-ink) 6%, transparent);
+  padding: 0.08em 0.3em;
+  border-radius: 2px;
+}
+
+.table-wrap {
+  overflow-x: auto;
+  border: var(--rule);
+  background: #fff;
+}
+.prose-spec table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 14.5px;
+  line-height: 1.45;
+}
+.prose-spec th {
+  text-align: left;
+  font-stretch: 112%;
+  font-weight: 800;
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: var(--color-canary);
+  border-bottom: var(--rule);
+  padding: 9px 12px;
+  white-space: nowrap;
+}
+.prose-spec td {
+  padding: 9px 12px;
+  border-bottom: var(--hair);
+  vertical-align: top;
+}
+.prose-spec td + td, .prose-spec th + th { border-left: var(--hair); }
+.prose-spec tr:last-child td { border-bottom: 0; }
+.prose-spec tr.id-row td:first-child { font-family: var(--font-data); font-size: 13px; font-weight: 600; white-space: nowrap; }
+.prose-spec tr:target td { background: var(--color-stamp-wash); }
+.prose-spec tr:target td:first-child { color: var(--color-stamp); }
+
+/* ASCII diagrams render on a true character grid: one face, no ligatures, no wrapping. */
+.ascii-wrap, .code-wrap {
+  overflow-x: auto;
+  border: var(--rule);
+}
+.code-wrap { background: var(--color-ink); }
+pre.ascii, pre.code {
+  margin: 0;
+  padding: 18px 20px;
+  font-family: var(--font-data);
+  font-size: 13px;
+  line-height: 1.38;
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+  white-space: pre;
+  tab-size: 4;
+  width: max-content;
+  min-width: 100%;
+}
+pre.ascii { color: var(--color-ink); }
+pre.code { color: #eceaf2; }
+pre.code ::selection { background: var(--color-canary); color: var(--color-ink); }
+
+a.spec-id {
+  font-family: var(--font-data);
+  font-size: 0.86em;
+  font-weight: 600;
+  color: var(--color-stamp);
+  text-decoration: underline dotted 1.5px;
+  text-underline-offset: 0.22em;
+  white-space: nowrap;
+}
+a.spec-id:hover { text-decoration-style: solid; }
+a.spec-id code { background: none; padding: 0; font-size: 1em; color: inherit; }
+
+/* Before hydration the stamps stay hidden, so the first stamp sequence never flashes its end state.
+   Without JavaScript the `js` class is never set and every stamp shows. */
+html.js .ticket[data-hydrated="false"] [data-stamp] { visibility: hidden; }
+
+/* Drawn diagrams: the drawing first, its ASCII original one click away. On phones the drawing keeps a
+   readable size and scrolls sideways instead of shrinking its labels to nothing. */
+/* The frame hugs the drawing and centres in its column; caption and ASCII toggle sit under it. */
+.diagram { margin: 0 auto 1.1em; width: fit-content; max-width: 100%; }
+.diagram-scroll { overflow-x: auto; border: var(--rule); background: #fff; }
+/* Every drawing renders at one scale (0.75 px per canvas unit), so a label reads the same size in every
+   figure on every page; a column narrower than that shrinks it, never stretches it. */
+.diagram-scroll img { display: block; width: calc(var(--fig-w, 1200) * 0.75px); max-width: 100%; height: auto; margin-inline: auto; }
+.diagram-scroll {
+  background:
+    linear-gradient(to right, #fff 40%, rgba(255, 255, 255, 0)) left / 32px 100% no-repeat local,
+    linear-gradient(to left, #fff 40%, rgba(255, 255, 255, 0)) right / 32px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, rgba(25, 27, 38, 0.22), transparent) left / 12px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, rgba(25, 27, 38, 0.22), transparent) right / 12px 100% no-repeat scroll,
+    #fff;
+}
+/* On phones a drawing keeps a readable size and scrolls sideways, with the edge shade as the cue. */
+@media (max-width: 767px) {
+  .diagram { width: auto; }
+  .diagram-scroll img { width: calc(var(--fig-w, 1200) * 0.57px); max-width: none; margin-inline: 0; }
+}
+.diagram figcaption { margin-top: 8px; font-size: 13.5px; color: var(--color-ink-mute); }
+.diagram-ascii { margin-top: 10px; }
+.diagram-ascii summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  cursor: pointer;
+  font-stretch: 125%;
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding-block: 6px;
+}
+.diagram-ascii summary::-webkit-details-marker { display: none; }
+.diagram-ascii .summary-arrow { transition: transform 150ms var(--ease-out); }
+.diagram-ascii[open] .summary-arrow { transform: rotate(90deg); }
+.diagram-ascii .ascii-wrap { margin-top: 8px; }
+
+/* Section anchors: every heading can be cited by its URL. */
+.prose-spec .heading-anchor {
+  margin-left: 0.4em;
+  font-family: var(--font-data);
+  font-weight: 500;
+  font-size: 0.7em;
+  color: var(--color-ink-mute);
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.prose-spec :is(h2, h3, h4):hover .heading-anchor,
+.prose-spec .heading-anchor:focus-visible { opacity: 1; }
+@media (hover: none) { .prose-spec .heading-anchor { opacity: 0.6; } }
+
+/* § references resolve to the section they cite. */
+a.spec-ref {
+  color: var(--color-stamp);
+  text-decoration: underline dotted 1.5px;
+  text-underline-offset: 0.22em;
+  white-space: nowrap;
+}
+a.spec-ref:hover { text-decoration-style: solid; }

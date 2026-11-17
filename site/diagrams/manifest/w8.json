@@ -1,0 +1,98 @@
+[
+  {
+    "slug": "09-chain",
+    "asciiIndex": 0,
+    "file": "09-chain-00",
+    "width": 1180,
+    "height": 1140,
+    "alt": "The chain on one page for one epoch. Orders go from the client to vyrn-seq, which returns fills in at most 1 µs, while the same packet goes to vyrn-data; both streams reach the 5-box committee of home H, where operator s replays and votes but never leads. A 4-of-5 certificate finalizes the chain log for followers and the public archive, and a StateCommit every second feeds the L1 bridge post; SessionOpen enters separately on the signed transaction path through the Simplex leader."
+  },
+  {
+    "slug": "09-chain",
+    "asciiIndex": 1,
+    "file": "09-chain-01",
+    "width": 1120,
+    "height": 920,
+    "alt": "The key hierarchy of one operator. The cold, offline OIK_i signs one NodeCert per home (TYO, LDN, NYC), and each NodeCert carries four single-purpose keys: NK, VK, SK and XK. Two secp256k1 keys stand apart for the L1 bridge: BK_i signs posts and GK_i can pause the bridge or veto a post."
+  },
+  {
+    "slug": "09-chain",
+    "asciiIndex": 14,
+    "file": "09-chain-14",
+    "width": 1180,
+    "height": 800,
+    "alt": "The boundary rule as a timeline of book heights. Chain block C includes book blocks up to x and is proposed near x+1.6; notarization-gated items apply at x+3, finality-gated items at x+4, and act(C) = x+9 is the deadline after which a missing item counts as censorship. The TXGATE arc shows that block x+9 waits for a finalization of block x."
+  },
+  {
+    "slug": "09-chain",
+    "asciiIndex": 20,
+    "file": "09-chain-20",
+    "width": 1180,
+    "height": 1020,
+    "alt": "A withdrawal as a sequence across user, VYRN and the L1 contract. The Withdraw moves funds to pending at the end of a chain block, a Post with the StateCommit and withdrawal root is built every 60 s and signed by 4 of 5 bridge keys, and a relayer proposes it on L1. A 3,600 s challenge period, during which any guardian may veto, makes up most of the roughly 1 h 3 min before the user can claim."
+  },
+  {
+    "slug": "11-build",
+    "asciiIndex": 0,
+    "file": "11-build-00",
+    "width": 1140,
+    "height": 2103,
+    "alt": "The repository tree of the single VYRN cargo workspace, with the C shim, the Vx code, tests, benchmarks, tools and deploy files beside the crates. The eight INV-DET engine crates sit together under crates/engine/ and share one strict clippy.toml. One repository means one commit hash per release."
+  },
+  {
+    "slug": "11-build",
+    "asciiIndex": 1,
+    "file": "11-build-01",
+    "width": 1180,
+    "height": 1490,
+    "alt": "The crate dependency graph, with every arrow meaning depends on. The eight engine crates rest on vyrn-types, and vyrn-engine depends on vyrn-lane, vyrn-bbo, vyrn-cut and vyrn-wire but never on vyrn-nic. vyrn-consensus depends only on vyrn-log and Commonware, and vyrn-replica is the only crate that sees both the Rust engine and the Vx client."
+  },
+  {
+    "slug": "11-build",
+    "asciiIndex": 3,
+    "file": "11-build-03",
+    "width": 1180,
+    "height": 864,
+    "alt": "The seven test layers as a staircase from cheapest to most expensive. Each step names the layer, when it runs and the bug class it catches, from unit, loom and Miri on every PR down to nightly cross-build determinism. Chaos on hardware is the only layer that runs on staging."
+  },
+  {
+    "slug": "11-build",
+    "asciiIndex": 4,
+    "file": "11-build-04",
+    "width": 1180,
+    "height": 1124,
+    "alt": "The vyrn-sim deterministic simulator as one container. A seeded event queue and scheduler drive simulated clients, a lossy sim network, the real vyrn-seq pipeline, a standby, replicas, data nodes and vyrn-consensus on a deterministic runtime, all on one virtual clock. Checkers test invariants after every event, so the same seed gives the same run on macOS and Linux."
+  },
+  {
+    "slug": "11-build",
+    "asciiIndex": 5,
+    "file": "11-build-05",
+    "width": 1180,
+    "height": 780,
+    "alt": "The optical capture rig. Generators send traffic over fiber through a passive tap to the SUT's RX port, and responses return through a second tap; each tap sends a 10% copy to one port of the same capture NIC. Because both ports share one PHC there is no clock error between request and response, and the capture host matches them by session and sequence."
+  },
+  {
+    "slug": "11-build",
+    "asciiIndex": 6,
+    "file": "11-build-06",
+    "width": 1180,
+    "height": 720,
+    "alt": "Observability split between a pinned core and the control core. The pinned core only writes its own CoreStats, histograms and TraceRing; the control core reads them with Relaxed loads every 100 ms, freezes traces on demand, and does all export and logging. NIC RX and TX timestamps give the in-box latency of every packet, and sampling costs at most 80 cache misses per second per core."
+  },
+  {
+    "slug": "11-build",
+    "asciiIndex": 8,
+    "file": "11-build-08",
+    "width": 1180,
+    "height": 740,
+    "alt": "The CI/CD stages as three assembly lines. A PR passes S1, S2 and the S3 perf gate before it merges; main runs S4 nightly and S5 weekly; a tag runs S6, which builds the release twice, compares the hashes, signs 2-of-3 and publishes. A perf-threshold breach cannot be overridden, and any byte difference stops the release."
+  },
+  {
+    "slug": "11-build",
+    "asciiIndex": 9,
+    "file": "11-build-09",
+    "width": 1180,
+    "height": 780,
+    "alt": "A release rollout across the three homes over four 8-hour epochs. Each home stages and restarts as followers while another home is active, and runs the new release only when its own epoch begins, so LDN, then NYC, then TYO switch over. The active home's boxes never restart mid-epoch, a canary follower must match for 4 h first, and a full rollout takes 24 hours."
+  }
+]

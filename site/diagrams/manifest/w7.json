@@ -1,0 +1,90 @@
+[
+  {
+    "slug": "08-epochs",
+    "asciiIndex": 0,
+    "file": "08-epochs-00",
+    "width": 1170.0,
+    "height": 514.5,
+    "alt": "A UTC timeline cut at 00:00, 08:00 and 16:00 into three 8-hour epochs (e ≡ 0, 1, 2, then e+3 …, by e mod 3), homed in TYO, LDN and NYC. Under each boundary sit the local opening hours (09:00 JST, 08:00 GMT or 09:00 BST, 11:00 EST or 12:00 EDT). It argues that the boundaries are UTC constants needing no time-zone table: daylight saving moves the local hour, never the boundary."
+  },
+  {
+    "slug": "08-epochs",
+    "asciiIndex": 1,
+    "file": "08-epochs-01",
+    "width": 1193.35,
+    "height": 1120.0,
+    "alt": "A two-lifeline timeline of one TYO → LDN handoff, old home on the left and new home on the right with the 110 ms WAN between them, from T−60 s to T+112.6+. The tail frames leave at the seal (T) and the HandoffSig leaves at T+2.3; both cross the WAN side by side and arrive at T+110.5 and T+112.4. It argues that the new home fills at T+112.6 ms (typical): the window is one WAN crossing plus finality and a little slack, while the old home only answers strays."
+  },
+  {
+    "slug": "08-epochs",
+    "asciiIndex": 2,
+    "file": "08-epochs-02",
+    "width": 1153.76,
+    "height": 810.0,
+    "alt": "The old sequencer's state machine: Active(e) to Deciding at T−10 s, back to Active on EpoHold (T := t_new), on to Armed(e) on EpoGo, Sealing at the first rx_ts ≥ T (or clock ≥ T + 5 µs slack), Sealed(e,S), then Redirect and Follower(e+1) once cert(e,S) is seen. A dark panel lists the five seal steps (lane stop, final cut C_f, drain, Seal step, last block). It argues that the seal takes at most 50 µs on the wire and that afterwards the old box only answers strays."
+  },
+  {
+    "slug": "08-epochs",
+    "asciiIndex": 3,
+    "file": "08-epochs-03",
+    "width": 1197.51,
+    "height": 750.0,
+    "alt": "The old replicas' state machine with two roads to Fenced(e,S). The normal road is Voting(e) → WaitFinal → Replay to S → Signed → Fenced(e,S) once Q signatures are seen. The fault road is ForceSeal (07 failover in seal mode) when no Seal frame arrives by T + EPO_SEAL_GRACE_MS (5 ms), with S := the last step of the finalized prefix. Both roads end at INV-FENCE, then EpoActivated leads to Follower(e+1)."
+  },
+  {
+    "slug": "08-epochs",
+    "asciiIndex": 4,
+    "file": "08-epochs-04",
+    "width": 1196.0,
+    "height": 596.0,
+    "alt": "The new-home replicas' state machine: Follower(e) → Preparing (sends EpoReady) at T−60 s → Collecting at T (votes on window blocks only) → Voting(e+1) once cert(e,S) verifies with an equal root → EpoActivated sent when the opening block is final. If the root differs, the replica goes Faulty and re-syncs from a snapshot. It argues that window blocks fix order, not outcome, so they can be final before the certificate, while steps wait for it."
+  },
+  {
+    "slug": "08-epochs",
+    "asciiIndex": 5,
+    "file": "08-epochs-05",
+    "width": 1200.0,
+    "height": 832.5,
+    "alt": "The new sequencer's state machine: Follower(e) → Preparing → Collect at T on its own PTP clock → Apply(S′) when the replay reaches the Seal step. A violet decision on cert(e,S) then forks. If S == S′ and the roots are equal, it runs Close window → Uncross → catch-up → Live(e+1). Otherwise it undoes to the last final block, replays to S and runs Apply(S), within a 15 ms budget. It argues that the box works ahead on its own S′ and keeps that work only if the certificate agrees."
+  },
+  {
+    "slug": "08-epochs",
+    "asciiIndex": 8,
+    "file": "08-epochs-08",
+    "width": 1080.0,
+    "height": 1322.0,
+    "alt": "Two vertical paths fork at the Seal step S and both cross the same WAN band (t_wan 110 ms, about 98% of either path). The cert path runs finality, root+sign, WAN and verify for a total of 112.4 ms. The tail path runs relay, WAN, replay tail and apply backlog for 111.8 ms at normal load. They converge on activation = max(cert path, tail path), and a dark panel gives W = activation + uncross + catch-up − (last old fill), with W typ 112.6, W max 121.8 and bound 123 ms for TYO → LDN."
+  },
+  {
+    "slug": "08-epochs",
+    "asciiIndex": 9,
+    "file": "08-epochs-09",
+    "width": 1200.0,
+    "height": 735.0,
+    "alt": "A phase bar from T: Collect, Apply (from S′ known), Close (from cert ok), Uncross (step U = (e+1, 1)), catch-up, then Live(e+1), with each phase's work written underneath. Below it, a bracket shows that the opening block spans the whole window, a violet line shows a 1 µs answer for every order throughout, and a fills line is dashed until the Uncross and solid after it. It argues that the window costs fills only."
+  },
+  {
+    "slug": "08-epochs",
+    "asciiIndex": 13,
+    "file": "08-epochs-13",
+    "width": 1200.0,
+    "height": 1041.5,
+    "alt": "The client's migration machine on a vertical spine: Active(e, H) → Scheduled(T) on the first EpochNotice → Switching at own clock ≥ T, EpochNotice(0) or Reject EPOCH_MISMATCH → Active(e+1, H′) on the first epoch-e+1 response. Beside each state are its actions: prepare keys and lanes, stop sending to H, resend unacked packets to H′ with the field changes listed in a dark panel, send new packets, and after U request any resp_seq gaps. It argues that the client switches on its own and never needs the old home after T."
+  },
+  {
+    "slug": "10-accounts-risk-md",
+    "asciiIndex": 1,
+    "file": "10-accounts-risk-md-01",
+    "width": 1200.0,
+    "height": 1060.0,
+    "alt": "The allocation cycle for one account in one book. LEDGER → IN_FLIGHT_IN on a finalized AllocTx, then into ESCROW in the lane via CtlAllocCredit. A finalized ShrinkTx moves it to SHRINKING (FREE_ONLY or CANCEL_SIDE, both debiting min(x, free)), then to IN_FLIGHT_OUT, and back to the LEDGER when the block holding AllocDebited is final. ESCROW and SHRINKING sit inside a dashed lane region. It argues that capital crosses the lane boundary only through finalized ledger transactions, never on the 1 µs path, and the conservation identity is given at the bottom."
+  },
+  {
+    "slug": "10-accounts-risk-md",
+    "asciiIndex": 8,
+    "file": "10-accounts-risk-md-08",
+    "width": 1197.36,
+    "height": 796.0,
+    "alt": "Two record streams side by side: lane channel k (ADD ADD SYNC(T) DEL ADD …, ending at a packet boundary whose header.step_base = W_k watermark) and the step channel (STEP(T) EXEC EXEC … STEP(T+3) EXEC …). A dashed link ties SYNC(T) to STEP(T), and a bracket marks the records after SYNC(T) as ordered after step T and before T+1. Definitions of SYNC(T) and W_k and the subscriber rule (apply step T only when W_k ≥ T − 1 for every k) follow. It argues that this rule lets a subscriber rebuild the replica's book exactly after every step."
+  }
+]
