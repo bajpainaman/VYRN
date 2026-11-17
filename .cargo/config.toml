@@ -1,14 +1,15 @@
 # spec/11-build.md §4.3. clang and lld must share rustc's LLVM major (§4.2); .agents/setup installs
-# them into /usr/local/bin.
+# them into /usr/local/bin. Cross-language LTO (`-C linker-plugin-lto`) is in .cargo/release.toml,
+# so debug builds skip it; `cargo release` (the alias below) adds it.
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "linker-plugin-lto", "-C", "link-arg=-fuse-ld=lld",
-             "-C", "target-cpu=x86-64-v3", "-C", "force-frame-pointers=yes"]
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "target-cpu=x86-64-v3",
+             "-C", "force-frame-pointers=yes"]
 
 [target.aarch64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "linker-plugin-lto", "-C", "link-arg=-fuse-ld=lld",
-             "-C", "target-cpu=neoverse-n1", "-C", "force-frame-pointers=yes"]
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "target-cpu=neoverse-n1",
+             "-C", "force-frame-pointers=yes"]
 
 # §2.6: once `cargo vendor` has written vendor/, uncomment this so builds run --offline.
 # [source.crates-io]
@@ -16,3 +17,9 @@ rustflags = ["-C", "linker-plugin-lto", "-C", "link-arg=-fuse-ld=lld",
 #
 # [source.vendored-sources]
 # directory = "vendor"
+
+# §4.3: `cargo release` is the release build with cross-language LTO. Run it from the repository
+# root, since Cargo resolves the --config path from the working directory. Benches take the same
+# flag: `cargo bench --config .cargo/release.toml`.
+[alias]
+release = ["build", "--release", "--config", ".cargo/release.toml"]

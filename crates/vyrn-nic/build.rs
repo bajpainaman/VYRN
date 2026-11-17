@@ -8,6 +8,18 @@ fn main() {
     if !linux || std::env::var_os("CARGO_FEATURE_SHIM").is_none() {
         return;
     }
+    // §4.3: release builds link the shim with cross-language LTO from .cargo/release.toml.
+    // Without it the link still succeeds, but the fast paths silently stop inlining.
+    let rustflags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    if std::env::var("PROFILE").as_deref() == Ok("release")
+        && !rustflags
+            .split('\x1f')
+            .any(|flag| flag.ends_with("linker-plugin-lto"))
+    {
+        panic!(
+            "release build of the C shim without -C linker-plugin-lto; use `cargo release` or pass --config .cargo/release.toml"
+        );
+    }
     cc::Build::new()
         .compiler("clang")
         .archiver("llvm-ar")

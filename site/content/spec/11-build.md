@@ -50,6 +50,7 @@ VYRN/
 ├── Cargo.lock                 committed; every build uses --locked --offline
 ├── rust-toolchain.toml        pinned rustc, plus rustfmt, clippy, miri, llvm-tools
 ├── .cargo/config.toml         vendored-source replacement, linker, per-target rustflags
+├── .cargo/release.toml        cross-language LTO for release and bench builds (§4.3)
 ├── clippy.toml                workspace rules (all crates)
 ├── deny.toml                  cargo-deny: licenses, advisories, bans, duplicate versions
 ├── UNSAFE.toml                the only modules allowed to contain `unsafe` (§3.2), with owners
@@ -657,19 +658,36 @@ Why the non-obvious ones:
 | `-fno-stack-protector` | The shim inlines into the Rust lane loop. A canary check on every inlined call costs cycles on the 1 µs path, and the shim has no stack buffers. clang-tidy (§4.5) rejects any array on the shim's stack. |
 | `-march` equal to rustc's `target-cpu` | LTO inlines only between functions with compatible target features. A shim built for a newer ISA than the Rust code is not inlined. |
 
-`.cargo/config.toml`:
+`.cargo/config.toml`, for every build:
 
 ```toml
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "linker-plugin-lto", "-C", "link-arg=-fuse-ld=lld",
-             "-C", "target-cpu=x86-64-v3", "-C", "force-frame-pointers=yes"]
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "target-cpu=x86-64-v3",
+             "-C", "force-frame-pointers=yes"]
 
 [target.aarch64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "linker-plugin-lto", "-C", "link-arg=-fuse-ld=lld",
-             "-C", "target-cpu=neoverse-n1", "-C", "force-frame-pointers=yes"]
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "target-cpu=neoverse-n1",
+             "-C", "force-frame-pointers=yes"]
 ```
+
+`.cargo/release.toml`, added to release and bench builds with `--config .cargo/release.toml`
+(Cargo appends its `rustflags` to the ones above). The `cargo release` alias in
+`.cargo/config.toml` runs `cargo build --release --config .cargo/release.toml` from the repository
+root:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "linker-plugin-lto"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "linker-plugin-lto"]
+```
+
+Debug builds skip cross-language LTO because it slows every link, and stable Cargo has no
+per-profile `rustflags`. A release build of the shim without `release.toml` would link but not
+inline the shim, so `vyrn-nic`'s build script fails it.
 
 Cargo's `lto` setting stays unset in the release profile. The linker plugin runs ThinLTO over the
 Rust and C bitcode together, which is the whole-program LTO this build needs.
