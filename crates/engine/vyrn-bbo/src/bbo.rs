@@ -160,6 +160,18 @@ enum Role {
     Batch,
 }
 
+/// A `Rescan` batch taker whose sweep hit the step cap (D14): it resumes in the next step at
+/// the same cut, `C_{s−1}` and key, so its visibility is unchanged (05 §5.2).
+#[derive(Clone, Copy, Debug)]
+struct RCont {
+    lane: usize,
+    slot: u32,
+    key: PrioKey,
+    band: (Tick, Tick),
+    cut: Cut,
+    prev: Cut,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sweep {
     Open,
@@ -184,6 +196,7 @@ pub struct Bbo {
     q: Vec<LaneQ>,
     ctl: Option<ControlCmd>,
     cont: Option<Fwd>,
+    rcont: Option<RCont>,
     pair: HalfPair,
     out: StepOut,
     held: bool,
@@ -220,6 +233,7 @@ impl Bbo {
             q: vec![LaneQ::default(); n],
             ctl: None,
             cont: None,
+            rcont: None,
             pair: HalfPair::default(),
             out: StepOut::default(),
             held: false,
@@ -391,6 +405,11 @@ impl Bbo {
     }
 
     fn decide<S: BookSource, C: Clock>(&mut self, src: &S, clock: &C) {
+        if let Some(r) = self.rcont {
+            self.out.reset(self.next);
+            self.rescan_finish(src, r, true);
+            return;
+        }
         let k = self.pair.k();
         let prev = self.cut;
         let floors: [Option<LaneSeq>; MAX_LANES] =
@@ -523,17 +542,18 @@ impl Bbo {
         &mut self,
         c: Cut,
         kind: StepKind,
-        src: Option<(usize, LaneSeq)>,
+        src: Option<(usize, LaneSeq, u32)>,
         cont: bool,
         band: Option<(Tick, Tick)>,
     ) {
         self.maybe_band();
+        self.out.drop_empty_tx();
         let s = self.next;
         let prev = self.cut;
         let e = &mut self.out.entry;
         e.step = s;
         e.kind = kind.code();
-        if let Some((l, q)) = src {
+        if let Some((l, q, _)) = src {
             e.src_lane = LaneId(lane_u8(l));
             e.src_lane_seq = q;
         }
@@ -552,6 +572,14 @@ impl Bbo {
                 if let Some(x) = self.lowver.get_mut(l) {
                     *x = v;
                 }
+            }
+        }
+        // 05 §8.6: the source lane's ops up to its cut were classified against ≥ the entry's
+        // `snap_ver`.
+        if let Some((l, _, sv)) = src {
+            let v = self.expand(sv);
+            if let Some(x) = self.lowver.get_mut(l) {
+                *x = v;
             }
         }
         let cont_phase = self.phase == Phase::Continuous;
@@ -779,7 +807,9 @@ impl Bbo {
     fn maker_record<S: BookSource>(&mut self, src: &S, m: &Maker, r: Record) {
         let lane = LaneId(lane_u8(m.lane));
         match (self.maker_route(m, self.out.deps_head), self.out.deps_head) {
-            (Some(g), Some(h)) => self.out.record(h, g, r),
+            // A full deps packet (9 Acks + 8 maker records > 16) spills the maker record to the
+            // session's MakerSeq packet instead of faulting (spec follow-up F8).
+            (Some(g), Some(h)) if self.out.has_room(h) => self.out.record(h, g, r),
             _ => {
                 let h = StepOut::maker_head(self.next, lane, src.session(lane, m.v.root));
                 self.out.record(h, 0, r);
@@ -841,6 +871,7 @@ impl Bbo {
                 tick: m.v.tick,
                 qty: m.open,
                 kind: FillKind::Out.code(),
+                liq: LIQ_MAKER,
                 cause: OUT_STP,
                 ordinal: ord,
                 ..FillEvent::default()
@@ -891,9 +922,10 @@ impl Bbo {
         kind: FillKind,
         cause: u16,
         rec: Option<Record>,
+        kill: bool,
     ) {
         let open = t.open(&self.st);
-        if let Some(r) = self.st.root_mut(t.lane, t.v.root, t.v.gen_) {
+        if kill && let Some(r) = self.st.root_mut(t.lane, t.v.root, t.v.gen_) {
             r.killed = true;
         }
         let ord = self.out.ordinal;
@@ -907,6 +939,7 @@ impl Bbo {
                 kind: kind.code(),
                 cause,
                 ordinal: ord,
+                liq: LIQ_TAKER,
                 ..FillEvent::default()
             },
         );
@@ -925,7 +958,15 @@ impl Bbo {
             }),
             Role::Batch => None,
         };
-        self.end_taker(t, role, FillKind::Reject, reason.code(), rec);
+        // A rejected `Replace` leaves the order's current version in the book (05 §2.3, §13.3):
+        // only the new version is refused. Post-only and FOK rejects end the order, since the
+        // replace already removed the old version at its position in L.
+        let keeps_old = t.v.kind == SlotKind::NewPrio
+            && matches!(
+                reason,
+                RejectReason::BookHalted | RejectReason::AuctionPhase | RejectReason::TooLate
+            );
+        self.end_taker(t, role, FillKind::Reject, reason.code(), rec, !keeps_old);
     }
 
     fn out_taker(&mut self, t: &Taker, role: Role, cause: u16) {
@@ -939,7 +980,7 @@ impl Bbo {
             }),
             Role::Batch => None,
         };
-        self.end_taker(t, role, FillKind::Out, cause, rec);
+        self.end_taker(t, role, FillKind::Out, cause, rec, true);
     }
 
     fn rest_taker(&mut self, t: &Taker, role: Role) {
@@ -964,6 +1005,7 @@ impl Bbo {
                 qty: open,
                 kind: FillKind::Rested.code(),
                 ordinal: ord,
+                liq: LIQ_TAKER,
                 ..FillEvent::default()
             },
         );
@@ -1181,7 +1223,7 @@ impl Bbo {
         } else {
             StepKind::Improve
         };
-        self.finish(c, kind, Some((lane, e.lane_seq)), cont, None);
+        self.finish(c, kind, Some((lane, e.lane_seq, e.snap_ver)), cont, None);
     }
 
     /// 05 §2.5 P1, §2.3 `Replace`, the post-only test and the FOK dry run. `true` when the taker
@@ -1239,6 +1281,7 @@ impl Bbo {
                         tick: t.tick,
                         qty: old,
                         kind: FillKind::Out.code(),
+                        liq: LIQ_TAKER,
                         cause: OUT_FINISHED,
                         ordinal: ord,
                         ..FillEvent::default()
@@ -1441,6 +1484,7 @@ impl Bbo {
                 qty: e.qty().0,
                 kind: FillKind::Reject.code(),
                 cause: busy.code(),
+                liq: LIQ_TAKER,
                 ..FillEvent::default()
             },
         );
@@ -1451,7 +1495,13 @@ impl Bbo {
             client_tag: e.client_tag(),
         };
         self.out.record(h, 0, r);
-        self.finish(c, StepKind::Shed, Some((lane, e.lane_seq)), false, None);
+        self.finish(
+            c,
+            StepKind::Shed,
+            Some((lane, e.lane_seq, e.snap_ver)),
+            false,
+            None,
+        );
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1522,12 +1572,36 @@ impl Bbo {
                 }
             }
         }
-        if let Some((key, l, _, slot)) = star {
-            self.rescan_taker(src, &cr, &prev, l, slot, key, band);
+        match star {
+            Some((key, lane, _, slot)) => {
+                let r = RCont {
+                    lane,
+                    slot,
+                    key,
+                    band,
+                    cut: cr,
+                    prev,
+                };
+                self.rescan_finish(src, r, false);
+            }
+            None => {
+                self.exact_bounds(src, &cr, self.bid.max(hi), self.ask.min(lo));
+                self.finish(cr, StepKind::Rescan, None, false, Some(band));
+            }
         }
-        let (b, a) = (self.bid.max(hi), self.ask.min(lo));
-        self.exact_bounds(src, &cr, b, a);
-        self.finish(cr, StepKind::Rescan, None, false, Some(band));
+    }
+
+    /// Runs (or resumes) the batch taker of a `Rescan` and finishes the step. While the taker
+    /// is in flight the bounds stay as they were: it is not resting (05 §2.3), and continuations
+    /// run before any other step.
+    fn rescan_finish<S: BookSource>(&mut self, src: &S, r: RCont, cont: bool) {
+        let swept = self.rescan_taker(src, &r.cut, &r.prev, r.lane, r.slot, r.key, r.band, cont);
+        self.rcont = (swept == Sweep::Capped).then_some(r);
+        if self.rcont.is_none() {
+            let (b, a) = (self.bid.max(r.band.1), self.ask.min(r.band.0));
+            self.exact_bounds(src, &r.cut, b, a);
+        }
+        self.finish(r.cut, StepKind::Rescan, None, cont, Some(r.band));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1540,11 +1614,12 @@ impl Bbo {
         slot: u32,
         key: PrioKey,
         band: (Tick, Tick),
-    ) {
+        cont: bool,
+    ) -> Sweep {
         let lid = LaneId(lane_u8(l));
         let Some(v) = src.slot(lid, slot) else {
             self.st.fault = true;
-            return;
+            return Sweep::Open;
         };
         let t = Taker {
             lane: l,
@@ -1566,20 +1641,22 @@ impl Bbo {
             .live(l, slot, &v)
             .is_none()
         {
-            return;
+            return Sweep::Open;
         }
         let side = t.side.opposite();
         let from = match side {
             Side::Sell => self.ask.min(band.0),
             Side::Buy => self.bid.max(band.1),
         };
-        if v.flags.post_only()
+        if !cont
+            && v.flags.post_only()
             && next_level(&self.ctx(src, c, prev, Some(key)), side, from, t.tick).is_some()
         {
             self.reject_taker(&t, Role::Batch, RejectReason::PostOnlyWouldCross);
-            return;
+            return Sweep::Killed;
         }
-        self.sweep(src, &t, Role::Batch, c, prev, Some(key), from, false);
+        // Capped like a forwarded sweep (D14): one level or ENG_STEP_FILLS per step.
+        self.sweep(src, &t, Role::Batch, c, prev, Some(key), from, true)
     }
 
     // -----------------------------------------------------------------------------------------

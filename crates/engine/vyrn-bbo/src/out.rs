@@ -198,6 +198,32 @@ impl StepOut {
         }
     }
 
+    /// Removes packets that got no record (an STP-only step leaves the source packet empty), so
+    /// `entry.n_tx` counts exactly the `TxEntry`s published.
+    pub(crate) fn drop_empty_tx(&mut self) {
+        let mut k = 0usize;
+        for i in 0..self.n_tx {
+            if let Some(p) = self.tx.get(i).copied()
+                && p.head.n_rec > 0
+            {
+                if let Some(d) = self.tx.get_mut(k) {
+                    *d = p;
+                }
+                k = k.saturating_add(1);
+            }
+        }
+        self.n_tx = k;
+        self.entry.n_tx = u8::try_from(k).unwrap_or(u8::MAX);
+    }
+
+    /// The packet `head` names can take one more record (or is not open yet).
+    pub(crate) fn has_room(&self, head: TxEntry) -> bool {
+        self.tx()
+            .iter()
+            .find(|p| p.head.session == head.session && p.head.role == head.role)
+            .is_none_or(|p| usize::from(p.head.n_rec) < MAX_RECORDS)
+    }
+
     /// Appends `r` to the packet `head` names; `g` orders records of the deps packet.
     pub(crate) fn record(&mut self, head: TxEntry, g: u8, r: Record) {
         let ok = self.packet(head).is_some_and(|p| p.push(g, r));

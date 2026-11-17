@@ -335,14 +335,17 @@ pub const DEP_ENDED: u16 = 0x8000;
 
 /// `FillEvent` (05 §4.12, 32 B). Writer: the BBO core, `step` last. Reader: the lane at B1.
 ///
-/// Field use by kind (this crate's reading of 05 §4.12, §7.4, §8.8):
+/// Field use by kind (this crate's reading of 05 §4.12, §7.4, §8.8). `liq` on `Rested`, `Out`
+/// and `Reject` tells the taker's own terminal event (`LIQ_TAKER`, also for a `Rescan` batch
+/// taker, whose record the lane emits at B3) from an STP maker kill (`LIQ_MAKER`, whose record
+/// the fill TX core already sent):
 ///
 /// | kind | handle / vslot | tick | qty | liq | cause |
 /// |---|---|---|---|---|---|
 /// | Fill | root+gen / version that traded | fill price | qty | 0, 1, 2 | 0 |
-/// | Rested | source | limit | open | 0 | 0 |
-/// | Out | order | limit | qty out | 0 | Out cause |
-/// | Reject | source | limit | open released | 0 | reject reason |
+/// | Rested | source | limit | open | 1 | 0 |
+/// | Out | order | limit | qty out | 1 taker side, 0 maker (STP kill) | Out cause, or `OUT_FINISHED` |
+/// | Reject | source | limit | open released | 1 | reject reason |
 /// | Dep | dependency's root+gen / `FwdDep.slot` | its tick | Join: open; Cancel: canceled open (0 = `TOO_LATE`) | `FwdDep.kind` | 0 (rested / canceled), `DEP_ENDED`, or a reject reason (`BUSY`, `BOOK_HALTED`, `AUCTION_PHASE`, `TOO_LATE`) |
 /// | Phase | `C*[l]` as `handle | vslot << 32` (Frozen only) | 0 | 0 | 0 | phase code |
 /// | Band | 0 | lo | hi | 0 | 0 |

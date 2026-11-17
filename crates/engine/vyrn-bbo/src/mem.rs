@@ -38,6 +38,8 @@ pub struct MemBook {
     heads: BTreeMap<(u8, u8, u32), u32>,
     tails: BTreeMap<(u8, u8, u32), u32>,
     pos_of: BTreeMap<(u8, u32), (u32, usize)>,
+    /// Version slot → the position slot of its queue position.
+    ver_pos: BTreeMap<(u8, u32), u32>,
     kills: BTreeMap<(u8, u32), AcctKill>,
     owners: BTreeMap<(u8, u32), (SessionId, u32)>,
     journal: Vec<Vec<JEnt>>,
@@ -201,6 +203,7 @@ impl MemBook {
             }
         }
         self.pos_of.insert((lane.0, slot), (seg, i));
+        self.ver_pos.insert((lane.0, slot), slot);
         let o = self.occ.entry((side, v.tick.0)).or_insert(0);
         *o |= 1u64.checked_shl(u32::from(lane.0)).unwrap_or(0);
         self.lane_occ.insert((lane.0, side, v.tick.0));
@@ -229,12 +232,8 @@ impl MemBook {
             v.tomb_ts = ts;
             v.tomb_seq = seq;
         }
-        let root_pos = self
-            .slot(lane, slot)
-            .and_then(|v| self.pos_of.get(&(lane.0, v.root)).copied());
-        if let Some((seg, i)) = self.pos_of.get(&(lane.0, slot)).copied().or(root_pos)
+        if let Some((seg, i)) = self.position(lane, slot)
             && let Some(g) = self.seg_mut(lane, seg)
-            && slot_is_position(g, i, slot)
         {
             g.mask = (g.mask & !bit(i)) | bit(i.saturating_add(16));
         }
@@ -273,7 +272,10 @@ impl MemBook {
             x.tomb_ts = ts;
             x.tomb_seq = seq;
         }
-        if let Some((seg, i)) = self.pos_of.get(&(lane.0, v.root)).copied()
+        if let Some(ps) = self.ver_pos.get(&(lane.0, old)).copied() {
+            self.ver_pos.insert((lane.0, w), ps);
+        }
+        if let Some((seg, i)) = self.position(lane, old)
             && let Some(g) = self.seg_mut(lane, seg)
         {
             g.vmask |= u16::try_from(bit(i)).unwrap_or(0);
@@ -311,6 +313,12 @@ impl MemBook {
         );
     }
 
+    /// The queue position of version `slot`.
+    fn position(&self, lane: LaneId, slot: u32) -> Option<(u32, usize)> {
+        let ps = self.ver_pos.get(&(lane.0, slot))?;
+        self.pos_of.get(&(lane.0, *ps)).copied()
+    }
+
     pub fn push_journal(&mut self, lane: LaneId, j: JEnt) {
         if let Some(jr) = self.journal.get_mut(Self::lane_ix(lane)) {
             jr.push(j);
@@ -322,10 +330,6 @@ impl MemBook {
             .get_mut(Self::lane_ix(lane))?
             .get_mut(usize::try_from(seg).ok()?)
     }
-}
-
-fn slot_is_position(g: &Segment16, i: usize, _slot: u32) -> bool {
-    g.slot.get(i).is_some_and(|s| *s != 0)
 }
 
 impl BookSource for MemBook {

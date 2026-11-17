@@ -46,7 +46,7 @@ pub(crate) const NO_DEP: u8 = u8::MAX;
 /// BBO-private per-order state, allocated once (`INV-NOALLOC`).
 pub(crate) struct State {
     pub n_lanes: usize,
-    slot_cap: usize,
+    pub slot_cap: usize,
     pub seg_cap: u32,
     roots: Vec<RootSt>,
     /// `BboVer` bit 1 as the `LaneSeq` of the explicit op that wrote the slot (0 = none), so a
@@ -289,7 +289,9 @@ impl<S: BookSource> Ctx<'_, S> {
     pub fn current_version(&self, l: usize, slot: u32) -> Option<(u32, OrderSlot, bool)> {
         let lane = LaneId(lane_u8(l));
         let (mut s, mut v) = (slot, self.src.slot(lane, slot)?);
-        for _ in 0..16 {
+        // A NewPrio position whose replace was refused ends with it, successors included.
+        let refused = v.kind == SlotKind::NewPrio && !self.st.replace_ok(l, slot, &v);
+        for _ in 0..self.st.slot_cap {
             if v.next_ver == 0 || !self.done(v.tomb_seq, v.tomb_ts, usize::from(v.tomb_lane.0)) {
                 break;
             }
@@ -298,7 +300,8 @@ impl<S: BookSource> Ctx<'_, S> {
         }
         let k = self.src.acct_kill(lane, v.acct_ix);
         let r = self.st.root(l, v.root, v.gen_);
-        let ended = self.done(v.tomb_seq, v.tomb_ts, usize::from(v.tomb_lane.0))
+        let ended = refused
+            || self.done(v.tomb_seq, v.tomb_ts, usize::from(v.tomb_lane.0))
             || (k.kill_seq.0 != 0 && v.ins_seq < k.kill_seq && self.done(k.kill_seq, k.kill_ts, l))
             || (r.np_seq != 0 && v.ins_seq.0 < r.np_seq);
         Some((s, v, ended))
@@ -315,8 +318,8 @@ impl<S: BookSource> Ctx<'_, S> {
         let pos = self.src.slot(lane, ps)?;
         let (mut s, mut v) = (ps, pos);
         if u64::from(g.vmask) & bit(i) != 0 {
-            // ≤ one hop per Reduce of the order; 16 bounds a corrupt chain.
-            for _ in 0..16 {
+            // ≤ one hop per Reduce of the order; the arena size bounds a corrupt chain.
+            for _ in 0..self.st.slot_cap {
                 if v.next_ver == 0 || !self.done(v.tomb_seq, v.tomb_ts, usize::from(v.tomb_lane.0))
                 {
                     break;
@@ -358,6 +361,15 @@ impl<S: BookSource> Ctx<'_, S> {
                 let Some((vs, v, pos)) = self.version_at(l, &g, i) else {
                     continue;
                 };
+                // replace_ok belongs to the NewPrio position slot; its KeepPrio successors
+                // inherit the decision (a refused replace never rests, 05 §8.5).
+                let ps = g.slot.get(i).copied().unwrap_or(0);
+                if pos.kind == SlotKind::NewPrio
+                    && (pos.ins_seq.0 <= self.cut(l) || self.st.explicit(l, ps, pos.ins_seq))
+                    && !self.st.replace_ok(l, ps, &pos)
+                {
+                    continue;
+                }
                 if self
                     .st
                     .in_pend(l, *g.slot.get(i).unwrap_or(&0), pos.ins_seq)
