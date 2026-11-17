@@ -504,7 +504,7 @@
   {
    "asciiIndex": 8,
    "heading": "7.4 MBO structure: lane channels, a step channel, and the merge rule",
-   "line": 1421,
+   "line": 1428,
    "ascii": " lane channel k:  ADD ADD SYNC(T) DEL ADD ... │ header.step_base = W_k (watermark)\n step channel:    STEP(T) EXEC EXEC ... STEP(T+3) EXEC ...\n\n SYNC(T): the lane-op records after it (up to the next SYNC) are ordered after step T and\n          before step T+1. Emitted lazily, only before the first record after a new step.\n W_k:     every record of channel k ordered before step W_k + 1 is in this packet or earlier.\n\n Subscriber rule: apply step T only when W_k ≥ T − 1 for every k. Before step T, apply every\n pending lane-op record whose SYNC position is < T, in any order across channels."
   }
  ],

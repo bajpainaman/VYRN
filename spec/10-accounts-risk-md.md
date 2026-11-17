@@ -75,7 +75,7 @@ pub struct AcctRisk {                 // 128 bytes: 2 cache lines on x86, 1 on A
     pub fee_mul: u64,                 // ceil(max_fee_ppm × 2^64 / RSK_FEE_DENOM) (§3.2)
     pub msg_fee_improve: u32,         // quote units per improve (§5.3)
     pub msg_fee_cross: u32,           // quote units per cross (§5.3)
-    pub new_bucket: Bucket,           // 16 B: new-order bucket (§3.8)
+    pub new_bucket: Bucket,           // 16 B packed Gcra: new-order bucket (§3.8)
     pub _pad0: [u8; 8],
     // line 1: read on crosses, fills and timers
     pub cross_bucket: Bucket,         // 16 B
@@ -757,8 +757,15 @@ Decisions:
 04 defines the bucket arithmetic (the `Gcra` of 04 §9.1, on `rx_ts` time, with its period
 rounding) and the per-session buckets that protect the parser. This chapter defines the
 per-account buckets that protect shared resources: the lane and the BBO core. Every bucket here,
-account, lane or pool, is that one `Gcra` type (`tat`, `t_ns`, `burst`; 24 bytes), so one
-conformance surface covers them all (`crates/engine/vyrn-risk/src/gcra.rs`).
+account, lane or pool, is that one `Gcra` (`tat`, `t_ns`, `burst`), so one conformance surface
+covers them all (`crates/engine/vyrn-risk/src/gcra.rs`).
+
+`Bucket` (16 B) is the packed form of a `Gcra` in the §1.2 and `LaneRisk` lines: `tat` u64 at
+offset 0, `t_ns` u32 at 8, `burst` u32 at 12. Both u32 fields are enough: `t_ns` = ⌈10^9 / rate⌉
+for any rate ≥ 1/s is < 2^32, and every burst of §3.4, §3.8 and 04 §9.1 is far below 2^32
+(`CtlSetLimit` keeps the burst). Packing changes no decision, because the arithmetic is the same
+integer `Gcra`. `vyrn-risk` stores the fields as u64 today; the packed 128 B `AcctRisk` layout is
+a follow-up with B-RSK1.
 
 | Bucket | Scope | Counts | Protects | Default (config) |
 |---|---|---|---|---|
@@ -1716,7 +1723,7 @@ Storing only the log works because market data, drop copy and statements are pur
 | 02 | `REQ-LAT-1`, `REQ-THR-*` (lane buckets of REQ-THR-6), `REQ-OPS-*` | the lane buckets (§3.8), `MD_LAG_P99_NS`, drop-copy latencies, retention |
 | 01 | core map (§10), lane classes (§14.15), observer box (§14.16), `AcctTake` and the `BUSY` bounds (§14.17), `PacketRecord.flags` (§6.6) | the lane map with classes (§1.3), per-pool caps (§3.8), `PoolTok` takes that `AcctTake` logs (§1.2) |
 | 03 | book-group size `K`, observer box per facility | the observer role, optical taps, `vyrn-md` and `vyrn-dropcopy` placement, router domain per (group, lane class) (§2.8) |
-| 04 | session open, sessions across epochs (01 §14.8), `Bucket` arithmetic, session buckets, `CancelAll`, risk session, the pooled `pkt_seq` check | `lane`, class, port and (AWS) RSS source port in the session-open response (§1.4); account buckets; no tokens for `BUSY` (§3.11); session-resident slots at open/close (§1.2); control session 0 |
+| 04 | session open, sessions across epochs (01 §14.8), `Gcra` bucket arithmetic, session buckets, `CancelAll`, risk session, the pooled `pkt_seq` check | `lane`, class, port and (AWS) RSS source port in the session-open response (§1.4); account buckets; no tokens for `BUSY` (§3.11); session-resident slots at open/close (§1.2); control session 0 |
 | 05 | classification, snapshot (`halted`, `ref_tick`, version), `filled_final` at ack, FIFO entry, step kinds, pool stealing and sibling-segment cancels, `predicted_path_ns` per class | fill-event layout and rules (§4.1, with `Shed`), `stp_tag` in FIFO entries and cross messages, risk fields of pre-assigned order records written in pass 1 (§3.9, §4.3), `RSK_PASS1_CYCLES`, the `f` choice (§4.2), `PoolTok` and `PoolRisk` (§1.2, §3.8) |
 | 06 | NIC loopback for `CtlTimerTick`, PTP accuracy, multicast/IGMP, `resctrl` L3 allocation | tick period; observer NICs (§7.2: 3 × dual-port CX-6 Dx + 3 × X2541, replacing 06's 6 × X2541, 01 §14.16); published ENA RSS key (§1.4) |
 | 07 | ledger (BASE), control-packet payload storage, replay scheduler, data-tier `dt_ts` | the replay rule for `fills_applied` (§4.2), conservation checks per block (`INV-ACC-2`) |

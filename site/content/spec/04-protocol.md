@@ -1062,7 +1062,7 @@ and **leaves the old order untouched**:
 | side differs | `SIDE_MISMATCH` |
 | phase (§6.9) | `BOOK_HALTED`, `AUCTION_PHASE` |
 | new `tick` out of band or 0 | `BAD_TICK` |
-| new `qty` = 0 (use `Cancel`); or same tick, same `total`, same flags | `BAD_QTY` (detail 0, or `PROTO_D_NO_CHANGE`) |
+| new `qty` = 0 (use `Cancel`); or same tick, same `total`, same flags | `BAD_QTY` (detail 0, or `PROTO_D_NO_CHANGE`; the new order's risk checks give 10's `RSK_D_*`, §8) |
 | invalid flag combination | `BAD_TYPE` (`PROTO_D_FLAGS`) |
 | risk of the new reservation, net of the old one | `RISK_*` |
 | post-only crosses the lane's snapshot | `POST_ONLY_WOULD_CROSS` |
@@ -1332,7 +1332,7 @@ out-of-stream (`resp_seq` 0, not accepted, the client resends the same logical c
 | 2 | `BAD_SEQ` | out (gap, duplicate not in ring); in (`ResendReq`) | V8; §6.7 | `expected`, or the limit of §6.7 | gap: resend from detail; `ResendReq`: fix the range or ask the other store (§5.4) |
 | 3 | `BAD_TYPE` | in | V9, M2, M3 | `PROTO_D_UNKNOWN_TYPE`, `_RESERVED`, `_FLAGS`, `_BAD_HDR` | client bug; do not resend the same content |
 | 4 | `BAD_TICK` | in | M6 | the nearest acceptable tick (`min_tick`, `max_tick` or the band edge, 10 §3.1) | reprice |
-| 5 | `BAD_QTY` | in | M6 | `New`: `RSK_D_QTY_ZERO` 1, `_QTY_MAX` 2, `_NOTIONAL` 3, `_OVERFLOW` 4 (10 §3.1); `Replace`: 0 or `PROTO_D_NO_CHANGE` | fix the qty |
+| 5 | `BAD_QTY` | in | M6 | `RSK_D_QTY_ZERO` 1, `_QTY_MAX` 2, `_NOTIONAL` 3, `_OVERFLOW` 4 (10 §3.1), for a `New` and for the new order of a priority-losing `Replace`; a `Replace` field check (§6.5) also gives 0 or `PROTO_D_NO_CHANGE` | fix the qty |
 | 6 | `RISK_CREDIT` | in | M7 | the asset that is short: 1 quote, 2 base (10 §3.1) | fund the book allocation (01 §12.4) |
 | 7 | `RISK_POSITION` | in | M7 | the limit | reduce exposure |
 | 8 | `RISK_ORDER_COUNT` | in | M7 | the limit | cancel orders first |
@@ -1918,7 +1918,7 @@ All values are **budgets** unless marked otherwise.
 | `PROTO_OUT_*` | 1–8 (01 §14.10) | `Out` cause names (§7.3) |
 | `PROTO_D_*` (close causes) | 1–7, §4.3 | `SESSION_CLOSED` detail |
 | `PROTO_D_*` (`BAD_TYPE`) | 1 `UNKNOWN_TYPE`, 2 `RESERVED`, 3 `FLAGS`, 4 `BAD_HDR`; 5 retired (now `BAD_BOOK` 23) | detail |
-| `PROTO_D_*` (`BAD_QTY`) | `NO_CHANGE` 0xFFFF_FFFE (`Replace`); `New` uses 10's `RSK_D_*` 1–4; `OVERFLOW` 0xFFFF_FFFF is retired (now `RSK_D_OVERFLOW` 4) | detail |
+| `PROTO_D_*` (`BAD_QTY`) | `NO_CHANGE` 0xFFFF_FFFE (`Replace` field check); risk checks of a `New` or of a `Replace`'s new order use 10's `RSK_D_*` 1–4; `OVERFLOW` 0xFFFF_FFFF is retired (now `RSK_D_OVERFLOW` 4) | detail |
 | `PROTO_D_*` (`TOO_LATE`) | 1 `FILLED`, 2 `CANCELED`, 3 `OUT` | detail |
 | `PROTO_CNT_*` | `MALFORMED`, `UNKNOWN_SESSION`, `UNBOUND_SRC`, `EPOCH`, `SEQ_WINDOW`, `BAD_MAC`, `CLOSED`, `DUP`, `GAP`, `BAD_HDR`, `RATE`, `DATA_LATE`, `BUSY` | per-lane and per-session counters, exported by the control core |
 
