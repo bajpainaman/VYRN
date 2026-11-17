@@ -1,0 +1,50 @@
+[
+  {
+    "slug": "design",
+    "asciiIndex": 0,
+    "file": "design-00",
+    "width": 1200,
+    "height": 960,
+    "alt": "The sequencer box, top to bottom. Four 100GbE ports feed 49 lane cores, which parse, authenticate, check risk and keep the joins and cancels. Only improves and crosses go down to the BBO core. The cut core sends the cut and versioned BBO back up and feeds the BBO core. The BBO core, cut core and TX core share one CCD. Fills go through the fill ring to the TX core, then CTPIO to the wire, and ordering frames go twice to the replicas. Notes: a BBO step costs at most 15 ns, and the NIC is 560 of the 965 ns budget."
+  },
+  {
+    "slug": "00-index",
+    "asciiIndex": 0,
+    "file": "00-index-00",
+    "width": 1200,
+    "height": 1130,
+    "alt": "The master diagram. Clients send each packet twice: once to vyrn-seq in facility F1 (NICs, 49 lanes, cut core, BBO core, TX), and once to the vyrn-data tier. Fills and acks loop back to the clients within 1 µs. Order frames go on 2 paths and payloads go from the data tier to the vyrn-replica nodes, which replay the log and run Simplex. Their certificate gives finality within 10 ms. The finalized log goes over the WAN to the follower homes, and the book moves TYO to LDN to NYC every 8 hours, with each handoff a certificate plus an opening auction."
+  },
+  {
+    "slug": "02-requirements",
+    "asciiIndex": 0,
+    "file": "02-requirements-00",
+    "width": 1200,
+    "height": 560,
+    "alt": "How M-WIRE latency is measured. The vyrn-bench generator and the exchange NIC port are joined through a passive optical splitter, one per direction, within 2 m of the NIC. Tap in and tap out, equal in length within 0.2 m, feed capture NICs that hardware-stamp the start of every frame on one timebase, with error at most REQ_CAP_ERR_NS. Notes: 0.2 m of fiber is about 1 ns, and a SPAN port is not used because it adds switch queueing and drops frames."
+  },
+  {
+    "slug": "02-requirements",
+    "asciiIndex": 1,
+    "file": "02-requirements-01",
+    "width": 1200,
+    "height": 700,
+    "alt": "The load generator. A seed drives per-session PRNG streams that fix an open-loop arrival schedule in advance. At each send time, the generator chooses type, side, price, quantity and TIF from a model book that the vyrn-md feed keeps. The message is then packetized, given both MAC tags and sent twice. Separately, the sequencer's per-class counters feed a controller that corrects the type probabilities once per second with gain 0.5. The model book is a few µs stale, so some intended joins arrive as crosses."
+  },
+  {
+    "slug": "02-requirements",
+    "asciiIndex": 2,
+    "file": "02-requirements-02",
+    "width": 1200,
+    "height": 720,
+    "alt": "When a fill can revert. The sequencer puts the frame on path A and path B before the fill reaches the wire (INV-FRAME-FIRST). A time axis marks the exposure window w from t_f to t_f + w, where w is flight plus repair, about 1 ms. A revert needs all three at every correct replica: the sequencer stops inside w, the frame is lost on A, and it is lost on B. The expected rate is about 3 × 10⁻¹⁴ reverted fills per year."
+  },
+  {
+    "slug": "02-requirements",
+    "asciiIndex": 3,
+    "file": "02-requirements-03",
+    "width": 1200,
+    "height": 580,
+    "alt": "The epoch handoff timeline. The old home trades continuously up to T, its last step S. The handoff window follows: finality of S (at most 10 ms), then one WAN one-way while cert(e, S) and the log tail cross the ocean (about 110 ms TYO to LDN, 35 ms LDN to NYC), then at most 5 ms to verify and uncross. After that the new home runs continuously. The new home's auction collects orders from T for the whole window, and the boundary is step S, not a clock."
+  }
+]

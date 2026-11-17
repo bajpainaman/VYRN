@@ -1,0 +1,90 @@
+[
+  {
+    "slug": "04-protocol",
+    "asciiIndex": 0,
+    "file": "04-protocol-00",
+    "width": 1040,
+    "height": 680,
+    "alt": "A client sends every request packet twice: the sequencer copy goes first to vyrn-seq lane l on the latency path and decides acceptance, and the data copy goes to vyrn-data node d on the payload path. The replicas fetch the payload from the data node by PktHash and vote when it is complete. The data copy leaves at most 100 µs after the sequencer copy."
+  },
+  {
+    "slug": "04-protocol",
+    "asciiIndex": 2,
+    "file": "04-protocol-02",
+    "width": 1160,
+    "height": 620,
+    "alt": "A 32-bit SessionId split into generation u12 (bits 31–20), LaneId u8 (bits 19–12) and slot u12 (bits 11–0). LaneId names the lane and slot indexes its session table directly, so the lane decides V2 with one compare and one load and no hash table; generation rises on each slot reuse so a stale SessionId never matches a new session."
+  },
+  {
+    "slug": "04-protocol",
+    "asciiIndex": 3,
+    "file": "04-protocol-03",
+    "width": 1160,
+    "height": 1070,
+    "alt": "The session state machine: OpenSession leads to OPENING, which becomes ACTIVE once the lane applies SessionOpen (or vanishes if the open record misses the final log). ACTIVE leaves through DRAINING (Logout, admin drain) or directly into CLOSED (bad MAC, equivocation, admin kill, lane move); stale is a flag inside ACTIVE. Only CLOSED, with no resting orders after PROTO_CLOSED_KEEP_S, frees the slot with generation + 1."
+  },
+  {
+    "slug": "04-protocol",
+    "asciiIndex": 4,
+    "file": "04-protocol-04",
+    "width": 1180,
+    "height": 820,
+    "alt": "Sequence diagram of a BASE-mode session open: the client opens mTLS to vyrn-admin and sends OpenSessionReq; vyrn-admin sends a SessionOpen control record to the sequencer lane, the lane's PacketRecord reaches the replicas, and only when the block with that record is final does vyrn-admin return OpenSessionResp with keys. The open takes up to 50 ms and is never on the 1 µs path; the first request then goes over UDP straight to the lane."
+  },
+  {
+    "slug": "04-protocol",
+    "asciiIndex": 6,
+    "file": "04-protocol-06",
+    "width": 1160,
+    "height": 790,
+    "alt": "Go-back-N on the request direction: with the lane expecting 7, packet 8 is lost, so the lane drops 9 and 10 (sending out-of-stream BAD_SEQ(8) under holdoff) instead of buffering them. The client gets resp(echo 7), which proves everything up to 7 was accepted, and BAD_SEQ detail 8, then resends 8, 9 and 10 with bit0 set. A loss costs one round trip of extra packets."
+  },
+  {
+    "slug": "04-protocol",
+    "asciiIndex": 8,
+    "file": "04-protocol-08",
+    "width": 1180,
+    "height": 810,
+    "alt": "Epoch handoff across three lifelines: the old home sends EpochNotice ahead of T, stops at step S and sends cert(e, S) and the log tail to the new home. From T the client sends to the new home with epoch16 = e+1, which stages packets through a silent window of 45–120 ms, then sends the epoch-start EpochNotice, answers the staged packets in the auction phase and sends uncross fills before continuous trading."
+  },
+  {
+    "slug": "04-protocol",
+    "asciiIndex": 9,
+    "file": "04-protocol-09",
+    "width": 1160,
+    "height": 810,
+    "alt": "One request packet with Cancel h1, New cross and New join enters the lane, which reserves resp_seq r and pushes the cross with r to the BBO ring. The BBO core and TX core send the B-packet r (Fill(1) … Ack(1)) on the ≤ 1 µs path, while the lane sends L-packet r+1 (CancelAck(0), Ack(2)) after a cut includes them. Only the lane allocates resp_seq."
+  },
+  {
+    "slug": "04-protocol",
+    "asciiIndex": 11,
+    "file": "04-protocol-11",
+    "width": 1190,
+    "height": 1110,
+    "alt": "The client's per-order state machine: from SENT (with resend on no answer), Reject, a full fill or Fill then Out end the order at REJECTED, FILLED or OUT, and an Ack makes it LIVE with handle h. From LIVE, maker fills or an Out also end it, and Cancel, Reduce and Replace lead to pending states that end in CANCELED, FILLED or OUT or return to LIVE. Maker fills can arrive in every pending state."
+  },
+  {
+    "slug": "05-engine",
+    "asciiIndex": 0,
+    "file": "05-engine-00",
+    "width": 1200,
+    "height": 890,
+    "alt": "Cores and data flow: on CCD 1..7 a lane runs RX, age check, MAC, pass 1 and pass 2, then settles fills at a boundary and reads LaneCut[l]. On CCD 0 the cut cores, the BBO core, the fill TX cores and the stream cores exchange data with the lane only through single-writer lines: counter line, FwdRing (about 3% of messages), FillRing[l], the snapshot line and LaneCut[l]."
+  },
+  {
+    "slug": "05-engine",
+    "asciiIndex": 23,
+    "file": "05-engine-23",
+    "width": 1160,
+    "height": 790,
+    "alt": "A waterfall, to scale in ns, of the six bounded hops of a local ack: cut core reads the counter (≤ 100), the BBO core finishes the step in progress (≤ 15), the next step takes the half-cut (≤ 15), the stream core writes LaneCut (≤ 40), the lane polls it (≤ 20), and the frame gate, B1–B3 and TX doorbell (≤ 10 + 20). The first four hops total ≤ 170 ns worst case, which is why every step kind is capped at 15 ns."
+  },
+  {
+    "slug": "05-engine",
+    "asciiIndex": 26,
+    "file": "05-engine-26",
+    "width": 1120,
+    "height": 660,
+    "alt": "The engine's book phases: Continuous goes to Auction on Control(Auction), to Frozen on Control(Frozen), and back to Continuous through m Uncross steps. Continuous can also go to Halted on Control(Halted), and a halt ends by Control(Auction). Each Uncross step is 15 ns, so every response during an auction keeps the 1 µs bound."
+  }
+]

@@ -1,0 +1,106 @@
+[
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 13,
+    "file": "03-architecture-13",
+    "width": 1160,
+    "height": 950,
+    "alt": "Core map of a grouped box (REF, layout G8): CCD0 holds cut cores c1–c2, BBO cores c5–7, FILL-TX-A c3 and ORDER-TX c4 for books 0–2; CCD1 holds cut cores c8–c9, BBO cores c11–15 and FILL-TX-B c10 for books 3–7. CCD2–CCD7 hold CONTROL, ORDER-HASH and the 46 lanes shared by all books. Each book's cut and fill hop stay inside one CCD, both cut-core pairs read all 46 lane counter lines, and c4 writes one LaneCut entry per (lane, book)."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 14,
+    "file": "03-architecture-14",
+    "width": 1160,
+    "height": 940,
+    "alt": "The lane pipeline for one packet: at dequeue the lane computes age and pred and applies deadline admission, dropping packets older than ARC_ADMIT_AGE_MAX_NS and answering Reject BUSY when age + pred exceeds 980 ns. Admitted packets go through pass 1, which pre-encodes the PacketRecord and pushes improve, cross, IOC, FOK and post-only-would-cross ops to the BBO ring at once while staging joins and cancels. Pass 2 applies the staged ops and releases the counter, and the lane responds once LaneCut covers the op."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 15,
+    "file": "03-architecture-15",
+    "width": 1160,
+    "height": 1130,
+    "alt": "Sequence of a join at index 9 of a 10-message packet: the lane admits it at t=320, runs pass 1 and pass 2, stores op 9's counter at t=505, and waits for the cut cores, BBO step and core 4 to release a step whose LaneCut covers the op at t=675. The lane then drains its fill ring, checks the gate and sends the Ack itself, first bit out at t=965. A budget bar shows the nine stage maxima summing to 965 ns, with the 170 ns logged cut as the longest wait inside the box."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 16,
+    "file": "03-architecture-16",
+    "width": 1160,
+    "height": 820,
+    "alt": "Sequence of a cancel at index 9: the lane stages Cancel(h), writes a tombstone in pass 2, stores its counter at t=505, and waits for LaneCut[L] to cover the op at t=675. After draining the fill ring and finding no fill on h, the lane sends CancelAck at t=725, first bit out at t=965. Notes add that a cancel at index 0 leaves about 81 ns earlier and that a depletion hint, if needed, is off this path."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 17,
+    "file": "03-architecture-17",
+    "width": 1160,
+    "height": 780,
+    "alt": "Case A of the cancel-versus-fill race: lane L applies cancel(h) at LaneSeq x and releases its counter before the taker's cross reaches the BBO core. Step s has cut[L] ≥ x, so the BBO core sees the tombstone on h, skips it and matches the next order in the level FIFO. Lane L finds no fill on h and sends CancelAck for the full quantity; the outcome depends only on the logged cut and x, so replicas agree."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 18,
+    "file": "03-architecture-18",
+    "width": 1160,
+    "height": 880,
+    "alt": "Case B of the cancel-versus-fill race: the taker's cross reaches the BBO core first, step s has cut[L] < x, and it fills h for q of Q and puts the fill event on lane L's fill ring. When LaneCut for step s+1 covers the cancel, lane L drains the ring, finds the fill, and sends Reject TOO_LATE if q = Q or CancelAck for Q − q otherwise. Because the ack waits for step s+1, it can never come before a fill from a step in flight."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 19,
+    "file": "03-architecture-19",
+    "width": 1160,
+    "height": 1110,
+    "alt": "Sequence of an improve at index 9: the lane pushes it to the BBO core at t=425, the BBO core runs an Improve step against the live BBO at t=525 and publishes snap v+1, core 4 frames the step to A|B and sets released_step, and the fill TX core sends the Ack at t=640, first bit out at t=880. The BBO core decides, not the lane, so a live BBO that moved turns the step into a Cross. A budget bar shows the stage maxima summing to 880 ns, the same as a cross fill."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 20,
+    "file": "03-architecture-20",
+    "width": 1160,
+    "height": 1210,
+    "alt": "Sequence of a buy 900 @ a3 that sweeps three ask levels: one level per BBO step (s, s+1, s+2, each at most 15 ns) fills 300, 250 and 350 from lanes 3 and 17, lane 40, and lanes 3 and 22. Core 4 frames step s by t=600 and the fill TX core sends Fill a1 at t=640, first bit out at t=880, with a2 and a3 following about 15 ns apart. The taker's first response meets 880 ns at any sweep depth."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 21,
+    "file": "03-architecture-21",
+    "width": 1160,
+    "height": 1030,
+    "alt": "Sequence of a sweep that leaves a resting residual and a rescan: lane T's buy 500 @ p sweeps asks a1..a2, rests 200 at bid p and publishes snap v+1, while lane M's sell 100 @ q was written as a join against the old snapshot v. When the cut includes M's op, a Rescan step finds it, M's sell crosses bid p and fills 100, with fill events to T as maker and to M as taker. Each rescan step is one bounded slice, so it never holds back other lanes."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 22,
+    "file": "03-architecture-22",
+    "width": 1160,
+    "height": 880,
+    "alt": "Sequence of a depletion: lane L cancels its last own order at its snapshot's best bid b and pushes a depletion hint to the BBO core. In step s the BBO core checks the merged level at b, filtered by the cut and tombstones; if other lanes still rest there it idles, otherwise it finds the next best bid and publishes snap v+1 on the snapshot line to all lanes. The new snapshot is visible about 215 ns after the hint, and until then the stale bid errs in the safe direction."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 23,
+    "file": "03-architecture-23",
+    "width": 1160,
+    "height": 980,
+    "alt": "Sequence of an IOC at index 9: the lane always routes it to the BBO core, which in step s fills what crosses at the cut and marks the rest out within 15 ns. Core 4 frames the step and the fill TX core, gated on step s, sends Fill(qty f) and Out(qty − f) at t=640, first bit out by t=880. A quantity bar shows the split between the filled part and the out part; an IOC never rests."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 24,
+    "file": "03-architecture-24",
+    "width": 1160,
+    "height": 660,
+    "alt": "Sequence of a FOK: after the push at t=425, the BBO core sums the fillable quantity at the cut over the levels within the limit, from the per-level visible totals and without mutating anything, within one slice. If the sum covers the quantity, it executes as a Cross and the fill TX core sends a Fill per level; otherwise it logs a Cross StepRecord with no fills and sends Reject FOK_UNFILLABLE. A FOK that fills runs with nothing in between, so it stays all-or-none."
+  },
+  {
+    "slug": "03-architecture",
+    "asciiIndex": 25,
+    "file": "03-architecture-25",
+    "width": 1160,
+    "height": 780,
+    "alt": "Sequence of a post-only order: the lane checks it against its own snapshot, sends it down the join path if it does not cross, and otherwise pushes it to the BBO core. The BBO core checks the live book in step s and answers Reject POST_ONLY_WOULD_CROSS if it crosses, or rests it as an improve and acks if the lane's snapshot was stale. The fill TX core sends the response gated on released_step ≥ s, by t≤880; the lane cannot reject on its own because its snapshot version is not logged."
+  }
+]
