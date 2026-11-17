@@ -1,0 +1,72 @@
+# S1 of spec/11-build.md §8, the parts that exist today: formatting, clippy, tests on Linux
+# x86-64 and aarch64 (macOS is left out to keep CI cheap), cargo-deny and the 04 §11 protocol
+# vectors. Miri, TSan, fuzzing and the asm gate join as the crates they cover land.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo fmt --all --check
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - name: clang and lld with rustc's LLVM major (11 §4.2)
+        run: |
+          major="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
+          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          sudo bash /tmp/llvm.sh "$major"
+          for tool in clang clang++ lld ld.lld llvm-ar llvm-nm llvm-objdump; do
+            sudo ln -sfn "/usr/lib/llvm-$major/bin/$tool" "/usr/local/bin/$tool"
+          done
+          clang_major="$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)"
+          echo "rustc LLVM $major, clang $clang_major"
+          test "$major" = "$clang_major"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
+  vectors:
+    name: protocol vectors (04 §11)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: script output equals the committed golden file
+        working-directory: /tmp
+        run: python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_proto_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_proto_vectors.out"

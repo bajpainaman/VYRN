@@ -1,0 +1,484 @@
+//! The 04 §11 protocol conformance vectors. `tests/golden/vyrn_proto_vectors.out` is the output of
+//! `python3 -I vyrn_proto_vectors.py`; this test builds the same 18 packets with `vyrn-wire`,
+//! compares them byte for byte, parses each back, and repeats the script's checks.
+
+use std::collections::BTreeMap;
+
+use vyrn_types::{
+    BookId, Epoch, Handle, LaneId, MAX_REQ_PAYLOAD, Qty, RejectReason, SessionId, Tick,
+};
+use vyrn_wire::{
+    Liq, Msg, OrderFlags, OutCause, PROTO_HANDLE_ALL, PROTO_RESP_MAX_BYTES, Record, ReqHeader,
+    Request, RespHeader, Response, Side, Stp, Tif, encode_request, encode_response, session_id,
+};
+
+const K_SEQ: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+const K_OUT: [u8; 16] = [
+    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+];
+const K_COM: [u8; 16] = [
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+];
+const E: u32 = 1000;
+const E16: u16 = 0x03e8;
+const BOOK: BookId = BookId(1);
+
+/// Vector name ("V1" … "V18") → bytes, from the script's hex dump.
+fn golden() -> BTreeMap<String, Vec<u8>> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../tests/golden/vyrn_proto_vectors.out"
+    );
+    let text = std::fs::read_to_string(path).expect("golden vectors");
+    let mut out = BTreeMap::new();
+    let mut lens = BTreeMap::new();
+    let mut cur = String::new();
+    for line in text.lines() {
+        if line.starts_with('V') {
+            cur = line.split_whitespace().next().unwrap().to_owned();
+            let len: usize = line
+                .rsplit_once('(')
+                .unwrap()
+                .1
+                .trim_end_matches(" B)")
+                .parse()
+                .unwrap();
+            lens.insert(cur.clone(), len);
+            out.insert(cur.clone(), Vec::new());
+        } else if let (Some(bytes), Some((_, hex))) = (
+            out.get_mut(&cur),
+            line.strip_prefix("  ").and_then(|l| l.split_once(": ")),
+        ) {
+            bytes.extend(hex.split(' ').map(|h| u8::from_str_radix(h, 16).unwrap()));
+        }
+    }
+    for (name, len) in &lens {
+        assert_eq!(out[name].len(), *len, "{name} length in the dump");
+    }
+    assert_eq!(out.len(), 18);
+    out
+}
+
+fn sid(slot: u16, lane: u8, generation: u16) -> SessionId {
+    session_id(slot, LaneId(lane), generation).unwrap()
+}
+
+fn h(slot: u32, generation: u8) -> Handle {
+    Handle::new(slot, generation).unwrap()
+}
+
+fn of(side: Side, tif: Tif, post_only: bool, stp: Stp) -> OrderFlags {
+    OrderFlags {
+        side,
+        tif,
+        post_only,
+        stp,
+    }
+}
+
+fn req(s: SessionId, seq: u32, msgs: &[Msg], k_com: Option<&[u8; 16]>, resend: bool) -> Vec<u8> {
+    let mut buf = [0u8; MAX_REQ_PAYLOAD];
+    let n = encode_request(
+        &mut buf,
+        ReqHeader::new(s, seq, E16, BOOK, resend),
+        msgs,
+        &K_SEQ,
+        k_com,
+    )
+    .unwrap();
+    buf[..n].to_vec()
+}
+
+fn resp(s: SessionId, rseq: u32, echo: u32, recs: &[Record], resend: bool) -> Vec<u8> {
+    let mut buf = [0u8; PROTO_RESP_MAX_BYTES];
+    let n = encode_response(
+        &mut buf,
+        RespHeader::new(s, rseq, E16, echo, resend),
+        recs,
+        &K_OUT,
+    )
+    .unwrap();
+    buf[..n].to_vec()
+}
+
+enum Pkt {
+    Req(Vec<Msg>, Vec<u8>),
+    Resp(Vec<Record>, Vec<u8>),
+}
+
+/// The scenario of 04 §11, in the script's order.
+fn built() -> Vec<(&'static str, Pkt)> {
+    let (a, b, c) = (sid(7, 3, 1), sid(9, 5, 1), sid(2, 0, 4));
+    let (a1, a2, a3, a4, b1) = (h(42, 1), h(43, 1), h(44, 1), h(45, 1), h(7, 3));
+    let buy_stp = of(Side::Buy, Tif::Day, false, Stp::CancelNewest);
+    let r = |m: Vec<Msg>, s, seq, com, resend| {
+        let bytes = req(s, seq, &m, com, resend);
+        Pkt::Req(m, bytes)
+    };
+    let p = |rs: Vec<Record>, s, rseq, echo, resend| {
+        let bytes = resp(s, rseq, echo, &rs, resend);
+        Pkt::Resp(rs, bytes)
+    };
+    let ack_a1 = Record::Ack {
+        index: 0,
+        handle: a1,
+        tick: Tick(100_000),
+        client_tag: 0x1111_1111,
+    };
+    let ioc_buy = Msg::New {
+        flags: of(Side::Buy, Tif::Ioc, false, Stp::None),
+        tick: Tick(100_000),
+        qty: Qty(2),
+        client_tag: 0x8888_8888,
+    };
+    vec![
+        (
+            "V1",
+            r(
+                vec![Msg::New {
+                    flags: buy_stp,
+                    tick: Tick(100_000),
+                    qty: Qty(5),
+                    client_tag: 0x1111_1111,
+                }],
+                a,
+                1,
+                None,
+                false,
+            ),
+        ),
+        ("V2", p(vec![ack_a1], a, 1, 1, false)),
+        (
+            "V3",
+            r(
+                vec![
+                    Msg::Cancel {
+                        handle: a1,
+                        client_tag: 0x2222_2222,
+                    },
+                    Msg::Reduce {
+                        handle: a2,
+                        by: Qty(2),
+                        client_tag: 0x3333_3333,
+                    },
+                    Msg::Replace {
+                        flags: buy_stp,
+                        handle: a3,
+                        tick: Tick(100_001),
+                        qty: Qty(8),
+                    },
+                ],
+                a,
+                2,
+                None,
+                false,
+            ),
+        ),
+        (
+            "V4",
+            p(
+                vec![
+                    Record::CancelAck {
+                        index: 0,
+                        handle: a1,
+                        qty: Qty(5),
+                        client_tag: 0x2222_2222,
+                    },
+                    Record::CancelAck {
+                        index: 1,
+                        handle: a2,
+                        qty: Qty(2),
+                        client_tag: 0x3333_3333,
+                    },
+                    Record::CancelAck {
+                        index: 2,
+                        handle: a3,
+                        qty: Qty(4),
+                        client_tag: 0x4444_4444,
+                    },
+                    Record::Ack {
+                        index: 2,
+                        handle: a4,
+                        tick: Tick(100_001),
+                        client_tag: 0x4444_4444,
+                    },
+                ],
+                a,
+                2,
+                2,
+                false,
+            ),
+        ),
+        (
+            "V5",
+            r(
+                vec![Msg::New {
+                    flags: of(Side::Sell, Tif::Ioc, false, Stp::None),
+                    tick: Tick(100_000),
+                    qty: Qty(10),
+                    client_tag: 0x5555_5555,
+                }],
+                b,
+                1,
+                None,
+                false,
+            ),
+        ),
+        (
+            "V6",
+            p(
+                vec![
+                    Record::Fill {
+                        index: 0,
+                        liq: Liq::Taker,
+                        handle: b1,
+                        tick: Tick(100_001),
+                        qty: Qty(8),
+                    },
+                    Record::Fill {
+                        index: 0,
+                        liq: Liq::Taker,
+                        handle: b1,
+                        tick: Tick(100_000),
+                        qty: Qty(1),
+                    },
+                    Record::Out {
+                        index: 0,
+                        cause: OutCause::IocRemainder,
+                        handle: b1,
+                        qty: Qty(1),
+                        client_tag: 0x5555_5555,
+                    },
+                ],
+                b,
+                1,
+                1,
+                false,
+            ),
+        ),
+        (
+            "V7",
+            p(
+                vec![Record::Fill {
+                    index: 0xFF,
+                    liq: Liq::Maker,
+                    handle: a4,
+                    tick: Tick(100_001),
+                    qty: Qty(8),
+                }],
+                a,
+                3,
+                0,
+                false,
+            ),
+        ),
+        ("V8", r(vec![Msg::Heartbeat], a, 3, None, false)),
+        (
+            "V9",
+            p(
+                vec![Record::EpochNotice {
+                    next: Epoch(E + 1),
+                    home: 2 | 1 << 8,
+                    secs: 3600,
+                }],
+                a,
+                4,
+                3,
+                false,
+            ),
+        ),
+        (
+            "V10",
+            r(
+                vec![Msg::New {
+                    flags: of(Side::Sell, Tif::Day, true, Stp::None),
+                    tick: Tick(100_002),
+                    qty: Qty(3),
+                    client_tag: 0x6666_6666,
+                }],
+                c,
+                1,
+                Some(&K_COM),
+                false,
+            ),
+        ),
+        (
+            "V11",
+            p(
+                vec![Record::Reject {
+                    index: 0xFF,
+                    reason: RejectReason::EpochMismatch,
+                    detail: E,
+                    client_tag: 0,
+                }],
+                a,
+                0,
+                4,
+                false,
+            ),
+        ),
+        (
+            "V12",
+            r(vec![Msg::ResendReq { from: 1, to: 1 }], a, 4, None, false),
+        ),
+        ("V13", p(vec![ack_a1], a, 1, 1, true)),
+        (
+            "V14",
+            r(
+                vec![Msg::CancelAll {
+                    client_tag: 0x7777_7777,
+                }],
+                a,
+                5,
+                None,
+                false,
+            ),
+        ),
+        (
+            "V15",
+            p(
+                vec![
+                    Record::CancelAck {
+                        index: 0,
+                        handle: a2,
+                        qty: Qty(3),
+                        client_tag: 0x7777_7777,
+                    },
+                    Record::CancelAck {
+                        index: 0,
+                        handle: h(46, 1),
+                        qty: Qty(6),
+                        client_tag: 0x7777_7777,
+                    },
+                    Record::CancelAck {
+                        index: 0,
+                        handle: Handle(PROTO_HANDLE_ALL),
+                        qty: Qty(2),
+                        client_tag: 0x7777_7777,
+                    },
+                ],
+                a,
+                6,
+                5,
+                false,
+            ),
+        ),
+        ("V16", r(vec![ioc_buy], a, 6, None, false)),
+        (
+            "V17",
+            p(
+                vec![Record::Reject {
+                    index: 0xFF,
+                    reason: RejectReason::Busy,
+                    detail: 6,
+                    client_tag: 0,
+                }],
+                a,
+                0,
+                6,
+                false,
+            ),
+        ),
+        ("V18", r(vec![ioc_buy], a, 6, None, true)),
+    ]
+}
+
+#[test]
+fn every_vector_builds_byte_for_byte_and_parses_back() {
+    let golden = golden();
+    let built = built();
+    assert_eq!(built.len(), golden.len());
+    for (name, pkt) in &built {
+        match pkt {
+            Pkt::Req(msgs, bytes) => {
+                assert_eq!(bytes, &golden[*name], "{name} bytes");
+                let p = Request::parse(bytes).unwrap();
+                p.check_header().unwrap();
+                assert!(p.verify_seq(&K_SEQ), "{name} tag_seq");
+                assert_eq!(
+                    p.msgs().collect::<Result<Vec<_>, _>>().unwrap(),
+                    *msgs,
+                    "{name} messages"
+                );
+            }
+            Pkt::Resp(recs, bytes) => {
+                assert_eq!(bytes, &golden[*name], "{name} bytes");
+                let p = Response::parse(bytes).unwrap();
+                assert!(p.verify(&K_OUT), "{name} tag");
+                assert_eq!(
+                    p.records().collect::<Result<Vec<_>, _>>().unwrap(),
+                    *recs,
+                    "{name} records"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_scripts_checks_hold() {
+    let g = golden();
+    let v1 = Request::parse(&g["V1"]).unwrap();
+    assert!(v1.verify_seq(&K_SEQ));
+    assert!(!v1.verify_seq(&K_OUT));
+    assert_eq!(v1.tag_com().0, 0, "BASE mode");
+
+    let mut bad = g["V1"].clone();
+    bad[32] ^= 0x01;
+    assert!(
+        !Request::parse(&bad).unwrap().verify_seq(&K_SEQ),
+        "one tag bit flipped"
+    );
+
+    let v10 = Request::parse(&g["V10"]).unwrap();
+    assert!(v10.verify_seq(&K_SEQ) && v10.verify_com(&K_COM) && !v10.verify_com(&K_SEQ));
+
+    let (v2, v13) = (
+        Response::parse(&g["V2"]).unwrap(),
+        Response::parse(&g["V13"]).unwrap(),
+    );
+    assert!(v13.is_resend() && !v2.is_resend());
+    assert_eq!(v2.header().resp_seq, v13.header().resp_seq);
+    assert_ne!(v2.tag(), v13.tag());
+
+    let v17 = Response::parse(&g["V17"]).unwrap();
+    assert!(v17.is_out_of_stream());
+    assert_eq!(v17.header().echo_pkt.get(), 6);
+
+    let (v16, v18) = (
+        Request::parse(&g["V16"]).unwrap(),
+        Request::parse(&g["V18"]).unwrap(),
+    );
+    assert!(v18.is_resend() && !v16.is_resend());
+    assert_eq!(v16.raw_msgs(), v18.raw_msgs());
+    assert_eq!(v16.header().pkt_seq, v18.header().pkt_seq);
+    assert!(v18.verify_seq(&K_SEQ));
+}
+
+#[test]
+fn wrong_lengths_and_header_bits_are_refused() {
+    let g = golden();
+    let v1 = &g["V1"];
+    // One byte short, one byte long, and a count that disagrees with the length.
+    assert!(Request::parse(&v1[..v1.len() - 1]).is_err());
+    assert!(Request::parse(&[v1.as_slice(), &[0]].concat()).is_err());
+    let mut two = v1.clone();
+    two[8] = 2;
+    assert!(Request::parse(&two).is_err());
+    // count 0 with a 32-byte packet.
+    let mut zero = v1[..16].to_vec();
+    zero[8] = 0;
+    zero.extend([0u8; 16]);
+    assert!(Request::parse(&zero).is_err());
+    // V9: flags bit 1 and `reserved` parse, but fail the header check.
+    let mut flag = v1.clone();
+    flag[9] = 0x02;
+    assert!(Request::parse(&flag).unwrap().check_header().is_err());
+    let mut res = v1.clone();
+    res[14] = 1;
+    assert!(Request::parse(&res).unwrap().check_header().is_err());
+    // Responses: a flags bit other than resend.
+    let mut r = g["V2"].clone();
+    r[9] = 0x80;
+    assert!(Response::parse(&r).is_err());
+}

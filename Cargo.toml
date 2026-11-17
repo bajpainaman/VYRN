@@ -37,8 +37,9 @@ zerocopy = { version = "=0.8.63", features = ["derive"] }
 
 # Tier S: other production crates.
 curve25519-dalek = "=5.0.0"
-ed25519-dalek = "=3.0.0"
-x25519-dalek = "=3.0.0"
+# "digest" re-exports SHA-512 for the ZIP-215 verifier in vyrn-crypto.
+ed25519-dalek = { version = "=3.0.0", features = ["digest"] }
+x25519-dalek = { version = "=3.0.0", features = ["static_secrets"] }
 k256 = "=0.14.0"
 # All commonware-* crates move together on one release tag (§2.6).
 commonware-consensus = "=2026.10.0"
