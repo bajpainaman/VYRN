@@ -78,5 +78,12 @@ msg 1 0x99 0 rx=21 seq=21 : heartbeat
 msg 1 0x11 0 rx=22 seq=22 : heartbeat
 => none
 
+# Replace: qty 0 is BAD_QTY with detail 0 (04 §6.5); a bad flag combination is BAD_TYPE before
+# any handle lookup, so an unknown handle still gets BAD_TYPE (as vyrn-wire's decoder does).
+msg 1 0x11 0 rx=23 seq=23 : replace buy day 0x01000003 98 0
+=> 0x11 reject 0 BAD_QTY 0 0xb1
+msg 1 0x11 0 rx=24 seq=24 : replace buy ioc post 0x0100abcd 98 1
+=> 0x11 reject 0 BAD_TYPE 3 0
+
 check resting 0x01000003 0x01000002
 check account 1 open=2 base_free=48 base_resv=2 quote_free=902 quote_resv=98

@@ -1,0 +1,24 @@
+# A reservation whose total the ledger cannot hold is RISK_CREDIT at entry (05 §2.6), even when
+# it fits the free balance. qptl = 2^62, no fees: a buy of 2 @ 1 reserves 2^63.
+
+book band=1..2 qptl=4611686018427387904 max_qty=10
+lane 1 first=0x01000001
+lane 2 first=0x01000101
+account 1 lane=1 base=1 quote=18446744073709551615
+account 2 lane=2 quote=9223372036854775808
+session 0x11 account=1
+session 0x22 account=2
+
+msg 1 0x11 0 rx=1 seq=1 : new buy day 1 2 0xa1
+=> 0x11 ack 0 0x01000001 1 0xa1
+msg 1 0x11 0 rx=2 seq=2 : new sell day 2 1 0xa2
+=> 0x11 ack 0 0x01000002 2 0xa2
+msg 2 0x22 0 rx=3 seq=1 step=1 : new buy day 2 1 0xb1
+=> 0x22 fill 0 1 0x01000101 2 1
+=> 0x11 fill maker 0 0x01000002 2 1
+check account 1 quote_free=18446744073709551615 quote_resv=9223372036854775808
+
+# 2^63 fits quote_free, but quote_resv would reach 2^64.
+msg 1 0x11 0 rx=4 seq=3 : new buy day 1 2 0xa3
+=> 0x11 reject 0 RISK_CREDIT 0xffffffff 0xa3
+check account 1 open=1 quote_free=18446744073709551615 quote_resv=9223372036854775808

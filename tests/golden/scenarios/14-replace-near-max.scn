@@ -1,0 +1,26 @@
+# A priority-losing Replace moves the reservation by its difference (05 §2.6, 04 §6.5), so a
+# Replace needing the same reservation works even when free + reserved exceeds u64.
+
+book band=1..2 qptl=1 max_qty=100
+lane 1 first=0x01000001
+lane 2 first=0x01000101
+account 1 lane=1 base=50 quote=18446744073709551615
+account 2 lane=2 quote=100
+session 0x11 account=1
+session 0x22 account=2
+
+msg 1 0x11 0 rx=1 seq=1 : new buy day 1 100 0xa1
+=> 0x11 ack 0 0x01000001 1 0xa1
+msg 1 0x11 0 rx=2 seq=2 : new sell day 2 50 0xa2
+=> 0x11 ack 0 0x01000002 2 0xa2
+msg 2 0x22 0 rx=3 seq=1 step=1 : new buy day 2 50 0xb1
+=> 0x22 fill 0 1 0x01000101 2 50
+=> 0x11 fill maker 0 0x01000002 2 50
+check account 1 quote_free=18446744073709551615 quote_resv=100
+
+# 100 @ 1 -> 50 @ 2: the same 100 reserved.
+msg 1 0x11 0 rx=4 seq=3 : replace buy day 0x01000001 2 50
+=> 0x11 cancel_ack 0 0x01000001 100 0xa1
+=> 0x11 ack 0 0x01000003 2 0xa1
+check resting 0x01000003
+check account 1 open=1 quote_free=18446744073709551615 quote_resv=100

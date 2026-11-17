@@ -332,15 +332,20 @@ fn reserve(b : *mut Book, a : i64, side : u64, t : u64, q : u64, idx : u64, tag 
         reject(b, idx, RISK_CREDIT, cap32(short), tag);
         return false;
       }
+      // An amount the ledger cannot hold is an overflow at entry: RISK_CREDIT (05 §2.6).
+      let (r, o) = (*ac).quote_resv.overflowing_add(amt);
+      if o { reject(b, idx, RISK_CREDIT, U32_MAX, tag); return false; }
       (*ac).quote_free = (*ac).quote_free - amt;
-      (*ac).quote_resv = (*ac).quote_resv + amt;
+      (*ac).quote_resv = r;
     } else {
+      let (r, o) = (*ac).base_resv.overflowing_add(q);
+      if o { reject(b, idx, RISK_CREDIT, U32_MAX, tag); return false; }
       if q > (*ac).base_free {
         reject(b, idx, RISK_CREDIT, cap32(q - (*ac).base_free), tag);
         return false;
       }
       (*ac).base_free = (*ac).base_free - q;
-      (*ac).base_resv = (*ac).base_resv + q;
+      (*ac).base_resv = r;
     }
   }
   return true;
@@ -567,18 +572,19 @@ fn op_replace(b : *mut Book, ev : &Ev, a : i64, m : *const u8) -> void {
   let found = find(b, a, rd32(m, 4i64));
   let mut tag = 0u64;
   if found >= 0i64 { unsafe { tag = (*ord(b, found)).tag; } }
-  if rd16(m, 2i64) != 0u64 || f >= 64u64 { reject(b, idx, BAD_TYPE, D_RESERVED, tag); return; }
+  // Wire checks (M3 and the flag combinations) come before any lookup, as in vyrn-wire.
+  let fb = if rd16(m, 2i64) != 0u64 { D_RESERVED } else { flags_bad(f) };
+  if fb != 0u64 { reject(b, idx, BAD_TYPE, fb, tag); return; }
   let i = target(b, a, rd32(m, 4i64), idx, tag);
   if i < 0i64 { return; }
   let o = ord(b, i);
   unsafe {
     if (*o).side != (f & 1u64) { reject(b, idx, SIDE_MISMATCH, 0u64, tag); return; }
     if !entry_ok(b, f, tick, idx, tag) { return; }
-    if qty == 0u64 || qty > (*b).max_qty { reject(b, idx, BAD_QTY, (*b).max_qty, tag); return; }
+    if qty == 0u64 { reject(b, idx, BAD_QTY, 0u64, tag); return; }          // 04 §6.5: detail 0
+    if qty > (*b).max_qty { reject(b, idx, BAD_QTY, (*b).max_qty, tag); return; }
     let same = tick == (*o).tick && f == (*o).flags;
     if same && qty == (*o).total { reject(b, idx, BAD_QTY, D_NO_CHANGE, tag); return; }
-    let fb = flags_bad(f);
-    if fb != 0u64 { reject(b, idx, BAD_TYPE, fb, tag); return; }
     if same && qty < (*o).total { reduce_by(b, i, (*o).total - qty, idx, tag); return; }
     // Priority loss (04 §6.5): the new reservation, net of the old one.
     let filled = (*o).filled;
@@ -596,10 +602,28 @@ fn op_replace(b : *mut Book, ev : &Ev, a : i64, m : *const u8) -> void {
     if (*b).fault != 0u64 { (*b).fault = 0u64; reject(b, idx, RISK_CREDIT, U32_MAX, tag); return; }
     if need > have && need - have > free { reject(b, idx, RISK_CREDIT, cap32(need - have - free), tag); return; }
     if left > 0u64 && (*b).n_orders >= (*b).max_orders { (*b).fault = 2u64; return; }
+    // Move the reservation from `have` to `need` in one step, so that no intermediate sum
+    // overflows; a result the ledger cannot hold rejects and leaves the old order (04 §6.5).
+    let mut resv = (*ac).base_resv;
+    if (*o).side == 0u64 { resv = (*ac).quote_resv; }
+    let mut nfree = 0u64;
+    let mut nresv = 0u64;
+    let mut ovf = false;
+    if need >= have {
+      nfree = free - (need - have);
+      let (r, o1) = resv.overflowing_add(need - have);
+      nresv = r; ovf = o1;
+    } else {
+      let (fr, o1) = free.overflowing_add(have - need);
+      nfree = fr; ovf = o1;
+      nresv = resv - (have - need);
+    }
+    if ovf { reject(b, idx, RISK_CREDIT, U32_MAX, tag); return; }
     emit(b, (*b).out_session, R_CXL, idx, 0u64, (*o).handle, open(b, i), tag);
-    kill(b, i, END_CANCELED);
+    end(b, i, END_CANCELED);
+    if (*o).side == 0u64 { (*ac).quote_free = nfree; (*ac).quote_resv = nresv; }
+    else { (*ac).base_free = nfree; (*ac).base_resv = nresv; }
     if left == 0u64 { return; }
-    let _reserved = reserve(b, a, f & 1u64, tick, left, idx, tag);
     enter(b, ev, a, f, tick, qty, filled, tag);
   }
 }
