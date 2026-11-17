@@ -467,10 +467,10 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::header::{header_hash, seq_sign};
     use crate::source::mem::MemSource;
     use commonware_consensus::types::View;
     use commonware_runtime::{Runner, Supervisor, deterministic};
+    use vyrn_log::block::{header_hash, sign_header};
     use vyrn_types::{BookId, Hash, StepId};
 
     const SEQ: [u8; 32] = [0x99; 32];
@@ -496,14 +496,14 @@ mod tests {
         };
         let src = MemSource::default();
         for _ in 0..n {
-            let mut h = BlockHeader {
+            let h = BlockHeader {
                 height: Height(prev.height.0 + 1),
                 first_step: StepId(prev.last_step.0 + 1),
                 last_step: StepId(prev.last_step.0 + 1),
                 prev: header_hash(&prev),
                 ..prev
             };
-            h.seq_sig = seq_sign(&SEQ, &h);
+            let h = sign_header(&h, &SEQ);
             src.insert(h);
             prev = h;
         }

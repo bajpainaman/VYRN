@@ -168,6 +168,12 @@ fn exercise<S: BlockStore>(s: &mut S) {
     assert_eq!(s.get(Height(13)).unwrap().unwrap(), c[3]);
     assert_eq!(s.get(Height(9)).unwrap(), None);
     assert_eq!(s.get(Height(18)).unwrap(), None);
+    // The header-only read agrees with the full record at every height, across drives.
+    for b in &c {
+        assert_eq!(s.header(b.header.height).unwrap(), Some(b.header));
+    }
+    assert_eq!(s.header(Height(9)).unwrap(), None);
+    assert_eq!(s.header(Height(18)).unwrap(), None);
     let read: Vec<Block> = s.read(Height(10), Height(17)).map(Result::unwrap).collect();
     assert_eq!(read, c);
     // A gap or a block that does not link is refused.

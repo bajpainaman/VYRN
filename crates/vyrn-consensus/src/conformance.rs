@@ -9,9 +9,9 @@
 
 use crate::Committee;
 use crate::cert::{CertErr, FinalityCert, verify_finality_cert};
-use crate::header::{header_bytes, header_hash, seq_sign};
 use crate::proposal::{Proposal, ProposalKind};
 use std::fmt::Write as _;
+use vyrn_log::block::{encode_header, header_hash, sign_header};
 use vyrn_types::{BlockHeader, BookId, Epoch, Hash, Height, Mode, StepId};
 
 const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/vectors/finality_cert.txt");
@@ -50,7 +50,7 @@ fn verdict(r: Result<(), CertErr>) -> &'static str {
 
 fn generate() -> String {
     let seq_seed = [0x99u8; 32];
-    let mut h = BlockHeader {
+    let h = BlockHeader {
         height: Height(101),
         epoch: Epoch(7),
         book: BookId(1),
@@ -61,7 +61,7 @@ fn generate() -> String {
         data_root: Hash([0x33; 32]),
         seq_sig: [0; 64],
     };
-    h.seq_sig = seq_sign(&seq_seed, &h);
+    let h = sign_header(&h, &seq_seed);
     let proposal = Proposal {
         kind: ProposalKind::Headers,
         epoch: Epoch(7),
@@ -78,7 +78,7 @@ fn generate() -> String {
     );
     let _ = writeln!(out, "case = header");
     let _ = writeln!(out, "seq_seed = {}", hex(&seq_seed));
-    let _ = writeln!(out, "header = {}", hex(&header_bytes(&h)));
+    let _ = writeln!(out, "header = {}", hex(&encode_header(&h)));
     let _ = writeln!(out, "header_hash = {}", hex(&header_hash(&h).0));
     let _ = writeln!(out, "\ncase = proposal");
     let _ = writeln!(out, "proposal = {}", hex(&proposal.encode()));

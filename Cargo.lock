@@ -3562,6 +3562,7 @@ dependencies = [
  "tokio",
  "tracing",
  "vyrn-crypto",
+ "vyrn-log",
  "vyrn-types",
 ]
 

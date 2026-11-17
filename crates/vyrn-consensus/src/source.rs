@@ -4,15 +4,18 @@
 //! Consensus orders blocks; it never builds them and never calls matching (11 §1.4). It reads
 //! headers ([`BlockHeader`], 01 §6.6) and asks one yes/no/not-yet question about the rest of a
 //! block. Everything below the header (ORDER bytes, payloads, CHAIN tags) is opaque to this crate
-//! and stays with the source, which is `vyrn-log` in production.
+//! and stays with the source. Header bytes, `header_hash` and `seq_sig` are `vyrn-log`'s
+//! ([`vyrn_log::block`]); [`LogSource`] is the source backed by a `vyrn-log` [`BlockStore`].
 //!
 //! Split of the vote rule INV-REP-4 (07 §6.4):
 //! - item 1 (headers, `seq_sig`, `prev` chain, step contiguity, `last_hash`) is checked here, from
 //!   [`BlockSource::header`], so every source gets the same header rule;
 //! - items 2–5 (order bytes, payloads, tags, fences) are [`BlockSource::check_body`].
 
-use crate::header::{header_hash, verify_seq_sig};
 use crate::proposal::{Proposal, ProposalKind};
+use std::sync::{Arc, PoisonError, RwLock};
+use vyrn_log::block::{check_anchor, header_hash, verify_seq_sig};
+use vyrn_log::store::BlockStore;
 use vyrn_types::{BlockHeader, Epoch, Hash, Height, PubKey, StepId};
 
 /// Answer of the source about a block range (07 §6.4).
@@ -84,15 +87,11 @@ pub(crate) fn chain_after<S: BlockSource>(
         let Some(h) = source.header(next) else {
             break;
         };
-        let contiguous = prev_step.0.checked_add(1) == Some(h.first_step.0)
-            && h.last_step
-                .0
-                .checked_add(1)
-                .is_some_and(|l| l >= h.first_step.0);
-        if h.height != next
+        // check_anchor: height, prev and last_step ≥ first_step − 1. Within one epoch the steps
+        // also continue from the previous header's.
+        if check_anchor(prev_hash, height, &h).is_err()
             || h.epoch != epoch
-            || h.prev != prev_hash
-            || !contiguous
+            || prev_step.0.checked_add(1) != Some(h.first_step.0)
             || !verify_seq_sig(&h, seq_key)
         {
             break;
@@ -132,12 +131,58 @@ pub(crate) fn proposal_range<S: BlockSource>(
     }
 }
 
+/// A [`BlockSource`] over a `vyrn-log` [`BlockStore`], for a voter that restarts or catches up
+/// and resolves notarized ranges from its own journal.
+///
+/// A block is written once, when its `verify` passes (07 §8.2), so a stored range has passed
+/// items 2–5: [`check_body`](BlockSource::check_body) is `Valid` when every height is stored and
+/// `Pending` otherwise. Only headers are read ([`BlockStore::header`]); order bytes and payloads
+/// stay in the store. A read error counts as not held. `excl_root` is BASE's 32 zero bytes: the
+/// CHAIN exclusion root (09) is not part of `REP_BlockRecord`.
+pub struct LogSource<St>(Arc<RwLock<St>>);
+
+impl<St> LogSource<St> {
+    /// The source over `store`; the caller keeps its handle to write blocks.
+    pub const fn new(store: Arc<RwLock<St>>) -> Self {
+        Self(store)
+    }
+}
+
+impl<St> Clone for LogSource<St> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<St: BlockStore + Send + Sync + 'static> BlockSource for LogSource<St> {
+    fn header(&self, height: Height) -> Option<BlockHeader> {
+        let store = self.0.read().unwrap_or_else(PoisonError::into_inner);
+        store.header(height).ok().flatten()
+    }
+
+    fn check_body(&self, _: Epoch, first: Height, last: Height) -> Verdict {
+        if first > last {
+            return Verdict::Invalid;
+        }
+        let store = self.0.read().unwrap_or_else(PoisonError::into_inner);
+        // Heights are stored without gaps (BlockStore::put), so the range bounds decide.
+        match store.range() {
+            Some((lo, hi)) if lo <= first && last <= hi => Verdict::Valid,
+            _ => Verdict::Pending,
+        }
+    }
+
+    fn excl_root(&self, _: Epoch, _: Height, _: Height) -> Hash {
+        Hash([0; 32])
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod mem {
     //! An in-memory source for tests: every body is valid, `excl_root` is zero (BASE).
     use super::*;
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     #[derive(Clone, Default)]
     pub struct MemSource(pub Arc<Mutex<BTreeMap<Height, BlockHeader>>>);
@@ -167,13 +212,14 @@ pub(crate) mod mem {
 mod tests {
     use super::mem::MemSource;
     use super::*;
-    use crate::header::seq_sign;
+    use vyrn_log::block::sign_header;
+    use vyrn_log::store::{Block, BlockKind, MemStore};
     use vyrn_types::BookId;
 
     const SEED: [u8; 32] = [0x51; 32];
 
     fn next(prev: &BlockHeader) -> BlockHeader {
-        let mut h = BlockHeader {
+        let h = BlockHeader {
             height: Height(prev.height.0 + 1),
             epoch: prev.epoch,
             book: prev.book,
@@ -184,8 +230,7 @@ mod tests {
             data_root: Hash([5; 32]),
             seq_sig: [0; 64],
         };
-        h.seq_sig = seq_sign(&SEED, &h);
-        h
+        sign_header(&h, &SEED)
     }
 
     #[test]
@@ -215,13 +260,76 @@ mod tests {
         }
         assert_eq!(chain_after(&src, Epoch(1), &key, tip, 16).len(), 16);
         // A header whose seq_sig is not the sequencer's ends the run before it.
-        let mut bad = src.header(Height(14)).unwrap_or(base);
-        bad.seq_sig = seq_sign(&[0x52; 32], &bad);
+        let bad = sign_header(&src.header(Height(14)).unwrap_or(base), &[0x52; 32]);
         src.insert(bad);
         let run = chain_after(&src, Epoch(1), &key, tip, 16);
         assert_eq!(run.last().map(|h| h.height), Some(Height(13)));
         let p = proposal_for(&src, Epoch(1), tip, &run[2]);
         assert_eq!((p.first_height, p.last_height), (Height(11), Height(13)));
         assert_eq!(p.last_hash, header_hash(&run[2]));
+    }
+
+    #[test]
+    fn log_source_reads_headers_from_the_store_and_waits_for_missing_blocks() {
+        let key = vyrn_crypto::ed25519::public_key(&SEED);
+        let genesis = BlockHeader {
+            height: Height(0),
+            epoch: Epoch(1),
+            book: BookId(1),
+            first_step: StepId(1),
+            last_step: StepId(0),
+            prev: Hash([0; 32]),
+            order_root: Hash([0; 32]),
+            data_root: Hash([0; 32]),
+            seq_sig: [0; 64],
+        };
+        let block = |header| Block {
+            header,
+            tenure: 0,
+            kind: BlockKind::Normal,
+            order_a: Vec::new(),
+            order_b: Vec::new(),
+            pkt_hashes: Vec::new(),
+            data: vec![0xEE; 300],
+            unavailable: Vec::new(),
+        };
+        let store = Arc::new(RwLock::new(MemStore::default()));
+        let src = LogSource::new(Arc::clone(&store));
+        let mut prev = genesis;
+        for _ in 0..5 {
+            prev = next(&prev);
+            store.write().unwrap().put(&block(prev)).unwrap();
+        }
+        let tip = Tip {
+            height: genesis.height,
+            hash: header_hash(&genesis),
+            last_step: genesis.last_step,
+        };
+        let run = chain_after(&src, Epoch(1), &key, tip, 16);
+        assert_eq!(run.len(), 5);
+        assert_eq!(run.last(), Some(&prev));
+        assert_eq!(
+            src.check_body(Epoch(1), Height(1), Height(5)),
+            Verdict::Valid
+        );
+        assert_eq!(
+            src.check_body(Epoch(1), Height(4), Height(6)),
+            Verdict::Pending
+        );
+        assert_eq!(
+            src.check_body(Epoch(1), Height(0), Height(2)),
+            Verdict::Pending
+        );
+        assert_eq!(
+            src.check_body(Epoch(1), Height(3), Height(2)),
+            Verdict::Invalid
+        );
+        // Height 6 arrives through the writer's handle; the same source now sees it.
+        store.write().unwrap().put(&block(next(&prev))).unwrap();
+        assert_eq!(
+            src.check_body(Epoch(1), Height(4), Height(6)),
+            Verdict::Valid
+        );
+        assert_eq!(chain_after(&src, Epoch(1), &key, tip, 16).len(), 6);
     }
 }
