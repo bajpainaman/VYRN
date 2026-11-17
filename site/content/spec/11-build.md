@@ -189,9 +189,9 @@ an engine crate depends on a crate outside `crates/engine/`, other than the allo
   layer 4   vyrn-engine ──► vyrn-lane, vyrn-bbo, vyrn-cut, vyrn-wire
             vyrn-consensus ──► vyrn-log, Commonware (consensus, p2p, runtime, cryptography, storage, codec)
             vyrn-data ──► vyrn-log, vyrn-nic
-  layer 5   vyrn-replica ──► vyrn-engine, vyrn-consensus, libvyrn_vx_client (Vx, C ABI)
-            vyrn-epoch ──► vyrn-consensus
-  layer 6   vyrn-md ──► vyrn-replica
+  layer 5   vyrn-epoch ──► vyrn-consensus
+  layer 6   vyrn-replica ──► vyrn-engine, vyrn-consensus, vyrn-epoch, libvyrn_vx_client (Vx, C ABI)
+  layer 7   vyrn-md ──► vyrn-replica
             vyrn-chain ──► vyrn-replica, vyrn-epoch
 
   test-only:  vyrn-sim ──► everything above + libvyrn_vx_oracle (Vx, C ABI)
