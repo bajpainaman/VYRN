@@ -371,7 +371,8 @@ fn is_exported(toks: &[TokenTree], i: usize) -> bool {
 }
 
 /// Items in an `unsafe extern` block are unsafe to call unless marked `safe`, so a `pub` one is a
-/// `pub unsafe fn` by another name. Items are separated by `;`; attributes come first.
+/// `pub unsafe fn` by another name. Items are separated by `;`; attributes come first, then the
+/// visibility, then `safe` if present.
 fn foreign_items(toks: &[TokenTree], out: &mut Vec<Site>) {
     for item in toks.split(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ';')) {
         let mut k = 0;
@@ -384,9 +385,14 @@ fn foreign_items(toks: &[TokenTree], out: &mut Vec<Site>) {
         if first != "pub" {
             continue;
         }
-        let is_safe = item
-            .iter()
-            .any(|t| matches!(t, TokenTree::Ident(id) if id == "safe"));
+        // After the visibility comes the qualifier: `pub safe fn f();`. A function that is merely
+        // named `safe` (`pub fn safe();`) is still unsafe to call.
+        let mut q = k + 1;
+        if matches!(item.get(q), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+        {
+            q += 1;
+        }
+        let is_safe = matches!(item.get(q), Some(TokenTree::Ident(id)) if id == "safe");
         if !is_safe {
             out.push(Site {
                 line: first.span().start().line,
@@ -453,7 +459,7 @@ mod tests {
         let src = "pub unsafe fn a() {}\nfn b() { unsafe { x() } }\nunsafe impl Send for T {}\n\
                    pub(crate) const unsafe fn c() {}\npub(self) unsafe fn d() {}\n\
                    #[unsafe(no_mangle)]\nfn e() {}\n\
-                   unsafe extern \"C\" {\n    pub fn f();\n    pub safe fn g();\n    fn h();\n}\n";
+                   unsafe extern \"C\" {\n    pub fn f();\n    pub safe fn g();\n    pub fn safe();\n    fn h();\n}\n";
         assert_eq!(
             sites(src),
             [
@@ -464,6 +470,7 @@ mod tests {
                 (5, "item"),
                 (6, "other"),
                 (9, "pub-foreign"),
+                (11, "pub-foreign"),
                 (8, "extern"),
             ]
         );

@@ -75,14 +75,18 @@ fn walk(toks: &[TokenTree], cx: &mut Cx) {
     }
 }
 
-fn ident(toks: &[TokenTree], i: usize, name: &str, line: usize, cx: &mut Cx) {
+fn ident(toks: &[TokenTree], i: usize, written: &str, line: usize, cx: &mut Cx) {
+    // `r#std` and `std` name the same item, so rules match the name without `r#`. A raw `r#async`
+    // is a plain identifier and not the keyword, so it is not an async finding.
+    let raw = written.starts_with("r#");
+    let name = written.strip_prefix("r#").unwrap_or(written);
     match name {
         "f32" | "f64" => cx.hit(
             line,
             "float-type",
             format!("`{name}` in an engine crate (11 §3.3)"),
         ),
-        "async" | "await" => {
+        "async" | "await" if !raw => {
             cx.hit(
                 line,
                 "async",
@@ -144,7 +148,7 @@ fn banned_path(prefix: &[String], rest: &[TokenTree], banned: &[Vec<String>]) ->
     match rest.get(2) {
         Some(TokenTree::Ident(id)) => {
             let mut next = prefix.to_vec();
-            next.push(id.to_string());
+            next.push(id.to_string().trim_start_matches("r#").to_owned());
             banned_path(&next, rest.get(3..).unwrap_or(&[]), banned)
         }
         Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => {
@@ -154,7 +158,7 @@ fn banned_path(prefix: &[String], rest: &[TokenTree], banned: &[Vec<String>]) ->
                     return None;
                 };
                 let mut next = prefix.to_vec();
-                next.push(id.to_string());
+                next.push(id.to_string().trim_start_matches("r#").to_owned());
                 banned_path(&next, chunk.get(1..).unwrap_or(&[]), banned)
             })
         }
@@ -275,6 +279,11 @@ mod tests {
             [(1, "banned-path")]
         );
         assert_eq!(hits("use ::std::env;"), [(1, "banned-path")]);
+        assert_eq!(
+            hits("use r#std::r#env; fn f(_: r#f64) {}"),
+            [(1, "banned-path"), (1, "float-type")]
+        );
+        assert_eq!(hits("fn r#async() { r#async(); }"), []);
         assert_eq!(
             hits("fn f() { ::std::thread::spawn(g); }"),
             [(1, "banned-path")]
