@@ -2029,6 +2029,10 @@
     {
      "id": "e_chain_rep",
      "type": "arrow"
+    },
+    {
+     "id": "e_rep_epoch",
+     "type": "arrow"
     }
    ],
    "link": null,
@@ -2170,6 +2174,10 @@
     },
     {
      "id": "e_chain_epoch",
+     "type": "arrow"
+    },
+    {
+     "id": "e_rep_epoch",
      "type": "arrow"
     }
    ],
@@ -2881,6 +2889,54 @@
    "elbowed": false,
    "startBinding": {
     "elementId": "chain",
+    "focus": 0,
+    "gap": 4
+   },
+   "endBinding": {
+    "elementId": "epoch",
+    "focus": 0,
+    "gap": 4
+   }
+  },
+  {
+   "type": "arrow",
+   "id": "e_rep_epoch",
+   "x": 484,
+   "y": 960,
+   "width": 112,
+   "height": 100,
+   "strokeColor": "#191B26",
+   "backgroundColor": "transparent",
+   "fillStyle": "solid",
+   "strokeWidth": 2,
+   "strokeStyle": "solid",
+   "roughness": 1,
+   "opacity": 100,
+   "angle": 0,
+   "seed": 1491,
+   "version": 1,
+   "versionNonce": 1494,
+   "isDeleted": false,
+   "groupIds": [],
+   "boundElements": null,
+   "link": null,
+   "locked": false,
+   "points": [
+    [
+     0,
+     0
+    ],
+    [
+     112,
+     100
+    ]
+   ],
+   "roundness": null,
+   "startArrowhead": null,
+   "endArrowhead": "arrow",
+   "elbowed": false,
+   "startBinding": {
+    "elementId": "replica",
     "focus": 0,
     "gap": 4
    },

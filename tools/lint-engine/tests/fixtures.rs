@@ -2,6 +2,7 @@
 //! `tree/` and the `expected.txt` a conforming implementation prints for it, as `path:line: rule`
 //! (messages are free text). In `tree/`, a file named `x.fixture` stands for `x`: the suffix keeps
 //! cargo, rustfmt and the repository's own gate runs from seeing the fixture's manifests and code.
+//! A fixture with its own `rules.toml` runs with `--rules` on it; the others use the built-in rules.
 //! Exit status is 0 when `expected.txt` is empty and 1 otherwise.
 
 use std::fs;
@@ -42,11 +43,12 @@ fn every_fixture_prints_exactly_its_expected_violations() {
         let work = std::env::temp_dir().join(format!("lint-engine-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&work);
         copy_tree(&case.join("tree"), &work);
-        let out = Command::new(env!("CARGO_BIN_EXE_lint-engine"))
-            .arg("--root")
-            .arg(&work)
-            .output()
-            .unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_lint-engine"));
+        cmd.arg("--root").arg(&work);
+        if case.join("rules.toml").exists() {
+            cmd.arg("--rules").arg(case.join("rules.toml"));
+        }
+        let out = cmd.output().unwrap();
         fs::remove_dir_all(&work).unwrap();
         let want: Vec<String> = fs::read_to_string(case.join("expected.txt"))
             .unwrap()
