@@ -27,13 +27,19 @@ step() {
   echo "<== $name ($((SECONDS - start))s)"
 }
 
+# Refresh the apt index at most once per run, and again only after llvm_repo adds a repository.
+apt_fresh=0
+
 apt_install_missing() {
   local missing=()
   for pkg in "$@"; do
     dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
   done
   if ((${#missing[@]})); then
-    sudo apt-get update -qq
+    if ((!apt_fresh)); then
+      sudo apt-get update -qq
+      apt_fresh=1
+    fi
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}"
   fi
 }
@@ -55,19 +61,22 @@ rustup_install() {
 }
 
 toolchains() {
-  # Stable is the default until rust-toolchain.toml lands; then rustup also installs the pin.
-  rustup toolchain install stable --profile minimal \
-    --component rustfmt,clippy,rust-src,llvm-tools-preview
-  rustup default stable >/dev/null
-  # Miri, TSan/ASan (-Zsanitizer) and cargo-fuzz need nightly (11 L608, L901, L1935).
-  rustup toolchain install nightly --profile minimal --component miri,rust-src,llvm-tools-preview
-  # B4 build C uses the previous rustc release (11 L1546).
-  local minor
-  minor="$(rustc +stable --version | sed -E 's/^rustc 1\.([0-9]+).*/\1/')"
-  rustup toolchain install "1.$((minor - 1))" --profile minimal
-  if [[ -f rust-toolchain.toml || -f rust-toolchain ]]; then
-    rustup toolchain install
+  # The pin from rust-toolchain.toml is the default. A separate `stable` toolchain would download
+  # the same rustc again under another name, and a different one once stable moves past the pin.
+  rustup toolchain install
+  local pin minor
+  pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+  rustup default "$pin" >/dev/null
+  # Miri, TSan/ASan (-Zsanitizer) and cargo-fuzz need nightly (11 L608, L901, L1935). Install it
+  # once: rerunning `rustup toolchain install nightly` on a restored snapshot pulls the day's
+  # nightly and forces a Miri sysroot rebuild.
+  if ! rustup run nightly cargo miri --version >/dev/null 2>&1; then
+    rustup toolchain install nightly --profile minimal --component miri,rust-src,llvm-tools-preview
   fi
+  # B4 build C uses the rustc release before the pin (11 L1546).
+  minor="${pin#1.}"
+  minor="${minor%%.*}"
+  rustup toolchain install "1.$((minor - 1))" --profile minimal
 }
 
 miri_sysroot() {
@@ -87,8 +96,8 @@ llvm_repo() {
   fi
   echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-${version} main" |
     sudo tee "$list" >/dev/null
-  # Force apt_install_missing to refresh the index for the new repository.
-  sudo apt-get update -qq
+  # Make apt_install_missing refresh the index for the new repository.
+  apt_fresh=0
 }
 
 llvm_for_rust() {
@@ -187,10 +196,11 @@ agent_guidance() {
   rustc's LLVM major, as cross-language LTO requires. LLVM/MLIR 22 under /usr/lib/llvm-22 is
   only for building vxc.
 - `vxc` v0.0.4 (tag 3a89e3c7, commit c6dffec7) is built from source in ~/.local/src/vx and
-  linked into ~/.local/bin, on orbs with at least 4 GiB of memory only. Pass
+  linked into ~/.local/bin, only once vx/ has `.vx` sources and on orbs with at least 4 GiB of
+  memory. After adding the first `.vx` file, run `.agents/setup` to build it. Pass
   `-fweak-relaxed-atomics` on aarch64.
-- Toolchains: stable (default), nightly (miri, sanitizers, cargo-fuzz), and the previous stable
-  release for B4 build C. Foundry (`forge`, `anvil`) is in ~/.foundry/bin.
+- Toolchains: the rust-toolchain.toml pin (default), nightly (miri, sanitizers, cargo-fuzz), and
+  the release before the pin for B4 build C. Foundry (`forge`, `anvil`) is in ~/.foundry/bin.
 - Use the `sim` or `kernel_udp` NIC backends. ef_vi, DPDK on hardware, PTP, 1 GiB huge pages
   and core pinning are unavailable here; never report DEV numbers as latency results.
 EOF
@@ -231,7 +241,12 @@ mem_limit="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)"
 if [[ "$mem_limit" == max ]]; then
   mem_limit=$(($(awk '/^MemTotal/ {print $2}' /proc/meminfo) * 1024))
 fi
-if [[ -x "$LOCAL_BIN/vxc" ]] || ((mem_limit >= 4 * 1024 * 1024 * 1024)); then
+# LLVM/MLIR 22 and the vxc build take most of a cold setup, and only vx/build.sh uses vxc, so
+# build it once the repository has Vx sources (the check vx/build.sh makes) or keep it current.
+if [[ ! -x "$LOCAL_BIN/vxc" &&
+  -z "$(find vx/vyrn-vx-oracle vx/vyrn-vx-client -name '*.vx' -print -quit 2>/dev/null)" ]]; then
+  echo "==> vxc $VX_TAG skipped: no Vx sources yet (rerun .agents/setup after adding one)"
+elif [[ -x "$LOCAL_BIN/vxc" ]] || ((mem_limit >= 4 * 1024 * 1024 * 1024)); then
   step "LLVM/MLIR $VX_LLVM for vxc" llvm_for_vx
   step "vxc $VX_TAG" vxc_build
 else
