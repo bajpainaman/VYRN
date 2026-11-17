@@ -2,7 +2,11 @@ import type { Metadata } from "next";
 import { SiteFooter } from "@/components/SiteFooter";
 import { REPO_URL } from "@/lib/site";
 
-export const metadata: Metadata = { title: "Privacy", description: "What this site collects: cookieless, aggregate page analytics, and nothing else." };
+export const metadata: Metadata = {
+  title: "Privacy",
+  description: "What this site collects: cookieless, aggregate page analytics, and nothing else.",
+  alternates: { canonical: "/privacy" },
+};
 
 export default function PrivacyPage() {
   return (
