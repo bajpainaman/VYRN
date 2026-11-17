@@ -40,20 +40,17 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup show active-toolchain || rustup toolchain install
-      - name: clang and lld with rustc's LLVM major (11 §4.2)
-        run: |
-          major="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
-          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
-          sudo bash /tmp/llvm.sh "$major"
-          for tool in clang clang++ lld ld.lld llvm-ar llvm-nm llvm-objdump; do
-            sudo ln -sfn "/usr/lib/llvm-$major/bin/$tool" "/usr/local/bin/$tool"
-          done
-          clang_major="$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)"
-          echo "rustc LLVM $major, clang $clang_major"
-          test "$major" = "$clang_major"
+      - uses: ./.github/actions/llvm # clang and lld with rustc's LLVM major (11 §4.2)
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        if: matrix.os == 'ubuntu-24.04'
+        with:
+          tool: git-cliff@2.14.2
+      - name: per-crate release dry run (deploy/release/README.md)
+        if: matrix.os == 'ubuntu-24.04'
+        run: deploy/release/crate.sh vyrn-wire "$RUNNER_TEMP/crate-bundle"
 
   gates:
     name: gates (unsafe-audit, lint-engine)
@@ -72,6 +69,15 @@ jobs:
         run: cargo run --locked --quiet -p unsafe-audit
       - name: engine crates keep to the dependency DAG and the engine source rules (11 §1.4, §2.3, §3.3)
         run: cargo run --locked --quiet -p lint-engine
+
+  actionlint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: actionlint 1.7.12
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color
 
   deny:
     runs-on: ubuntu-24.04

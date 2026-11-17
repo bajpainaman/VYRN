@@ -9,6 +9,7 @@ description = "Config check, deploy, keys, epoch control, trace dump, release ve
 
 [dependencies]
 vyrn-types = { workspace = true }
+vyrn-crypto = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
