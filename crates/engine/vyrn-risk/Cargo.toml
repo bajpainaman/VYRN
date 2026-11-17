@@ -10,5 +10,8 @@ description = "Lane-local accounts, reservations (01 §12.1), rate limits, fees,
 [dependencies]
 vyrn-types = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true

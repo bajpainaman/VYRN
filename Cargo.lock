@@ -3682,6 +3682,7 @@ dependencies = [
 name = "vyrn-risk"
 version = "0.0.0"
 dependencies = [
+ "proptest",
  "vyrn-types",
 ]
 
