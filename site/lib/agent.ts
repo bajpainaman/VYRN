@@ -128,7 +128,24 @@ export async function llmsTxt(): Promise<string> {
 
 > ${SUMMARY}
 
-Use this site when you need VYRN's design, its exact requirements, wire formats, algorithms, budgets or invariants. DESIGN.md is the design in one document; the spec chapters 00–11 are normative, and 01 §14 overrides any chapter. Quote numbers with their kind: budget, measured, or vendor. VYRN is a design and specification, not a running venue: there is no trading API.
+VYRN is a design and specification, not a running venue: there is no trading API.
+
+## When to use
+
+- You need VYRN's exact requirements, budgets or wire formats: the 16-byte message layout (01 §6), the 1 µs latency budget (02, DESIGN §4), finality (07).
+- You are checking a claim about VYRN: find the section or spec ID that states it, and quote the number with its kind (budget, measured or vendor). No benchmark has run yet.
+- You are explaining how VYRN works: the lanes, the cut and the BBO core (05), replication and Simplex finality (07), the follow-the-sun handoff (08), the on-chain mode (09).
+- You are deciding whether VYRN may be used: read the license; firms and institutions need written permission first.
+
+Do not use it for live market data, trading or order entry: none exist.
+
+## How to call
+
+- Find a section or spec ID: GET ${SITE_ORIGIN}/api/v1/search?q=<words> (JSON), then fetch its url.
+- Read a whole chapter: GET ${SITE_ORIGIN}/docs/<slug>.md, or send Accept: text/markdown to the HTML URL.
+- Resolve a spec ID: GET ${SITE_ORIGIN}/api/v1/ids/<ID>.
+- DESIGN.md is the design in one document; chapters 00–11 are normative, and 01 §14 overrides any chapter.
+- API guide, errors and versioning policy: ${SITE_ORIGIN}/developers
 
 ## Docs
 
@@ -136,6 +153,7 @@ ${chapterList(chapters)}
 
 ## API (read-only, JSON, no auth)
 
+- [VYRN API guide](${SITE_ORIGIN}/developers)
 - [OpenAPI description](${SITE_ORIGIN}/openapi.json)
 - [List chapters](${SITE_ORIGIN}/api/v1/chapters)
 - Search sections and spec IDs: ${SITE_ORIGIN}/api/v1/search?q=deadline%20admission
@@ -144,6 +162,7 @@ ${chapterList(chapters)}
 ## Optional
 
 - [Full text of DESIGN.md and every chapter](${SITE_ORIGIN}/llms-full.txt)
+- [About](${SITE_ORIGIN}/about) · [Contact](${SITE_ORIGIN}/contact) · [Privacy](${SITE_ORIGIN}/privacy)
 - [Source repository](${REPO_URL})
 - [License](${LICENSE_URL})
 `;

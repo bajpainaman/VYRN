@@ -24,6 +24,7 @@ export async function generateMetadata({
   const doc = await getDoc((await params).slug);
   return doc
     ? {
+        alternates: { canonical: `/docs/${doc.slug}` },
         title: doc.number === "D" ? "Design" : `${doc.number} ${doc.short}`,
         description: doc.title,
       }

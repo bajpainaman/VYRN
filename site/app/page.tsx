@@ -1,3 +1,4 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { Arrow } from "@/components/Arrow";
@@ -21,6 +22,8 @@ import {
 } from "@/lib/design";
 import { renderNodes } from "@/lib/render";
 import { CONTACT_EMAIL, LICENSE_REQUEST_URL, LICENSE_URL, REPO_URL } from "@/lib/site";
+
+export const metadata: Metadata = { alternates: { canonical: "/" } };
 
 type Ply = "canary" | "white" | "pink";
 
@@ -402,6 +405,11 @@ export default async function Home() {
         logo: `${SITE_ORIGIN}/icon.svg`,
         description: SUMMARY,
         sameAs: [REPO_URL],
+        contactPoint: [
+          { "@type": "ContactPoint", contactType: "licensing", url: LICENSE_REQUEST_URL, availableLanguage: "en" },
+          { "@type": "ContactPoint", contactType: "technical support", url: `${REPO_URL}/issues`, availableLanguage: "en" },
+          { "@type": "ContactPoint", contactType: "security", url: `${REPO_URL}/security/advisories/new`, availableLanguage: "en" },
+        ],
         knowsAbout: ["exchange design", "central limit order book", "matching engine", "low-latency trading", "BFT consensus", "Simplex consensus"],
       },
       {

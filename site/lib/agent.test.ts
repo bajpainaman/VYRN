@@ -55,7 +55,9 @@ describe("landing Markdown and llms.txt", () => {
   it("tells agents when to use the site, and that there is no trading API", async () => {
     const txt = await llmsTxt();
     expect(txt).toMatch(/^# VYRN\n\n> /);
-    expect(txt).toContain("Use this site when");
+    expect(txt).toContain("## When to use");
+    expect(txt).toContain("## How to call");
+    expect(txt).toContain(`${SITE_ORIGIN}/developers`);
     expect(txt).toContain("there is no trading API");
     expect(txt).toContain(`${SITE_ORIGIN}/docs/11-build.md`);
   });

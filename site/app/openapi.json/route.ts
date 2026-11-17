@@ -11,9 +11,10 @@ const spec = {
     title: "VYRN spec API",
     version: "1.0.0",
     summary: "Read-only access to the VYRN design and specification.",
-    description: `${SUMMARY}\n\nThis API serves the design document and spec chapters. VYRN is a design, not a running venue: there is no trading API.`,
+    description: `${SUMMARY}\n\nThis API serves the design document and spec chapters. VYRN is a design, not a running venue: there is no trading API.\n\nVersioning: the version is in the path (/api/v1); v1 only gains fields and endpoints. Deprecation: a retiring endpoint sends Deprecation (RFC 9745) and Sunset (RFC 8594) headers at least 90 days ahead; policy at /developers#versioning.`,
     license: { name: "VYRN Research and Education License 1.0", url: "https://github.com/bajpainaman/VYRN/blob/main/LICENSE" },
   },
+  externalDocs: { description: "VYRN API guide: endpoints, errors, versioning and deprecation policy", url: `${SITE_ORIGIN}/developers` },
   servers: [{ url: SITE_ORIGIN }],
   paths: {
     "/api/v1/chapters": {
