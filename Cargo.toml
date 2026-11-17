@@ -13,10 +13,11 @@ rust-version = "1.100"
 license-file = "LICENSE"
 
 [workspace.dependencies]
-# Internal crates (§1.3, graph §1.4).
-vyrn-types = { path = "crates/engine/vyrn-types" }
-vyrn-crypto = { path = "crates/engine/vyrn-crypto" }
-vyrn-wire = { path = "crates/engine/vyrn-wire" }
+# Internal crates (§1.3, graph §1.4). A library crate with its own version (deploy/release/README.md)
+# also carries `version` here, which `cargo package` needs; cargo-release keeps it in step.
+vyrn-types = { path = "crates/engine/vyrn-types", version = "0.1.0" }
+vyrn-crypto = { path = "crates/engine/vyrn-crypto", version = "0.1.0" }
+vyrn-wire = { path = "crates/engine/vyrn-wire", version = "0.1.0" }
 vyrn-cut = { path = "crates/engine/vyrn-cut" }
 vyrn-risk = { path = "crates/engine/vyrn-risk" }
 vyrn-bbo = { path = "crates/engine/vyrn-bbo" }
@@ -73,6 +74,23 @@ rand_chacha = "=0.10.0"
 # (lint-engine). Neither is on the §2.2 allowlist; both are already in Cargo.lock.
 proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
 serde_json = "=1.0.154"
+
+# Release framework (deploy/release/README.md). The workspace version above is the version of the
+# final package (§9.5); a library crate that sets its own `version` is released on its own as well.
+# The protocol version is vyrn-wire's PROTO_VERSION (§10.2 keeps it apart from the release version).
+[workspace.metadata.vyrn]
+# §10.1's config schema. deploy/schema/ is empty, so no schema is defined yet: 0.
+config_schema_version = 0
+
+# cargo-release, per-crate releases only. GitHub Releases, never crates.io: every crate is
+# `publish = false` under the LICENSE.
+[workspace.metadata.release]
+publish = false
+push = false
+tag-name = "{{crate_name}}-v{{version}}"
+pre-release-commit-message = "release: bump crate versions"
+pre-release-hook = ["sh", "-c", "exec \"$WORKSPACE_ROOT/deploy/release/changelog.sh\" \"$CRATE_NAME\" \"$NEW_VERSION\""]
+dependent-version = "upgrade"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

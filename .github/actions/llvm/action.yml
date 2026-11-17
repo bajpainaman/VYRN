@@ -1,0 +1,17 @@
+# clang and lld with rustc's LLVM major (spec/11-build.md §4.2); .cargo/config.toml links with them.
+name: llvm
+description: Install clang and lld matching rustc's LLVM major into /usr/local/bin.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        major="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
+        curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+        sudo bash /tmp/llvm.sh "$major"
+        for tool in clang clang++ lld ld.lld llvm-ar llvm-nm llvm-objdump; do
+          sudo ln -sfn "/usr/lib/llvm-$major/bin/$tool" "/usr/local/bin/$tool"
+        done
+        clang_major="$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)"
+        echo "rustc LLVM $major, clang $clang_major"
+        test "$major" = "$clang_major"

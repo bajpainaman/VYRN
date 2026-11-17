@@ -1,0 +1,93 @@
+# Per-crate release (deploy/release/README.md): one library crate's .crate, changelog and unsigned
+# manifest as a GitHub Release. Never crates.io: every crate is `publish = false`.
+# Runs on a `<crate>-v<version>` tag push, or by hand in dry-run mode (the default), which builds
+# and verifies the bundle and uploads it as a workflow artifact only.
+name: Release crate
+
+on:
+  push:
+    tags: ["*-v[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: Crate to release at its current version, such as vyrn-wire
+        required: true
+        type: string
+      dry_run:
+        description: Build and verify only; publish nothing
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      crate:
+        required: true
+        type: string
+      dry_run:
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-crate-${{ github.ref }}-${{ inputs.crate }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  crate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # gh release create, only when not a dry run
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0 # the changelog reads the crate's history since its last tag
+      - name: Which crate
+        id: which
+        env:
+          INPUT_CRATE: ${{ inputs.crate }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        # `inputs` is empty only on a direct tag push. A caller's push event reaches a called
+        # workflow too, so the event name cannot tell a tag release from a dry run.
+        run: |
+          if [[ -n "$INPUT_CRATE" ]]; then
+            name="$INPUT_CRATE"
+            dry_run="$INPUT_DRY_RUN"
+          elif [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            name="${GITHUB_REF_NAME%-v*}"
+            dry_run=false
+          else
+            echo "no crate input and not a tag push" >&2; exit 1
+          fi
+          echo "name=$name" >>"$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run" >>"$GITHUB_OUTPUT"
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/llvm
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: git-cliff@2.14.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Build and verify the bundle
+        run: deploy/release/crate.sh "${{ steps.which.outputs.name }}" dist
+      - name: The tag names this crate at this version
+        if: steps.which.outputs.dry_run == 'false'
+        run: |
+          tag="$(sed -n 's/^tag = "\(.*\)"/\1/p' dist/manifest.toml)"
+          test "$tag" = "$GITHUB_REF_NAME" || {
+            echo "tag $GITHUB_REF_NAME, but the crate at this commit is $tag" >&2; exit 1; }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: crate-bundle-${{ steps.which.outputs.name }}
+          path: dist/
+          if-no-files-found: error
+      - name: GitHub Release
+        if: steps.which.outputs.dry_run == 'false' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes-file dist/CHANGELOG.md dist/*
