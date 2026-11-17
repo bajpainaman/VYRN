@@ -456,7 +456,8 @@ fn the_scripts_checks_hold() {
 }
 
 /// `tests/golden/vyrn_reject_vectors.out`: validly tagged packets whose layout a v1 codec must
-/// refuse (04 §3.1 V1 and V9, §3.3 M2 and M3, §12 VR1 and VR3), each with its expected verdict.
+/// refuse (04 §3.1 V1 and V9, §3.3 M2 and M3, §12 VR1 and VR3), each with its expected verdict,
+/// and Reject records it must decode to their reason and detail (the `RATE_LIMIT` ids of 04 §9.1).
 #[test]
 fn reject_vectors_get_their_verdicts() {
     let path = concat!(
@@ -493,7 +494,13 @@ fn reject_vectors_get_their_verdicts() {
             Response::parse(&bytes).ok().map(|p| {
                 assert!(p.verify(&K_OUT), "{id} tag");
                 p.records()
-                    .map(|r| if r.is_ok() { "ok" } else { "bad" })
+                    .map(|r| match r {
+                        Ok(Record::Reject { reason, detail, .. }) => {
+                            format!("{}/{detail}", reason.code())
+                        }
+                        Ok(_) => "ok".to_owned(),
+                        Err(_) => "bad".to_owned(),
+                    })
                     .collect::<Vec<_>>()
                     .join(",")
             })
@@ -501,5 +508,5 @@ fn reject_vectors_get_their_verdicts() {
         assert_eq!(got.as_deref(), want, "{id}");
         n += 1;
     }
-    assert_eq!(n, 45);
+    assert_eq!(n, 49);
 }

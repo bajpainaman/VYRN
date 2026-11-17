@@ -409,9 +409,10 @@ The lane's response to a control op goes to the control core, not to a client:
 | `CtlSetLimit` | value outside the §3.4 range | `BAD_QTY` | the limit id (1–8) |
 | `CtlSetFees` | raises `fee_mul` while the book holds a buy reservation (`quote_resv ≠ 0`, §5.2 rule 2) | `RISK_ORDER_COUNT` | the account's `open_orders` in the book |
 
-The reasons are `vyrn-risk`'s (`ctl.rs`). **Proposed `CtlDone` encoding (no code yet):** bytes
-2–3 = the reason u16 (0 = done), bytes 8–11 = the detail u32, bytes 12–15 = 0. `CtlAllocDebit`
-never fails: it debits `min(amount, free)` and reports that amount in `AllocDebited`.
+The reasons are `vyrn-risk`'s (`ctl.rs`). **`CtlDone` bytes:** byte 0 = 0xA2, byte 1 = the op
+code, bytes 2–3 = the reason u16 (0 = done), bytes 4–7 = the account, bytes 8–11 = the detail
+u32, bytes 12–15 = 0. `CtlAllocDebit` never fails: it debits `min(amount, free)` and reports that
+amount in `AllocDebited`.
 
 Replicas derive the same responses by replay; the ledger acts only on their finalized view.
 
@@ -529,19 +530,19 @@ the first message; column **M** marks the per-message work that must fit `RSK_PA
 | 3 | Account state `Active` | M4 | P | `ACCOUNT_KILLED` (21) | 0 |
 | 4 | Snapshot `halted` flag clear | M5 | P | `BOOK_HALTED` | 0 |
 | 5 | Phase allows the TIF and post-only (04 §6.9, 08) | M5 | P phase, M 1 compare | `AUCTION_PHASE` | `PROTO_PHASE_*` of the current phase |
-| 6 | Account `new_bucket` (§3.8), cost 1 | M1 (10's bucket) | P refill, M 1 decrement | `RATE_LIMIT` | `RSK_BUCKET_NEW` |
+| 6 | Account `new_bucket` (§3.8), cost 1 | M1 (10's bucket) | P refill, M 1 decrement | `RATE_LIMIT` | `RSK_BUCKET_NEW` 8 |
 | 7 | `1 ≤ qty ≤ max_order_qty` | M6 | M | `BAD_QTY` | `RSK_D_QTY_ZERO` / `RSK_D_QTY_MAX` |
 | 8 | `min_tick ≤ tick ≤ max_tick`, then inside the band (§3.5) | M6 | P edges, M 1 compare | `BAD_TICK` | `min_tick` below the range, `max_tick` above it, else the band edge: always the nearest acceptable tick |
 | 9 | Notional `≤ max_notional` | M6 | M | `BAD_QTY` | `RSK_D_NOTIONAL` (`RSK_D_OVERFLOW` if it overflows) |
 | 10 | `open_orders < max_open_orders`, then a free slot in the lane's pool for the book (§3.4) | M7 | M, packet-local count | `RISK_ORDER_COUNT` | the limit; `RSK_D_LANE_FULL` |
 | 11 | Balance covers reservation + message fee of the charged route (§3.2, §5.3) | M7 | M | `RISK_CREDIT` | `RSK_CREDIT_QUOTE` 1, `RSK_CREDIT_BASE` 2: the asset that is short |
 | 12 | Post-only that the classification (05) calls a cross | M8 | M (05's cost) | `POST_ONLY_WOULD_CROSS` | best opposite tick of the snapshot |
-| 13 | BBO-routed only: `BBO` bucket of the session, then of the account (04 §9.1); then a cross takes `cross_bucket` and the lane cross bucket, an improve the lane improve bucket (§3.8) | M8 | P refill, M 1 decrement | `RATE_LIMIT` | 3, 6 (04 §9.1); `RSK_BUCKET_CROSS`, `_LANE_CROSS`, `_LANE_IMPROVE` |
+| 13 | BBO-routed only: `BBO` bucket of the session, then of the account (04 §9.1); then a cross takes `cross_bucket` and the lane cross bucket, an improve the lane improve bucket (§3.8) | M8 | P refill, M 1 decrement | `RATE_LIMIT` | 3, 6 (04 §9.1); `RSK_BUCKET_CROSS` 9, `_LANE_CROSS` 10, `_LANE_IMPROVE` 11 |
 
 The order is 04 §3.3's M1–M8, which is the client-visible contract; this table places 10's
 checks inside it. `vyrn-risk` implements it (`Risk::check_new`, `crates/engine/vyrn-risk/src/check.rs`).
-A `RATE_LIMIT` detail names its bucket by the ids of 04 §9.1, which lists 10's bucket ids too
-(the overlap of the two ranges is an open question there). `IOC` and `FOK` are charged as
+A `RATE_LIMIT` detail names its bucket by the ids of 04 §9.1: 1–7 for 04's buckets and 8–11
+for this chapter's, so each id names one bucket. `IOC` and `FOK` are charged as
 crosses in checks 11 and 13 whatever the classification (04 §6.2); check 12 uses the
 classification. Exposure (`RISK_POSITION`, 04 M7) has no v1 spot limit; it is the v2 perps limit
 (§6).
@@ -1753,7 +1754,7 @@ Storing only the log works because market data, drop copy and statements are pur
 | `RSK_BAND_MIN_TICKS`, `RSK_COD_MIN_NS` | 16, 10^6 ns | config | band floor, minimum cancel-on-disconnect |
 | `RSK_TIMER_TICK_NS`, `RSK_KILL_CHUNK`, `RSK_DRAIN_MAX`, `RSK_CTL_MAX_WAIT_NS` | 10^6 ns, 16, 8, 10^5 ns | budget | tick period; work units per chunk and per B1; control-packet wait bound |
 | `RSK_FILL_EVENT_BYTES` | 32 | const | §4.1 (ring size is 05's `ENG_FILL_RING`) |
-| `RSK_BUCKET_NEW`, `_CROSS`, `_LANE_CROSS`, `_LANE_IMPROVE`; `RSK_D_QTY_ZERO`, `_QTY_MAX`, `_NOTIONAL`, `_OVERFLOW`, `_LANE_FULL`; `RSK_CREDIT_QUOTE`, `_BASE`; `RSK_D_MOVED` | 1–4 (`RATE_LIMIT`, 04 §9.1); 1–4 (`BAD_QTY`), 5 (`RISK_ORDER_COUNT`); 1–2 (`RISK_CREDIT`); 0x100 | const | reject detail codes (§3.1, §1.4) |
+| `RSK_BUCKET_NEW`, `_CROSS`, `_LANE_CROSS`, `_LANE_IMPROVE`; `RSK_D_QTY_ZERO`, `_QTY_MAX`, `_NOTIONAL`, `_OVERFLOW`, `_LANE_FULL`; `RSK_CREDIT_QUOTE`, `_BASE`; `RSK_D_MOVED` | 8–11 (`RATE_LIMIT`, 04 §9.1); 1–4 (`BAD_QTY`), 5 (`RISK_ORDER_COUNT`); 1–2 (`RISK_CREDIT`); 0x100 | const | reject detail codes (§3.1, §1.4) |
 | `LaneRisk` | 64 B | type | a dedicated lane's `lane_cross` and `lane_improve` buckets and `fee_acc`; on a pool core, `fee_acc` only (§3.8) |
 | `RSK_MARK_PERIOD_MS`, `RSK_LIQ_SLIPPAGE_BPS` | 100, 200 | config | v2 (§6) |
 | `RSK_SURV_FAST_PPM`, `RSK_SURV_OVERTAKE_NS`, `RSK_SURV_SCAN_MAX` | 10_000, 2_000, 4_096 | config, budget, budget | fairness metrics (§9.1) |
@@ -1781,7 +1782,7 @@ token takes (`AcctTake`, §14.17 item 4). Still open:
    included), `n_ded`, `n_pool`, `fee_schedule_hash`, `risk_config_hash`, `stp_tag_table_hash`,
    `router_config_hash`.
 5. §6.5: define `detail` for `BAD_QTY`, `RATE_LIMIT`, `RISK_CREDIT` and `SESSION_CLOSED` as in
-   §3.1 and §1.4, including the lane bucket codes 3 and 4 and `RSK_D_MOVED`.
+   §3.1 and §1.4, including the bucket codes 8–11 of 04 §9.1 and `RSK_D_MOVED`.
 6. §9: name the BASE-mode ledger (`vyrn-ledger` binary and crate).
 7. §6.2: message 0x05 `RouteMove`; §6.4: record 0x88 `Routed` (§2.8). v2: order flag bit 6 =
    reduce-only.

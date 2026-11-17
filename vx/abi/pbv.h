@@ -115,7 +115,9 @@ typedef struct {
  * - Replace (04 §6.5, vector V4): a priority-losing Replace gives the new order a new handle.
  * - STP cancel-newest and cancel-both before any fill: Reject STP, detail = the resting handle;
  *   after a fill: Out STP (04 §6.8).
- * - Fees are ppm of notional (10 §5): ceil for a charge, floor for a rebate, once per fill. */
+ * - Fees are ppm of notional (10 §5): ceil for a charge, floor for a rebate. A maker or auction
+ *   fill pays per fill; a taker pays once per step on the step's total notional (10 §3.3, §4.4).
+ * - Post-only New and Replace outside Continuous: Reject AUCTION_PHASE, detail the phase (04 §6.9). */
 
 /* Canonical state bytes, version 1 (05 §2.8):
  *   header 32 B: 0 magic 0x31534250 ("PBS1"), 4 u16 version 1, 6 u8 phase, 7 u8 0,

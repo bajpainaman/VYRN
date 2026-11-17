@@ -564,9 +564,10 @@ order-entry path:
   are refused.
 - The channel stays open for the life of the session. `vyrn-admin` pushes status and key bundles
   on it. If it drops, the client reconnects. The UDP session is not affected.
-- The encoding of the admin messages belongs to `vyrn-admin` (`11-build.md`). This chapter fixes
-  their fields, and the tables after the structs propose their bytes. **No code implements the
-  encoding yet** (`bin/vyrn-admin` is a stub), so it is a proposal until §16 Q14 is settled.
+- `vyrn-admin` implements the admin messages (`11-build.md`). This chapter fixes their fields,
+  and the tables after the structs fix their bytes. `tests/golden/vyrn_admin_vectors.out` holds
+  an `OpenSessionReq` and an `OpenSessionResp` built from these tables, and frames a receiver
+  must refuse.
 
 ```rust
 struct OpenSessionReq {
@@ -597,9 +598,8 @@ struct BoxKeys {
 // Pushes: KeyBundle(e+1), DataTierStatus, SequencerStatus.
 ```
 
-**Proposed encoding (§16 Q14; not implemented).** Every admin message on the TLS stream is one
-frame: `len` u32 (bytes after this field), `type` u16, then the body. All integers are
-little-endian, like 01 §6. `SocketAddrV4` is 4 bytes of IPv4 address in network order, then the
+**Encoding.** Every admin message on the TLS stream is one frame: `len` u32 (bytes after this
+field), `type` u16, then the body. All integers are little-endian, like 01 §6. `SocketAddrV4` is 4 bytes of IPv4 address in network order, then the
 port u16 little-endian. A receiver rejects a frame with a nonzero reserved byte, an unknown
 `type`, or a `len` that does not match the body (VR1). Types: 0x0001 `OpenSessionReq`,
 0x8001 `OpenSessionResp`, 0x8002 `KeyBundle` push, 0x80FF `Error` (body: a 01 §6.5 reason u16,
@@ -1336,7 +1336,7 @@ out-of-stream (`resp_seq` 0, not accepted, the client resends the same logical c
 | 6 | `RISK_CREDIT` | in | M7 | the asset that is short: 1 quote, 2 base (10 §3.1) | fund the book allocation (01 §12.4) |
 | 7 | `RISK_POSITION` | in | M7 | the limit | reduce exposure |
 | 8 | `RISK_ORDER_COUNT` | in | M7 | the limit | cancel orders first |
-| 9 | `RATE_LIMIT` | in | V10, M1, M8 | bucket id (§9.1, including 10's ids) | slow down; the bucket refills on `rx_ts` time |
+| 9 | `RATE_LIMIT` | in | V10, M1, M8 | bucket id: 1–7 are 04's, 8–11 are 10's (§9.1) | slow down; the bucket refills on `rx_ts` time |
 | 10 | `POST_ONLY_WOULD_CROSS` | in | M8 (lane), BBO core | opposite best tick seen | reprice |
 | 11 | `FOK_UNFILLABLE` | in | BBO core | qty available at or better than the limit (capped) | — |
 | 12 | `UNKNOWN_HANDLE` | in | M6 | 0 | check the client's handle table |
@@ -1388,22 +1388,19 @@ type and rounding (`Gcra::from_rate`, `crates/engine/vyrn-risk/src/gcra.rs`).
 | 3 / 6 | `BBO` | session / account | M8, after classification | cross, `IOC`, `FOK`: 5; improve: 1 | 100k cross-equivalents/s, burst 640 units |
 | 7 | `RESEND` | session | §5.2, §6.7 | 1 per resent packet | 100k/s, burst 1,024 |
 
-10 §3.8's account and lane buckets report their own ids in the same `RATE_LIMIT` detail
+10 §3.8's account and lane buckets report their own ids, 8–11, in the same `RATE_LIMIT` detail
 (10 §3.1, `vyrn-risk` `consts.rs`):
 
-| Detail | 10 bucket | Charged at | Also means here |
-|---|---|---|---|
-| 1 `RSK_BUCKET_NEW` | account `new_bucket` | 10 check 6, after M5 | session `PKT` |
-| 2 `RSK_BUCKET_CROSS` | account `cross_bucket` | M8, cross | session `MSG` |
-| 3 `RSK_BUCKET_LANE_CROSS` | lane or pool `lane_cross` | M8, cross | session `BBO` |
-| 4 `RSK_BUCKET_LANE_IMPROVE` | lane or pool `lane_improve` | M8, improve | account `PKT` |
+| Detail | 10 bucket | Charged at |
+|---|---|---|
+| 8 `RSK_BUCKET_NEW` | account `new_bucket` | 10 check 6, after M5 |
+| 9 `RSK_BUCKET_CROSS` | account `cross_bucket` | M8, cross |
+| 10 `RSK_BUCKET_LANE_CROSS` | lane or pool `lane_cross` | M8, cross |
+| 11 `RSK_BUCKET_LANE_IMPROVE` | lane or pool `lane_improve` | M8, improve |
 
-**The two ranges overlap (open, §16 Q13).** A client can tell some cases apart by where the reject
-comes from (a V10 reject has index 0xFF; `PKT` never fires on a single message), but detail 2 at
-M1 or M8 and detail 3 at M8 are ambiguous. The client action is the same for all of them (slow
-down), so no outcome depends on it; a client that needs to know which bucket refused cannot
-learn it. A proposed fix, which changes the wire and needs vectors, is to move 10's ids to
-8–11.
+**One id per bucket.** 04's ids are 1–7 and 10's are 8–11, so every `RATE_LIMIT` detail names
+exactly one bucket. A new bucket in either chapter takes the next free id, from 12. The golden
+reject vectors S23–S26 carry ids 8–11 (`tests/golden/vyrn_reject_vectors.out`).
 
 - **Cancel reserve.** `New` and priority-losing `Replace` take from `MSG` with
   `keep = PROTO_CANCEL_RESERVE` (a quarter of the burst). `Cancel`, `Reduce` and `CancelAll` use
@@ -1923,7 +1920,7 @@ All values are **budgets** unless marked otherwise.
 | `PROTO_CNT_*` | `MALFORMED`, `UNKNOWN_SESSION`, `UNBOUND_SRC`, `EPOCH`, `SEQ_WINDOW`, `BAD_MAC`, `CLOSED`, `DUP`, `GAP`, `BAD_HDR`, `RATE`, `DATA_LATE`, `BUSY` | per-lane and per-session counters, exported by the control core |
 
 Types: the `SessionId` bit layout (§4.1); `OpenSessionReq`, `OpenSessionResp`, `KeyBundle`,
-`BoxKeys` (§4.4); `Cod` = `Off | On`; `Gcra` (§9.1); bucket ids 1–7 and 10's 1–4 (§9.1); the B-packet and
+`BoxKeys` (§4.4); `Cod` = `Off | On`; `Gcra` (§9.1); bucket ids 1–7 and 10's 8–11 (§9.1); the B-packet and
 L-packet (§7.1); the `Attest` record (§7.5).
 
 ## 15. Requests to 01
@@ -1967,6 +1964,9 @@ credit bound (`STEP_FILL_CAP`, §14.15), `PacketRecord.flags` (§6.6),
 
 ## 16. Open questions
 
+Settled and removed: Q13 (10's `RATE_LIMIT` ids moved to 8–11, §9.1, reject vectors S23–S26) and
+Q14 (the §4.4 admin encoding is normative, vectors in `tests/golden/vyrn_admin_vectors.out`).
+
 | # | Question | Owner | Settled by |
 |---|---|---|---|
 | Q1 | Do V1–V8 with SipHash-2-4 over a 10-message packet fit the 45 ns of `LANE_PASS1_NS`, and M1–M8 the 5 ns per message? | 05 | B2 with the packet-size sweep |
@@ -1981,5 +1981,3 @@ credit bound (`STEP_FILL_CAP`, §14.15), `PacketRecord.flags` (§6.6),
 | Q10 | Until Request 3 lands, does 07 detect equivocation by logical content across resends and epochs with no false positive? | 07 | `vyrn-sim` resend-across-handoff test |
 | Q11 | Does every `BUSY`, lane and BBO-core, leave within 1 µs at 2× overload, and does each lane class meet §3.6 at the reference load? | 05 | B3 overload sweep with the capture NIC; per-class curves |
 | Q12 | Does the leaf switch keep a paced gap within `PROTO_PACE_JITTER_NS` = 25 ns at 60% port load, and is a 35 ns pacing overhead per packet acceptable to market makers? | 06, 10 | B3 rx-gap histogram per dedicated lane; review with MM firms |
-| Q13 | `RATE_LIMIT` detail ids 1–4 of 10 §3.8 overlap 04's 1–7 (§9.1). Keep the overlap, or move 10's ids to 8–11 (a wire change with new vectors)? | 04, 10 | owner decision; reject vectors for the chosen ids |
-| Q14 | The `vyrn-admin` encoding in §4.4 is a proposal with no implementation. Adopt it, change it, or use another framing (for example protobuf over the TLS channel)? | 04, 11 | owner decision; then vectors for `OpenSessionReq` and `OpenSessionResp` |

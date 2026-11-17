@@ -1,0 +1,37 @@
+# The taker fee is charged once per (taker order, step) on the step's total notional, rounded
+# once (10 §3.3, §4.4 TakerEnd). Maker fees are per fill (zero here).
+#
+# qptl = 1, max_fee_ppm = 1000, so rpl(t) = t + ceil(t × 1000 / 10^6) and rpl(101) = 102.
+# The taker buys 3 @ 101 against makers of 1 lot at 100, 100 and 101 in one step:
+#   N = 100 + 100 + 101 = 301; fee = ceil(301 × 1000 / 10^6) = ceil(0.301) = 1.
+# Rounding each fill would charge ceil(0.1) + ceil(0.1) + ceil(0.101) = 3.
+# Taker ledger: reserve 3 × 102 = 306 from 1000; each fill releases 102 and pays its notional;
+#   quote_free = 1000 − 301 − 1 = 698, quote_resv = 0, base_free = 3; fee_acc[2] = 1.
+
+book band=90..110 qptl=1 max_fee_ppm=1000 max_qty=100
+lane 1 first=0x01000001
+lane 2 first=0x01000201
+account 1 lane=1 base=3
+account 2 lane=2 quote=1000 taker=1000
+session 0x11 account=1
+session 0x22 account=2
+
+msg 1 0x11 0 rx=1 seq=1 : new sell day 100 1 0xa1
+=> 0x11 ack 0 0x01000001 100 0xa1
+msg 1 0x11 0 rx=2 seq=2 : new sell day 100 1 0xa2
+=> 0x11 ack 0 0x01000002 100 0xa2
+msg 1 0x11 0 rx=3 seq=3 : new sell day 101 1 0xa3
+=> 0x11 ack 0 0x01000003 101 0xa3
+
+msg 2 0x22 0 rx=4 seq=1 step=1 : new buy day 101 3 0xb1
+=> 0x22 fill 0 1 0x01000201 100 2
+=> 0x22 fill 0 1 0x01000201 101 1
+=> 0x11 fill maker 0 0x01000001 100 1
+=> 0x11 fill maker 0 0x01000002 100 1
+=> 0x11 fill maker 0 0x01000003 101 1
+
+check resting
+check account 2 open=0 base_free=3 base_resv=0 quote_free=698 quote_resv=0
+check account 1 open=0 base_free=0 base_resv=0 quote_free=301 quote_resv=0
+check fee_acc 2 1
+check fee_acc 1 0

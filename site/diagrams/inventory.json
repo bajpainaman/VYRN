@@ -318,7 +318,7 @@
   {
    "asciiIndex": 11,
    "heading": "10.1 Client state machine",
-   "line": 1447,
+   "line": 1444,
    "ascii": "                    send New (pkt_seq p, index i)\n                                │\n                                ▼\n                         ┌─────────────┐ no answer: resend p with bit0 = 1 (§5.1)\n                         │   SENT      │◄──────────────┐\n                         └──────┬──────┘───────────────┘\n        Reject ─────────────────┼────────────────────────────────────► REJECTED\n        Fill… with open = 0 ────┼────────────────────────────────────► FILLED\n        Fill… then Out ─────────┼────────────────────────────────────► OUT\n        Fill… then Ack, or Ack  │\n                                ▼\n                         ┌─────────────┐  maker Fill: open −= qty; open = 0 ──► FILLED\n                         │    LIVE     │  Out (STP, POST_ONLY, EXPIRED, DISCONNECT,\n                         │  (handle h) │       LANE_MOVED, ADMIN, AUCTION_UNFILLED) ──► OUT\n                         └──┬───┬───┬──┘\n              send Cancel   │   │   │ send Replace\n                            ▼   │   ▼\n                 ┌──────────────┐ │ ┌────────────────┐\n                 │CANCEL_PENDING│ │ │REPLACE_PENDING │ Reject (not TOO_LATE): back to LIVE, h kept\n                 └──────┬───────┘ │ └───────┬────────┘ CancelAck(h), no new handle: LIVE (reduced)\n     CancelAck: CANCELED│         │         │          CancelAck(h) + records of h': h ends\n     TOO_LATE: the fills│  send   │         │          (CANCELED), h' starts in SENT-like\n     before it ended it │  Reduce ▼         │          state with its records\n     (FILLED or OUT)    │  REDUCE_PENDING: CancelAck: open −= qty; open = 0 ──► CANCELED\n                        ▼                   otherwise back to LIVE\n             CANCELED / FILLED / OUT (terminal)"
   }
  ],
@@ -332,13 +332,13 @@
   {
    "asciiIndex": 23,
    "heading": "7.7 Latency of a local ack (a maximum)",
-   "line": 1654,
+   "line": 1672,
    "ascii": "op applied, counter published ─► its cut core reads it          ≤ 100 ns (CUT_REFRESH_NS)\n  ─► the BBO core finishes the step in progress                  ≤ ENG_STEP_MAX_NS = 15\n  ─► the next step takes that half-cut and finishes              ≤ 15\n  ─► order-stream core queues the step's frame, writes LaneCut[l] ≤ 40\n  ─► lane polls LaneCut within ENG_UNIT_NS, even inside another packet (§6.1)   ≤ 20\n  ─► frame-gate check, B1–B3 with the pre-built response, lane TX doorbell     ≤ 10 + 20"
   },
   {
    "asciiIndex": 26,
    "heading": "8.8 Auction mode (engine side; 08-epochs.md owns the rule)",
-   "line": 2052,
+   "line": 2070,
    "ascii": "Continuous ──Control(Auction)──► Auction ──Control(Frozen)──► Frozen ──Uncross × m──► Continuous\n     │                              ▲\n     └──Control(Halted)──► Halted ──┘ (Control(Auction); a halt ends by auction)"
   }
  ],
@@ -504,7 +504,7 @@
   {
    "asciiIndex": 8,
    "heading": "7.4 MBO structure: lane channels, a step channel, and the merge rule",
-   "line": 1428,
+   "line": 1429,
    "ascii": " lane channel k:  ADD ADD SYNC(T) DEL ADD ... │ header.step_base = W_k (watermark)\n step channel:    STEP(T) EXEC EXEC ... STEP(T+3) EXEC ...\n\n SYNC(T): the lane-op records after it (up to the next SYNC) are ordered after step T and\n          before step T+1. Emitted lazily, only before the first record after a new step.\n W_k:     every record of channel k ordered before step W_k + 1 is in this packet or earlier.\n\n Subscriber rule: apply step T only when W_k ≥ T − 1 for every k. Before step T, apply every\n pending lane-op record whose SYNC position is < T, in any order across channels."
   }
  ],
