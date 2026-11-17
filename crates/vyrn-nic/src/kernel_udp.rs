@@ -14,8 +14,18 @@
 //! frames with one `sendmmsg` (06 §6.6, wrappers in `sys`). `TxRing::send` is a burst of one.
 //! Other targets use std's one-datagram calls, which meet the same contract. `SO_BUSY_POLL`,
 //! `SO_TIMESTAMPING` and `kqueue` are not used yet.
+//!
+//! On Linux a queue bound to `0.0.0.0` sets `IP_PKTINFO`, and each frame's destination IP is
+//! `in_pktinfo.ipi_addr`: the destination address of the datagram's IP header, which is what the
+//! frame would have carried on the wire. Not `ipi_spec_dst`, the local address a reply would be
+//! sent from, which differs from it for a broadcast. A datagram that arrives without that control
+//! message, or with it cut short, is dropped (`rx_discard`). Other targets refuse a wildcard bind.
+//!
+//! Transmit does not pin a source address with `IP_PKTINFO`. Each datagram's source is the TX
+//! socket's own address (`KernelTx::local_addr`) whatever the frame's source says; on a port
+//! configured as `0.0.0.0` the kernel picks it from the route, as for any unbound sender.
 
-use core::net::{SocketAddr, SocketAddrV4};
+use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::io::ErrorKind;
 use std::net::UdpSocket;
 #[cfg(target_os = "linux")]
@@ -83,17 +93,25 @@ impl NicBackend for KernelUdp {
     /// `0.0.0.0` would not say which address the datagram arrived on.
     fn rx_ring(&mut self, bind: &RxBind) -> Result<KernelRx, NicError> {
         self.cfg.port(bind.port)?;
-        if bind.ip.is_unspecified() {
+        let wildcard = bind.ip.is_unspecified();
+        if wildcard && !cfg!(target_os = "linux") {
             return Err(NicError::Config {
                 field: "bind.ip",
                 why: "must be a specific address for kernel_udp, not 0.0.0.0",
             });
         }
         let sock = socket(bind.port, SocketAddrV4::new(bind.ip, bind.udp_port))?;
+        #[cfg(target_os = "linux")]
+        if wildcard {
+            sys::set_pktinfo(sock.as_raw_fd())
+                .map_err(|e| NicError::io(KIND, bind.port, "setsockopt(IP_PKTINFO)", &e))?;
+        }
         let local = local_v4(&sock, bind.port)?;
         Ok(KernelRx {
             sock,
             local,
+            #[cfg(target_os = "linux")]
+            wildcard,
             slots: RxSlots::new(self.cfg.rx_slots),
             counters: NicCounters::new(),
             ext: ExtCounters::default(),
@@ -129,22 +147,33 @@ fn realtime() -> Nanos {
 pub struct KernelRx {
     sock: UdpSocket,
     local: SocketAddrV4,
+    /// Bound to `0.0.0.0` with `IP_PKTINFO` set.
+    #[cfg(target_os = "linux")]
+    wildcard: bool,
     slots: RxSlots,
     counters: NicCounters,
     ext: ExtCounters,
 }
 
 impl KernelRx {
-    /// The address senders reach this queue at, and the destination of its frames.
+    /// The address senders reach this queue at, and the destination of its frames. For a
+    /// wildcard bind the IP is `0.0.0.0`: senders use any local address, and each frame carries
+    /// the one its datagram was sent to.
     pub fn local_addr(&self) -> SocketAddrV4 {
         self.local
     }
 }
 
 impl KernelRx {
-    /// Writes the fast-path headers of an `n`-byte datagram from `src` in front of its payload,
-    /// which is already in the next slot, and publishes the frame.
-    fn deliver(&mut self, src: SocketAddrV4, n: usize, ts: Nanos) -> Option<RxPkt> {
+    /// Writes the fast-path headers of an `n`-byte datagram from `src` to `dst_ip` in front of
+    /// its payload, which is already in the next slot, and publishes the frame.
+    fn deliver(
+        &mut self,
+        src: SocketAddrV4,
+        dst_ip: Ipv4Addr,
+        n: usize,
+        ts: Nanos,
+    ) -> Option<RxPkt> {
         let hdr = FrameHdr {
             src: Endpoint {
                 mac: [0; 6],
@@ -153,7 +182,7 @@ impl KernelRx {
             },
             dst: Endpoint {
                 mac: [0; 6],
-                ip: *self.local.ip(),
+                ip: dst_ip,
                 port: self.local.port(),
             },
         };
@@ -172,8 +201,9 @@ impl KernelRx {
 }
 
 impl RxRing for KernelRx {
-    /// Datagrams over `MAX_PAYLOAD` are counted in `rx_trunc` and dropped; IPv6 senders and
-    /// socket errors other than "empty" in `rx_discard`. At most `RX_BURST` datagrams per `poll`,
+    /// Datagrams over `MAX_PAYLOAD` are counted in `rx_trunc` and dropped; IPv6 senders, a
+    /// wildcard queue's datagrams without `IP_PKTINFO`, and socket errors other than "empty" in
+    /// `rx_discard`. At most `RX_BURST` datagrams per `poll`,
     /// dropped ones included, so a flood of bad ones cannot hold the caller: on Linux one
     /// `recvmmsg` for up to `RX_BURST` (fewer when fewer buffers are free), elsewhere at most
     /// `RX_BURST` receive calls.
@@ -199,7 +229,12 @@ impl RxRing for KernelRx {
         let ts = realtime();
         let mut k = 0;
         for (i, d) in got[..n].iter().enumerate() {
-            let Some(src) = d.src else {
+            let dst_ip = if self.wildcard {
+                d.dst
+            } else {
+                Some(*self.local.ip())
+            };
+            let (Some(src), Some(dst_ip)) = (d.src, dst_ip) else {
                 NicCounters::add(&self.counters.rx_discard, 1);
                 continue;
             };
@@ -211,7 +246,7 @@ impl RxRing for KernelRx {
             if i > k {
                 self.slots.pull(i - k, HDR_BYTES + d.len);
             }
-            if let Some(p) = self.deliver(src, d.len, ts) {
+            if let Some(p) = self.deliver(src, dst_ip, d.len, ts) {
                 out[k] = p;
                 k += 1;
             }
@@ -246,7 +281,7 @@ impl RxRing for KernelRx {
                 NicCounters::add(&self.counters.rx_trunc, 1);
                 continue;
             }
-            if let Some(p) = self.deliver(src, n, ts) {
+            if let Some(p) = self.deliver(src, *self.local.ip(), n, ts) {
                 out[got] = p;
                 got += 1;
             }
