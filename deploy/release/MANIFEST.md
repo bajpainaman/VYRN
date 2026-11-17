@@ -85,6 +85,7 @@ A crate bundle holds `<name>-<version>.crate` (from `cargo package`) and `CHANGE
 
 - **Rule.** Signatures verify under ZIP-215 (§2.5, `vyrn_crypto::ed25519::verify`). A bundle is
   signed when at least `BLD_RELEASE_SIGS` = 2 distinct trusted keys have a valid signature. A
+  keys file that lists one public key twice, under any ids, is rejected. A
   signature file whose key is not trusted, or that does not verify, fails the bundle: a bad
   signature is a sign of tampering, never a file to skip.
 - **Rotation.** The keys file changes by a reviewed commit; a release names no keys, so old

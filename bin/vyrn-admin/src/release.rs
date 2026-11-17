@@ -232,6 +232,13 @@ fn check_signatures(
     for key in &keys.keys {
         let public: [u8; 32] = unhex(&key.ed25519)
             .ok_or_else(|| format!("key {:?}: ed25519 is not 64 lowercase hex", key.id))?;
+        if trusted.values().any(|k| *k == public) {
+            // One key under two ids would let one holder supply both signatures.
+            return Err(format!(
+                "key {:?}: the same public key is trusted twice",
+                key.id
+            ));
+        }
         if !valid_key_id(&key.id) || trusted.insert(key.id.as_str(), public).is_some() {
             return Err(format!("key id {:?} is malformed or repeated", key.id));
         }

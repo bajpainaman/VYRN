@@ -208,3 +208,21 @@ fn a_path_outside_the_bundle_is_rejected() {
     let (ok, out) = b.run(&["--unsigned"]);
     assert!(!ok && out.contains("is not a bundle file name"), "{out}");
 }
+
+#[test]
+fn one_key_trusted_under_two_ids_is_rejected() {
+    let b = Bundle::new("dup-key");
+    let public = hex(&vyrn_crypto::ed25519::public_key(&seed(SEED_1)));
+    fs::write(
+        &b.keys,
+        format!("[[key]]\nid = \"a\"\ned25519 = \"{public}\"\n\n[[key]]\nid = \"b\"\ned25519 = \"{public}\"\n"),
+    )
+    .unwrap();
+    // The same signature under both ids would otherwise count twice.
+    b.sign("a", SEED_1).sign("b", SEED_1);
+    let (ok, out) = b.verify();
+    assert!(
+        !ok && out.contains("the same public key is trusted twice"),
+        "{out}"
+    );
+}
