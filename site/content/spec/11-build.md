@@ -1015,7 +1015,12 @@ cannot.
   core's sweep): every interleaving up to a preemption bound of 3, with the real atomics replaced
   by loom's. These are the tests that check the `Release`/`Acquire` pairs of 05.
 - **Miri** runs the unit tests of `vyrn-cut::ring`, `vyrn-lane::arena` and `vyrn-engine::alloc` on every
-  PR, with `-Zmiri-strict-provenance`.
+  PR, with `-Zmiri-strict-provenance`. These tests are single-threaded: Miri checks the `unsafe`
+  code for undefined behaviour (provenance, aliasing, bounds, uninitialised reads) on one thread,
+  and loom (above) checks the cross-thread races. `lint-engine` bans `std::thread` in every
+  engine source file, test files included (§2.3), so an engine crate has no threaded Miri test.
+  A threaded Miri run of the rings would need a test-only exemption in
+  `tools/lint-engine/rules.toml` (`[source] banned_paths`); that is a separate change.
 
 ### 6.2 Property tests: engine against oracle
 
@@ -1133,7 +1138,20 @@ replication, failover and handoff protocols.
 - `vyrn-cut`'s `Sim` visibility backend holds every published store (lane counter, cut, snapshot,
   ring tail) in a delay queue for a seeded number of virtual nanoseconds before readers see it.
   That is how stale cuts and stale snapshots, the inputs to the lemma's slow path, happen in the
-  simulator.
+  simulator. **Ordering model.** One `Sim` serves one simulated box. Publication `k` gets the
+  deadline `d_k = max(now + δ_k, d_{k−1})`, with `δ_k` drawn from 0..=`BLD_SIM_VIS_MAX_NS` by a
+  seeded SplitMix64, so deadlines never decrease in publication order across every line of the
+  box. A reader sees, on each line, the newest publication whose deadline has passed. So the
+  visible publications are always a prefix of the box's global publication order: a reader can
+  see a stale value, but never a later store without every earlier one, on any line. That is
+  one of the executions x86-64 TSO allows (one global store order that keeps each core's program
+  order), so it invents no reordering the `REF` hardware could not show. A line holds at most `SIM_PENDING` = 8 publications in flight;
+  publishing a ninth makes that line's oldest publication, and every earlier one on every line,
+  visible at once. Values are never merged or dropped. Pool read-modify-writes (token CAS, steal
+  lock, segment `fetch_and`) are not delayed: an RMW always acts on the newest value. A weaker
+  mode with per-line delays would model aarch64; it is not specified (`vis.rs` in
+  `crates/engine/vyrn-cut`, tests `sim_visibility_is_a_global_prefix` and
+  `sim_full_queue_keeps_cross_line_order`).
 - `vyrn-consensus` already runs on Commonware's runtime trait, so the simulator gives it the
   `deterministic` runtime with the simulator's clock and network.
 - The Vx client runs in the simulator through `VxReplay` with its threads replaced by

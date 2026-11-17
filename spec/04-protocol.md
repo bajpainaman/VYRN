@@ -565,7 +565,8 @@ order-entry path:
 - The channel stays open for the life of the session. `vyrn-admin` pushes status and key bundles
   on it. If it drops, the client reconnects. The UDP session is not affected.
 - The encoding of the admin messages belongs to `vyrn-admin` (`11-build.md`). This chapter fixes
-  their fields.
+  their fields, and the tables after the structs propose their bytes. **No code implements the
+  encoding yet** (`bin/vyrn-admin` is a stub), so it is a proposal until §16 Q14 is settled.
 
 ```rust
 struct OpenSessionReq {
@@ -595,6 +596,38 @@ struct BoxKeys {
 // Other operations: GetKeyBundle(epoch), Rebind(src), Logout, SetCod(Cod).
 // Pushes: KeyBundle(e+1), DataTierStatus, SequencerStatus.
 ```
+
+**Proposed encoding (§16 Q14; not implemented).** Every admin message on the TLS stream is one
+frame: `len` u32 (bytes after this field), `type` u16, then the body. All integers are
+little-endian, like 01 §6. `SocketAddrV4` is 4 bytes of IPv4 address in network order, then the
+port u16 little-endian. A receiver rejects a frame with a nonzero reserved byte, an unknown
+`type`, or a `len` that does not match the body (VR1). Types: 0x0001 `OpenSessionReq`,
+0x8001 `OpenSessionResp`, 0x8002 `KeyBundle` push, 0x80FF `Error` (body: a 01 §6.5 reason u16,
+reserved u16, detail u32).
+
+`OpenSessionReq` body (20 + 2 × `n_books` bytes):
+
+| Offset | Size | Field | Value |
+|---|---|---|---|
+| 0 | 4 | `account` | `AccountId` |
+| 4 | 2 | `proto_version` | 1 |
+| 6 | 1 | `cod` | 0 `Off`, 1 `On` |
+| 7 | 1 | `rate_tier` | 0–3 (T0–T3, 10) |
+| 8 | 6 | `src` | `SocketAddrV4` |
+| 14 | 1 | `attest` | 0 or 1 |
+| 15 | 1 | `n_books` | 1–255 |
+| 16 | 4 | `timeout_ms` | `PROTO_TIMEOUT_MIN_MS` ..= `_MAX_MS` |
+| 20 | 2 × `n_books` | `books` | `BookId` each, no duplicates |
+
+`OpenSessionResp` body: `session` u32 | `lane` u8 | reserved u8 | `n_limits` u16 | `epoch` u32 |
+`active_from_step` u64 | then `n_limits` entries of { limit id u8 (10 §3.4), reserved [u8; 7],
+value u64 } | then the `KeyBundle` body.
+
+`KeyBundle` body: `epoch` u32 | `boundary_ts` u64 | `home` u8 | `seq_index` u8 | `next_home` u8 |
+`n_boxes` u8 | `lane_move` u8 (0xFF = none) | reserved [u8; 3] | `failover_order` [u8; n_boxes] |
+`data` 8 × `SocketAddrV4` | then `n_boxes` entries of `BoxKeys` { `index` u8, reserved u8,
+`order` `SocketAddrV4`, `recovery` `SocketAddrV4`, `k_seq` [u8; 16], `k_out` [u8; 16] } (46 bytes
+each).
 
 ```
  client                    vyrn-admin                      sequencer lane      replicas
@@ -944,17 +977,17 @@ state (CHAIN) for `SequencerStatus`.
 
 Fields: flags, `tick`, `qty`, `client_tag`.
 
-Validation, in M-order (§3.3):
+Validation, in M-order (§3.3; 10 §3.1 gives the full order with the rate buckets):
 
 | Check | Reason | Detail |
 |---|---|---|
 | phase (§6.9) | `BOOK_HALTED`, `AUCTION_PHASE` | halt cause from 10; phase code |
-| `tick` = 0, or outside the price band of the lane's snapshot | `BAD_TICK` | nearest tick inside the band |
-| `qty` = 0, or > the book's `max_order_qty` | `BAD_QTY` | `max_order_qty` |
-| notional `qty × price` overflows u128 or the book's notional cap | `BAD_QTY` | `PROTO_D_OVERFLOW` |
-| resting orders of the account ≥ its limit | `RISK_ORDER_COUNT` | the limit |
-| open exposure on that side would pass its limit | `RISK_POSITION` | the limit |
-| reservation (buy: `qty × price + max fee` in quote; sell: `qty` in base, 01 §12.1) > free balance | `RISK_CREDIT` | shortfall, capped at u32::MAX |
+| `qty` = 0, or > the account's `max_order_qty` | `BAD_QTY` | `RSK_D_QTY_ZERO` (1) / `RSK_D_QTY_MAX` (2) (10 §3.1) |
+| `tick` below `min_tick` (0 included), above `max_tick`, or outside the price band of the lane's snapshot | `BAD_TICK` | the nearest acceptable tick: `min_tick`, `max_tick` or the band edge (10 §3.1 check 8) |
+| notional above the account's `max_notional`; any overflow in the risk arithmetic | `BAD_QTY` | `RSK_D_NOTIONAL` (3); `RSK_D_OVERFLOW` (4) |
+| resting orders of the account ≥ its limit; the lane's slot pool is full | `RISK_ORDER_COUNT` | the limit; `RSK_D_LANE_FULL` (5) |
+| open exposure on that side would pass its limit (v2 only; v1 spot has no such limit, 10 §3.1) | `RISK_POSITION` | the limit |
+| reservation (buy: `R_buy(qty, tick)` plus the message fee in quote; sell: `qty` in base and the message fee in quote, 10 §3.2) > free balance | `RISK_CREDIT` | `RSK_CREDIT_QUOTE` (1) or `RSK_CREDIT_BASE` (2): the asset that is short |
 | post-only and the order crosses the lane's snapshot | `POST_ONLY_WOULD_CROSS` | opposite best tick of the snapshot |
 
 Routing after validation:
@@ -1298,12 +1331,12 @@ out-of-stream (`resp_seq` 0, not accepted, the client resends the same logical c
 | 1 | `BAD_MAC` | in, final | V6 | offending `pkt_seq` | session is `CLOSED`; find the key bug; open a new session |
 | 2 | `BAD_SEQ` | out (gap, duplicate not in ring); in (`ResendReq`) | V8; §6.7 | `expected`, or the limit of §6.7 | gap: resend from detail; `ResendReq`: fix the range or ask the other store (§5.4) |
 | 3 | `BAD_TYPE` | in | V9, M2, M3 | `PROTO_D_UNKNOWN_TYPE`, `_RESERVED`, `_FLAGS`, `_BAD_HDR` | client bug; do not resend the same content |
-| 4 | `BAD_TICK` | in | M6 | nearest tick inside the band | reprice |
-| 5 | `BAD_QTY` | in | M6 | `max_order_qty`, `PROTO_D_OVERFLOW`, `PROTO_D_NO_CHANGE` | fix the qty |
-| 6 | `RISK_CREDIT` | in | M7 | shortfall (capped) | fund the book allocation (01 §12.4) |
+| 4 | `BAD_TICK` | in | M6 | the nearest acceptable tick (`min_tick`, `max_tick` or the band edge, 10 §3.1) | reprice |
+| 5 | `BAD_QTY` | in | M6 | `New`: `RSK_D_QTY_ZERO` 1, `_QTY_MAX` 2, `_NOTIONAL` 3, `_OVERFLOW` 4 (10 §3.1); `Replace`: 0 or `PROTO_D_NO_CHANGE` | fix the qty |
+| 6 | `RISK_CREDIT` | in | M7 | the asset that is short: 1 quote, 2 base (10 §3.1) | fund the book allocation (01 §12.4) |
 | 7 | `RISK_POSITION` | in | M7 | the limit | reduce exposure |
 | 8 | `RISK_ORDER_COUNT` | in | M7 | the limit | cancel orders first |
-| 9 | `RATE_LIMIT` | in | V10, M1, M8 | bucket id (§9) | slow down; the bucket refills on `rx_ts` time |
+| 9 | `RATE_LIMIT` | in | V10, M1, M8 | bucket id (§9.1, including 10's ids) | slow down; the bucket refills on `rx_ts` time |
 | 10 | `POST_ONLY_WOULD_CROSS` | in | M8 (lane), BBO core | opposite best tick seen | reprice |
 | 11 | `FOK_UNFILLABLE` | in | BBO core | qty available at or better than the limit (capped) | — |
 | 12 | `UNKNOWN_HANDLE` | in | M6 | 0 | check the client's handle table |
@@ -1330,7 +1363,7 @@ nanoseconds of `rx_ts`, so a replica that replays the `PacketRecord`s gets the s
 (`INV-DET`). The bucket state is part of the lane's replicated state.
 
 ```rust
-struct Gcra { tat: Nanos, t_ns: u64, burst: u64 }        // t_ns = 10^9 / rate, set at open
+struct Gcra { tat: Nanos, t_ns: u64, burst: u64 }        // t_ns = ceil(10^9 / rate), set at open
 impl Gcra {
     /// Takes `cost` tokens at order-stream time `now` unless fewer than `keep` would be left.
     fn take(&mut self, now: Nanos, cost: u64, keep: u64) -> bool {
@@ -1343,12 +1376,34 @@ impl Gcra {
 }
 ```
 
+**Period rounding.** `t_ns = ⌈10^9 / rate⌉`, rounded up, so the integer bucket never admits more
+than `rate` tokens per second (220_000/s gives 4_546 ns, an admitted rate of 219_974/s). A rate of
+0 is not a bucket: `CtlSetLimit` refuses it (10 §3.4). Every bucket of 04 and 10 uses this one
+type and rounding (`Gcra::from_rate`, `crates/engine/vyrn-risk/src/gcra.rs`).
+
 | Bucket id | Bucket | Scope | Charged at | Cost | Default, tier T1 (budget) |
 |---|---|---|---|---|---|
 | 1 / 4 | `PKT` | session / account | V10, every accepted packet | 1 | 1M/s, burst 256 |
 | 2 / 5 | `MSG` | session / account | M1, every message | 1; `CancelAll` `PROTO_CANCELALL_TOKENS` | 5M/s, burst 2,560 |
 | 3 / 6 | `BBO` | session / account | M8, after classification | cross, `IOC`, `FOK`: 5; improve: 1 | 100k cross-equivalents/s, burst 640 units |
 | 7 | `RESEND` | session | §5.2, §6.7 | 1 per resent packet | 100k/s, burst 1,024 |
+
+10 §3.8's account and lane buckets report their own ids in the same `RATE_LIMIT` detail
+(10 §3.1, `vyrn-risk` `consts.rs`):
+
+| Detail | 10 bucket | Charged at | Also means here |
+|---|---|---|---|
+| 1 `RSK_BUCKET_NEW` | account `new_bucket` | 10 check 6, after M5 | session `PKT` |
+| 2 `RSK_BUCKET_CROSS` | account `cross_bucket` | M8, cross | session `MSG` |
+| 3 `RSK_BUCKET_LANE_CROSS` | lane or pool `lane_cross` | M8, cross | session `BBO` |
+| 4 `RSK_BUCKET_LANE_IMPROVE` | lane or pool `lane_improve` | M8, improve | account `PKT` |
+
+**The two ranges overlap (open, §16 Q13).** A client can tell some cases apart by where the reject
+comes from (a V10 reject has index 0xFF; `PKT` never fires on a single message), but detail 2 at
+M1 or M8 and detail 3 at M8 are ambiguous. The client action is the same for all of them (slow
+down), so no outcome depends on it; a client that needs to know which bucket refused cannot
+learn it. A proposed fix, which changes the wire and needs vectors, is to move 10's ids to
+8–11.
 
 - **Cancel reserve.** `New` and priority-losing `Replace` take from `MSG` with
   `keep = PROTO_CANCEL_RESERVE` (a quarter of the burst). `Cancel`, `Reduce` and `CancelAll` use
@@ -1778,7 +1833,8 @@ do not count V16 as acknowledged.
 | VR5 | The byte layouts change only by an edit of 01 §6. |
 
 Code space: request types 0x01–0x0F are order messages, 0x10–0x1F control, 0x20–0x7F reserved.
-Response types are 0x80–0xFF; v1 uses 0x81–0x86.
+Response types are 0x80–0xFF; v1 uses 0x81–0x88 (0x87 `Bust` in CHAIN only, 0x88 `Attest`,
+01 §6.4, §14.10).
 
 Planned use of reserved fields (informative; not part of v1):
 
@@ -1789,7 +1845,7 @@ Planned use of reserved fields (informative; not part of v1):
 | order flags bits 6–7 | 0 | bit 6: reduce-only (v2 perpetuals) |
 | message bytes 2–3 | 0 | `New`: an STP group (u16) so that STP can span the accounts of one firm; `Replace`: the low 16 bits of a new `client_tag` |
 | response `flags` bits 1–7 | 0 | bit 1: more records for the same request follow in the next packet |
-| `Out` cause 2 (`FOK`) | never sent | free for v2 |
+| `Out` causes 9–65535 | never sent | free for v2 (causes 1–8 are v1, §7.3; cause 2 is `STP`) |
 | transport | IPv4 | the same payloads over IPv6/UDP |
 
 ## 13. Interfaces to other chapters
@@ -1862,12 +1918,12 @@ All values are **budgets** unless marked otherwise.
 | `PROTO_OUT_*` | 1–8 (01 §14.10) | `Out` cause names (§7.3) |
 | `PROTO_D_*` (close causes) | 1–7, §4.3 | `SESSION_CLOSED` detail |
 | `PROTO_D_*` (`BAD_TYPE`) | 1 `UNKNOWN_TYPE`, 2 `RESERVED`, 3 `FLAGS`, 4 `BAD_HDR`; 5 retired (now `BAD_BOOK` 23) | detail |
-| `PROTO_D_*` (`BAD_QTY`) | `OVERFLOW` 0xFFFF_FFFF, `NO_CHANGE` 0xFFFF_FFFE; otherwise `max_order_qty` | detail |
+| `PROTO_D_*` (`BAD_QTY`) | `NO_CHANGE` 0xFFFF_FFFE (`Replace`); `New` uses 10's `RSK_D_*` 1–4; `OVERFLOW` 0xFFFF_FFFF is retired (now `RSK_D_OVERFLOW` 4) | detail |
 | `PROTO_D_*` (`TOO_LATE`) | 1 `FILLED`, 2 `CANCELED`, 3 `OUT` | detail |
 | `PROTO_CNT_*` | `MALFORMED`, `UNKNOWN_SESSION`, `UNBOUND_SRC`, `EPOCH`, `SEQ_WINDOW`, `BAD_MAC`, `CLOSED`, `DUP`, `GAP`, `BAD_HDR`, `RATE`, `DATA_LATE`, `BUSY` | per-lane and per-session counters, exported by the control core |
 
 Types: the `SessionId` bit layout (§4.1); `OpenSessionReq`, `OpenSessionResp`, `KeyBundle`,
-`BoxKeys` (§4.4); `Cod` = `Off | On`; `Gcra` (§9.1); bucket ids 1–7 (§9.1); the B-packet and
+`BoxKeys` (§4.4); `Cod` = `Off | On`; `Gcra` (§9.1); bucket ids 1–7 and 10's 1–4 (§9.1); the B-packet and
 L-packet (§7.1); the `Attest` record (§7.5).
 
 ## 15. Requests to 01
@@ -1925,3 +1981,5 @@ credit bound (`STEP_FILL_CAP`, §14.15), `PacketRecord.flags` (§6.6),
 | Q10 | Until Request 3 lands, does 07 detect equivocation by logical content across resends and epochs with no false positive? | 07 | `vyrn-sim` resend-across-handoff test |
 | Q11 | Does every `BUSY`, lane and BBO-core, leave within 1 µs at 2× overload, and does each lane class meet §3.6 at the reference load? | 05 | B3 overload sweep with the capture NIC; per-class curves |
 | Q12 | Does the leaf switch keep a paced gap within `PROTO_PACE_JITTER_NS` = 25 ns at 60% port load, and is a 35 ns pacing overhead per packet acceptable to market makers? | 06, 10 | B3 rx-gap histogram per dedicated lane; review with MM firms |
+| Q13 | `RATE_LIMIT` detail ids 1–4 of 10 §3.8 overlap 04's 1–7 (§9.1). Keep the overlap, or move 10's ids to 8–11 (a wire change with new vectors)? | 04, 10 | owner decision; reject vectors for the chosen ids |
+| Q14 | The `vyrn-admin` encoding in §4.4 is a proposal with no implementation. Adopt it, change it, or use another framing (for example protobuf over the TLS channel)? | 04, 11 | owner decision; then vectors for `OpenSessionReq` and `OpenSessionResp` |

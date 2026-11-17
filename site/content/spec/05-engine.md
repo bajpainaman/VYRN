@@ -363,7 +363,7 @@ fn rank_e(e: Epoch, l: LaneId) -> u8 { ((l as u32 + e) % N_LANES as u32) as u8 }
 ### 3.3 Step cuts
 
 Let `K` be the newest cut, read at the start of step `s`: lanes 0–24 from cut core A's newest
-half-cut, lanes 25–49 from cut core B's (§7.1). The two halves may come from passes taken at
+half-cut, lanes 25–48 from cut core B's (§7.1). The two halves may come from passes taken at
 different times; each half is monotone on its own (`INV-CUT-MONO` per half, 01 §14.3), and
 nothing below needs the halves to be simultaneous. Let `h[l]` be the **dependency floor** of
 lane `l`'s oldest FwdRing entry that no step has executed yet: its `lane_seq` minus its largest
@@ -507,9 +507,16 @@ every cut.
 ## 4. Shared structures: the writer map
 
 Every structure below is preallocated in 1 GB huge pages before `seal()` (`INV-NOALLOC`). Every
-line that two cores touch is aligned to `CACHE_LINE` and has one writer (`INV-WRITER`). Sizes
-are for `CACHE_LINE = 64`. On Apple M-series (128) every padded line doubles; field offsets do
-not change.
+line that two cores touch has one writer (`INV-WRITER`). Sizes and offsets below are the bytes
+of each layout. **Padding (11 §3.6, 06 §5.5):** a line that one
+core writes and another core reads (`CounterLine`, `SnapshotLine`, `BboFloor`, each `CutPub`
+publication and its `newest` word, `LaneCut`, ring index lines, `FwdCons`, `FillCons`,
+`FramesOut`, the `RxQueue` lock) is padded and aligned to `BLD_SHARED_ALIGN` = 128 bytes on
+every target, so a 64 B layout takes one 128 B line and the bytes past it are padding. Bulk
+arrays (`OrderSlot`, `Segment16`, ring entries) are aligned to `CACHE_LINE` (01 §5). `AcctTok`
+entries are 16 B, four per line, changed only by CAS and release stores (§6.9).
+Field offsets never change. `vyrn-cut` (`SHARED_ALIGN`, `crates/engine/vyrn-cut/src/lib.rs`)
+asserts these sizes.
 
 ### 4.1 Table
 
@@ -542,7 +549,7 @@ not change.
 | snapshot history | box | `ENG_SNAP_HIST` × 8 B | BBO | BBO | CCD 0 | 1 per version |
 | `StepLog` | box | `ENG_STEP_LOG` × 64 B | BBO | stream cores, fill TX cores | CCD 0 | 1–8 lines per step |
 | `TxRing` A, B | box | 2 × `ENG_TX_RING` × 64 B | BBO | fill TX core A (core 3) / B (core 5) | CCD 0 | 1+ per forwarded step, 1 per maker session hit |
-| `LaneCut` | box | 13 lines (4 lanes per line; lines of half A and half B disjoint) | stream core of the lane's half | lanes | CCD 0 | ≤ 1 per lane per step, after the step's frame |
+| `LaneCut` | box | 13 lines with a 16-B atomic store (4 lanes per line; lines of half A and half B disjoint); 49 lines with the seqlock fallback (§4.15) | stream core of the lane's half | lanes | CCD 0 | ≤ 1 per lane per step, after the step's frame |
 | `FramesOut` A, B | box | 2 × 64 B | stream core A / B | fill TX cores, other stream core | CCD 0 | per step sent |
 | `AuctionCtl` | box | 64 B | BBO | lanes | CCD 0 | per uncross |
 | `AuctionHist` | lane | 2 × `ENG_AUCTION_TICKS` × 8 B + 64 B | lane | BBO | lane | per uncross |
@@ -823,13 +830,14 @@ FwdDep (16 B, 4 per line; ceil(n_dep / 4) lines follow their FwdEntry in the rin
 ### 4.13 `CutPub` half-cuts and occupancy masks (cut-core-written, 01 §14.3)
 
 ```
-CutPub[h] for half h ∈ {A, B} (ring of 4 per half; one is "newest"; h = A: lanes 0–24, B: 25–49):
+CutPub[h] for half h ∈ {A, B} (ring of 4 per half; h = A: lanes 0–24, B: lanes 25–48):
   line 0:    lock u64 | pub_id u64 | wild u32 (lanes of the half not trusted) | occ_center Tick
-             | newest u64 | rsv
+             | rsv (bytes 24–63)
   lines 1–7: entry[l] (16 B) = { seq: LaneSeq, snap_ver: u32, f_lo: u32 }   25 entries
+newest[h]:   u64 on its own line: the pub_id of the newest publication (Release store)
 
 occA[side][i] : u32   bit l set ⇒ lane l (0–24) may have a non-empty FIFO at window index i
-occB[side][i] : u32   bit l − 25 likewise for lanes 25–49
+occB[side][i] : u32   bit l − 25 likewise for lanes 25–48
 occ(side, i)  = occA[side][i] as u64 | (occB[side][i] as u64) << 25        (BBO core, 2 loads)
 BboFloor      : { done_A: u64, done_B: u64 }  written by the BBO core: every step it starts from
                                               now on uses half-cuts ≥ (done_A, done_B)
@@ -839,6 +847,13 @@ Each cut core is the only writer of its half's lines and its mask array, so no l
 writers (`INV-WRITER`). The BBO core reads both `newest` publications with their seqlocks. It
 reads the masks without a lock: Lemma 7.1 proves that every mask word it can read is conservative
 for the cut it uses.
+
+Half B holds 24 lanes (25–48, `N_LANES_REF` = 49, 01 §5, §14.3) in the same 25-entry layout as
+half A; its entry 24 is never a lane and stays 0, and occupancy bit 24 of `occB` is never set.
+`newest` sits on its own line, apart from the four publications: a reader loads `newest`
+(`Acquire`), then that publication, and refuses a publication whose `pub_id` differs (the writer
+lapped it). That is `vyrn-cut::PubRing` (`crates/engine/vyrn-cut/src/line.rs`), with
+`LANES_PER_HALF` = 25 (`lines.rs`).
 
 ### 4.14 `SnapshotLine` (64 B, BBO-written, lane-read)
 
@@ -887,7 +902,9 @@ LaneCut[l] (16 B, 4 per line, stream core of l's half → lane l):  { step: Step
 
 - A 16-B aligned SSE/AVX load or store is single-copy atomic on x86-64 CPUs with AVX (vendor:
   Intel SDM vol. 3A §9.1.1; AMD APM vol. 2 §7.3.2). On aarch64 the pair is an `STP`/`LDP` with
-  FEAT_LSE2. A target without either uses a per-entry seqlock (3 entries per line).
+  FEAT_LSE2. A target without either uses a per-entry seqlock. `vyrn-cut` uses the seqlock on
+  every target, one `LaneCut[l]` per `BLD_SHARED_ALIGN` line, because safe Rust cannot express
+  a 16-byte single-copy-atomic store (`LaneCut` in `crates/engine/vyrn-cut/src/lines.rs`).
 - Each stream core keeps the full cut and expands the deltas into `StepRecord.cut`
   (01 §6.6). After step `s` is framed, it writes `LaneCut[l]` when `C_s[l]` changed
   or when bit `l` of `StepEntry.fill_lanes` is set (lanes that received fill events in `s`). It
@@ -1385,6 +1402,7 @@ wait.
 
 ```
 AcctTok[a] (16 B, 4 per line)  { holder: u8 (0xFF = free), rsv: [u8; 3], ver: u32, rsv: u64 }
+                               (10 §1.2 and 11 call it PoolTok; this is its one layout)
 PoolAcct[a]                    the account's ledger, sessions, RootAux of its orders, AcctKill
 RxQueue[c] consumer lock (64 B) { lock: u32, next: u32 }   per pool core's RX VI
 ```
