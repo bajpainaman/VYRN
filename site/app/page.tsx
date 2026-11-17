@@ -1,7 +1,11 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { Arrow } from "@/components/Arrow";
 import { HomeNow } from "@/components/HomeNow";
+import { JsonLd } from "@/components/JsonLd";
+import { TrackedLink } from "@/components/TrackedLink";
+import { SITE_ORIGIN, SUMMARY } from "@/lib/agent";
 import { SiteFooter } from "@/components/SiteFooter";
 import { Ticket } from "@/components/Ticket";
 import {
@@ -18,6 +22,8 @@ import {
 } from "@/lib/design";
 import { renderNodes } from "@/lib/render";
 import { CONTACT_EMAIL, LICENSE_REQUEST_URL, LICENSE_URL, REPO_URL } from "@/lib/site";
+
+export const metadata: Metadata = { alternates: { canonical: "/" } };
 
 type Ply = "canary" | "white" | "pink";
 
@@ -364,22 +370,22 @@ function Close() {
           </p>
         </div>
         <nav aria-label="Next steps" className="grid grid-cols-1 gap-[2px] border-2 border-canary bg-canary sm:grid-cols-2">
-          <Link href="/docs/design" className="routebox inverse primary sm:col-span-2">
+          <TrackedLink href="/docs/design" event="route_click" eventProps={{ to: "design", from: "close" }} className="routebox inverse primary sm:col-span-2">
             <span className="box"><Arrow /></span>
             <span>Read the design<small>DESIGN.md, the answer in one document</small></span>
-          </Link>
-          <Link href="/docs/00-index" className="routebox inverse">
+          </TrackedLink>
+          <TrackedLink href="/docs/00-index" event="route_click" eventProps={{ to: "spec", from: "close" }} className="routebox inverse">
             <span className="box"><Arrow /></span>
-            <span>Read the spec<small>Chapters 00–11</small></span>
-          </Link>
-          <a href={REPO_URL} className="routebox inverse">
+            <span>Read the spec<small>Chapters 00–14</small></span>
+          </TrackedLink>
+          <TrackedLink href={REPO_URL} event="route_click" eventProps={{ to: "github", from: "close" }} className="routebox inverse">
             <span className="box"><Arrow /></span>
             <span>GitHub<small>bajpainaman/VYRN</small></span>
-          </a>
-          <a href={LICENSE_REQUEST_URL} className="routebox inverse sm:col-span-2">
+          </TrackedLink>
+          <TrackedLink href={LICENSE_REQUEST_URL} event="route_click" eventProps={{ to: "license_request", from: "close" }} className="routebox inverse sm:col-span-2">
             <span className="box"><Arrow /></span>
             <span>Request a license<small>Opens the public request form</small></span>
-          </a>
+          </TrackedLink>
         </nav>
       </div>
     </section>
@@ -388,8 +394,48 @@ function Close() {
 
 export default async function Home() {
   const [d0, d1, d3, d9, d10] = await Promise.all(["0.", "1.", "3.", "9.", "10."].map(designHref));
+  const jsonLd = {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Organization",
+        "@id": `${SITE_ORIGIN}/#org`,
+        name: "VYRN",
+        url: SITE_ORIGIN,
+        logo: `${SITE_ORIGIN}/icon.svg`,
+        description: SUMMARY,
+        sameAs: [REPO_URL],
+        contactPoint: [
+          { "@type": "ContactPoint", contactType: "licensing", url: LICENSE_REQUEST_URL, availableLanguage: "en" },
+          { "@type": "ContactPoint", contactType: "technical support", url: `${REPO_URL}/issues`, availableLanguage: "en" },
+          { "@type": "ContactPoint", contactType: "security", url: `${REPO_URL}/security/advisories/new`, availableLanguage: "en" },
+        ],
+        knowsAbout: ["exchange design", "central limit order book", "matching engine", "low-latency trading", "BFT consensus", "Simplex consensus"],
+      },
+      {
+        "@type": "WebSite",
+        "@id": `${SITE_ORIGIN}/#site`,
+        url: SITE_ORIGIN,
+        name: "VYRN: a 1 µs exchange design",
+        description: SUMMARY,
+        publisher: { "@id": `${SITE_ORIGIN}/#org` },
+        inLanguage: "en",
+      },
+      {
+        "@type": "TechArticle",
+        headline: "VYRN: filled within 1 µs of the first bit",
+        description: SUMMARY,
+        url: SITE_ORIGIN,
+        keywords: "exchange design, central limit order book, matching engine, 1 µs fills, BFT finality, follow the sun",
+        isPartOf: { "@id": `${SITE_ORIGIN}/#site` },
+        author: { "@id": `${SITE_ORIGIN}/#org` },
+        license: LICENSE_URL,
+      },
+    ],
+  };
   return (
     <>
+      <JsonLd data={jsonLd} />
       <main id="main" className="flex-1">
         <Ticket />
         <div className="mx-auto w-full max-w-[1440px] px-4 pb-16 sm:px-8">

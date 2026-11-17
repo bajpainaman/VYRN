@@ -7,7 +7,9 @@ import { Arrow } from "@/components/Arrow";
 import { Binder } from "@/components/docs/Binder";
 import { SpecSearch } from "@/components/docs/SpecSearch";
 import { Toc } from "@/components/docs/Toc";
+import { JsonLd } from "@/components/JsonLd";
 import { SiteFooter } from "@/components/SiteFooter";
+import { SITE_ORIGIN } from "@/lib/agent";
 import { renderNodes } from "@/lib/render";
 import { getDoc, getDocs } from "@/lib/spec";
 import { REPO_URL } from "@/lib/site";
@@ -22,6 +24,7 @@ export async function generateMetadata({
   const doc = await getDoc((await params).slug);
   return doc
     ? {
+        alternates: { canonical: `/docs/${doc.slug}` },
         title: doc.number === "D" ? "Design" : `${doc.number} ${doc.short}`,
         description: doc.title,
       }
@@ -89,6 +92,18 @@ async function DocSheet({ slug }: { slug: string }) {
         current={doc.slug}
       />
 
+      <JsonLd
+        data={{
+          "@context": "https://schema.org",
+          "@type": "TechArticle",
+          headline: doc.title.replace(/^\d{2}\.\s*/, ""),
+          url: `${SITE_ORIGIN}/docs/${doc.slug}`,
+          isPartOf: { "@type": "WebSite", "@id": `${SITE_ORIGIN}/#site` },
+          author: { "@type": "Organization", "@id": `${SITE_ORIGIN}/#org`, name: "VYRN" },
+          encoding: { "@type": "MediaObject", encodingFormat: "text/markdown", contentUrl: `${SITE_ORIGIN}/docs/${doc.slug}.md` },
+          inLanguage: "en",
+        }}
+      />
       <main id="main" className="min-w-0 border-ink bg-ply lg:border-x-2">
         <header className="border-b-2 border-ink px-5 pb-6 pt-8 sm:px-10">
           <span className="data block text-[30px] font-semibold leading-none text-stamp">

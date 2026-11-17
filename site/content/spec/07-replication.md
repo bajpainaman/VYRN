@@ -965,6 +965,12 @@ fetch, with these sources in order:
 Every fetched packet is checked like a pushed one. Source 3 is the only source of the bytes the
 sequencer actually matched, so it settles every conflict (§5.6).
 
+**Withheld copies (draft 0.3, 01 §14.19 C).** Source 3 serves one session at most
+`DAV_SESSION_REPAIR_PPS` = 2,000 packets/s (DAV-2). A voter that resolves more than 16 of a
+session's records from source 3 in 10 ms signs `DataMissing`; Q of them close the session with
+`Reject DATA_MISSING` (DAV-1), and the leader may then mark its unrepaired packets unavailable
+while the sequencer lives (DAV-3, extending §9.4). 13 §3–§5 gives the capacity analysis.
+
 ### 5.6 Mismatch between the client's two copies
 
 The two copies of one packet can differ in three ways.

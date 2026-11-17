@@ -1,0 +1,8 @@
+# Root Directory is site/; upload only what its build needs.
+/*
+!/site
+!/spec
+!/DESIGN.md
+/site/node_modules
+/site/.next
+/site/.impeccable

@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import { Archivo, Doto, Martian_Mono } from "next/font/google";
+import { Analytics } from "@vercel/analytics/next";
+import { SpeedInsights } from "@vercel/speed-insights/next";
 import { SiteHeader } from "@/components/SiteHeader";
 import "./globals.css";
 
@@ -44,6 +46,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
         </a>
         <SiteHeader />
         {children}
+        {/* Vercel Web Analytics and Speed Insights: cookieless, and inert outside a Vercel deployment. */}
+        <Analytics />
+        <SpeedInsights />
       </body>
     </html>
   );

@@ -4,7 +4,7 @@ import { SpecSearch } from "./SpecSearch";
 
 type Tab = { slug: string; number: string; short: string };
 
-/** The binder's index tabs: DESIGN.md, then chapters 00–11. */
+/** The binder's index tabs: DESIGN.md, then chapters 00–14. */
 export function Binder({ docs, current }: { docs: Tab[]; current: string }) {
   return (
     <nav aria-label="Spec chapters" data-binder className="border-b-2 border-ink bg-canary lg:border-b-0">

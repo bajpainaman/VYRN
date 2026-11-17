@@ -12,9 +12,13 @@ BFT finality in 10 ms, a book that follows the sun, and (extra credit) all of it
 2. **The cut replaces the sequencer.** No core waits to be sequenced. The BBO core reads every
    lane's counter and logs that vector. That log *is* the total order, and replicas replay it
    bit for bit.
-3. **The fill goes out before consensus and does not revert.** The ordering frame leaves the NIC
-   on two paths before the fill does. A fill reverts only if the leader dies *and* both paths drop
-   the same frame inside the same 0.5 ms.
+3. **The fill goes out before consensus and almost never reverts.** The ordering frame leaves the
+   NIC on two paths before the fill does, so no single fault can revert a fill, except a power loss
+   inside a ≤ 100 ns window (spec 12 §2). A revert otherwise needs two
+   faults, such as the leader dying *and* both paths dropping the same frame inside the same
+   0.5 ms. Spec 07 §9.6 lists every such case, and none can happen after the fill is final
+   (spec 01 §14.19 B). In CHAIN mode a fill against a packet with a bad `K_com` MAC is busted (§7):
+   it stays in the log and is reversed by compensating transfers.
 4. **BFT finalizes the order, not the state.** Simplex runs over 1 ms blocks of ordering metadata
    inside one metro: ~3 ms typical, < 10 ms p99. Fills are a deterministic function of the order,
    so they are final at the same moment.
@@ -302,8 +306,9 @@ The design above already is a chain. These are the changes that make it one:
     both byzantine. That is 2 > f. All honest validators that verify hold the same `K_com`, so they
     reach the same verdict on every packet, and a client cannot split them.
   - A client that sends a good `K_seq` MAC and a bad `K_com` MAC gets filled and then excluded
-    from the block. Its fills, and those of its counterparties, are reverted. Its session bond pays
-    the counterparties, and the session is killed.
+    from the block. Its fills, and those of its counterparties, are busted: they stay in the log,
+    the verdict is final with the block, and compensating transfers reverse them at the next
+    boundary. Its session bond pays the counterparties, and the session is killed.
   - **Public verifiability:** each interval's `K_com` comes from a hash chain committed when the
     session opens, and it is disclosed after the block is final (TESLA-style). Anyone can
     re-verify the whole log afterwards.
@@ -454,7 +459,7 @@ giving up the ecosystem that makes OCaml worth using.
 - **"Why not shard the book across servers?"** A cross-box hop is ≥ 1 µs, which is the whole
   budget. The book stays in one socket, and its replicas run on other boxes.
 - **"The leader crashes right after a fill."** The ordering frame was already on two paths. A
-  revert requires leader death plus a double drop inside 0.5 ms.
+  revert requires a second fault, such as a double drop inside 0.5 ms (spec 07 §9.6).
 - **"The book pauses when it moves."** For one WAN one-way latency, by physics, and the auction
   makes that window fair.
 - **"Why not a GPU?"** A PCIe round trip to a GPU costs microseconds. GPUs are fine off the

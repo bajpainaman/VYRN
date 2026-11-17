@@ -1217,7 +1217,7 @@ cores each). Most bugs need a specific combination, and a fixed configuration ne
 | `INV-QUORUM` | every finalisation | the certificate has q valid signatures from distinct replicas |
 | `INV-ACK-AFTER-CUT` | every `Ack`/`CancelAck` | a published cut (both halves) already covered the op, and the frame gate was open |
 | Oracle equality | every message | §6.3 |
-| No lost fill or ack | end of run, and at each failover | every `Fill` any client received, and every order any client got an `Ack` for, is in the final log, unless the double-drop condition of DESIGN §0 was injected, in which case the reverted fills are exactly those of the dropped frames |
+| No lost fill or ack | end of run, and at each failover | every `Fill` any client received, and every order any client got an `Ack` for, is in the final log, unless a revert case of 07 §9.6 was injected, in which case the reverted fills are exactly those that case covers (01 §14.19 B); a CHAIN bust leaves the fill in the log |
 | Safety of finality | every finalisation | no two finalised blocks at one `Height` |
 | Conservation | every block | per asset: Σ balances + Σ reservations + fees = deposits − withdrawals |
 | Session sanity | every response | `resp_seq` gapless per session; each handle ends in at most one terminal record |

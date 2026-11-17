@@ -1,3 +1,5 @@
 .amp/portals/*
 /target
 /fuzz/target
+
+.vercel
