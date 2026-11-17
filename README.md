@@ -1,4 +1,7 @@
-<a href="https://www.vryn.trade"><img src="site/public/og.png" alt="A VYRN order ticket: filled within 1 µs of the first bit. Stamped filled ≤ 965 ns wire to wire, final in about 3 ms with 3 of 4 signed. One book at 1B msg/s, BFT final within 10 ms, home TYO → LDN → NYC, every figure a budget." width="100%"></a>
+<a href="https://www.vryn.trade"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/og-dark.png">
+  <img src="site/public/og.png" alt="A VYRN order ticket: filled within 1 µs of the first bit. Stamped filled ≤ 965 ns wire to wire, final in about 3 ms with 3 of 4 signed. One book at 1B msg/s, BFT final within 10 ms, home TYO → LDN → NYC, every figure a budget." width="100%">
+</picture></a>
 
 # VYRN
 
