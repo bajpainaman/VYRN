@@ -3637,9 +3637,9 @@ dependencies = [
 name = "vyrn-log"
 version = "0.0.0"
 dependencies = [
- "commonware-codec",
- "commonware-storage",
+ "proptest",
  "thiserror",
+ "vyrn-crypto",
  "vyrn-types",
 ]
 

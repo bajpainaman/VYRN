@@ -9,9 +9,11 @@ description = "Order-stream encoding, block assembly, hash chain, block storage,
 
 [dependencies]
 vyrn-types = { workspace = true }
-commonware-codec = { workspace = true }
-commonware-storage = { workspace = true }
+vyrn-crypto = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true
