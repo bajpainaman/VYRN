@@ -20,7 +20,10 @@ use std::fmt;
 
 use vyrn_crypto::hash::derive_key;
 use vyrn_types::{BookId, Handle, LaneId, MAX_REQ_PAYLOAD, Qty, SessionId, Tick};
-use vyrn_wire::{Msg, OrderFlags, ReqHeader, Side, Stp, Tif, encode_request, session_id};
+use vyrn_wire::{
+    Msg, OrderFlags, ReqHeader, Side, Stp, Tif, encode_request, session_generation, session_id,
+    session_lane, session_slot,
+};
 
 use crate::config::{
     Auction, Class, ClassKind, Config, ConfigError, Cross, Dist, LifetimeRow,
@@ -287,6 +290,8 @@ fn random_side(rng: &mut Xoshiro256) -> Side {
 
 struct Order {
     side: Side,
+    tick: u32,
+    post_only: bool,
     qty: u32,
     end_ps: u64,
     near_pos: Option<usize>,
@@ -333,6 +338,15 @@ impl Orders {
     fn oldest(&self) -> Option<u32> {
         self.by_end.first().map(|&(_, slot)| slot)
     }
+
+    /// The first order whose drawn lifetime has run out at `now_ps` (02 §6.7: it ends at entry + T,
+    /// never before).
+    fn due(&self, now_ps: u64) -> Option<u32> {
+        self.by_end
+            .first()
+            .filter(|&&(end, _)| end <= now_ps)
+            .map(|&(_, slot)| slot)
+    }
 }
 
 struct Session {
@@ -351,6 +365,28 @@ struct Session {
 }
 
 impl Session {
+    /// Moves to the next `pkt_seq`. `pkt_seq` is a u32 and gapless (04 P5), so after 2³²−1 packets
+    /// the session continues as the next generation of its `SessionId` (04 §4.1) with `pkt_seq`
+    /// from 1 and fresh MAC keys; the rig reopens it. False when the 12-bit generation is used
+    /// up: the session sends no more.
+    fn advance_seq(&mut self, seed: u64, mode: Mode) -> bool {
+        if let Some(n) = self.pkt_seq.checked_add(1) {
+            self.pkt_seq = n;
+            return true;
+        }
+        let Some(id) = session_id(
+            session_slot(self.id),
+            session_lane(self.id),
+            session_generation(self.id).saturating_add(1),
+        ) else {
+            return false;
+        };
+        self.id = id;
+        (self.k_seq, self.k_com) = session_keys(seed, id, mode);
+        self.pkt_seq = 1;
+        true
+    }
+
     /// A handle slot: 1 … 0xFF_FFFE (slot 0xFF_FFFF is never a real handle, 04 §6.1), skipping
     /// slots of live orders.
     fn serial(&mut self) -> u32 {
@@ -458,10 +494,16 @@ fn make_msg(
     now_ps: u64,
 ) -> (Msg, MsgKind) {
     let mut kind = kind;
+    // Orders end at their drawn expiry (02 §6.7): a cancel or replace takes an order whose lifetime
+    // has run out, and a draw with none due becomes a join (the controller of 02 §6.10 compensates
+    // in a real run). Only the live-order cap overrides a lifetime.
+    let due = s.orders.due(now_ps);
+    let mut forced = false;
     if matches!(kind, MsgKind::Join | MsgKind::Improve) && s.orders.len() >= cl.max_live {
         kind = MsgKind::Cancel;
+        forced = true;
     }
-    if kind == MsgKind::Cancel && s.orders.by_slot.is_empty() {
+    if kind == MsgKind::Cancel && (s.orders.by_slot.is_empty() || (!forced && due.is_none())) {
         kind = MsgKind::Join;
     }
     if kind == MsgKind::Reduce && s.orders.near.is_empty() {
@@ -469,7 +511,7 @@ fn make_msg(
     }
     if kind == MsgKind::Join
         && t.auction.is_none()
-        && !s.orders.by_slot.is_empty()
+        && due.is_some()
         && s.rng.chance_ppm(t.replace_ppm)
     {
         kind = MsgKind::Replace;
@@ -513,11 +555,21 @@ fn make_msg(
             }
         }
         MsgKind::Replace => {
-            if let Some(old) = s.orders.oldest()
+            if let Some(old) = due
                 && let Some(o) = s.orders.remove(old)
             {
                 let d = t.distance(&mut s.rng);
-                let tick = t.join_tick(o.side, d);
+                let mut tick = t.join_tick(o.side, d);
+                // Same tick and same flags would be a reduction or a no-change (04 §6.5) that keeps
+                // the order's handle. The generator models only priority-losing replaces, so step
+                // one tick away from the touch.
+                if tick == o.tick && !o.post_only {
+                    tick = match o.side {
+                        Side::Buy if tick > 1 => tick - 1,
+                        Side::Buy => tick.saturating_add(1),
+                        Side::Sell => tick.saturating_add(1),
+                    };
+                }
                 let qty = quantity(&mut s.rng, cl.qty_p_ppm);
                 let end = now_ps.saturating_add(t.lifetime_ps(&mut s.rng));
                 let slot = s.serial();
@@ -525,6 +577,8 @@ fn make_msg(
                     slot,
                     Order {
                         side: o.side,
+                        tick,
+                        post_only: false,
                         qty,
                         end_ps: end,
                         near_pos: None,
@@ -560,6 +614,8 @@ fn make_msg(
                 slot,
                 Order {
                     side,
+                    tick,
+                    post_only: true,
                     qty,
                     end_ps: end,
                     near_pos: None,
@@ -599,6 +655,8 @@ fn make_join(t: &Tables, cl: &ClassRt, s: &mut Session, now_ps: u64) -> Msg {
         slot,
         Order {
             side,
+            tick,
+            post_only: false,
             qty,
             end_ps: end,
             near_pos: None,
@@ -660,33 +718,59 @@ struct Bursts {
     rng: Xoshiro256,
     rate_uhz: u64,
     window_ps: u64,
-    cursor: u64,
+    /// Windows from this start on are not generated: the run is over.
+    horizon_ps: u64,
+    /// Start of the next burst that is drawn but not yet in `wins` (`u64::MAX`: none before the
+    /// horizon).
+    next: u64,
+    /// Merged windows, ascending and disjoint.
     wins: VecDeque<(u64, u64)>,
 }
 
 impl Bursts {
-    /// Generates windows until one starts after `t`.
+    fn new(rng: Xoshiro256, rate_uhz: u64, window_ps: u64, horizon_ps: u64) -> Self {
+        let mut b = Self {
+            rng,
+            rate_uhz,
+            window_ps,
+            horizon_ps,
+            next: 0,
+            wins: VecDeque::new(),
+        };
+        b.draw();
+        b
+    }
+
+    fn draw(&mut self) {
+        let e = neg_ln_q32(self.rng.next_u64());
+        let n = self.next.saturating_add(gap_ps(e, self.rate_uhz));
+        self.next = if n >= self.horizon_ps { u64::MAX } else { n };
+    }
+
+    /// Makes the window containing `t` (if any) final: generates bursts until the next one starts
+    /// after `t` and after the end of every window merged so far. Overlapping bursts merge, so a
+    /// long window at a high rate generates up to the end of the run, never past it.
     fn extend(&mut self, t: u64) {
-        while self.wins.back().is_none_or(|w| w.0 <= t) {
-            let e = neg_ln_q32(self.rng.next_u64());
-            let start = self.cursor.saturating_add(gap_ps(e, self.rate_uhz));
+        while self.next != u64::MAX {
+            let start = self.next;
             let end = start.saturating_add(self.window_ps);
-            self.cursor = start;
             match self.wins.back_mut() {
                 Some(b) if start <= b.1 => b.1 = b.1.max(end),
-                _ => self.wins.push_back((start, end)),
+                _ if start <= t => self.wins.push_back((start, end)),
+                _ => break,
             }
+            self.draw();
         }
     }
 
-    /// Whether `t` is in a burst, and when that changes.
+    /// Whether `t` is in a burst, and when that changes. Exact after `extend(t)`.
     fn at(&self, t: u64) -> (bool, u64) {
         for &(s, e) in &self.wins {
             if e > t {
                 return if s <= t { (true, e) } else { (false, s) };
             }
         }
-        (false, u64::MAX)
+        (false, self.next)
     }
 
     fn prune(&mut self, floor: u64) {
@@ -724,12 +808,13 @@ impl Timeline {
                 .map(|p| u64::from(p.cross_scale_ppm))
                 .collect(),
             end_ps: acc,
-            bursts: (b.rate_per_s > 0).then(|| Bursts {
-                rng: Xoshiro256::for_global(seed),
-                rate_uhz: u64::from(b.rate_per_s) * 1_000_000,
-                window_ps: b.window_ns.saturating_mul(PS_PER_NS),
-                cursor: 0,
-                wins: VecDeque::new(),
+            bursts: (b.rate_per_s > 0).then(|| {
+                Bursts::new(
+                    Xoshiro256::for_global(seed),
+                    u64::from(b.rate_per_s) * 1_000_000,
+                    b.window_ns.saturating_mul(PS_PER_NS),
+                    acc,
+                )
             }),
             burst_mult_ppm: u64::from(b.mult_ppm),
             base_scale_ppm: u64::from(b.base_scale_ppm),
@@ -943,6 +1028,8 @@ pub struct Generator {
     msgs: Vec<Msg>,
     book: BookId,
     epoch16: u16,
+    seed: u64,
+    mode: Mode,
     stats: Stats,
 }
 
@@ -1003,6 +1090,8 @@ impl Generator {
             msgs: Vec::with_capacity(16),
             book: BookId(cfg.book),
             epoch16: cfg.epoch16,
+            seed: opts.seed,
+            mode: cfg.mode,
             stats: Stats::default(),
         })
     }
@@ -1053,7 +1142,7 @@ impl Iterator for Generator {
             self.msgs.push(m);
         }
         let header = ReqHeader::new(s.id, s.pkt_seq, self.epoch16, self.book, false);
-        s.pkt_seq = s.pkt_seq.wrapping_add(1);
+        let seq_ok = s.advance_seq(self.seed, self.mode);
         let mut bytes = [0u8; MAX_REQ_PAYLOAD];
         // None only for a message count outside 1..=10, which validation rules out.
         let len = encode_request(&mut bytes, header, &self.msgs, &s.k_seq, s.k_com.as_ref())?;
@@ -1063,7 +1152,7 @@ impl Iterator for Generator {
         self.stats.bytes += u64::try_from(len).unwrap_or(0);
         self.stats.last_send_ns = send_ns;
         let uhz = s.rate_uhz.get(usize::from(stream)).copied().unwrap_or(0);
-        if let Some(next) = self.timeline.next_arrival(t_ps, uhz, cl.bursty, &mut s.rng) {
+        if seq_ok && let Some(next) = self.timeline.next_arrival(t_ps, uhz, cl.bursty, &mut s.rng) {
             self.heap.push(Reverse((next, s.id.0, stream, idx)));
         }
         Some(Packet {
@@ -1073,5 +1162,75 @@ impl Iterator for Generator {
             len,
             bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(pkt_seq: u32, generation: u16) -> Session {
+        let id = session_id(5, LaneId(3), generation).unwrap_or_default();
+        let (k_seq, k_com) = session_keys(1, id, Mode::Chain);
+        Session {
+            id,
+            lane: LaneId(3),
+            class: 0,
+            rng: Xoshiro256::from_seed(1),
+            pkt_seq,
+            next_serial: 1,
+            next_tag: 1,
+            k_seq,
+            k_com,
+            rate_uhz: [0; 2],
+            orders: Orders::default(),
+        }
+    }
+
+    #[test]
+    fn pkt_seq_rolls_into_the_next_session_generation_instead_of_wrapping() {
+        let mut s = session(u32::MAX - 1, 7);
+        let before = (s.id, s.k_seq);
+        assert!(s.advance_seq(1, Mode::Chain));
+        assert_eq!((s.pkt_seq, s.id), (u32::MAX, before.0));
+        // The 2^32-th packet's successor: generation 8, slot and lane kept, seq from 1, new keys.
+        assert!(s.advance_seq(1, Mode::Chain));
+        assert_eq!(s.pkt_seq, 1);
+        assert_eq!(
+            (
+                session_slot(s.id),
+                session_lane(s.id),
+                session_generation(s.id)
+            ),
+            (5, LaneId(3), 8)
+        );
+        assert_ne!(s.k_seq, before.1);
+        assert_eq!((s.k_seq, s.k_com), session_keys(1, s.id, Mode::Chain));
+    }
+
+    #[test]
+    fn the_last_generation_ends_the_session() {
+        let mut s = session(u32::MAX, 0xFFF);
+        assert!(!s.advance_seq(1, Mode::Base));
+    }
+
+    #[test]
+    fn an_order_is_due_only_once_its_drawn_lifetime_has_run_out() {
+        let mut o = Orders::default();
+        let order = |end_ps| Order {
+            side: Side::Buy,
+            tick: 10,
+            post_only: false,
+            qty: 1,
+            end_ps,
+            near_pos: None,
+        };
+        o.insert(1, order(5_000), 0);
+        o.insert(2, order(3_000), 0);
+        assert_eq!(o.due(2_999), None);
+        assert_eq!(o.due(3_000), Some(2));
+        o.remove(2);
+        assert_eq!(o.due(4_999), None);
+        assert_eq!(o.due(5_000), Some(1));
     }
 }

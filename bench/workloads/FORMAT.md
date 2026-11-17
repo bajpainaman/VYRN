@@ -28,7 +28,7 @@ No new wire format is invented for packets.
 | `[pool]` | `first_lane`, `lanes`: lanes of pooled sessions. |
 | `[auction]` | Optional. Every order is `AUCTION_ONLY`; `through_ppm` of them go through the reference. |
 | `[[phase]]` | `duration_ns`, `rate_ppm`, optional `cross_scale_ppm`. Phases run back to back. |
-| `[[class]]` | `kind` (`mm`, `tk`, `rt`), `placement`, `skew`, `mix`, `qty_p_ppm`, `packets`, and the optional `enabled`, `stp_cancel_newest`, `bursty`, `max_live_orders`. |
+| `[[class]]` | `kind` (`mm`, `tk`, `rt`), `placement`, `skew`, `mix`, `qty_p_ppm`, `packets`, and the optional `enabled`, `stp_cancel_newest`, `bursty`, `max_live_orders` (default 8,192 per session; one tracked entry per live order). |
 | `[extensions]` | The one table a v1 reader ignores. Everything else unknown is an error, so a typo never falls back to a default. |
 
 Probabilities are parts per million, times are ns, rates are msgs/s. A class `mix` is the class's
@@ -56,6 +56,18 @@ Each packet is a VYRN request: header (`session`, `pkt_seq` gapless from 1, `cou
 `book`), 1–10 messages, `tag_seq`, `tag_com`. MAC keys are derived for tests only:
 BLAKE3 `derive_key` with the contexts `vyrn-bench v1 gen k_seq` and `vyrn-bench v1 gen k_com`
 over `run_seed` (u64 LE) ‖ `SessionId` (u32 LE), first 16 bytes. They protect nothing.
+
+**Lifetimes (02 §6.7).** Each join or improve draws a lifetime T. A cancel or replace takes the
+session's order whose drawn expiry (entry + T) has passed, earliest first; an order is never ended
+before its expiry. A cancel or replace draw with no expired order becomes a join, so the cancel
+share starts below target until the first lifetimes run out; the controller of 02 §6.10 (the rig's)
+closes that gap. Only `max_live_orders` overrides a lifetime. A replace always changes the price,
+so it loses priority and gets a new placeholder handle (04 §6.5); reductions and no-change
+replaces are not generated.
+
+**Packet numbers.** `pkt_seq` is a gapless u32 from 1 (04 P5). After 2³²−1 packets a session
+continues as the next generation of its `SessionId` (04 §4.1), `pkt_seq` from 1, with fresh test
+keys; the rig reopens it. When the 12-bit generation is used up the session sends no more.
 
 **Handles are placeholders.** The lane assigns the real handle on `Ack`. The generator numbers a
 session's orders 1, 2, 3 … in the slot bits (generation 0). A rig sending to a live sequencer

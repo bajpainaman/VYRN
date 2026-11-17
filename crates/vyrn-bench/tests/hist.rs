@@ -125,3 +125,24 @@ fn empty_and_malformed_exports() {
         Err(HistError::Line(_))
     ));
 }
+
+#[test]
+fn an_overflow_max_must_name_a_request_that_is_in_the_samples() {
+    let mut h = LatencyHist::new();
+    h.record(20_000, req(1));
+    h.record(20_000, req(9));
+    h.record(15_000, req(5));
+    let good = h.export("x").unwrap();
+    assert!(LatencyHist::parse(&good).is_ok());
+    assert!(good.contains("\nmax 20000 1 2 1\n"));
+    // A request that is not in the overflow list, one that is but is not the smallest among the
+    // equal maxima, and one that belongs to a smaller sample.
+    for wrong in ["max 20000 7 8 7", "max 20000 9 10 9", "max 20000 5 6 5"] {
+        let text = good.replace("max 20000 1 2 1", wrong);
+        assert_eq!(
+            LatencyHist::parse(&text).unwrap_err(),
+            HistError::Max,
+            "{wrong}"
+        );
+    }
+}

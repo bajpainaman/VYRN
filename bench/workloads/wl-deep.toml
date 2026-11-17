@@ -122,6 +122,10 @@ rate_ppm = 1_000_000
 duration_ns = 600_000_000_000
 rate_ppm = 1_000_000
 
+# max_live_orders is raised from the 8,192 default: 252 MM sessions x 1.5M = 3.8x10^8 >= the 3x10^8 resting
+# orders this workload targets. The generator keeps one entry per live order, so a full run needs
+# tens of GB; restrict it with `lane = N` for a single lane (about 1/49 of that).
+
 # 02 §6.3, §6.4: MM, the top 17 firms on dedicated lanes 0-41, 6 sessions per lane.
 [[class]]
 kind = "mm"
@@ -130,6 +134,7 @@ placement = { kind = "dedicated", lane_first = 0, lane_count = 42, sessions_per_
 skew = { kind = "equal" }
 mix = { join = 490_000, cancel = 442_000, reduce = 20_000, improve = 15_500, cross = 2_500 }
 qty_p_ppm = 200_000
+max_live_orders = 1_500_000
 stp_cancel_newest = true
 bursty = true
 packets = { kind = "bundled", bundle_size = 10, urgent_cancel_ppm = 50_000, urgent_two_ppm = 500_000 }
@@ -141,6 +146,7 @@ placement = { kind = "pooled", sessions = 4000 }
 skew = { kind = "zipf", s_milli = 500 }
 mix = { join = 8_000, cancel = 6_500, reduce = 0, improve = 4_000, cross = 6_500 }
 qty_p_ppm = 200_000
+max_live_orders = 1_500_000
 bursty = true
 packets = { kind = "single", two_ppm = 200_000 }
 
@@ -151,4 +157,5 @@ placement = { kind = "pooled", sessions = 24000 }
 skew = { kind = "equal" }
 mix = { join = 2_000, cancel = 1_500, reduce = 0, improve = 500, cross = 1_000 }
 qty_p_ppm = 500_000
+max_live_orders = 1_500_000
 packets = { kind = "single", two_ppm = 0 }

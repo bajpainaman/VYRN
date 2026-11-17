@@ -276,15 +276,18 @@ impl LatencyHist {
                 actual: h.count(),
             });
         }
-        // The exact max is a statement of the export; the body must not exceed it.
-        let largest_body = h
-            .overflow
-            .last()
-            .map(|s| s.value_ns)
-            .or_else(|| h.hdr.iter_recorded().last().map(|v| v.value_iterated_to()));
+        // The exact max is a statement of the export. Above 10 us the body holds its request, so
+        // the line must name the smallest request among the equal largest samples; in the 1 ns
+        // buckets a count carries no request, so only the value is checked.
+        let top = h.overflow.last().map(|s| s.value_ns);
+        let largest_body =
+            top.or_else(|| h.hdr.iter_recorded().last().map(|v| v.value_iterated_to()));
+        let canonical = top.and_then(|v| h.overflow.iter().find(|s| s.value_ns == v).copied());
         match (stated_max, largest_body) {
             (None, None) => {}
-            (Some(m), Some(l)) if m.value_ns == l => h.max = Some(m),
+            (Some(m), Some(l)) if m.value_ns == l && canonical.is_none_or(|c| c == m) => {
+                h.max = Some(m);
+            }
             _ => return Err(HistError::Max),
         }
         Ok((name, h))

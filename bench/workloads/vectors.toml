@@ -13,52 +13,52 @@ blake3 = "f219c723ffceede827366e3fca27f27df70f1cd083e2bcc9807b45221ee2afd1"
 config = "wl-aws.toml"
 seed = "0xC0FFEE"
 packets = 20000
-blake3 = "dd09aa17b3107d83679b83635c38f22741e7a574ef5d7c684e1ee77d0ee4b03b"
+blake3 = "fb2855be3566f228da52352c57a10e9f50e23ac59002f7163b0d44d8bfdb0a31"
 
 [[vector]]
 config = "wl-deep.toml"
 seed = "0xC0FFEE"
 packets = 20000
-blake3 = "71033a5680a16e0d2acdd9ea74b9ce8798011aa6c398165163ac5bfda5a10b3b"
+blake3 = "ea9d81eca4f7d87cd7de5597a4beaa78b622573eccfefbb909fb59fe56f74ce7"
 
 [[vector]]
 config = "wl-diurnal.toml"
 seed = "0xC0FFEE"
 packets = 20000
-blake3 = "97e229718437c05d2c12eb788161cfc36939c7a92fa33407fe1abe5d0c45a7cb"
+blake3 = "0e1f3373ac4d966eccba820e70692378267670d4f10b6e8f10032a289132f16e"
 
 [[vector]]
 config = "wl-lane.toml"
 seed = "0xC0FFEE"
 packets = 20000
-blake3 = "d36b9a134dabc980bd6874bb2e77074bc5e9727e874df7d57f0bbe2ac4dde95a"
+blake3 = "d56b540e5b256c94898fac0ba149f76f5ea9d0b9ab9330e302fedc22aa451993"
 
 [[vector]]
 config = "wl-low.toml"
 seed = "0xC0FFEE"
 packets = 20000
-blake3 = "224f4a9fc5c19a9acd8fdc43eaab28308d482ddb511ad03f87db7e9917d27757"
+blake3 = "329ad7751207ecfba43173ddea025817bf2851f69858e08b4d075c4cf4530c0b"
 
 [[vector]]
 config = "wl-pool.toml"
 seed = "0xC0FFEE"
 packets = 20000
-blake3 = "f1dae4ffa80ff92271b48fadbaa777ea840d35e5e9ead7bdbe5b2861b09e341e"
+blake3 = "2a36802c8d91d790f00e4435948b79591ef9bc193ffbdb9c6673b39d0d75b59b"
 
 [[vector]]
 config = "wl-ref.toml"
 seed = "0xC0FFEE"
 packets = 20000
-blake3 = "8f1b9798237b470c8c82dda9e74d6f01bfd0a9288c54caab8a9a0af7f46cf51c"
+blake3 = "69d8b534a8710ca880428719d71995a3e65000ad1ed57b24c0876fec55ba1568"
 
 [[vector]]
 config = "wl-sess.toml"
 seed = "0xC0FFEE"
 packets = 20000
-blake3 = "e88b8ddc727aa13807840be26a660c2bfb333ffd51290cb467da11e1db53abba"
+blake3 = "f9c2b960dd3b555f7047a2c1d74c8363f424598313cfa82b6e787d587a74eccd"
 
 [[vector]]
 config = "wl-xsweep.toml"
 seed = "0xC0FFEE"
 packets = 20000
-blake3 = "88287656dcd5ca887af8be7b925d468ddac6a35fbb95b710dae4ffe3baf857b9"
+blake3 = "abb10fa4e2c980b307e1ccc92784f0a5c3d1383d277251dde7ce43cf20af3347"

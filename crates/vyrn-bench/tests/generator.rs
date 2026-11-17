@@ -171,7 +171,7 @@ fn fixed_config_and_seed_give_a_fixed_hash() {
     // is the B4 contract that the same config and seed give the same bytes on every build.
     assert_eq!(
         hex(&hash(&bytes).0),
-        "76dbb6850775b63034ef3152a367679faa1a4b18d55e37f54ce939c650e31e7e",
+        "262976ee000182f251b2a1db505fbbdeabdf86014177c0b4896c7bbd6fb1f28d",
         "{} bytes",
         bytes.len()
     );
@@ -312,9 +312,12 @@ fn realized_mix_follows_the_config() {
     assert!(near(s.share_ppm(s.by_class[1]), 25_000, 4_000), "{s}");
     assert!(near(s.share_ppm(s.by_class[2]), 5_000, 2_000), "{s}");
     let joins = s.kind(MsgKind::Join) + s.kind(MsgKind::Replace);
-    assert!(near(s.share_ppm(joins), 500_000, 25_000), "{s}");
+    // Orders end only at their drawn expiry, so until the first lifetimes run out (2 ms here) some
+    // cancel draws become joins: the cancel share starts low and the join share high, and the mix
+    // controller of 02 §6.10 closes the gap in a real run.
+    assert!(near(s.share_ppm(joins), 500_000, 60_000), "{s}");
     assert!(
-        near(s.share_ppm(s.kind(MsgKind::Cancel)), 450_000, 25_000),
+        near(s.share_ppm(s.kind(MsgKind::Cancel)), 450_000, 60_000),
         "{s}"
     );
     assert!(
@@ -431,4 +434,71 @@ fn bad_configs_and_streams_are_rejected() {
     let with_ext = format!("{ok}\n[extensions]\nfuture = 1\n");
     assert!(Config::parse(&with_ext).is_ok());
     assert_eq!(Mode::Base, cfg.mode);
+}
+
+/// Bursts whose windows overlap (here 60 s windows at 2000 bursts/s over a 4 ms run) merge into
+/// one window up to the end of the run; generating them must not look past it.
+#[test]
+fn overlapping_bursts_terminate_at_the_run_end() {
+    let base = mini("base", None);
+    let long = base.replace("window_ns = 100_000", "window_ns = 60_000_000_000");
+    let off = base.replace("rate_per_s = 2000", "rate_per_s = 0");
+    let count = |text: &str| {
+        Generator::new(&Config::parse(text).unwrap(), &opts(3))
+            .unwrap()
+            .count()
+    };
+    let (n_long, n_off) = (count(&long), count(&off));
+    // Bursty classes send at 2x for most of the run, so well over the burst-free count.
+    assert!(n_long * 10 > n_off * 14, "{n_long} vs {n_off}");
+}
+
+/// 02 §6.7: an order ends at its drawn expiry, never before. With every lifetime set to 1 ms and
+/// a 2 ms run, no cancel or replace may reach an order before 1 ms.
+#[test]
+fn nothing_is_canceled_or_replaced_before_its_lifetime() {
+    let base = mini("base", None);
+    let fixed = base
+        .replace(
+            "lo_ns = 5_000\nhi_ns = 100_000",
+            "lo_ns = 1_000_000\nhi_ns = 1_000_001",
+        )
+        .replace(
+            "lo_ns = 100_000\nhi_ns = 1_000_000",
+            "lo_ns = 1_000_000\nhi_ns = 1_000_001",
+        )
+        .replace(
+            "lo_ns = 1_000_000\nhi_ns = 100_000_000",
+            "lo_ns = 1_000_000\nhi_ns = 1_000_001",
+        )
+        .replace(
+            "lo_ns = 100_000_000\nhi_ns = 28_800_000_000_000",
+            "lo_ns = 1_000_000\nhi_ns = 1_000_001",
+        );
+    // No reduces (a reduce of a one-lot order is sent as a cancel, 02 §6.6) and no live cap in reach.
+    let fixed = fixed
+        .replace(
+            "join = 490_000, cancel = 442_000, reduce = 20_000",
+            "join = 510_000, cancel = 442_000, reduce = 0",
+        )
+        .replace(
+            "qty_p_ppm = 200_000\n",
+            "qty_p_ppm = 200_000\nmax_live_orders = 1_000_000\n",
+        );
+    assert_ne!(fixed, base);
+    let cfg = Config::parse(&fixed).unwrap();
+    let (mut early, mut late) = (0, 0);
+    for p in Generator::new(&cfg, &opts(8)).unwrap() {
+        for m in Request::parse(p.bytes()).unwrap().msgs() {
+            if matches!(m, Ok(Msg::Cancel { .. } | Msg::Replace { .. })) {
+                if p.send_ns < 1_000_000 {
+                    early += 1;
+                } else {
+                    late += 1;
+                }
+            }
+        }
+    }
+    assert!(late > 1_000, "{late}");
+    assert_eq!(early, 0, "{early} early vs {late} late");
 }
