@@ -33,7 +33,7 @@
 //! crash mid-write is undone. io_uring and O_DIRECT are not used yet.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use vyrn_crypto::hash::hash;
@@ -339,11 +339,12 @@ impl FileStore {
             return Err(StoreError::Corrupt);
         }
         let mut drives = Vec::new();
-        let mut found: Vec<(Block, usize, u64, u64)> = Vec::new();
+        // Only headers and locations: recovery memory scales with the index, not the log.
+        let mut found: Vec<(BlockHeader, usize, u64, u64)> = Vec::new();
         for (d, dir) in dirs.iter().enumerate() {
             std::fs::create_dir_all(dir)?;
             let path = dir.join(DRIVE_FILE);
-            let mut file = OpenOptions::new()
+            let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
@@ -351,22 +352,21 @@ impl FileStore {
                 .open(&path)?;
             sync_dir(dir)?;
             let len = file.metadata()?.len();
-            for (b, off, n) in scan(&mut file, len)? {
-                found.push((b, d, off, n));
+            for (h, off, n) in scan(&file, len)? {
+                found.push((h, d, off, n));
             }
             drives.push(Drive { file, len });
         }
-        found.sort_by_key(|(b, ..)| b.header.height.0);
+        found.sort_by_key(|(h, ..)| h.height.0);
         // Keep the longest prefix of consecutive, chained heights, drive-placed by height.
         let mut keep = 0usize;
         let n_drives = drives.len() as u64;
         for i in 0..found.len() {
             let ok = match (i.checked_sub(1).and_then(|p| found.get(p)), found.get(i)) {
                 (_, None) => false,
-                (None, Some((b, d, ..))) => drive_of(b.header.height, n_drives) == *d,
-                (Some((p, ..)), Some((b, d, ..))) => {
-                    drive_of(b.header.height, n_drives) == *d
-                        && check_link(&p.header, &b.header).is_ok()
+                (None, Some((h, d, ..))) => drive_of(h.height, n_drives) == *d,
+                (Some((p, ..)), Some((h, d, ..))) => {
+                    drive_of(h.height, n_drives) == *d && check_link(p, h).is_ok()
                 }
             };
             if !ok {
@@ -390,8 +390,8 @@ impl FileStore {
         }
         let kept: Vec<_> = found.into_iter().take(keep).collect();
         Ok(Self {
-            first: kept.first().map_or(0, |(b, ..)| b.header.height.0),
-            last_header: kept.last().map(|(b, ..)| b.header),
+            first: kept.first().map_or(0, |(h, ..)| h.height.0),
+            last_header: kept.last().map(|(h, ..)| *h),
             index: kept.into_iter().map(|(_, d, off, n)| (d, off, n)).collect(),
             drives,
         })
@@ -418,8 +418,29 @@ fn sync_dir(_dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Every record that checks, from the start of the file up to the first that does not.
-fn scan(file: &mut File, len: u64) -> Result<Vec<(Block, u64, u64)>, StoreError> {
+/// Reads exactly `buf.len()` bytes at `off` without moving the file cursor, so concurrent
+/// [`BlockStore::get`] calls on one drive never race.
+#[cfg(unix)]
+fn read_at(file: &File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, off)
+}
+
+#[cfg(windows)]
+fn read_at(file: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let n = std::os::windows::fs::FileExt::seek_read(file, buf, off)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = buf.get_mut(n..).unwrap_or_default();
+        off = off.saturating_add(n as u64);
+    }
+    Ok(())
+}
+
+/// The header and location of every record that checks, from the start of the file up to the
+/// first that does not. Each record is decoded and dropped; payloads are not retained.
+fn scan(file: &File, len: u64) -> Result<Vec<(BlockHeader, u64, u64)>, StoreError> {
     let mut out = Vec::new();
     let mut off = 0u64;
     let mut head = [0u8; RECORD_HEAD_BYTES];
@@ -427,18 +448,16 @@ fn scan(file: &mut File, len: u64) -> Result<Vec<(Block, u64, u64)>, StoreError>
         if off.saturating_add(RECORD_HEAD_BYTES as u64) > len {
             break;
         }
-        file.seek(SeekFrom::Start(off))?;
-        file.read_exact(&mut head)?;
+        read_at(file, &mut head, off)?;
         let Ok(n) = record_len(&head) else { break };
         let n64 = n as u64;
         if off.saturating_add(n64) > len {
             break;
         }
         let mut rec = vec![0u8; n];
-        file.seek(SeekFrom::Start(off))?;
-        file.read_exact(&mut rec)?;
+        read_at(file, &mut rec, off)?;
         let Ok(b) = decode_record(&rec) else { break };
-        out.push((b, off, n64));
+        out.push((b.header, off, n64));
         off = off.saturating_add(n64);
     }
     Ok(out)
@@ -473,10 +492,12 @@ impl BlockStore for FileStore {
         };
         let drive = self.drives.get(d).ok_or(StoreError::Corrupt)?;
         let mut rec = vec![0u8; usize::try_from(n).map_err(|_| StoreError::Corrupt)?];
-        let mut f = &drive.file;
-        f.seek(SeekFrom::Start(off))?;
-        f.read_exact(&mut rec)?;
-        decode_record(&rec).map(Some)
+        read_at(&drive.file, &mut rec, off)?;
+        let b = decode_record(&rec)?;
+        if b.header.height != height {
+            return Err(StoreError::Corrupt);
+        }
+        Ok(Some(b))
     }
 
     fn range(&self) -> Option<(Height, Height)> {

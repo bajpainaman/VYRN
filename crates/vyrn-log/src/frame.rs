@@ -190,6 +190,17 @@ impl StreamEncoder {
         self.state.take_closed()
     }
 
+    /// The encoder side of [`StreamDecoder::next_tenure`]: `ident` is a later tenure of the same
+    /// epoch, `frame_seq` restarts at 1, and session slots carry over.
+    pub fn next_tenure(&mut self, ident: Ident) -> Result<(), RepErr> {
+        if ident.epoch != self.ident.epoch || ident.tenure <= self.ident.tenure {
+            return Err(RepErr::Tenure);
+        }
+        self.ident = ident;
+        self.next_seq = 1;
+        Ok(())
+    }
+
     /// Encodes the next frame, path A copy (`flags` = 0). [`with_flags`] makes the other copies.
     pub fn encode(&mut self, body: &Body) -> Result<Vec<u8>, RepErr> {
         let first = self.next_seq == 1;
@@ -266,12 +277,15 @@ fn heartbeat_bytes(hb: &Heartbeat) -> Vec<u8> {
 /// Decodes one substream in `frame_seq` order (the replica's side, 07 §3.12). The caller
 /// deduplicates the two paths and repairs gaps; a frame whose `frame_seq` is not
 /// [`next_frame_seq`](Self::next_frame_seq) is `RepErr::Seq`. After any other error the
-/// substream is faulty and every later call returns `RepErr::Poisoned`.
+/// substream is faulty and every later call returns `RepErr::Poisoned`; a frame whose header
+/// does not parse counts as such an error.
 #[derive(Clone, Debug)]
 pub struct StreamDecoder {
     state: SubstreamState,
     next_seq: u64,
     ident: Option<(BookId, u16, u8, u8)>,
+    /// `(epoch16, tenure)` of the tenure before [`next_tenure`](Self::next_tenure).
+    prior: Option<(u16, u8)>,
     poisoned: bool,
 }
 
@@ -281,8 +295,26 @@ impl StreamDecoder {
             state: SubstreamState::new(layout, stream)?,
             next_seq: 1,
             ident: None,
+            prior: None,
             poisoned: false,
         })
+    }
+
+    /// Starts the next tenure of the same epoch after a failover (07 §9.5): `frame_seq` restarts
+    /// at 1 and the next frame must open with a `TenureStart` of a later tenure in this epoch.
+    /// Session slots and their `pkt_seq` predictions are epoch-scoped (07 §3.5) and carry over;
+    /// `TenureStart` resets every other base. A new epoch takes a new decoder. A faulty
+    /// substream cannot continue: its state past the sealed prefix is undefined, so the caller
+    /// rebuilds it by decoding the final prefix again.
+    pub fn next_tenure(&mut self) -> Result<(), RepErr> {
+        if self.poisoned {
+            return Err(RepErr::Poisoned);
+        }
+        let (_, epoch16, tenure, _) = self.ident.ok_or(RepErr::Tenure)?;
+        self.prior = Some((epoch16, tenure));
+        self.ident = None;
+        self.next_seq = 1;
+        Ok(())
     }
 
     pub const fn state(&self) -> &SubstreamState {
@@ -301,7 +333,13 @@ impl StreamDecoder {
         if self.poisoned {
             return Err(RepErr::Poisoned);
         }
-        let (header, body) = FrameHeader::parse(bytes)?;
+        let (header, body) = match FrameHeader::parse(bytes) {
+            Ok(x) => x,
+            Err(e) => {
+                self.poisoned = true;
+                return Err(e);
+            }
+        };
         if header.frame_seq != self.next_seq {
             return Err(RepErr::Seq);
         }
@@ -327,9 +365,13 @@ impl StreamDecoder {
                 let mut r = Reader::new(body);
                 let tenure_start = if first {
                     let ts = self.state.decode_tenure_start(&mut r)?;
+                    let later = self
+                        .prior
+                        .is_none_or(|(e, t)| e == header.epoch16 && ts.tenure > t);
                     if ts.epoch.low16() != header.epoch16
                         || ts.tenure != header.tenure
                         || ts.sender != header.sender
+                        || !later
                     {
                         return Err(RepErr::Tenure);
                     }

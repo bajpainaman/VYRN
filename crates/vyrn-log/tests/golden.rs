@@ -451,3 +451,65 @@ fn reserved_tags_are_rejected() {
         Err(RepErr::Tenure)
     );
 }
+
+fn ident(tenure: u8) -> Ident {
+    Ident {
+        book: BookId(1),
+        epoch: Epoch(1000),
+        tenure,
+        sender: 0,
+    }
+}
+
+#[test]
+fn a_bad_frame_header_poisons_the_substream() {
+    let g = golden();
+    let a1 = bytes(&g, "blk.frame.a1");
+    let mut dec = StreamDecoder::new(layout4(), 0).unwrap();
+    let mut bad = a1.clone();
+    bad[0] ^= 1;
+    assert_eq!(dec.decode(&bad), Err(RepErr::Header));
+    assert_eq!(dec.decode(&a1), Err(RepErr::Poisoned));
+}
+
+#[test]
+fn a_new_tenure_keeps_the_epochs_session_slots() {
+    let g = golden();
+    let (a, _, _) = bodies(&g);
+    let mut enc = StreamEncoder::new(layout4(), 0, ident(0)).unwrap();
+    let mut dec = StreamDecoder::new(layout4(), 0).unwrap();
+    for b in &a {
+        dec.decode(&enc.encode(b).unwrap()).unwrap();
+    }
+    // Tenure 1 opens without a SessionBind; slot 5 still predicts pkt_seq 6.
+    let mut ts = tenure_start();
+    ts.tenure = 1;
+    ts.first_step = StepId(3);
+    ts.first_height = Height(101);
+    let body = Body::Order {
+        tenure_start: Some(ts),
+        sections: vec![Section::LaneRun {
+            lane: LaneId(0),
+            recs: vec![pkt(0, 1, 0x0030_1007, 6, 1_000_100, 1, 0)],
+        }],
+    };
+    assert_eq!(enc.next_tenure(ident(0)), Err(RepErr::Tenure));
+    enc.next_tenure(ident(1)).unwrap();
+    let f = enc.encode(&body).unwrap();
+    // The record costs no SEQ_EXC: h = 01, slot 05, zigzag(+100) = c8 01.
+    assert!(f.ends_with(&[0x00, 0x01, 0x01, 0x05, 0xc8, 0x01]));
+    let mut fresh = StreamDecoder::new(layout4(), 0).unwrap();
+    assert_eq!(
+        fresh.decode(&f),
+        Err(RepErr::Range),
+        "a fresh decoder has no slot 5"
+    );
+    dec.next_tenure().unwrap();
+    assert_eq!(dec.decode(&f).unwrap().body, body);
+    // An older tenure cannot follow.
+    let mut back = dec.clone();
+    back.next_tenure().unwrap();
+    let mut old = StreamEncoder::new(layout4(), 0, ident(0)).unwrap();
+    let f0 = old.encode(&a[0]).unwrap();
+    assert_eq!(back.decode(&f0), Err(RepErr::Tenure));
+}

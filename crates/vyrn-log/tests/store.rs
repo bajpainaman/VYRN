@@ -291,3 +291,24 @@ fn file_store_drops_everything_after_a_corrupt_record() {
         encode_record(&c[1]).unwrap().len() as u64
     );
 }
+
+#[test]
+fn file_store_serves_concurrent_reads() {
+    let c = chain(8);
+    let dirs = TempDirs::new("concurrent", 1);
+    let mut s = FileStore::open(&dirs.0).unwrap();
+    for b in &c {
+        s.put(b).unwrap();
+    }
+    std::thread::scope(|sc| {
+        for t in 0..4u64 {
+            let (s, c) = (&s, &c);
+            sc.spawn(move || {
+                for i in 0..200u64 {
+                    let k = ((i * 7 + t * 3) % 8) as usize;
+                    assert_eq!(s.get(Height(10 + k as u64)).unwrap().unwrap(), c[k]);
+                }
+            });
+        }
+    });
+}

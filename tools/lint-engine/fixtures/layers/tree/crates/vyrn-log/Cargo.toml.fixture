@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 gate = { path = "../../tools/gate" }
+vyrn-crypto = { path = "../engine/vyrn-crypto" }

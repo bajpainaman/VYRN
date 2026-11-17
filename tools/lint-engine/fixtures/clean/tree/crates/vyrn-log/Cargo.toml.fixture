@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 vyrn-types = { path = "../engine/vyrn-types" }
+vyrn-crypto = { path = "../engine/vyrn-crypto" }
