@@ -13,11 +13,11 @@ crates = ["vyrn-types"]
 
 [[layer]]
 index = 1
-crates = ["vyrn-crypto", "vyrn-cut", "vyrn-risk", "vyrn-log"]
+crates = ["vyrn-crypto", "vyrn-cut", "vyrn-risk"]
 
 [[layer]]
 index = 2
-crates = ["vyrn-wire", "vyrn-bbo"]
+crates = ["vyrn-wire", "vyrn-bbo", "vyrn-log"]
 
 [[layer]]
 index = 3
@@ -50,11 +50,6 @@ crates = ["vyrn-sim", "vyrn-bench"]
 # Named exceptions to the layer rule go here as [[exception]] tables (from, to, reason). Each is
 # reported on every run, and it is an error if the edge no longer exists, so an exception cannot
 # outlive the disagreement it records. There are none today.
-
-[[exception]]
-from = "vyrn-log"
-to = "vyrn-crypto"
-reason = "07 §2.2, §3.10 and §6.1 make vyrn-log hash with BLAKE3 and check seq_sig, and vyrn-crypto's ZIP-215 verify is the only one allowed (11 §2.5); the §1.4 diagram draws both in layer 1 and has no such arrow"
 
 # §2.2 "Used by" column: the external crates an engine crate (under crates/engine/) may depend on
 # in [dependencies] and [build-dependencies]. Any other external crate is a violation.
