@@ -92,6 +92,10 @@ pub enum StoreError {
     NotNext { got: u64, want: u64 },
     #[error("chain: {0}")]
     Chain(#[from] ChainError),
+    #[error("a record sits on the wrong drive: the drive list differs from the one written")]
+    Placement,
+    #[error("another FileStore holds this drive")]
+    Locked,
     #[error("height {0} is not stored")]
     Missing(u64),
     #[error("order_root does not match the stored order bytes")]
@@ -342,7 +346,18 @@ impl FileStore {
         // Only headers and locations: recovery memory scales with the index, not the log.
         let mut found: Vec<(BlockHeader, usize, u64, u64)> = Vec::new();
         for (d, dir) in dirs.iter().enumerate() {
+            let missing: Vec<PathBuf> = dir
+                .ancestors()
+                .take_while(|a| !a.as_os_str().is_empty() && !a.exists())
+                .map(Path::to_path_buf)
+                .collect();
             std::fs::create_dir_all(dir)?;
+            // A new directory's entry lives in its parent, so sync each parent too.
+            for m in &missing {
+                if let Some(parent) = m.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    sync_dir(parent)?;
+                }
+            }
             let path = dir.join(DRIVE_FILE);
             let file = OpenOptions::new()
                 .read(true)
@@ -350,6 +365,11 @@ impl FileStore {
                 .create(true)
                 .truncate(false)
                 .open(&path)?;
+            // One writer per drive for the store's lifetime; the lock drops with the File.
+            file.try_lock().map_err(|e| match e {
+                std::fs::TryLockError::WouldBlock => StoreError::Locked,
+                std::fs::TryLockError::Error(e) => StoreError::Io(e),
+            })?;
             sync_dir(dir)?;
             let len = file.metadata()?.len();
             for (h, off, n) in scan(&file, len)? {
@@ -357,17 +377,23 @@ impl FileStore {
             }
             drives.push(Drive { file, len });
         }
+        // A valid record on the wrong drive means the drive list changed; refuse before
+        // recovery truncates anything.
+        let n_drives = drives.len() as u64;
+        if found
+            .iter()
+            .any(|(h, d, ..)| drive_of(h.height, n_drives) != *d)
+        {
+            return Err(StoreError::Placement);
+        }
         found.sort_by_key(|(h, ..)| h.height.0);
         // Keep the longest prefix of consecutive, chained heights, drive-placed by height.
         let mut keep = 0usize;
-        let n_drives = drives.len() as u64;
         for i in 0..found.len() {
             let ok = match (i.checked_sub(1).and_then(|p| found.get(p)), found.get(i)) {
                 (_, None) => false,
-                (None, Some((h, d, ..))) => drive_of(h.height, n_drives) == *d,
-                (Some((p, ..)), Some((h, d, ..))) => {
-                    drive_of(h.height, n_drives) == *d && check_link(p, h).is_ok()
-                }
+                (None, Some(_)) => true,
+                (Some((p, ..)), Some((h, ..))) => check_link(p, h).is_ok(),
             };
             if !ok {
                 break;

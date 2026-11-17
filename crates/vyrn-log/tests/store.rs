@@ -312,3 +312,44 @@ fn file_store_serves_concurrent_reads() {
         }
     });
 }
+
+#[test]
+fn file_store_refuses_a_reordered_drive_list_without_touching_files() {
+    let c = chain(4);
+    let dirs = TempDirs::new("reorder", 2);
+    {
+        let mut s = FileStore::open(&dirs.0).unwrap();
+        for b in &c {
+            s.put(b).unwrap();
+        }
+    }
+    let lens: Vec<u64> = dirs
+        .0
+        .iter()
+        .map(|d| std::fs::metadata(FileStore::drive_path(d)).unwrap().len())
+        .collect();
+    let swapped = vec![dirs.0[1].clone(), dirs.0[0].clone()];
+    assert!(matches!(
+        FileStore::open(&swapped),
+        Err(StoreError::Placement)
+    ));
+    let after: Vec<u64> = dirs
+        .0
+        .iter()
+        .map(|d| std::fs::metadata(FileStore::drive_path(d)).unwrap().len())
+        .collect();
+    assert_eq!(lens, after, "no file was truncated");
+    assert_eq!(
+        FileStore::open(&dirs.0).unwrap().range(),
+        Some((Height(10), Height(13)))
+    );
+}
+
+#[test]
+fn file_store_has_one_owner() {
+    let dirs = TempDirs::new("lock", 2);
+    let first = FileStore::open(&dirs.0).unwrap();
+    assert!(matches!(FileStore::open(&dirs.0), Err(StoreError::Locked)));
+    drop(first);
+    FileStore::open(&dirs.0).unwrap();
+}
