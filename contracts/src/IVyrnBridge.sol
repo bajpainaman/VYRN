@@ -140,13 +140,14 @@ interface IVyrnBridge {
     function deposit(address token, uint256 amount, uint8 ownerKind, bytes32 owner) external;
 
     /// @notice Accept a post signed by >= 4 distinct current bridge keys. A vetoed post number is
-    /// accepted again only with 5 signatures, or with 4 once CHN_VETO_OVERRIDE_S has passed.
+    /// accepted again, with the same digest, only with 5 signatures, or with 4 once CHN_VETO_OVERRIDE_S has passed.
     function proposePost(Post calldata p, bytes[] calldata bridgeSigs) external;
 
     /// @notice Any one current guardian vetoes an accepted post inside its challenge period.
     function veto(uint64 postNo) external;
 
-    /// @notice Pay one withdrawal of an accepted post whose challenge period has passed.
+    /// @notice Pay one withdrawal of an accepted post whose challenge period has passed. Pays as much of
+    /// the unpaid amount as the rolling 24 h cap allows; call again later for the rest.
     function claim(uint64 postNo, Withdrawal calldata w, bytes32[] calldata proof) external;
 
     /// @notice Any one current guardian pauses; a pause also cancels a scheduled unpause.

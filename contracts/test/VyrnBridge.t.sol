@@ -200,15 +200,27 @@ contract VyrnBridgeTest is BridgeBase {
         vm.warp(block.timestamp + 3_600);
         _claim(1, 0); // 1,000,000: exactly the cap
         uint256 t = block.timestamp;
-        (IVyrnBridge.Withdrawal memory w, bytes32[] memory proof) = _wd(2);
+        (IVyrnBridge.Withdrawal memory w, bytes32[] memory proof) = _wd(2); // 3,500,000
         vm.expectRevert(IVyrnBridge.OverDailyCap.selector);
         bridge.claim(1, w, proof);
-        vm.warp(t + 24 hours);
+        vm.warp(t + 24 hours); // the hour of t is still in the window
         vm.expectRevert(IVyrnBridge.OverDailyCap.selector);
         bridge.claim(1, w, proof);
-        _deposit(USDC, 40_000_000); // cap grows with the balance: (49M + 1M used) / 10 = 5M
+        // A withdrawal above the cap is paid in parts, one per window (Codex review 1).
+        vm.warp(t + 25 hours);
+        bridge.claim(1, w, proof); // cap 9,000,000 / 10
+        assertEq(bridge.wdPaid(w.wdId), 900_000);
+        vm.expectRevert(IVyrnBridge.OverDailyCap.selector);
+        bridge.claim(1, w, proof);
+        vm.warp(t + 50 hours);
+        bridge.claim(1, w, proof); // cap 8,100,000 / 10
+        assertEq(bridge.wdPaid(w.wdId), 1_710_000);
+        _deposit(USDC, 40_000_000); // cap (47,290,000 + 810,000 used) / 10 = 4,810,000: the rest fits
         bridge.claim(1, w, proof);
         assertEq(MockERC20(USDC).balanceOf(w.recipient), 3_500_000);
+        assertEq(bridge.postClaimed(1, 0), 4_500_000);
+        vm.expectRevert(IVyrnBridge.AlreadyClaimed.selector);
+        bridge.claim(1, w, proof);
     }
 
     function test_dailyCap_windowRolls() public {
@@ -263,6 +275,10 @@ contract VyrnBridgeTest is BridgeBase {
         vm.warp(tv + 259_199);
         _proposeExpect(_wdPost(1), FOUR, IVyrnBridge.NotEnoughSignatures.selector);
         vm.warp(tv + 259_200);
+        // Only the vetoed post itself returns; different contents under its number are refused.
+        IVyrnBridge.Post memory other = _wdPost(1);
+        other.smtRoot = keccak256("another root");
+        _proposeExpect(other, ALL, IVyrnBridge.BadPost.selector);
         _propose(_wdPost(1), FOUR);
         (VyrnBridge.PostRec memory r,) = bridge.posts(1);
         assertTrue(r.overridden);

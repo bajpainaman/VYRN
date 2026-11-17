@@ -92,7 +92,7 @@ contract VyrnBridge is IVyrnBridge {
     mapping(uint64 => PostRec) private _posts;
     mapping(uint64 => uint256[]) private _postTotals;
     mapping(uint64 => mapping(uint256 => uint256)) public postClaimed; // postNo => asset => paid
-    mapping(uint64 => bool) public wdClaimed; // wdId => paid
+    mapping(uint64 => uint256) public wdPaid; // wdId => amount paid so far (claims may be partial)
 
     // asset => hour => outflow by claim
     mapping(uint256 => mapping(uint256 => uint256)) private _outflow;
@@ -186,6 +186,8 @@ contract VyrnBridge is IVyrnBridge {
         if (p.postNo == lastPostNo + 1) {
             lastPostNo = p.postNo;
         } else if (p.postNo != 0 && r.status == PostStatus.Vetoed) {
+            // 09 §6.5: only the same post is proposed again; a veto never lets its contents change.
+            if (digest != r.postHash) revert BadPost();
             // 09 §6.5: 5-of-5 at once, or 4-of-5 once CHN_VETO_OVERRIDE_S has passed since the veto.
             if (n < SIGNERS && block.timestamp < uint256(r.vetoedAt) + CHN_VETO_OVERRIDE_S) {
                 revert NotEnoughSignatures();
@@ -230,19 +232,25 @@ contract VyrnBridge is IVyrnBridge {
         if (r.status != PostStatus.Accepted || block.timestamp < uint256(r.acceptedAt) + CHN_CHALLENGE_S) {
             revert PostNotClaimable();
         }
-        if (wdClaimed[w.wdId]) revert AlreadyClaimed();
+        uint256 done = wdPaid[w.wdId];
         uint256 idx = _assetIdx[w.token];
         if (idx == 0) revert BadAsset();
         if (w.amount == 0 || w.recipient == address(0)) revert BadAmount();
         bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(w.wdId, w.token, w.amount, w.recipient))));
         if (_merkleRoot(leaf, proof) != r.wdRoot) revert BadProof();
-        uint256 paid = postClaimed[postNo][idx - 1] + w.amount;
+        if (done >= w.amount) revert AlreadyClaimed();
+        // Pay what the rolling cap allows now; the rest stays claimable in later windows (09 §6.4).
+        (uint256 used, uint256 cap) = capState(idx - 1);
+        if (used >= cap) revert OverDailyCap();
+        uint256 pay = w.amount - done;
+        if (pay > cap - used) pay = cap - used;
+        uint256 paid = postClaimed[postNo][idx - 1] + pay;
         if (paid > _postTotals[postNo][idx - 1]) revert OverPostTotal();
-        _takeCap(idx - 1, w.amount);
-        wdClaimed[w.wdId] = true;
+        _outflow[idx - 1][block.timestamp / CAP_BUCKET_S] += pay;
+        wdPaid[w.wdId] = done + pay;
         postClaimed[postNo][idx - 1] = paid;
-        _transfer(w.token, w.recipient, w.amount);
-        emit Claimed(postNo, w.wdId, w.token, w.amount, w.recipient);
+        _transfer(w.token, w.recipient, pay);
+        emit Claimed(postNo, w.wdId, w.token, pay, w.recipient);
     }
 
     // ---------------------------------------------------------------- pause (09 §6.6)
@@ -567,12 +575,6 @@ contract VyrnBridge is IVyrnBridge {
                 h := keccak256(0, 64)
             }
         }
-    }
-
-    function _takeCap(uint256 idx, uint256 amount) private {
-        (uint256 used, uint256 cap) = capState(idx);
-        if (used + amount > cap) revert OverDailyCap();
-        _outflow[idx][block.timestamp / CAP_BUCKET_S] += amount;
     }
 
     function _transfer(address token, address to, uint256 amount) private {
