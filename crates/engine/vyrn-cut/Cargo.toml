@@ -9,10 +9,10 @@ description = "Cross-core primitives: counters, cut publication, SPSC rings, seq
 
 [dependencies]
 vyrn-types = { workspace = true }
-zerocopy = { workspace = true }
 
 [dev-dependencies]
 loom = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true
