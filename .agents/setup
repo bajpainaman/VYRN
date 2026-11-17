@@ -69,6 +69,11 @@ toolchains() {
   if [[ -f rust-toolchain.toml || -f rust-toolchain ]]; then
     rustup toolchain install
   fi
+}
+
+miri_sysroot() {
+  # Runs after llvm_for_rust: .cargo/config.toml sets `linker = "clang"`, and Miri's sysroot
+  # build (compiler_builtins' build script) links with it.
   cargo +nightly miri setup >/dev/null
 }
 
@@ -220,6 +225,7 @@ source "$HOME/.cargo/env"
 export PATH="$LOCAL_BIN:$HOME/.foundry/bin:$PATH"
 step "rust toolchains" toolchains
 step "LLVM matching rustc" llvm_for_rust
+step "miri sysroot" miri_sysroot
 # Compiling vxc's MLIR lowering needs more than 1.4 GB in one clang++ process; small orbs
 # (1.5 GiB cgroup, no swap) OOM-kill it, so skip vxc and its LLVM 22 there.
 mem_limit="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)"
