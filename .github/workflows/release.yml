@@ -90,9 +90,10 @@ jobs:
           # workflow too, so the event name cannot tell a tag release from a dry run.
           dry_run="${INPUT_DRY_RUN:-false}"
           if [[ "$dry_run" == false ]]; then
-            test "$GITHUB_REF_TYPE" = tag && test "$GITHUB_REF_NAME" = "$tag" || {
+            if [[ "$GITHUB_REF_TYPE" != tag || "$GITHUB_REF_NAME" != "$tag" ]]; then
               echo "a release needs the tag $tag; this is $GITHUB_REF_TYPE $GITHUB_REF_NAME" >&2
-              exit 1; }
+              exit 1
+            fi
           fi
           deploy/release/changelog.sh vyrn "$version" >dist/CHANGELOG.md
           cargo metadata --format-version 1 --no-deps --locked |
