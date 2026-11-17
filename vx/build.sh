@@ -19,6 +19,7 @@ skip() {
 }
 
 # Step 1: the vxc on PATH must be the pinned build for this host (vx/TOOLCHAIN).
+# VX-WORKAROUND W-10 (issue to file): no release binary, so the pin is per host kind.
 vxc_path="$(command -v vxc)" || skip "vxc not on PATH"
 command -v b3sum >/dev/null || die "b3sum not on PATH (cargo install --locked b3sum)"
 host="$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')"

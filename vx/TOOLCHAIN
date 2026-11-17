@@ -2,6 +2,7 @@
 # at commit c6dffec7. vxc_blake3.<uname -m>-<os> is the BLAKE3 of the vxc binary that .agents/setup
 # builds from that commit on that host (rustc 1.100.0, LLVM/MLIR 22). There is no release binary,
 # so each host kind is pinned on its own (FRICTION.md W-10); vx/build.sh skips an unpinned host.
+# VX-WORKAROUND W-10 (issue to file): one vxc_blake3 per host kind.
 vxc_version = "v0.0.4"
 vxc_tag_object = "3a89e3c761b60270f257521277c174c9e9a784c3"
 vxc_commit = "c6dffec704182d98c271c93afefba1c38ba18d21"
