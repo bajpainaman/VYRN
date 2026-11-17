@@ -22,6 +22,10 @@ hdrhistogram = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
 
 [lints]
 workspace = true
