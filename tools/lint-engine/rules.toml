@@ -13,11 +13,11 @@ crates = ["vyrn-types"]
 
 [[layer]]
 index = 1
-crates = ["vyrn-crypto", "vyrn-cut", "vyrn-risk", "vyrn-log"]
+crates = ["vyrn-crypto", "vyrn-cut", "vyrn-risk"]
 
 [[layer]]
 index = 2
-crates = ["vyrn-wire", "vyrn-bbo"]
+crates = ["vyrn-wire", "vyrn-bbo", "vyrn-log"]
 
 [[layer]]
 index = 3

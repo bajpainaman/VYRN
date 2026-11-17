@@ -181,9 +181,10 @@ an engine crate depends on a crate outside `crates/engine/`, other than the allo
 
   layer 0   vyrn-types
                ▲
-  layer 1   vyrn-crypto · vyrn-cut · vyrn-risk · vyrn-log · (all others) ──► vyrn-types
+  layer 1   vyrn-crypto · vyrn-cut · vyrn-risk · (all others) ──► vyrn-types
   layer 2   vyrn-wire ──► vyrn-crypto
             vyrn-bbo ───► vyrn-cut
+            vyrn-log ───► vyrn-crypto
   layer 3   vyrn-nic (+ C shim) ──► vyrn-wire
             vyrn-lane ──► vyrn-wire, vyrn-cut, vyrn-risk, vyrn-bbo
   layer 4   vyrn-engine ──► vyrn-lane, vyrn-bbo, vyrn-cut, vyrn-wire

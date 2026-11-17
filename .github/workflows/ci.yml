@@ -92,6 +92,7 @@ jobs:
         run: |
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_proto_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_proto_vectors.out"
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_reject_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_reject_vectors.out"
+          python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_log_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_log_vectors.out"
 
   contracts:
     name: L1 bridge contracts (09 §6)

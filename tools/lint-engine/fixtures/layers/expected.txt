@@ -3,5 +3,6 @@ crates/engine/vyrn-risk/Cargo.toml:9: layer-order
 crates/engine/vyrn-types/Cargo.toml:7: engine-dependency
 crates/engine/vyrn-types/Cargo.toml:7: layer-order
 crates/engine/vyrn-wire/Cargo.toml:7: engine-dependency
+crates/engine/vyrn-wire/Cargo.toml:7: layer-order
 crates/vyrn-log/Cargo.toml:7: tool-dependency
 crates/vyrn-mystery/Cargo.toml:1: unknown-crate
