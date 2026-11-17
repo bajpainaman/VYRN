@@ -9,3 +9,9 @@ unsafe extern "C" {
     pub safe fn d();
     fn e();
 }
+pub trait Api {
+    unsafe fn access();
+}
+trait Hidden {
+    unsafe fn ok();
+}

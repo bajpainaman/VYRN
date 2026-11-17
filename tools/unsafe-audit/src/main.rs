@@ -201,7 +201,7 @@ fn audit(root: &Path, cfg: &Config, config_name: &str) -> Result<Vec<Violation>,
             }
         };
         let mut sites = Vec::new();
-        scan(&tokens.into_iter().collect::<Vec<_>>(), &mut sites);
+        scan(&tokens.into_iter().collect::<Vec<_>>(), false, &mut sites);
         let Some(module) = listed.iter().find(|m| &m.file == rel) else {
             for s in sites.iter().filter(|s| s.kind != Kind::ExportedForeign) {
                 out.push(Violation {
@@ -297,17 +297,31 @@ fn display_rel(root: &Path, path: &Path) -> String {
 }
 
 /// Finds every `unsafe` keyword in a token tree, including inside macro invocations and attributes.
-fn scan(toks: &[TokenTree], out: &mut Vec<Site>) {
+/// `in_pub_trait` is true for the direct items of a `pub` trait body, where `unsafe fn` is exported
+/// without a `pub` of its own.
+fn scan(toks: &[TokenTree], in_pub_trait: bool, out: &mut Vec<Site>) {
+    let mut pub_trait_body = None;
     for (i, tt) in toks.iter().enumerate() {
         match tt {
-            TokenTree::Group(g) => scan(&g.stream().into_iter().collect::<Vec<_>>(), out),
-            TokenTree::Ident(id) if id == "unsafe" => classify(toks, i, out),
+            TokenTree::Group(g) => {
+                let inner = g.stream().into_iter().collect::<Vec<_>>();
+                scan(&inner, pub_trait_body == Some(i), out);
+            }
+            TokenTree::Ident(id) if id == "unsafe" => classify(toks, i, in_pub_trait, out),
+            TokenTree::Ident(id) if id == "trait" && is_exported(toks, i) => {
+                pub_trait_body = toks
+                    .iter()
+                    .enumerate()
+                    .skip(i + 1)
+                    .find(|(_, t)| matches!(t, TokenTree::Group(g) if g.delimiter() == Delimiter::Brace))
+                    .map(|(k, _)| k);
+            }
             _ => {}
         }
     }
 }
 
-fn classify(toks: &[TokenTree], i: usize, out: &mut Vec<Site>) {
+fn classify(toks: &[TokenTree], i: usize, in_pub_trait: bool, out: &mut Vec<Site>) {
     let line = toks[i].span().start().line;
     let mut j = i + 1;
     let has_extern = matches!(toks.get(j), Some(TokenTree::Ident(id)) if id == "extern");
@@ -319,7 +333,7 @@ fn classify(toks: &[TokenTree], i: usize, out: &mut Vec<Site>) {
     }
     let kind = match toks.get(j) {
         Some(TokenTree::Ident(id)) if id == "fn" || id == "trait" => Kind::Item {
-            exported: is_exported(toks, i),
+            exported: in_pub_trait || is_exported(toks, i),
         },
         Some(TokenTree::Ident(id)) if id == "impl" && !has_extern => Kind::Impl,
         Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => {
@@ -336,13 +350,14 @@ fn classify(toks: &[TokenTree], i: usize, out: &mut Vec<Site>) {
 }
 
 /// True when the item whose `unsafe` keyword is at `i` has a `pub` or `pub(..)` visibility other
-/// than `pub(self)`. Looks back over `const` and `async`, the only qualifiers that precede it.
+/// than `pub(self)`. Looks back over `const`, `async` and `unsafe`, the qualifiers that can precede
+/// `fn` or `trait`.
 fn is_exported(toks: &[TokenTree], i: usize) -> bool {
     let mut k = i;
     while k > 0 {
         k -= 1;
         match &toks[k] {
-            TokenTree::Ident(id) if id == "const" || id == "async" => {}
+            TokenTree::Ident(id) if id == "const" || id == "async" || id == "unsafe" => {}
             TokenTree::Ident(id) if id == "pub" => return true,
             TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => {
                 let after_pub =
@@ -416,7 +431,7 @@ mod tests {
     fn sites(src: &str) -> Vec<(usize, &'static str)> {
         let mut out = Vec::new();
         let toks: Vec<_> = src.parse::<TokenStream>().unwrap().into_iter().collect();
-        scan(&toks, &mut out);
+        scan(&toks, false, &mut out);
         out.iter()
             .map(|s| {
                 let k = match s.kind {
@@ -450,6 +465,22 @@ mod tests {
                 (6, "other"),
                 (9, "pub-foreign"),
                 (8, "extern"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unsafe_methods_of_a_pub_trait_are_exported() {
+        let src = "pub trait A { unsafe fn a(); fn d() { unsafe fn inner() {} } }\n\
+                   trait B { unsafe fn b(); }\npub unsafe trait C { unsafe fn c(); }\n";
+        assert_eq!(
+            sites(src),
+            [
+                (1, "pub-item"),
+                (1, "item"),
+                (2, "item"),
+                (3, "pub-item"),
+                (3, "pub-item")
             ]
         );
     }

@@ -15,3 +15,6 @@ crates/engine/vyrn-types/src/lib.rs:17: banned-path
 crates/engine/vyrn-types/src/lib.rs:18: deadline-clock
 crates/engine/vyrn-types/src/lib.rs:19: deadline-clock
 crates/engine/vyrn-types/src/lib.rs:22: float-literal
+crates/engine/vyrn-types/src/lib.rs:24: banned-path
+crates/engine/vyrn-types/src/lib.rs:26: float-literal
+crates/engine/vyrn-types/src/lib.rs:27: float-literal

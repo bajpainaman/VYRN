@@ -59,9 +59,9 @@ fn walk(toks: &[TokenTree], cx: &mut Cx) {
         match tt {
             TokenTree::Group(g) => walk(&g.stream().into_iter().collect::<Vec<_>>(), cx),
             TokenTree::Literal(lit) => {
-                // `t.0.1` lexes `0.1` as one literal; a literal after `.` is a tuple index.
-                if is_float_literal(&lit.to_string()) && !is_punct(toks.get(i.wrapping_sub(1)), '.')
-                {
+                // `t.0.1` lexes `0.1` as one literal; a literal after a single `.` is a tuple index, but
+                // after the `..` of a range (`..1.5`, `0..2.5`) it is a bound.
+                if is_float_literal(&lit.to_string()) && !is_tuple_index(toks, i) {
                     cx.hit(
                         line,
                         "float-literal",
@@ -170,6 +170,18 @@ fn is_clock_call(toks: &[TokenTree], i: usize) -> bool {
     called && qualified
 }
 
+/// A literal at `toks[i]` that follows a single `.`, not the second dot of `..`.
+fn is_tuple_index(toks: &[TokenTree], i: usize) -> bool {
+    is_punct(i.checked_sub(1).and_then(|k| toks.get(k)), '.')
+        && !is_punct(i.checked_sub(2).and_then(|k| toks.get(k)), '.')
+}
+
+/// Keywords that can precede a path (`use ::std::env`) without being one of its segments.
+const KEYWORDS: [&str; 22] = [
+    "use", "as", "in", "return", "break", "else", "match", "if", "while", "let", "mut", "ref",
+    "move", "pub", "for", "where", "dyn", "impl", "fn", "const", "static", "type",
+];
+
 /// True when the identifier at `i` begins a path: it is not a field or method (`x.std`) and not a
 /// later segment (`a::std`). A leading `::std` does begin one.
 fn starts_path(toks: &[TokenTree], i: usize) -> bool {
@@ -180,7 +192,7 @@ fn starts_path(toks: &[TokenTree], i: usize) -> bool {
         Some(k) if is_sep(toks, k) => {
             !matches!(
                 k.checked_sub(1).and_then(|j| toks.get(j)),
-                Some(TokenTree::Ident(_))
+                Some(TokenTree::Ident(p)) if !KEYWORDS.contains(&p.to_string().as_str())
             ) && !is_punct(k.checked_sub(1).and_then(|j| toks.get(j)), '>')
         }
         _ => true,
@@ -242,6 +254,10 @@ mod tests {
         }
         assert_eq!(hits("fn f(t: ((u8, u8), u8)) -> u8 { t.0.1 }"), []);
         assert_eq!(
+            hits("fn f() { let _ = ..1.5; let _ = 0..2.5; let _ = 0..2; }"),
+            [(1, "float-literal"), (1, "float-literal")]
+        );
+        assert_eq!(
             hits("const X: u32 = 1;\nconst Y: f32 = 1.5;"),
             [(2, "float-type"), (2, "float-literal")]
         );
@@ -258,7 +274,15 @@ mod tests {
             hits("fn f() { std::env::var(\"X\"); }"),
             [(1, "banned-path")]
         );
-        assert_eq!(hits("use std::io;\nfn f() { crate::thread::x(); }"), []);
+        assert_eq!(hits("use ::std::env;"), [(1, "banned-path")]);
+        assert_eq!(
+            hits("fn f() { ::std::thread::spawn(g); }"),
+            [(1, "banned-path")]
+        );
+        assert_eq!(
+            hits("use std::io;\nfn f() { crate::thread::x(); a::std::env::b(); }"),
+            []
+        );
     }
 
     #[test]
