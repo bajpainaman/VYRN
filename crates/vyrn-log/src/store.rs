@@ -31,6 +31,11 @@
 //! syncs each write, and on open keeps the longest run of consecutive heights whose records
 //! check and whose `prev` links chain; it truncates everything after that run, which is how a
 //! crash mid-write is undone. io_uring and O_DIRECT are not used yet.
+//!
+//! Each drive directory also holds `drive.id` (32 bytes): `"PBDRV001"`, a 16-byte store id,
+//! the drive's index u32 and the drive count u32. Recovery truncates nothing unless every
+//! drive's `drive.id` matches its position, so a missing, empty or substituted drive is an
+//! error (`StoreError::Drive`), never a reason to delete acknowledged blocks.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -94,6 +99,8 @@ pub enum StoreError {
     Chain(#[from] ChainError),
     #[error("a record sits on the wrong drive: the drive list differs from the one written")]
     Placement,
+    #[error("a drive is missing, replaced, or from another store")]
+    Drive,
     #[error("another FileStore holds this drive")]
     Locked,
     #[error("height {0} is not stored")]
@@ -343,6 +350,7 @@ impl FileStore {
             return Err(StoreError::Corrupt);
         }
         let mut drives = Vec::new();
+        let mut ids = Vec::new();
         // Only headers and locations: recovery memory scales with the index, not the log.
         let mut found: Vec<(BlockHeader, usize, u64, u64)> = Vec::new();
         for (d, dir) in dirs.iter().enumerate() {
@@ -371,12 +379,18 @@ impl FileStore {
                 std::fs::TryLockError::Error(e) => StoreError::Io(e),
             })?;
             sync_dir(dir)?;
+            ids.push(match std::fs::read(dir.join(DRIVE_ID_FILE)) {
+                Ok(b) => Some(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            });
             let len = file.metadata()?.len();
             for (h, off, n) in scan(&file, len)? {
                 found.push((h, d, off, n));
             }
             drives.push(Drive { file, len });
         }
+        check_drive_ids(dirs, &ids, drives.iter().all(|d| d.len == 0))?;
         // A valid record on the wrong drive means the drive list changed; refuse before
         // recovery truncates anything.
         let n_drives = drives.len() as u64;
@@ -427,6 +441,61 @@ impl FileStore {
     pub fn drive_path(dir: &Path) -> PathBuf {
         dir.join(DRIVE_FILE)
     }
+}
+
+/// The file in each drive directory that names its store and position.
+pub const DRIVE_ID_FILE: &str = "drive.id";
+
+fn drive_id(store: &[u8], i: usize, n: usize) -> Result<Vec<u8>, StoreError> {
+    let mut b = b"PBDRV001".to_vec();
+    b.extend_from_slice(store);
+    b.extend_from_slice(&len32(i)?);
+    b.extend_from_slice(&len32(n)?);
+    Ok(b)
+}
+
+/// Every drive's `drive.id` must name one store and the drive's position. A store with no
+/// blocks on any drive is (re)initialised instead, since it has nothing to lose.
+fn check_drive_ids(
+    dirs: &[PathBuf],
+    ids: &[Option<Vec<u8>>],
+    empty: bool,
+) -> Result<(), StoreError> {
+    let n = dirs.len();
+    let store = ids
+        .first()
+        .and_then(Option::as_ref)
+        .and_then(|b| b.get(8..24))
+        .map(<[u8]>::to_vec);
+    let valid = store.as_ref().is_some_and(|sid| {
+        ids.iter().enumerate().all(|(i, id)| {
+            id.as_ref()
+                .is_some_and(|b| drive_id(sid, i, n).is_ok_and(|want| *b == want))
+        })
+    });
+    if valid {
+        return Ok(());
+    }
+    if !empty {
+        return Err(StoreError::Drive);
+    }
+    let mut seed = std::process::id().to_le_bytes().to_vec();
+    let t = std::time::SystemTime::UNIX_EPOCH
+        .elapsed()
+        .unwrap_or_default();
+    seed.extend_from_slice(&t.as_nanos().to_le_bytes());
+    for d in dirs {
+        seed.extend_from_slice(d.as_os_str().as_encoded_bytes());
+    }
+    let sid = hash(&seed);
+    let sid = sid.0.get(..16).unwrap_or_default();
+    for (i, dir) in dirs.iter().enumerate() {
+        let mut f = File::create(dir.join(DRIVE_ID_FILE))?;
+        f.write_all(&drive_id(sid, i, n)?)?;
+        f.sync_all()?;
+        sync_dir(dir)?;
+    }
+    Ok(())
 }
 
 fn drive_of(h: Height, n: u64) -> usize {

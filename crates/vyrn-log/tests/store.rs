@@ -331,7 +331,7 @@ fn file_store_refuses_a_reordered_drive_list_without_touching_files() {
     let swapped = vec![dirs.0[1].clone(), dirs.0[0].clone()];
     assert!(matches!(
         FileStore::open(&swapped),
-        Err(StoreError::Placement)
+        Err(StoreError::Drive | StoreError::Placement)
     ));
     let after: Vec<u64> = dirs
         .0
@@ -352,4 +352,26 @@ fn file_store_has_one_owner() {
     assert!(matches!(FileStore::open(&dirs.0), Err(StoreError::Locked)));
     drop(first);
     FileStore::open(&dirs.0).unwrap();
+}
+
+#[test]
+fn file_store_refuses_a_missing_drive_without_touching_files() {
+    let c = chain(6);
+    let dirs = TempDirs::new("missing", 2);
+    {
+        let mut s = FileStore::open(&dirs.0).unwrap();
+        for b in &c {
+            s.put(b).unwrap();
+        }
+    }
+    let healthy = FileStore::drive_path(&dirs.0[0]);
+    let len = std::fs::metadata(&healthy).unwrap().len();
+    // Drive 1 is replaced by an empty directory (an unmounted or swapped disk).
+    std::fs::remove_dir_all(&dirs.0[1]).unwrap();
+    assert!(matches!(FileStore::open(&dirs.0), Err(StoreError::Drive)));
+    assert_eq!(
+        std::fs::metadata(&healthy).unwrap().len(),
+        len,
+        "no block was truncated"
+    );
 }
