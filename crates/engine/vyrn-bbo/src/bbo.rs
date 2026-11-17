@@ -22,7 +22,7 @@ use crate::book::{
 use crate::codec::{
     ControlCmd, CutDelta, DEP_ENDED, DEP_JOIN, FillEvent, FillKind, FwdDep, FwdEntry, INDEX_MAKER,
     LIQ_AUCTION, LIQ_MAKER, LIQ_TAKER, MSG_NEW, OUT_AUCTION, OUT_FINISHED, OUT_IOC_REST, OUT_STP,
-    Phase, Record, STEP_CONT, TxEntry, encode_records,
+    Phase, RESTED_DONE, RESTED_IN_FLIGHT, Record, STEP_CONT, TxEntry, encode_records,
 };
 use crate::cut::{Cut, HalfPair, SrcRule, step_cut};
 use crate::io::{Poll, Ports};
@@ -174,6 +174,8 @@ struct RCont {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sweep {
+    /// The batch taker was not live at its key: nothing ran.
+    Skipped,
     Open,
     Capped,
     Killed,
@@ -1206,7 +1208,7 @@ impl Bbo {
                 true,
             ) {
                 Sweep::Capped => capped = true,
-                Sweep::Killed => {}
+                Sweep::Killed | Sweep::Skipped => {}
                 Sweep::Open => {
                     if t.open(&self.st) > 0 {
                         match t.tif() {
@@ -1572,6 +1574,12 @@ impl Bbo {
                 }
             }
         }
+        // Ops after the taker's key stay out of this step's cut, so no lane settles one (05 §7.6)
+        // while a capped sweep of the taker still runs in CONT steps. Any cut between C_{s−1}
+        // and the rule is a valid partial cut (05 §3.3); the ops held back enter later steps.
+        if let Some((key, _, _, _)) = star {
+            self.clamp_after_key(src, &prev, &mut cr, key);
+        }
         match star {
             Some((key, lane, _, slot)) => {
                 let r = RCont {
@@ -1591,12 +1599,84 @@ impl Bbo {
         }
     }
 
+    /// Lowers `cut[l]` to just below lane `l`'s first journal entry in `(prev[l], cut[l]]` whose
+    /// key is greater than `key`. Within a lane, key order is `LaneSeq` order (05 §3.2).
+    fn clamp_after_key<S: BookSource>(&self, src: &S, prev: &Cut, cut: &mut Cut, key: PrioKey) {
+        for l in 0..self.n {
+            let (Some(p), Some(x)) = (prev.get(l).copied(), cut.get(l).copied()) else {
+                continue;
+            };
+            if x <= p {
+                continue;
+            }
+            let lid = LaneId(lane_u8(l));
+            let rank = self.rank(l);
+            let mut stop: Option<LaneSeq> = None;
+            src.journal(lid, p, x, |j| {
+                if stop.is_some() {
+                    return;
+                }
+                let ts = match j.kind {
+                    JKind::Tomb => src.slot(lid, j.slot).map(|v| v.tomb_ts),
+                    JKind::AcctKill => Some(src.acct_kill(lid, j.slot).kill_ts),
+                    _ => src.slot(lid, j.slot).map(|v| v.ins_time()),
+                }
+                .unwrap_or_default();
+                if (PrioKey {
+                    ts,
+                    rank,
+                    seq: j.seq,
+                }) > key
+                {
+                    stop = Some(j.seq);
+                }
+            });
+            if let (Some(q), Some(c)) = (stop, cut.get_mut(l)) {
+                *c = LaneSeq(q.0.saturating_sub(1).max(p.0));
+            }
+        }
+    }
+
     /// Runs (or resumes) the batch taker of a `Rescan` and finishes the step. While the taker
     /// is in flight the bounds stay as they were: it is not resting (05 §2.3), and continuations
     /// run before any other step.
     fn rescan_finish<S: BookSource>(&mut self, src: &S, r: RCont, cont: bool) {
         let swept = self.rescan_taker(src, &r.cut, &r.prev, r.lane, r.slot, r.key, r.band, cont);
         self.rcont = (swept == Sweep::Capped).then_some(r);
+        // One status event per Rescan step that ran a batch taker, so its lane can tell "in
+        // flight" from "rests" at a boundary between CONT steps (spec follow-up F10).
+        let status = match swept {
+            Sweep::Capped => Some(RESTED_IN_FLIGHT),
+            Sweep::Open => Some(RESTED_DONE),
+            Sweep::Skipped | Sweep::Killed => None,
+        };
+        if let Some(cause) = status
+            && let Some(v) = src.slot(LaneId(lane_u8(r.lane)), r.slot)
+        {
+            let r0 = self.st.root(r.lane, v.root, v.gen_);
+            let open = if r0.killed {
+                0
+            } else {
+                v.total.saturating_sub(r0.filled)
+            };
+            if open > 0 {
+                let ord = self.out.ordinal;
+                self.out.event(
+                    LaneId(lane_u8(r.lane)),
+                    FillEvent {
+                        handle: Handle::new(v.root, v.gen_).unwrap_or(Handle(0)),
+                        vslot: r.slot,
+                        tick: v.tick,
+                        qty: open,
+                        kind: FillKind::Rested.code(),
+                        liq: LIQ_TAKER,
+                        cause,
+                        ordinal: ord,
+                        ..FillEvent::default()
+                    },
+                );
+            }
+        }
         if self.rcont.is_none() {
             let (b, a) = (self.bid.max(r.band.1), self.ask.min(r.band.0));
             self.exact_bounds(src, &r.cut, b, a);
@@ -1641,7 +1721,7 @@ impl Bbo {
             .live(l, slot, &v)
             .is_none()
         {
-            return Sweep::Open;
+            return Sweep::Skipped;
         }
         let side = t.side.opposite();
         let from = match side {

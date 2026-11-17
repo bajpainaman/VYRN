@@ -484,3 +484,151 @@ fn step_cut_follows_05_3_3() {
         LaneSeq(41)
     );
 }
+
+#[test]
+fn a_capped_rescan_keeps_later_ops_out_of_its_cut() {
+    // Nine 1-lot asks of lane 0 at 102. Lane 1 (stale snapshot) joins a buy of 9 at ts 100;
+    // lane 0 then cancels its ninth ask at ts 200. In key order the buy comes first, so it
+    // fills all nine (05 §3.4): 8 in the Rescan, 1 in its CONT step. The cancel has a later key
+    // and must stay out of both steps' cuts, or lane 0 would settle it (and release its
+    // reservation) before the ninth fill.
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    stale_bid_105(&mut x, &mut bbo);
+    let mut last = 0;
+    for acct in 1..=9u32 {
+        last = rest(
+            &mut x,
+            &mut bbo,
+            0,
+            u64::from(acct) + 10,
+            Side::Sell,
+            102,
+            1,
+            acct,
+        );
+    }
+    x.join(1, 100, day(Side::Buy), 102, 9, 1);
+    x.cancel(0, last, 200);
+    let cancel_seq = LaneSeq(x.seq[0]);
+    x.publish_cut();
+    let r1 = x.step(&mut bbo, &CLK);
+    assert_eq!(r1.kind(), StepKind::Rescan);
+    assert_eq!(r1.fills().iter().filter(|f| f.1 == LIQ_MAKER).count(), 8);
+    assert!(
+        bbo.cut()[0] < cancel_seq,
+        "the cancel is not in the Rescan's cut"
+    );
+    let r2 = x.step(&mut bbo, &CLK);
+    assert_eq!(r2.entry.flags & STEP_CONT, STEP_CONT);
+    assert_eq!(
+        r2.fills(),
+        vec![(0, LIQ_MAKER, 102, 1), (1, LIQ_TAKER, 102, 1)]
+    );
+    assert_eq!(
+        r2.of(FillKind::Fill)[0].1.vslot,
+        last,
+        "the ninth ask trades"
+    );
+    assert!(
+        bbo.cut()[0] < cancel_seq,
+        "still out while the taker is in flight"
+    );
+}
+
+/// The `Rested` status events of the batch taker at `vslot` on lane 1, as `(cause, qty)`.
+fn taker_status(s: &Seen, vslot: u32) -> Vec<(u16, u32)> {
+    s.of(FillKind::Rested)
+        .iter()
+        .filter(|(l, e)| *l == 1 && e.vslot == vslot && e.liq == LIQ_TAKER)
+        .map(|(_, e)| (e.cause, e.qty))
+        .collect()
+}
+
+#[test]
+fn a_capped_step_of_only_stp_kills_reports_the_taker_in_flight() {
+    // Lane 1, account 1 joins 8 asks of 1 @ 102 (ts 30..37); lane 0 has an ask of 1 @ 102 at
+    // ts 50. A lane-1 CancelOldest buy of 1 @ 102 (ts 40) meets its own 8 asks first (key
+    // order): 8 STP kills fill the step cap with no fill and no taker Fill event. The step
+    // must still say the taker is in flight with 1 open; the CONT step fills lane 0's ask.
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    stale_bid_105(&mut x, &mut bbo);
+    rest(&mut x, &mut bbo, 0, 50, Side::Sell, 102, 1, 2);
+    for i in 0..8u64 {
+        x.join(1, 30 + i, day(Side::Sell), 102, 1, 1);
+    }
+    let f = OrderFlags::new(Side::Buy, Tif::Day, false, Stp::CancelOldest);
+    let taker = x.join(1, 40, f, 102, 1, 1);
+    x.publish_cut();
+    let mut capped = None;
+    for _ in 0..16 {
+        let s = x.step(&mut bbo, &CLK);
+        if s.of(FillKind::Out).len() == 8 {
+            capped = Some(s);
+            break;
+        }
+    }
+    let s = capped.expect("the STP step ran");
+    assert_eq!(s.kind(), StepKind::Rescan);
+    assert!(s.fills().is_empty());
+    assert_eq!(taker_status(&s, taker), vec![(RESTED_IN_FLIGHT, 1)]);
+    let c = x.step(&mut bbo, &CLK);
+    assert_eq!(c.entry.flags & STEP_CONT, STEP_CONT);
+    assert_eq!(
+        c.fills(),
+        vec![(0, LIQ_MAKER, 102, 1), (1, LIQ_TAKER, 102, 1)]
+    );
+    assert!(
+        taker_status(&c, taker).is_empty(),
+        "fully filled: no Rested"
+    );
+}
+
+#[test]
+fn a_batch_taker_that_rests_after_two_cont_steps_reports_in_flight_twice_then_done() {
+    // Lane 0 rests 8 one-lot asks @ 102 and one @ 103 (9 sessions). Lane 1 (stale) joins a buy
+    // of 20 @ 103. Step 1: 8 fills @ 102 (fill cap). Step 2: 1 fill @ 103 (one level). Step 3:
+    // nothing within 103, so it rests with 20 − 9 = 11.
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    stale_bid_105(&mut x, &mut bbo);
+    for acct in 1..=8u32 {
+        rest(
+            &mut x,
+            &mut bbo,
+            0,
+            u64::from(acct) + 10,
+            Side::Sell,
+            102,
+            1,
+            acct,
+        );
+    }
+    rest(&mut x, &mut bbo, 0, 30, Side::Sell, 103, 1, 9);
+    let taker = x.join(1, 100, day(Side::Buy), 103, 20, 1);
+    x.publish_cut();
+    let steps: Vec<Seen> = (0..3).map(|_| x.step(&mut bbo, &CLK)).collect();
+    let kinds: Vec<(StepKind, u8)> = steps
+        .iter()
+        .map(|s| (s.kind(), s.entry.flags & STEP_CONT))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (StepKind::Rescan, 0),
+            (StepKind::Rescan, STEP_CONT),
+            (StepKind::Rescan, STEP_CONT)
+        ]
+    );
+    let status: Vec<Vec<(u16, u32)>> = steps.iter().map(|s| taker_status(s, taker)).collect();
+    assert_eq!(
+        status,
+        vec![
+            vec![(RESTED_IN_FLIGHT, 12)],
+            vec![(RESTED_IN_FLIGHT, 11)],
+            vec![(RESTED_DONE, 11)]
+        ]
+    );
+    assert_eq!(bbo.bounds(), (Tick(103), NO_ASK));
+}

@@ -333,6 +333,13 @@ pub const OUT_FINISHED: u16 = 0;
 /// finished, `qty` = canceled open (05 §2.3). Other `Dep` causes are 0 or a reject reason.
 pub const DEP_ENDED: u16 = 0x8000;
 
+/// `Rested.cause` when the sweep has ended and the order rests with `qty` open: a forwarded
+/// source, or a `Rescan` batch taker.
+pub const RESTED_DONE: u16 = 0;
+/// `Rested.cause` of a `Rescan` batch taker at the end of a capped step: CONT steps follow and
+/// may fill it more; `qty` = open now.
+pub const RESTED_IN_FLIGHT: u16 = 1;
+
 /// `FillEvent` (05 §4.12, 32 B). Writer: the BBO core, `step` last. Reader: the lane at B1.
 ///
 /// Field use by kind (this crate's reading of 05 §4.12, §7.4, §8.8). `liq` on `Rested`, `Out`
@@ -343,7 +350,7 @@ pub const DEP_ENDED: u16 = 0x8000;
 /// | kind | handle / vslot | tick | qty | liq | cause |
 /// |---|---|---|---|---|---|
 /// | Fill | root+gen / version that traded | fill price | qty | 0, 1, 2 | 0 |
-/// | Rested | source | limit | open | 1 | 0 |
+/// | Rested | source, or a `Rescan` batch taker | limit | open | 1 | `RESTED_DONE`, or `RESTED_IN_FLIGHT` (batch taker, capped step) |
 /// | Out | order | limit | qty out | 1 taker side, 0 maker (STP kill) | Out cause, or `OUT_FINISHED` |
 /// | Reject | source | limit | open released | 1 | reject reason |
 /// | Dep | dependency's root+gen / `FwdDep.slot` | its tick | Join: open; Cancel: canceled open (0 = `TOO_LATE`) | `FwdDep.kind` | 0 (rested / canceled), `DEP_ENDED`, or a reject reason (`BUSY`, `BOOK_HALTED`, `AUCTION_PHASE`, `TOO_LATE`) |
