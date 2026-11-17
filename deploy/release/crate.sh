@@ -16,6 +16,8 @@ dist="$(mkdir -p "$2" && cd "$2" && pwd)"
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 meta="$(cargo metadata --format-version 1 --no-deps --locked)"
+# Where `cargo package` writes, wherever CARGO_TARGET_DIR or build.target-dir put it.
+target_dir="$(jq -r .target_directory <<<"$meta")"
 
 pkg() { jq -e --arg n "$1" '.packages[] | select(.name == $n)' <<<"$meta"; }
 pkg "$name" >/dev/null || { echo "crate.sh: no workspace package $name" >&2; exit 1; }
@@ -52,7 +54,7 @@ trap 'rm -rf "$work"' EXIT
 members="" patch=""
 for n in "${closure[@]}"; do
   v="$(pkg "$n" | jq -r .version)"
-  tar -xzf "target/package/$n-$v.crate" -C "$work"
+  tar -xzf "$target_dir/package/$n-$v.crate" -C "$work"
   members+="\"$n-$v\", "
   patch+="$n = { path = \"$n-$v\" }"$'\n'
 done
@@ -60,10 +62,10 @@ printf '[workspace]\nresolver = "3"\nmembers = [%s]\n\n[patch.crates-io]\n%s' \
   "$members" "$patch" >"$work/Cargo.toml"
 # The pinned toolchain too: outside the repository rustup would pick its default.
 cp Cargo.lock rust-toolchain.toml "$work/"
-(cd "$work" && CARGO_TARGET_DIR="$root/target/crate-verify" cargo build --quiet -p "$name")
+(cd "$work" && CARGO_TARGET_DIR="$target_dir/crate-verify" cargo build --quiet -p "$name")
 echo "crate.sh: the unpacked $name-$version.crate builds"
 
-cp "target/package/$name-$version.crate" "$dist/"
+cp "$target_dir/package/$name-$version.crate" "$dist/"
 crate_dir="$(dirname "$(pkg "$name" | jq -r .manifest_path)")"
 if [[ -f "$crate_dir/CHANGELOG.md" ]]; then
   cp "$crate_dir/CHANGELOG.md" "$dist/CHANGELOG.md"
