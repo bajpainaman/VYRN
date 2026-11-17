@@ -194,7 +194,7 @@ export function Ticket() {
                     pad.current?.scrollIntoView({ block: "center", behavior: prefersReducedMotion() ? "auto" : "smooth" });
                   }
                 }}
-                className="flex-none border-2 border-ink bg-canary px-3 py-2 text-[14px] font-extrabold [font-stretch:112%] hover:bg-ink hover:text-canary"
+                className="flex-none border-2 border-ink bg-canary px-3 py-2 text-[14px] font-extrabold [font-stretch:112%] hover:bg-slab hover:text-on-slab"
               >
                 Stamp an order
               </button>
@@ -310,7 +310,7 @@ function DayRule({ home }: { home: HomeState | null }) {
         {HOMES.map((h, i) => (
           <span
             key={h}
-            className={`caption grid place-items-center ${i < 2 ? "border-r-2 border-ink" : ""} ${home?.home === h ? "bg-ink text-canary" : ""}`}
+            className={`caption grid place-items-center ${i < 2 ? "border-r-2 border-ink" : ""} ${home?.home === h ? "bg-slab text-on-slab" : ""}`}
           >
             {h}
           </span>

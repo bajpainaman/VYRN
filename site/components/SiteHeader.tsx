@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { REPO_URL } from "@/lib/site";
+import { ThemeToggle } from "./ThemeToggle";
 
 const NAV = [
   { href: "/docs/design", label: "Design", wide: false },
@@ -20,17 +21,18 @@ export function SiteHeader() {
             <Link
               key={item.href}
               href={item.href}
-              className={`${item.wide ? "hidden sm:flex" : "flex"} items-center border-l-2 border-ink px-3 text-[15px] font-bold no-underline [font-stretch:112%] hover:bg-canary-shade sm:px-5`}
+              className={`${item.wide ? "hidden sm:flex" : "flex"} items-center border-l-2 border-ink px-2 text-[14px] font-bold no-underline [font-stretch:112%] hover:bg-canary-shade sm:px-5 sm:text-[15px]`}
             >
               {item.label}
             </Link>
           ))}
           <a
             href={REPO_URL}
-            className="flex items-center border-l-2 border-ink px-3 text-[15px] font-bold no-underline [font-stretch:112%] hover:bg-canary-shade sm:px-5"
+            className="flex items-center border-l-2 border-ink px-2 text-[14px] font-bold no-underline [font-stretch:112%] hover:bg-canary-shade sm:px-5 sm:text-[15px]"
           >
             GitHub
           </a>
+          <ThemeToggle />
         </nav>
       </div>
     </header>

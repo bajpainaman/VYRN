@@ -2,19 +2,31 @@
 
 /* The order-ticket world. Canary is the top ply, pink the carbon copy routed to the data
    tier, white the original ply people read from. Blue and red mean BUY and SELL and
-   nothing else; violet is the time clock's ribbon and marks every stamp, status and ID. */
+   nothing else; violet is the time clock's ribbon and marks every stamp, status and ID.
+
+   Each token is a light-dark() pair, resolved by the root's color-scheme: the OS preference by
+   default, or the reader's choice when the layout script sets data-theme. In the dark the form
+   is a carbon sheet: the plies keep their hue as dark paper, ink turns pale, and canary moves
+   from ground to accent (the slab). Ratios are checked against each pair's own ground. */
 @theme {
-  --color-canary: #f2d447;
-  --color-canary-shade: #e6c534;
-  --color-pink: #f4b7c2;
-  --color-ply: #fcfcf9;
-  --color-ink: #191b26;
-  --color-ink-soft: #4a4318; /* secondary text on canary: ink tinted toward the ply */
-  --color-ink-mute: #565a6b; /* secondary text on the white ply */
-  --color-buy: #1e4db7;
-  --color-sell: #a3161d; /* 5.3:1 on canary, so SELL reads at field size */
-  --color-stamp: #5a2d91;
-  --color-stamp-wash: #ede5f6;
+  --color-canary: light-dark(#f2d447, #272107);
+  --color-canary-shade: light-dark(#e6c534, #352c0c);
+  --color-pink: light-dark(#f4b7c2, #2e1d23);
+  --color-ply: light-dark(#fcfcf9, #18191f);
+  --color-figure: light-dark(#ffffff, #121318); /* the field inside table, ASCII and diagram frames */
+  --color-ink: light-dark(#191b26, #ebe6d2);
+  --color-ink-soft: light-dark(#4a4318, #d6c26a); /* secondary text on canary: ink tinted toward the ply */
+  --color-ink-mute: light-dark(#565a6b, #a3a7b7); /* secondary text on the white ply */
+  --color-buy: light-dark(#1e4db7, #8aa9ff);
+  --color-sell: light-dark(#a3161d, #ff8a80); /* 5.3:1 on canary, 7.4:1 on the dark sheet */
+  --color-stamp: light-dark(#5a2d91, #c4a6f7);
+  --color-stamp-wash: light-dark(#ede5f6, #2e2542);
+  /* Inked controls (primary route, active tab, live home): ink in the light, canary in the dark. */
+  --color-slab: light-dark(#191b26, #f2d447);
+  --color-on-slab: light-dark(#f2d447, #191b26);
+  /* Inked surfaces (license slip, code): the darkest layer in both themes, canary on it. */
+  --color-well: light-dark(#191b26, #0e0f14);
+  --color-on-well: #f2d447;
 
   --font-display: var(--font-archivo), "Archivo", sans-serif;
   --font-data: var(--font-martian), ui-monospace, monospace;
@@ -27,8 +39,11 @@
   --header-h: 56px;
   --ease-strike: cubic-bezier(0.2, 1.4, 0.4, 1);
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-  color-scheme: light;
+  --edge-shade: light-dark(rgba(25, 27, 38, 0.22), rgba(0, 0, 0, 0.6));
+  color-scheme: light dark;
 }
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
 
 @layer base {
 html {
@@ -51,18 +66,18 @@ body {
 
 ::selection {
   background: var(--color-stamp);
-  color: #fff;
+  color: light-dark(#fff, var(--color-well));
 }
 
 :focus-visible {
   outline: 2px solid var(--color-stamp);
   outline-offset: 3px;
 }
-/* Violet is 1.8:1 on ink; on dark surfaces the ring turns canary (11.6:1). */
+/* Violet is 1.8:1 on ink; on inked surfaces the ring turns canary (11.6:1, 13:1 on the dark well). */
 [data-surface="ink"] :focus-visible,
 .routebox.primary:focus-visible,
 .code-wrap:focus-visible {
-  outline-color: var(--color-canary);
+  outline-color: var(--color-on-well);
 }
 
 a {
@@ -151,8 +166,8 @@ a {
 .routebox:hover .box svg,
 .routebox:focus-visible .box svg { transform: translateX(2px); }
 .routebox:hover { background: var(--color-canary-shade); }
-.routebox.primary { background: var(--color-ink); color: var(--color-canary); }
-.routebox.primary:hover { background: #000; }
+.routebox.primary { background: var(--color-slab); color: var(--color-on-slab); }
+.routebox.primary:hover { background: light-dark(#000, #fff3a8); }
 .routebox small {
   display: block;
   font-stretch: 100%;
@@ -161,10 +176,10 @@ a {
   margin-top: 3px;
   color: var(--color-ink-soft);
 }
-.routebox.inverse { background: var(--color-ink); color: var(--color-canary); }
+.routebox.inverse { background: var(--color-well); color: var(--color-on-well); }
 .routebox.inverse:hover { background: #000; }
-.routebox.inverse small { color: color-mix(in oklab, var(--color-canary) 78%, var(--color-ink)); }
-.routebox.primary small { color: color-mix(in oklab, var(--color-canary) 82%, var(--color-ink)); }
+.routebox.inverse small { color: color-mix(in oklab, var(--color-on-well) 78%, var(--color-well)); }
+.routebox.primary small { color: color-mix(in oklab, var(--color-on-slab) 82%, var(--color-slab)); }
 
 /* The ticket's punched binding edge. */
 .ticket::before {
@@ -180,18 +195,18 @@ a {
   z-index: 1; /* above the rows' own backgrounds, so the holes run the full height of every ply */
 }
 
-.routebox.inverse.primary { background: var(--color-canary); color: var(--color-ink); }
+.routebox.inverse.primary { background: var(--color-on-well); color: var(--color-well); }
 .routebox.inverse.primary:hover { background: #fff3a8; }
-.routebox.inverse.primary small { color: var(--color-ink-soft); }
+.routebox.inverse.primary small { color: #4a4318; } /* ink-soft on canary, in both themes */
 
 /* Wide diagrams and tables scroll sideways; an edge shade says there is more. */
-.ascii-wrap, .table-wrap {
+.ascii-wrap, .table-wrap, .diagram-scroll {
   background:
-    linear-gradient(to right, #fff 40%, rgba(255, 255, 255, 0)) left / 32px 100% no-repeat local,
-    linear-gradient(to left, #fff 40%, rgba(255, 255, 255, 0)) right / 32px 100% no-repeat local,
-    radial-gradient(farthest-side at 0 50%, rgba(25, 27, 38, 0.22), transparent) left / 12px 100% no-repeat scroll,
-    radial-gradient(farthest-side at 100% 50%, rgba(25, 27, 38, 0.22), transparent) right / 12px 100% no-repeat scroll,
-    #fff;
+    linear-gradient(to right, var(--color-figure) 40%, transparent) left / 32px 100% no-repeat local,
+    linear-gradient(to left, var(--color-figure) 40%, transparent) right / 32px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, var(--edge-shade), transparent) left / 12px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, var(--edge-shade), transparent) right / 12px 100% no-repeat scroll,
+    var(--color-figure);
 }
 
 /* ---------- Stamps ---------- */
@@ -281,7 +296,6 @@ a {
 .table-wrap {
   overflow-x: auto;
   border: var(--rule);
-  background: #fff;
 }
 .prose-spec table {
   border-collapse: collapse;
@@ -317,7 +331,7 @@ a {
   overflow-x: auto;
   border: var(--rule);
 }
-.code-wrap { background: var(--color-ink); }
+.code-wrap { background: var(--color-well); }
 pre.ascii, pre.code {
   margin: 0;
   padding: 18px 20px;
@@ -333,7 +347,7 @@ pre.ascii, pre.code {
 }
 pre.ascii { color: var(--color-ink); }
 pre.code { color: #eceaf2; }
-pre.code ::selection { background: var(--color-canary); color: var(--color-ink); }
+pre.code ::selection { background: var(--color-on-well); color: var(--color-well); }
 
 a.spec-id {
   font-family: var(--font-data);
@@ -355,17 +369,17 @@ html.js .ticket[data-hydrated="false"] [data-stamp] { visibility: hidden; }
    readable size and scrolls sideways instead of shrinking its labels to nothing. */
 /* The frame hugs the drawing and centres in its column; caption and ASCII toggle sit under it. */
 .diagram { margin: 0 auto 1.1em; width: fit-content; max-width: 100%; }
-.diagram-scroll { overflow-x: auto; border: var(--rule); background: #fff; }
+.diagram-scroll { overflow-x: auto; border: var(--rule); }
 /* Every drawing renders at one scale (0.75 px per canvas unit), so a label reads the same size in every
    figure on every page; a column narrower than that shrinks it, never stretches it. */
 .diagram-scroll img { display: block; width: calc(var(--fig-w, 1200) * 0.75px); max-width: 100%; height: auto; margin-inline: auto; }
-.diagram-scroll {
-  background:
-    linear-gradient(to right, #fff 40%, rgba(255, 255, 255, 0)) left / 32px 100% no-repeat local,
-    linear-gradient(to left, #fff 40%, rgba(255, 255, 255, 0)) right / 32px 100% no-repeat local,
-    radial-gradient(farthest-side at 0 50%, rgba(25, 27, 38, 0.22), transparent) left / 12px 100% no-repeat scroll,
-    radial-gradient(farthest-side at 100% 50%, rgba(25, 27, 38, 0.22), transparent) right / 12px 100% no-repeat scroll,
-    #fff;
+/* Each drawing has a palette-swapped dark copy (scripts/sync-diagrams.mjs); show the one for the theme. */
+.diagram-scroll img.fig-dark { display: none; }
+:root[data-theme="dark"] .diagram-scroll img.fig-light { display: none; }
+:root[data-theme="dark"] .diagram-scroll img.fig-dark { display: block; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .diagram-scroll img.fig-light { display: none; }
+  :root:not([data-theme="light"]) .diagram-scroll img.fig-dark { display: block; }
 }
 /* On phones a drawing keeps a readable size and scrolls sideways, with the edge shade as the cue. */
 @media (max-width: 767px) {
@@ -415,3 +429,26 @@ a.spec-ref {
   white-space: nowrap;
 }
 a.spec-ref:hover { text-decoration-style: solid; }
+
+/* ---------- Theme cell ---------- */
+
+/* The icon follows the root's data-theme, so it is right before hydration: no attribute means System. */
+.theme-icon { display: none; }
+:root:not([data-theme]) .theme-icon[data-for="system"],
+:root[data-theme="light"] .theme-icon[data-for="light"],
+:root[data-theme="dark"] .theme-icon[data-for="dark"] { display: block; }
+
+.theme-button { anchor-name: --theme-cell; }
+/* The menu hangs from the header's bottom rule under its cell, as one more ply of the form. */
+.theme-menu {
+  position: fixed;
+  inset: auto;
+  top: calc(var(--header-h) - 2px);
+  right: max(1rem, calc((100vw - 1440px) / 2 + 2rem));
+  margin: 0;
+  min-width: 220px;
+  padding: 0;
+}
+@supports (position-anchor: --a) {
+  .theme-menu { position-anchor: --theme-cell; top: anchor(bottom); right: anchor(right); }
+}

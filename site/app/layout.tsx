@@ -14,6 +14,9 @@ const SITE_URL =
   process.env.NEXT_PUBLIC_SITE_URL ??
   (process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : "http://localhost:3000");
 
+const THEME_SCRIPT =
+  "(function(){var d=document.documentElement;d.classList.add('js');try{var t=localStorage.getItem('vyrn-theme');if(t==='light'||t==='dark')d.dataset.theme=t}catch(e){}})()";
+
 const DESCRIPTION =
   "VYRN is an exchange design: a fill at most 1 µs after the first bit arrives, 1B messages a second on one book, BFT finality within 10 ms, and a book that follows the sun. Every figure is a design budget.";
 
@@ -35,12 +38,14 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html lang="en" suppressHydrationWarning className={`${archivo.variable} ${martian.variable} ${doto.variable} antialiased`}>
       <head>
-        <script dangerouslySetInnerHTML={{ __html: "document.documentElement.classList.add('js')" }} />
+        {/* Runs before first paint: marks JavaScript as present and applies a saved theme (ThemeToggle), so a
+            reader who chose Dark never sees a light frame. Without a saved choice the CSS follows the OS. */}
+        <script dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} />
       </head>
       <body className="min-h-dvh flex flex-col">
         <a
           href="#main"
-          className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-3 focus:z-50 focus:bg-ink focus:px-3 focus:py-2 focus:text-canary"
+          className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-3 focus:z-50 focus:bg-slab focus:px-3 focus:py-2 focus:text-on-slab"
         >
           Skip to content
         </a>
