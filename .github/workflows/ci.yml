@@ -1,7 +1,8 @@
 # S1 of spec/11-build.md §8, the parts that exist today: formatting, clippy, tests on Linux
 # x86-64 and aarch64 (macOS is left out to keep CI cheap), cargo-deny, the 04 §11 protocol
 # vectors, and the unsafe-audit and lint-engine gates (Linux only, §9.2 S1). Miri, TSan, fuzzing
-# and the asm gate join as the crates they cover land.
+# and the asm gate join as the crates they cover land. Third-party actions are pinned to a
+# commit, with the tag it was taken from in a comment.
 name: CI
 
 on:
@@ -25,7 +26,7 @@ jobs:
   fmt:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup show active-toolchain || rustup toolchain install
       - run: cargo fmt --all --check
 
@@ -37,7 +38,7 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup show active-toolchain || rustup toolchain install
       - name: clang and lld with rustc's LLVM major (11 §4.2)
         run: |
@@ -50,7 +51,7 @@ jobs:
           clang_major="$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)"
           echo "rustc LLVM $major, clang $clang_major"
           test "$major" = "$clang_major"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
 
@@ -64,9 +65,9 @@ jobs:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
       RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: unsafe only in the modules of UNSAFE.toml (11 §3.2, REQ-SEC-10)
         run: cargo run --locked --quiet -p unsafe-audit
       - name: engine crates keep to the dependency DAG and the engine source rules (11 §1.4, §2.3, §3.3)
@@ -75,8 +76,8 @@ jobs:
   deny:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-deny
       - run: cargo deny check
@@ -85,10 +86,12 @@ jobs:
     name: protocol vectors (04 §11)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - name: script output equals the committed golden file
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: script output equals the committed golden files
         working-directory: /tmp
-        run: python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_proto_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_proto_vectors.out"
+        run: |
+          python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_proto_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_proto_vectors.out"
+          python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_reject_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_reject_vectors.out"
 
   contracts:
     name: L1 bridge contracts (09 §6)
@@ -97,10 +100,10 @@ jobs:
       run:
         working-directory: contracts
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
         with:
           version: v1.9.0
       - run: forge fmt --check
