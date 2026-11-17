@@ -18,7 +18,7 @@ mod linux {
     pub(crate) const BATCH: usize = vyrn_wire::RX_BURST;
 
     /// Bytes of ancillary data each received message has room for. Nothing asks for any yet, so
-    /// `msg_control` is null; a socket option that adds a control message (IP_PKTINFO, say) sets
+    /// `msg_controllen` is 0; a socket option that adds a control message (IP_PKTINFO, say) sets
     /// this, and `recv_batch` reads it out of `ctrl` into `Recvd`.
     const CTRL_BYTES: usize = 0;
 
@@ -101,10 +101,8 @@ mod linux {
             m.msg_namelen = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
             m.msg_iov = iov;
             m.msg_iovlen = 1;
-            if CTRL_BYTES > 0 {
-                m.msg_control = c.0.as_mut_ptr().cast();
-                m.msg_controllen = CTRL_BYTES as _;
-            }
+            m.msg_control = c.0.as_mut_ptr().cast();
+            m.msg_controllen = CTRL_BYTES as _;
             n += 1;
         }
         if n == 0 {
