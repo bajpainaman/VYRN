@@ -43,7 +43,7 @@ impl RxFlags {
 ///
 /// The fields are read-only, so safe code cannot lengthen or redirect a descriptor it was given.
 /// Safe code can still build one with `new`; that is why `RxRing::bytes` validates descriptors
-/// against the ring's own storage instead of trusting `data` and `len`.
+/// against the ring's own storage and never dereferences `data`.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct RxPkt {
@@ -84,8 +84,9 @@ impl RxPkt {
         }
     }
 
-    /// The pointer the backend stored. Only the backend that produced this descriptor may
-    /// dereference it, after checking `buf_id` and `len` against its own buffers.
+    /// The address the backend stored, for diagnostics and for the shim's own bookkeeping.
+    /// Nothing dereferences it: a forged descriptor can carry the same address with no
+    /// provenance, so `RxRing::bytes` slices from the backend's own buffer pointer instead.
     pub const fn data(&self) -> NonNull<u8> {
         self.data
     }
@@ -188,10 +189,11 @@ pub trait RxRing: Send {
     fn release(&mut self, n: usize);
     /// A frame's bytes. The borrow ends before the next `release`.
     ///
-    /// `p` is untrusted: safe code can build any `RxPkt`. The backend resolves it against storage
-    /// it owns (by `buf_id`) and bounds-checks `len` against that buffer, and returns an empty
-    /// slice for a descriptor it did not produce or has already released. It never dereferences
-    /// `p.data()` without that check, so this method is sound for every input.
+    /// `p` is untrusted: safe code can build any `RxPkt`, including one that copies a live
+    /// descriptor's fields. The backend looks up `p.buf_id()` among the unreleased buffers it
+    /// owns, bounds-checks `p.len()` against that buffer, and derives the slice from its own
+    /// buffer pointer. It never dereferences `p.data()`. For a descriptor it did not produce or
+    /// has already released it returns an empty slice, so this method is sound for every input.
     fn bytes<'a>(&'a self, p: &'a RxPkt) -> &'a [u8];
     fn ts_source(&self) -> TsSource;
     fn counters(&self) -> &NicCounters;
