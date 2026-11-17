@@ -1,0 +1,109 @@
+{
+ "_source": "tests/golden/blake3_test_vectors.json (official BLAKE3 vectors), cases of at most one chunk, first 32 output bytes",
+ "key": "whats the Elvish word for friend",
+ "context": "BLAKE3 2019-12-27 16:29:52 test vectors context",
+ "cases": [
+  {
+   "inputLen": 0,
+   "hash": "0xaf1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+   "keyedHash": "0x92b2b75604ed3c761f9d6f62392c8a9227ad0ea3f09573e783f1498a4ed60d26",
+   "deriveKey": "0x2cc39783c223154fea8dfb7c1b1660f2ac2dcbd1c1de8277b0b0dd39b7e50d7d"
+  },
+  {
+   "inputLen": 1,
+   "hash": "0x2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
+   "keyedHash": "0x6d7878dfff2f485635d39013278ae14f1454b8c0a3a2d34bc1ab38228a80c95b",
+   "deriveKey": "0xb3e2e340a117a499c6cf2398a19ee0d29cca2bb7404c73063382693bf66cb06c"
+  },
+  {
+   "inputLen": 2,
+   "hash": "0x7b7015bb92cf0b318037702a6cdd81dee41224f734684c2c122cd6359cb1ee63",
+   "keyedHash": "0x5392ddae0e0a69d5f40160462cbd9bd889375082ff224ac9c758802b7a6fd20a",
+   "deriveKey": "0x1f166565a7df0098ee65922d7fea425fb18b9943f19d6161e2d17939356168e6"
+  },
+  {
+   "inputLen": 3,
+   "hash": "0xe1be4d7a8ab5560aa4199eea339849ba8e293d55ca0a81006726d184519e647f",
+   "keyedHash": "0x39e67b76b5a007d4921969779fe666da67b5213b096084ab674742f0d5ec62b9",
+   "deriveKey": "0x440aba35cb006b61fc17c0529255de438efc06a8c9ebf3f2ddac3b5a86705797"
+  },
+  {
+   "inputLen": 4,
+   "hash": "0xf30f5ab28fe047904037f77b6da4fea1e27241c5d132638d8bedce9d40494f32",
+   "keyedHash": "0x7671dde590c95d5ac9616651ff5aa0a27bee5913a348e053b8aa9108917fe070",
+   "deriveKey": "0xf46085c8190d69022369ce1a18880e9b369c135eb93f3c63550d3e7630e91060"
+  },
+  {
+   "inputLen": 5,
+   "hash": "0xb40b44dfd97e7a84a996a91af8b85188c66c126940ba7aad2e7ae6b385402aa2",
+   "keyedHash": "0x73ac69eecf286894d8102018a6fc729f4b1f4247d3703f69bdc6a5fe3e0c8461",
+   "deriveKey": "0x1f24eda69dbcb752847ec3ebb5dd42836d86e58500c7c98d906ecd82ed9ae47f"
+  },
+  {
+   "inputLen": 6,
+   "hash": "0x06c4e8ffb6872fad96f9aaca5eee1553eb62aed0ad7198cef42e87f6a616c844",
+   "keyedHash": "0x82d3199d0013035682cc7f2a399d4c212544376a839aa863a0f4c91220ca7a6d",
+   "deriveKey": "0xbe96b30b37919fe4379dfbe752ae77b4f7e2ab92f7ff27435f76f2f065f6a5f4"
+  },
+  {
+   "inputLen": 7,
+   "hash": "0x3f8770f387faad08faa9d8414e9f449ac68e6ff0417f673f602a646a891419fe",
+   "keyedHash": "0xaf0a7ec382aedc0cfd626e49e7628bc7a353a4cb108855541a5651bf64fbb28a",
+   "deriveKey": "0xdc3b6485f9d94935329442916b0d059685ba815a1fa2a14107217453a7fc9f0e"
+  },
+  {
+   "inputLen": 8,
+   "hash": "0x2351207d04fc16ade43ccab08600939c7c1fa70a5c0aaca76063d04c3228eaeb",
+   "keyedHash": "0xbe2f5495c61cba1bb348a34948c004045e3bd4dae8f0fe82bf44d0da245a0600",
+   "deriveKey": "0x2b166978cef14d9d438046c720519d8b1cad707e199746f1562d0c87fbd32940"
+  },
+  {
+   "inputLen": 63,
+   "hash": "0xe9bc37a594daad83be9470df7f7b3798297c3d834ce80ba85d6e207627b7db7b",
+   "keyedHash": "0xbb1eb5d4afa793c1ebdd9fb08def6c36d10096986ae0cfe148cd101170ce37ae",
+   "deriveKey": "0xb6451e30b953c206e34644c6803724e9d2725e0893039cfc49584f991f451af3"
+  },
+  {
+   "inputLen": 64,
+   "hash": "0x4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98",
+   "keyedHash": "0xba8ced36f327700d213f120b1a207a3b8c04330528586f414d09f2f7d9ccb7e6",
+   "deriveKey": "0xa5c4a7053fa86b64746d4bb688d06ad1f02a18fce9afd3e818fefaa7126bf73e"
+  },
+  {
+   "inputLen": 65,
+   "hash": "0xde1e5fa0be70df6d2be8fffd0e99ceaa8eb6e8c93a63f2d8d1c30ecb6b263dee",
+   "keyedHash": "0xc0a4edefa2d2accb9277c371ac12fcdbb52988a86edc54f0716e1591b4326e72",
+   "deriveKey": "0x51fd05c3c1cfbc8ed67d139ad76f5cf8236cd2acd26627a30c104dfd9d3ff8a8"
+  },
+  {
+   "inputLen": 127,
+   "hash": "0xd81293fda863f008c09e92fc382a81f5a0b4a1251cba1634016a0f86a6bd640d",
+   "keyedHash": "0xc64200ae7dfaf35577ac5a9521c47863fb71514a3bcad18819218b818de85818",
+   "deriveKey": "0xc91c090ceee3a3ac81902da31838012625bbcd73fcb92e7d7e56f78deba4f0c3"
+  },
+  {
+   "inputLen": 128,
+   "hash": "0xf17e570564b26578c33bb7f44643f539624b05df1a76c81f30acd548c44b45ef",
+   "keyedHash": "0xb04fe15577457267ff3b6f3c947d93be581e7e3a4b018679125eaf86f6a628ec",
+   "deriveKey": "0x81720f34452f58a0120a58b6b4608384b5c51d11f39ce97161a0c0e442ca0225"
+  },
+  {
+   "inputLen": 129,
+   "hash": "0x683aaae9f3c5ba37eaaf072aed0f9e30bac0865137bae68b1fde4ca2aebdcb12",
+   "keyedHash": "0xd4a64dae6cdccbac1e5287f54f17c5f985105457c1a2ec1878ebd4b57e20d38f",
+   "deriveKey": "0x938d2d4435be30eafdbb2b7031f7857c98b04881227391dc40db3c7b21f41fc1"
+  },
+  {
+   "inputLen": 1023,
+   "hash": "0x10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11",
+   "keyedHash": "0xc951ecdf03288d0fcc96ee3413563d8a6d3589547f2c2fb36d9786470f1b9d6e",
+   "deriveKey": "0x74a16c1c3d44368a86e1ca6df64be6a2f64cce8f09220787450722d85725dea5"
+  },
+  {
+   "inputLen": 1024,
+   "hash": "0x42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7",
+   "keyedHash": "0x75c46f6f3d9eb4f55ecaaee480db732e6c2105546f1e675003687c31719c7ba4",
+   "deriveKey": "0x7356cd7720d5b66b6d0697eb3177d9f8d73a4a5c5e968896eb6a689684302706"
+  }
+ ]
+}
