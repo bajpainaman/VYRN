@@ -9,6 +9,11 @@ description = "NIC backends: efvi, dpdk (Linux, C shim), kernel_udp, sim; platfo
 build = "build.rs"
 links = "vyrn_nic_shim"
 
+[features]
+# Builds c/vyrn-nic-shim (Linux only), which the efvi and dpdk backends will need. Off by default:
+# kernel_udp and sim are pure Rust, so without it the build script never looks for clang.
+shim = []
+
 [dependencies]
 vyrn-types = { workspace = true }
 vyrn-wire = { workspace = true }

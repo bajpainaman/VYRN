@@ -1,7 +1,11 @@
-//! Builds the C shim on Linux only (spec/11-build.md §4.1); macOS uses kernel_udp and sim.
+//! Builds the C shim with clang (spec/11-build.md §4.1), on Linux and only with the `shim`
+//! feature. kernel_udp and sim need no C, so by default, and always on macOS, this looks for no
+//! compiler (06 §7.4).
 fn main() {
     println!("cargo:rerun-if-changed=../../c/vyrn-nic-shim");
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SHIM");
+    let linux = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux");
+    if !linux || std::env::var_os("CARGO_FEATURE_SHIM").is_none() {
         return;
     }
     cc::Build::new()
