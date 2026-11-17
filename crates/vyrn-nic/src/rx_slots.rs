@@ -58,6 +58,29 @@ impl RxSlots {
         s.try_into().unwrap_or_else(|_| unreachable!())
     }
 
+    /// The buffers of the next `k` frames, in order, wrapping at the end of the ring. Only call
+    /// it with `k <= free()`. `kernel_udp` receives a burst into them with one syscall.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn next_bufs(&mut self, k: usize) -> impl Iterator<Item = &mut [u8; SLOT_BYTES]> {
+        debug_assert!(k <= self.free());
+        let (wrapped, ahead) = self.buf.split_at_mut(self.slot(self.produced) * SLOT_BYTES);
+        // Both halves are whole slots: the buffer is `n * SLOT_BYTES`, split at a slot edge.
+        let (ahead, rest_a) = ahead.as_chunks_mut::<SLOT_BYTES>();
+        let (wrapped, rest_w) = wrapped.as_chunks_mut::<SLOT_BYTES>();
+        debug_assert!(rest_a.is_empty() && rest_w.is_empty());
+        ahead.iter_mut().chain(wrapped).take(k)
+    }
+
+    /// Copies the first `len` bytes of the buffer `ahead` frames past the next one into the
+    /// next one's, so the frames after a dropped datagram of a burst fill the ring in order.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pull(&mut self, ahead: usize, len: usize) {
+        debug_assert!(ahead < self.free() && len <= SLOT_BYTES);
+        let to = self.slot(self.produced) * SLOT_BYTES;
+        let from = self.slot(self.produced.wrapping_add(ahead as u32)) * SLOT_BYTES;
+        self.buf.copy_within(from..from + len, to);
+    }
+
     /// Publishes the frame just written to `next_buf` and returns its descriptor. Clamps a
     /// regressing stamp to the previous one and counts it (06 §6.1 rule 1), and counts `rx_pkts`.
     pub(crate) fn commit(

@@ -210,3 +210,171 @@ fn kernel_udp_refuses_a_wildcard_bind() {
         }
     ));
 }
+
+/// The payload and `buf_id` of each frame of `ps`.
+#[cfg(target_os = "linux")]
+fn read(rx: &impl RxRing, ps: &[RxPkt]) -> Vec<(Vec<u8>, u32)> {
+    ps.iter()
+        .map(|p| {
+            let f = frame::parse(rx.bytes(p)).expect("a received frame parses");
+            (f.payload.to_vec(), p.buf_id())
+        })
+        .collect()
+}
+
+/// Polls until `n` frames have arrived, releasing each poll's frames once read.
+#[cfg(target_os = "linux")]
+fn drain(rx: &mut impl RxRing, n: usize) -> Vec<(Vec<u8>, u32)> {
+    let mut got = Vec::new();
+    let mut out = [RxPkt::empty(); RX_BURST];
+    let t = Instant::now();
+    while got.len() < n {
+        let k = rx.poll(&mut out);
+        got.extend(read(rx, &out[..k]));
+        rx.release(k);
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "{} of {n} arrived",
+            got.len()
+        );
+    }
+    got
+}
+
+/// A payload unique to `i`, its length varying with `i`, so a frame read from the wrong slot or
+/// cut short does not compare equal.
+#[cfg(target_os = "linux")]
+fn payload(i: u32) -> Vec<u8> {
+    let mut p = i.to_le_bytes().to_vec();
+    p.extend((0..(i as usize * 37) % 300).map(|j| (j as u32 ^ i) as u8));
+    p
+}
+
+/// More datagrams than one `poll` returns, landing in bursts that start mid-ring and cross the end
+/// of a 32-buffer ring: no poll returns more than `RX_BURST` or more than the free buffers, a full
+/// ring returns nothing, and every datagram arrives once, whole, in order, with consecutive ids.
+#[cfg(target_os = "linux")]
+#[test]
+fn kernel_udp_burst_bigger_than_rx_burst_wraps_the_ring() {
+    let mut c = cfg(BackendKind::Kernel);
+    c.rx_slots = 32;
+    let mut nic = KernelUdp::open(&c).unwrap();
+    let mut rx = nic.rx_ring(&bind(0)).unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for i in 0..5 {
+        peer.send_to(&payload(i), rx.local_addr()).unwrap();
+    }
+    let mut all = drain(&mut rx, 5);
+    let total = 3 * RX_BURST + 7;
+    for i in 5..5 + total as u32 {
+        peer.send_to(&payload(i), rx.local_addr()).unwrap();
+    }
+    // Hold every frame until the ring is full.
+    let mut out = [RxPkt::empty(); RX_BURST];
+    let mut held = 0;
+    let t = Instant::now();
+    while held < 32 {
+        let k = rx.poll(&mut out);
+        assert!(
+            k <= RX_BURST.min(32 - held),
+            "poll returned {k} frames with {held} of 32 buffers held"
+        );
+        all.extend(read(&rx, &out[..k]));
+        held += k;
+        assert!(t.elapsed() < Duration::from_secs(5), "{held} of 32 arrived");
+    }
+    assert_eq!(rx.poll(&mut out), 0, "a full ring returned a frame");
+    rx.release(held);
+    all.extend(drain(&mut rx, total - 32));
+    assert_eq!(all.len(), 5 + total);
+    for (i, (p, id)) in all.iter().enumerate() {
+        assert_eq!(
+            *p,
+            payload(i as u32),
+            "datagram {i} changed or out of order"
+        );
+        assert_eq!(*id, i as u32, "datagram {i} got buf_id {id}");
+    }
+    assert_eq!(ExtCounters::get(&rx.counters().rx_pkts), (5 + total) as u64);
+    assert_eq!(ExtCounters::get(&rx.counters().rx_discard), 0);
+}
+
+/// Datagrams one byte over `MAX_PAYLOAD` in the middle of a burst, the kernel cutting each to its
+/// buffer: each is counted in `rx_trunc` and makes no frame, and the datagrams after it in the
+/// same burst arrive whole in the next buffers, with no gap in `buf_id`.
+#[cfg(target_os = "linux")]
+#[test]
+fn kernel_udp_truncated_datagram_in_a_burst_is_a_drop() {
+    let mut nic = KernelUdp::open(&cfg(BackendKind::Kernel)).unwrap();
+    let mut rx = nic.rx_ring(&bind(0)).unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let big = vec![0xEE; frame::MAX_PAYLOAD + 1];
+    let mut good = Vec::new();
+    for i in 0..12u32 {
+        if i % 4 == 1 {
+            peer.send_to(&big, rx.local_addr()).unwrap();
+        } else {
+            peer.send_to(&payload(i), rx.local_addr()).unwrap();
+            good.push(payload(i));
+        }
+    }
+    let got = drain(&mut rx, good.len());
+    let payloads: Vec<_> = got.iter().map(|(p, _)| p.clone()).collect();
+    assert_eq!(payloads, good, "a frame after a truncated datagram changed");
+    let ids: Vec<u32> = got.iter().map(|&(_, id)| id).collect();
+    assert_eq!(ids, (0..good.len() as u32).collect::<Vec<_>>());
+    assert_eq!(ExtCounters::get(&rx.counters().rx_trunc), 3);
+    assert_eq!(ExtCounters::get(&rx.counters().rx_pkts), good.len() as u64);
+    let mut out = [RxPkt::empty(); RX_BURST];
+    assert_eq!(rx.poll(&mut out), 0, "a truncated datagram made a frame");
+}
+
+/// A burst the kernel takes only part of: a frame to the limited broadcast address (refused,
+/// EACCES, as the socket has no SO_BROADCAST) makes `sendmmsg` stop short. `send_burst` counts it
+/// in `tx_drop`, sends every frame after it in order, and counts the rest as sent, exactly as
+/// calling `send` on each would. Frames that do not parse are dropped in place too.
+#[cfg(target_os = "linux")]
+#[test]
+fn kernel_udp_send_burst_resumes_after_a_partial_send() {
+    let mut nic = KernelUdp::open(&cfg(BackendKind::Kernel)).unwrap();
+    let mut tx = nic.tx_ring(PortId(0), TxClass::Fill).unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let to = match peer.local_addr().unwrap() {
+        std::net::SocketAddr::V4(a) => a,
+        _ => unreachable!(),
+    };
+    let refused = SocketAddrV4::new(Ipv4Addr::BROADCAST, to.port());
+    // 40 frames, more than one sendmmsg takes: refused at 3 and 20 (in the second batch),
+    // unparseable at 7 and 30.
+    let frames: Vec<Vec<u8>> = (0..40u32)
+        .map(|i| match i {
+            3 | 20 => test_frame(refused, i, 8),
+            7 | 30 => vec![0u8; 10],
+            _ => test_frame(to, i, (i as usize * 37) % 300),
+        })
+        .collect();
+    let refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        tx.send_burst(&refs),
+        40,
+        "a refused frame stopped the burst"
+    );
+    assert_eq!(ExtCounters::get(&tx.counters().tx_pkts), 36);
+    assert_eq!(ExtCounters::get(&tx.ext_counters().tx_drop), 4);
+    assert_eq!(ExtCounters::get(&tx.counters().tx_full), 0);
+    assert_eq!(tx.reap(), 36);
+    let mut buf = [0u8; 2048];
+    for i in (0..40u32).filter(|i| ![3, 7, 20, 30].contains(i)) {
+        let (n, _) = peer
+            .recv_from(&mut buf)
+            .expect("a sent frame did not arrive");
+        let want = frame::parse(&frames[i as usize]).unwrap().payload;
+        assert_eq!(&buf[..n], want, "frame {i} out of order or changed");
+    }
+    peer.set_nonblocking(true).unwrap();
+    assert!(
+        peer.recv_from(&mut buf).is_err(),
+        "an extra datagram arrived"
+    );
+}
