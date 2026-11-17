@@ -18,8 +18,9 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "target-cpu=neoverse-n1",
 # [source.vendored-sources]
 # directory = "vendor"
 
-# §4.3: `cargo release` is the release build with cross-language LTO. Run it from the repository
-# root, since Cargo resolves the --config path from the working directory. Benches take the same
-# flag: `cargo bench --config .cargo/release.toml`.
+# §4.3: `cargo release` and `cargo bench-release` are the release build and the benches with
+# cross-language LTO. Run them from the repository root, since Cargo resolves the --config path
+# from the working directory.
 [alias]
 release = ["build", "--release", "--config", ".cargo/release.toml"]
+bench-release = ["bench", "--config", ".cargo/release.toml"]

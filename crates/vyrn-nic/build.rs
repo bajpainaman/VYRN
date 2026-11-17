@@ -17,7 +17,7 @@ fn main() {
             .any(|flag| flag.ends_with("linker-plugin-lto"))
     {
         panic!(
-            "release build of the C shim without -C linker-plugin-lto; use `cargo release` or pass --config .cargo/release.toml"
+            "release build of the C shim without -C linker-plugin-lto; use `cargo release`, `cargo bench-release` or pass --config .cargo/release.toml"
         );
     }
     cc::Build::new()

@@ -673,9 +673,10 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "target-cpu=neoverse-n1",
 ```
 
 `.cargo/release.toml`, added to release and bench builds with `--config .cargo/release.toml`
-(Cargo appends its `rustflags` to the ones above). The `cargo release` alias in
-`.cargo/config.toml` runs `cargo build --release --config .cargo/release.toml` from the repository
-root:
+(Cargo appends its `rustflags` to the ones above). The aliases in `.cargo/config.toml`
+run them from the repository root: `cargo release` is
+`cargo build --release --config .cargo/release.toml`, and `cargo bench-release` is
+`cargo bench --config .cargo/release.toml`:
 
 ```toml
 [target.x86_64-unknown-linux-gnu]
