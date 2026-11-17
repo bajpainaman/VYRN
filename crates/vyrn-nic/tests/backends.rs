@@ -174,3 +174,39 @@ fn sim_faults_and_overflow_are_counters() {
         "two queues on one address"
     );
 }
+
+#[test]
+fn kernel_udp_poll_is_bounded_by_dropped_datagrams_too() {
+    let mut nic = KernelUdp::open(&cfg(BackendKind::Kernel)).unwrap();
+    let mut rx = nic.rx_ring(&bind(0)).unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for _ in 0..3 * RX_BURST {
+        peer.send_to(&[0u8; frame::MAX_PAYLOAD + 1], rx.local_addr())
+            .unwrap();
+    }
+    let mut out = [RxPkt::empty(); RX_BURST];
+    let t = Instant::now();
+    while ExtCounters::get(&rx.counters().rx_trunc) == 0 {
+        assert_eq!(rx.poll(&mut out), 0);
+        assert!(t.elapsed() < Duration::from_secs(5), "nothing arrived");
+    }
+    let first = ExtCounters::get(&rx.counters().rx_trunc);
+    assert!(
+        first <= RX_BURST as u64,
+        "one poll handled {first} > RX_BURST datagrams"
+    );
+}
+
+#[test]
+fn kernel_udp_refuses_a_wildcard_bind() {
+    let mut nic = KernelUdp::open(&cfg(BackendKind::Kernel)).unwrap();
+    let mut b = bind(0);
+    b.ip = Ipv4Addr::UNSPECIFIED;
+    assert!(matches!(
+        nic.rx_ring(&b).err().unwrap(),
+        vyrn_nic::NicError::Config {
+            field: "bind.ip",
+            ..
+        }
+    ));
+}

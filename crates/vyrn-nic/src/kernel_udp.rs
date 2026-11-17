@@ -12,7 +12,7 @@
 //! The spec's `recvmmsg`/`sendmmsg` with `SO_BUSY_POLL` (Linux) and `kqueue` (macOS) are not
 //! used yet; std's one-datagram calls meet the same contract.
 
-use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use core::net::{SocketAddr, SocketAddrV4};
 use std::io::ErrorKind;
 use std::net::UdpSocket;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,14 +72,18 @@ impl NicBackend for KernelUdp {
     }
 
     /// Binds `bind.ip:bind.udp_port`. Port 0 picks a free port; `KernelRx::local_addr` names it.
+    /// A wildcard address is refused: each frame's destination IP is the bound one, and
+    /// `0.0.0.0` would not say which address the datagram arrived on.
     fn rx_ring(&mut self, bind: &RxBind) -> Result<KernelRx, NicError> {
         self.cfg.port(bind.port)?;
-        let sock = socket(bind.port, SocketAddrV4::new(bind.ip, bind.udp_port))?;
-        let mut local = local_v4(&sock, bind.port)?;
-        if local.ip().is_unspecified() {
-            // The frame needs one destination address; an unspecified bind reports loopback.
-            local.set_ip(Ipv4Addr::LOCALHOST);
+        if bind.ip.is_unspecified() {
+            return Err(NicError::Config {
+                field: "bind.ip",
+                why: "must be a specific address for kernel_udp, not 0.0.0.0",
+            });
         }
+        let sock = socket(bind.port, SocketAddrV4::new(bind.ip, bind.udp_port))?;
+        let local = local_v4(&sock, bind.port)?;
         Ok(KernelRx {
             sock,
             local,
@@ -132,10 +136,14 @@ impl KernelRx {
 
 impl RxRing for KernelRx {
     /// Datagrams over `MAX_PAYLOAD` are counted in `rx_trunc` and dropped; IPv6 senders and
-    /// socket errors other than "empty" in `rx_discard`.
+    /// socket errors other than "empty" in `rx_discard`. At most `RX_BURST` receive calls per
+    /// `poll`, dropped datagrams included, so a flood of bad ones cannot hold the caller.
     fn poll(&mut self, out: &mut [RxPkt; RX_BURST]) -> usize {
         let mut got = 0;
-        while got < RX_BURST && self.slots.free() > 0 {
+        for _ in 0..RX_BURST {
+            if self.slots.free() == 0 {
+                break;
+            }
             let buf = self.slots.next_buf();
             // The slot has room past MAX_PAYLOAD, so an oversize datagram shows as one.
             let (n, src) = match self.sock.recv_from(&mut buf[HDR_BYTES..]) {
