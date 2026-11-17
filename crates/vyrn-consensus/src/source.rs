@@ -135,40 +135,62 @@ pub(crate) fn proposal_range<S: BlockSource>(
 /// and resolves notarized ranges from its own journal.
 ///
 /// A block is written once, when its `verify` passes (07 §8.2), so a stored range has passed
-/// items 2–5: [`check_body`](BlockSource::check_body) is `Valid` when every height is stored and
-/// `Pending` otherwise. Only headers are read ([`BlockStore::header`]); order bytes and payloads
-/// stay in the store. A read error counts as not held. `excl_root` is BASE's 32 zero bytes: the
-/// CHAIN exclusion root (09) is not part of `REP_BlockRecord`.
-pub struct LogSource<St>(Arc<RwLock<St>>);
+/// items 2–4 (order bytes, payloads, tags): those never change once true. Item 5 (fences, a
+/// seal, `REP_A_DIVERGE`, the state-root gate) can close after the write, so `gate` answers it
+/// at every call. [`check_body`](BlockSource::check_body) is `Pending` while a height is not
+/// stored, and `gate`'s verdict once all are. Only headers are read ([`BlockStore::header`]);
+/// order bytes and payloads stay in the store. A read error counts as not held. `excl_root` is
+/// BASE's 32 zero bytes: the CHAIN exclusion root (09) is not part of `REP_BlockRecord`.
+pub struct LogSource<St, G> {
+    store: Arc<RwLock<St>>,
+    gate: G,
+}
 
-impl<St> LogSource<St> {
-    /// The source over `store`; the caller keeps its handle to write blocks.
-    pub const fn new(store: Arc<RwLock<St>>) -> Self {
-        Self(store)
+impl<St, G> LogSource<St, G>
+where
+    G: Fn(Epoch, Height, Height) -> Verdict,
+{
+    /// The source over `store`; the caller keeps its handle to write blocks. `gate(epoch, first,
+    /// last)` is vote-rule item 5 for the range as of now (07 §6.4).
+    pub const fn new(store: Arc<RwLock<St>>, gate: G) -> Self {
+        Self { store, gate }
     }
 }
 
-impl<St> Clone for LogSource<St> {
+impl<St, G: Clone> Clone for LogSource<St, G> {
     fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
+        Self {
+            store: Arc::clone(&self.store),
+            gate: self.gate.clone(),
+        }
     }
 }
 
-impl<St: BlockStore + Send + Sync + 'static> BlockSource for LogSource<St> {
+impl<St, G> BlockSource for LogSource<St, G>
+where
+    St: BlockStore + Send + Sync + 'static,
+    G: Fn(Epoch, Height, Height) -> Verdict + Clone + Send + Sync + 'static,
+{
     fn header(&self, height: Height) -> Option<BlockHeader> {
-        let store = self.0.read().unwrap_or_else(PoisonError::into_inner);
+        let store = self.store.read().unwrap_or_else(PoisonError::into_inner);
         store.header(height).ok().flatten()
     }
 
-    fn check_body(&self, _: Epoch, first: Height, last: Height) -> Verdict {
+    fn check_body(&self, epoch: Epoch, first: Height, last: Height) -> Verdict {
         if first > last {
             return Verdict::Invalid;
         }
-        let store = self.0.read().unwrap_or_else(PoisonError::into_inner);
         // Heights are stored without gaps (BlockStore::put), so the range bounds decide.
-        match store.range() {
-            Some((lo, hi)) if lo <= first && last <= hi => Verdict::Valid,
-            _ => Verdict::Pending,
+        let stored = {
+            let store = self.store.read().unwrap_or_else(PoisonError::into_inner);
+            store
+                .range()
+                .is_some_and(|(lo, hi)| lo <= first && last <= hi)
+        };
+        if stored {
+            (self.gate)(epoch, first, last)
+        } else {
+            Verdict::Pending
         }
     }
 
@@ -294,7 +316,19 @@ mod tests {
             unavailable: Vec::new(),
         };
         let store = Arc::new(RwLock::new(MemStore::default()));
-        let src = LogSource::new(Arc::clone(&store));
+        // Item 5 as the replica would report it: a fence over heights ≥ 3 once `fenced` is set.
+        let fenced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = {
+            let fenced = Arc::clone(&fenced);
+            move |_: Epoch, _: Height, last: Height| {
+                if fenced.load(std::sync::atomic::Ordering::SeqCst) && last >= Height(3) {
+                    Verdict::Invalid
+                } else {
+                    Verdict::Valid
+                }
+            }
+        };
+        let src = LogSource::new(Arc::clone(&store), gate);
         let mut prev = genesis;
         for _ in 0..5 {
             prev = next(&prev);
@@ -331,5 +365,20 @@ mod tests {
             Verdict::Valid
         );
         assert_eq!(chain_after(&src, Epoch(1), &key, tip, 16).len(), 6);
+        // A fence that closes after the blocks were stored rejects them on the next check.
+        fenced.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            src.check_body(Epoch(1), Height(1), Height(5)),
+            Verdict::Invalid
+        );
+        assert_eq!(
+            src.check_body(Epoch(1), Height(1), Height(2)),
+            Verdict::Valid
+        );
+        // A missing height stays pending whatever the gate says.
+        assert_eq!(
+            src.check_body(Epoch(1), Height(6), Height(7)),
+            Verdict::Pending
+        );
     }
 }
