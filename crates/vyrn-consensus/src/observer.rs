@@ -27,7 +27,7 @@ use thiserror::Error;
 use vyrn_types::{Ed25519Sig, Epoch, Height};
 
 /// `FIN_GATE_BLOCKS` (01 §14.9): the most closed blocks that may be unfinal while responses flow.
-pub const FIN_GATE_BLOCKS: u64 = 8;
+pub const FIN_GATE_BLOCKS: u64 = 9;
 /// `REP_GATE_RESUME_BLOCKS` (07 §6.8).
 pub const GATE_RESUME_BLOCKS: u64 = 4;
 /// How many views above the last final one the listener keeps votes for. A voter's
@@ -231,7 +231,7 @@ pub enum GateAction {
     Resume,
 }
 
-/// INV-REP-10 (07 §6.8): block `h + 9` opens only when block `h` is final.
+/// INV-REP-10 (07 §6.8): block `h + 10` opens only when block `h` is final.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Gate {
     halted: bool,
@@ -368,14 +368,14 @@ mod tests {
     }
 
     #[test]
-    fn gate_halts_above_8_and_resumes_at_4() {
+    fn gate_halts_above_9_and_resumes_at_4() {
         let mut g = Gate::default();
         let f = Height(100);
-        assert_eq!(g.check(Height(108), f), GateAction::Hold);
-        assert_eq!(g.check(Height(109), f), GateAction::Halt);
+        assert_eq!(g.check(Height(109), f), GateAction::Hold);
+        assert_eq!(g.check(Height(110), f), GateAction::Halt);
         assert!(g.halted());
         assert_eq!(g.check(Height(112), f), GateAction::Hold);
-        // Between 4 and 8 stays halted (hysteresis).
+        // Between 4 and 9 stays halted (hysteresis).
         assert_eq!(g.check(Height(112), Height(105)), GateAction::Hold);
         assert_eq!(g.check(Height(112), Height(108)), GateAction::Resume);
         assert_eq!(g.check(Height(112), Height(108)), GateAction::Hold);

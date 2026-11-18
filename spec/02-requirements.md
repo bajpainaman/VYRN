@@ -286,7 +286,7 @@ exemption.
 |---|---|
 | **AWS.** The wire belongs to the Nitro card. | The 1 µs is a maximum inside the instance (REQ-LAT-8). 1B msgs/s depends on the instance's packet rate (B16, REQ-THR-11). |
 | **Handoff window.** For one WAN one-way, light keeps the order flow from the new home's book. | The new home cannot fill. Every order still gets its first record, an auction `Ack` or a reject, within `LAT_MAX_NS` (REQ-EPO-5). Fills come at the uncross. This is the only window without a 1 µs fill. |
-| **Finality needs a timely network** (FLP, partial synchrony). | Every accepted order is final ≤ `FINALITY_MAX_MS` while the metro network meets its delay bound. The book halts when finality lags > `FIN_GATE_BLOCKS`, so no fill is issued that cannot be final in time (REQ-FIN-1, REQ-FIN-5). |
+| **Finality needs a timely network** (FLP, partial synchrony). | Every accepted normal-path order is final ≤ `FINALITY_MAX_MS`, and every forced packet ≤ `CHN_FORCED_FINAL_MS` (REQ-CHN-9), while the metro network meets its delay bound. The book halts when finality lags > `FIN_GATE_BLOCKS`, so no fill is issued that cannot be final in time (REQ-FIN-1, REQ-FIN-5). |
 
 Every other situation is answered within `LAT_MAX_NS` with a defined outcome:
 
@@ -770,6 +770,10 @@ run also passes B4 (bit-identical replay) and matches the Vx oracle.
   one-way; healthy, with one voting replica powered off, and across a sequencer crash. In the
   one-down case every quorum needs all remaining voters, and views led by the dead node must time
   out fast (07). The sequencer never votes (01 §14.4).
+- Forced path: a forced packet (09 §7.4) is bounded by `CHN_FORCED_FINAL_MS` = 11.5 ms from send
+  instead (REQ-CHN-9; user ruling, 2026-11-18). The 10 ms bound holds for every normal-path order.
+- Faults: the conditions cover one fault at a time. A client exclusion in the same view as a
+  member fault is a two-fault case outside them (09 §5.7: 10.11 ms, up to 10.91 ms with skew).
 - Mechanism: the gate (REQ-FIN-5) halts the book before it issues a fill that cannot be final in
   time. After a sequencer crash, the voters finalize the order stream they already hold: every
   response was frame-gated (01 §14.5), so they hold every answered order.
@@ -817,7 +821,7 @@ the final log, because every response is frame-gated (01 §14.5), unless all thr
   frame-loss counters) bound the loss rate; B25 checks the logic.
 
 **REQ-FIN-5. The unfinalized part of the order stream is bounded.**
-- `BASE` and `CHAIN`: ≤ `FIN_GATE_BLOCKS` (8 in both modes) blocks, by `INV-CHN-TXGATE` (09 §4.6, 01
+- `BASE` and `CHAIN`: ≤ `FIN_GATE_BLOCKS` (9 in both modes) blocks, by `INV-CHN-TXGATE` (09 §4.6, 01
   §14.9). When the gap reaches it, the book halts: every packet gets `BOOK_HALTED` within
   `LAT_MAX_NS`, and nothing waits in the NIC rings. Reason: it keeps REQ-FIN-1 a maximum, and it
   turns a dead quorum into a halt, not unbounded risk.
@@ -1029,10 +1033,11 @@ certifies 4-of-5 a balance root (sparse Merkle tree) and a resting-order lattice
 net diff (09 §1, decision 8), within `REQ_CHN_COMMIT_LAG_S` (2 s) after the second ends. A
 `CommitCert` is posted to L1 at least every 60 s. Test: B30.
 
-**REQ-CHN-9. A forced packet is final within 10 ms, like any order, and the sequencer cannot
-censor it.** Under an honest sequencer, a forced-path packet is positioned at the first block
-boundary after the block that includes it is notarized (01 §14.9). Bound: max ≤ `FINALITY_MAX_MS`
-from send, by `M-INC`. `FIN_GATE_BLOCKS` (8) is only the deadline after which validators treat
+**REQ-CHN-9. A forced packet is final within `CHN_FORCED_FINAL_MS` (11.5 ms), and the sequencer
+cannot censor it.** Under an honest sequencer, a forced-path packet is positioned at the first block
+boundary after the block that includes it is notarized (01 §14.9). Bound: max ≤ `CHN_FORCED_FINAL_MS`
+(11.5 ms) from send, by `M-INC`: the forced path's own bound (09 §7.4), not a relaxation of
+`FINALITY_MAX_MS`, which bounds every normal-path order. `FIN_GATE_BLOCKS` (9) is only the deadline after which validators treat
 its absence as censorship: evidence plus failover, and then it is final within
 `FAILOVER_TARGET_MS` + `FINALITY_MAX_MS` (01 §14.0, fact 3). The sequencing operator is never the
 Simplex leader (09 §1, decision 4). Test: B29.
@@ -1214,7 +1219,7 @@ B21–B39 are new. 11 defines them fully.
 | B26 | Failure-class drills | `WL-REF` at 60% | each row of REQ-FIN-12; REQ-FIN-5 pause; REQ-FIN-10 power cut; REQ-OPS-3, -9, -10 |
 | B27 | Readiness and extension | `WL-REF` at 60%, 3 homes | REQ-EPO-7, REQ-EPO-8 |
 | B28 | Handoff correctness | `WL-REF` + `WL-AUCTION` | REQ-EPO-3 to -6, -10; REQ-FIN-7 |
-| B29 | Chain authentication and forced path | `WL-REF`, CHAIN | REQ-CHN-2, -4, -9 (forced max ≤ 10 ms), -12 |
+| B29 | Chain authentication and forced path | `WL-REF`, CHAIN | REQ-CHN-2, -4, -9 (forced max ≤ `CHN_FORCED_FINAL_MS` = 11.5 ms), -12 |
 | B30 | Chain commitments, custody, DA, slashing | `WL-REF`, CHAIN, L1 testnet | REQ-CHN-5 to -8, -10, -11 |
 | B31 | Platform and supply audit | — | REQ-PLT-1 to -4; REQ-CHN-1; REQ-SEC-7, -10 |
 | B32 | 24 h soak | `WL-DIURNAL` | REQ-LAT-1 max over 24 h (probe sessions plus in-box `M-TSC` on every packet); REQ-PLT-5; frame-loss counters; REQ-OPS-1, -2 |

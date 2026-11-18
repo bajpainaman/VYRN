@@ -161,7 +161,7 @@ Every request packet goes to two places:
 | D3 | Keep the **logical content** of a `pkt_seq` fixed forever. The logical content is (`session`, `pkt_seq`, `count`, `book`, the message bytes). Only `flags` bit0, `epoch16` and the tags may differ between transmissions of one `pkt_seq`. |
 | D4 | Pick the data node from the key bundle's `data` list (§4.4): the first entry that the latest `DataTierStatus` does not mark down. The first entry is the session's **data home**, which is never in the sequencer's facility (01 §14.16, 07); the list is ordered per session by rendezvous hash among the other facilities, so sessions spread evenly over the data nodes. |
 | D5 | Switch data nodes only when a `DataTierStatus` says so (admin channel in BASE, chain state in CHAIN). Data nodes never answer clients, so the client cannot detect a dead data node itself. The one exception is `DataRedirect` (§7.6): a valid one switches this session's data node as a `DataTierStatus` would. |
-| D6 | A client may send the data copy to two data nodes. The data tier deduplicates by `PktHash`. This costs bandwidth and buys nothing unless a data node is failing. |
+| D6 | Send a **standing backup copy** (copy 3) of every transmission, the same bytes as copy 2, to the next entry of the key bundle's `data` list after the data node of D4 that the latest `DataTierStatus` does not mark down, within `PROTO_DATA_LAG_MAX_US` of the sequencer copy (01 §14.20 PQ-13). The backup box stores it and forwards it to the replicas only once Q replicas mark the data node down (07 §5.7), so a data-box failure needs no client hop. The data tier deduplicates by `PktHash`. Cost: one more copy per packet, about double each data box's ingress (07 §5.1). |
 
 **Why D3.** A packet that the sequencer never answered may still have been accepted, and its data
 copy exists either way. If the client could reuse the `pkt_seq` for other content, the log would
@@ -590,12 +590,17 @@ order-entry path:
   are refused.
 - **Post-quantum binding (from `E_pq`, 01 §14.20 H).** TLS authenticates both sides with Ed25519
   only, which a quantum attacker can forge. So before any other frame, each side sends `PqBind`
-  (type 0x0002 client → `vyrn-admin`, 0x8003 `vyrn-admin` → client). Its body is a scheme-1 hybrid
+  (type 0x0002 client → `vyrn-admin`, 0x8004 `vyrn-admin` → client; 0x8003 is `DataTierStatus`). Its body is a scheme-1 hybrid
   signature (2,484 B) over `derive_key("vyrn v1 admin bind", exporter ‖ [side])`, where
   `exporter` is the connection's TLS exporter value for label `"EXPORTER-vyrn-admin-bind"`, empty
-  context, 32 bytes (RFC 8446 §7.5), and `side` is 0 for the client and 1 for `vyrn-admin`. The
-  client's hybrid key is in a non-critical extension of its client certificate. `vyrn-admin`'s
-  key is in the CA bundle that clients pin. Until both binds verify, `vyrn-admin` processes no
+  context, 32 bytes (RFC 8446 §7.5), and `side` is 0 for the client and 1 for `vyrn-admin`.
+  **The client's hybrid key is pinned in its account record**, never read from its certificate:
+  the exchange records it when it issues the account's client certificate and at every key
+  change, through the same operator path (10), and `vyrn-admin` verifies the client's `PqBind`
+  against that record alone. A certificate extension that names a key is ignored. So a forged
+  Ed25519 certificate for the account, carrying a key the attacker holds, fails the bind: the
+  certificate's authenticity rests on a classical signature, the pinned key does not (#145 P1,
+  reading). `vyrn-admin`'s key is in the CA bundle that clients pin. Until both binds verify, `vyrn-admin` processes no
   `OpenSessionReq` and sends no keys. The binding ties the post-quantum signature to this TLS
   session, so a forged Ed25519 certificate alone gets no keys. Cost: one hybrid signature and one
   verification per connection, ≤ 2 ms of a ≤ 50 ms open.
@@ -604,7 +609,9 @@ order-entry path:
 - `vyrn-admin` implements the admin messages (`11-build.md`). This chapter fixes their fields,
   and the tables after the structs fix their bytes. `tests/golden/vyrn_admin_vectors.out` holds
   an `OpenSessionReq` and an `OpenSessionResp` built from these tables, and frames a receiver
-  must refuse.
+  must refuse. B09 and B10 keep the two server push types apart: a 12-byte body under the
+  server `PqBind` type 0x8004 and a 2,484-byte body under `DataTierStatus` 0x8003 are both
+  refused for length (VR1).
 
 ```rust
 struct OpenSessionReq {
@@ -639,8 +646,9 @@ struct BoxKeys {
 field), `type` u16, then the body. All integers are little-endian, like 01 §6. `SocketAddrV4` is 4 bytes of IPv4 address in network order, then the
 port u16 little-endian. A receiver rejects a frame with a nonzero reserved byte, an unknown
 `type`, or a `len` that does not match the body (VR1). Types: 0x0001 `OpenSessionReq`,
-0x8001 `OpenSessionResp`, 0x8002 `KeyBundle` push, 0x8003 `DataTierStatus` push (below), 0x80FF
-`Error` (body: a 01 §6.5 reason u16, reserved u16, detail u32).
+0x0002 `PqBind` (client, body 2,484 B), 0x8001 `OpenSessionResp`, 0x8002 `KeyBundle` push, 0x8003
+`DataTierStatus` push (below), 0x8004 `PqBind` (server, body 2,484 B), 0x80FF `Error` (body: a 01
+§6.5 reason u16, reserved u16, detail u32). Bit 15 set means `vyrn-admin` → client.
 
 **`DataTierStatus` (reading, delegated ruling).** `vyrn-admin` pushes it to each session it
 affects when Q replicas mark a data box down or up (07 §5.7). Body, 12 bytes: `epoch` u32 | `seq`
@@ -1410,7 +1418,7 @@ Client handling:
 |---|---|
 | DR1 | Drop it, silently, unless it is 24 bytes, `magic`, `version` and reserved match, `session` is the client's, `down` and `to` are < 8 and differ, and `tag` verifies. A bad redirect closes nothing (unlike a bad MAC on a bound source, §3.1). |
 | DR2 | Drop it unless `down` is the position of the data node the client sends copy 2 to now, and the latest `DataTierStatus` does not mark `data[to]` down. Every live data box sends the same redirect, and a stale or replayed one names a node the client has already left, so the duplicates are no-ops. |
-| DR3 | Otherwise switch copy 2 to `data[to]` for the rest of the epoch, or until a `DataTierStatus` says otherwise (D5), and send `data[to]` the retained bytes of every transmission of every packet with `pkt_seq` ≥ `resend_from`, **unchanged**: same `flags`, `epoch16` and tags. The sequencer's `PacketRecord` names the `PktHash` of the transmission it accepted, and only those exact bytes resolve it (07 §5.4); a copy with bit0 newly set would hash differently. It sends nothing to the sequencer, which already holds them; dedupe at the data tier drops what is already stored (07 §5.7). |
+| DR3 | Otherwise switch copy 2 to `data[to]`, and copy 3 to the next entry after `data[to]` not marked down (D6), for the rest of the epoch, or until a `DataTierStatus` says otherwise (D5), and send `data[to]` the retained bytes of every transmission of every packet with `pkt_seq` ≥ `resend_from`, **unchanged**: same `flags`, `epoch16` and tags. The sequencer's `PacketRecord` names the `PktHash` of the transmission it accepted, and only those exact bytes resolve it (07 §5.4); a copy with bit0 newly set would hash differently. It sends nothing to the sequencer, which already holds them; dedupe at the data tier drops what is already stored (07 §5.7). |
 | DR4 | A client keeps the bytes of every transmission of every sent request packet (an original and its resends, 04 D3) for at least `REP_CLIENT_RETAIN_MS` = 100 ms (07 §5.7), so that DR3 can send them again. A packet it no longer holds is the `DATA_MISSING` case (§8). |
 
 **Reading (`vyrn-data`, 07 §5.7):** `down` and `to` index the session's `data` list, so the

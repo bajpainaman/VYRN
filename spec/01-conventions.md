@@ -119,7 +119,7 @@ the only definition of that name.
 | `SNAPSHOT_REFRESH` | once per inbound packet | When a lane re-reads the BBO snapshot |
 | `REPL_PATHS` | 2 | Independent switch paths for order frames |
 | `CACHE_LINE` | 64 (x86-64, Graviton), 128 (Apple M-series) | Alignment of every hot shared structure |
-| `PQ_HEDGE` | 4 on `vyrn-seq` (and the standby once promoted), 2 on a voter, 8 for a `HandoffSig` | Parallel ML-DSA signing attempts per hybrid signature, each with fresh randomness, one per PQ core; the first to finish is used (§14.20) |
+| `PQ_HEDGE` | 4 on `vyrn-seq` (and the standby once promoted), 4 on a voter (§14.20 PQ-15; was 2), 8 for a `HandoffSig` | Parallel ML-DSA signing attempts per hybrid signature, each with fresh randomness, one per PQ core; the first to finish is used (§14.20) |
 | `PQ_SIGN_MAX_US` | 400 at 4 attempts, 750 at 2, 250 at 8 | **Maximum** (budget) from the signed bytes to the ML-DSA-44 part (§14.20). Exceeded with probability ≤ 10⁻⁹ per signature (analytic, from the rejection-loop model fitted to the measured distribution); a later signature counts as a slow box, which is the one fault f |
 | `PQ_VERIFY_US` | 35 | ML-DSA-44 verification per signature (budget; 29–32 µs measured, §14.20) |
 
@@ -390,7 +390,7 @@ No chapter may exempt a packet size, a message index or a message type, or swap 
 
 1. **AWS.** The wire belongs to the Nitro card, so on AWS the 1 µs is measured inside the instance, and 1B/s depends on the instance's packet rate (B16). The full specification, with every number at the same time, is stated against bare metal (`REF`).
 2. **The handoff window.** For one WAN one-way latency plus one quorum round (W ≤ t_wan + `FINALITY_MAX_MS` + `EPO_WINDOW_SLACK_MS` = 3 ms, proof in 08 §6.3), the new home cannot fill. The opening auction serves that window (08), and every order in it still gets a 1 µs `Ack` that it joined the auction. This is the only window without a 1 µs fill.
-3. **Finality needs a timely network.** No BFT protocol can finalize while messages are delayed past the network's bound; this is FLP and partial synchrony. VYRN therefore never issues fills that it cannot finalize in time: the sequencer halts when finality lags more than `FIN_GATE_BLOCKS` (in both modes). A sequencer that crashes, censors or stalls is replaced by failover. Failover is the one fault case without fills, for at most `FAILOVER_TARGET_MS` = 20 ms. It is a fault, not a normal state, and every order acked before it survives (§14.5), and the orders it delayed are final within `FAILOVER_TARGET_MS` + `FINALITY_MAX_MS`. Under an honest sequencer and a timely network, every order is final within 10 ms, forced packets included (§14.9).
+3. **Finality needs a timely network.** No BFT protocol can finalize while messages are delayed past the network's bound; this is FLP and partial synchrony. VYRN therefore never issues fills that it cannot finalize in time: the sequencer halts when finality lags more than `FIN_GATE_BLOCKS` (in both modes). A sequencer that crashes, censors or stalls is replaced by failover. Failover is the one fault case without fills, for at most `FAILOVER_TARGET_MS` = 20 ms. It is a fault, not a normal state, and every order acked before it survives (§14.5), and the orders it delayed are final within `FAILOVER_TARGET_MS` + `FINALITY_MAX_MS`. Under an honest sequencer and a timely network, every normal-path order is final within `FINALITY_MAX_MS` = 10 ms, and every forced packet within `CHN_FORCED_FINAL_MS` = 11.5 ms (§14.9).
 
 ### 14.1 Deadline admission
 
@@ -454,8 +454,8 @@ Core 1 reads lanes 0–24 and core 6 reads lanes 25–48. Each writes its own ha
 
 ### 14.9 Chain gate and forced inclusion
 
-- `FIN_GATE_BLOCKS` = 8. In both modes, the sequencer never runs more than 8 blocks ahead of finality. If finality lags more than that, the book halts rather than issue fills that cannot be final within 10 ms.
-- A forced packet, under an honest sequencer, is positioned at the first block boundary after the block that includes it is notarized. It is final ≤ 10 ms after it is sent, like any order. `FIN_GATE_BLOCKS` = 8 is only the deadline after which validators treat its absence as censorship (evidence plus failover, §14.0 fact 3).
+- `FIN_GATE_BLOCKS` = 9 (8 before §14.20 PQ-14). In both modes, the sequencer never runs more than 9 closed blocks ahead of finality: block h + 10 opens only when h is final, 9.00 ms after h closes. If finality lags more than that, the book halts. Within the fault model the gate never binds (worst case 8.84 ms after close, 07 §6.8, 09 §4.8), so every order is final ≤ `FINALITY_MAX_MS` before it could; the gate bounds how far the book runs ahead of finality outside the model.
+- A forced packet, under an honest sequencer, is positioned at the first block boundary after the block that includes it is notarized. It is final ≤ `CHN_FORCED_FINAL_MS` = 11.5 ms after it is sent (09 §7.4). That is the forced path's own bound: the packet takes two hops (client → members, hint → sequencer) before it enters a block. It is not a relaxation of `FINALITY_MAX_MS`, which stays the hard bound for every order on the normal path. `FIN_GATE_BLOCKS` = 9 is only the deadline after which validators treat its absence as censorship (evidence plus failover, §14.0 fact 3).
 - Orders through the normal path are final ≤ `FINALITY_MAX_MS` = 10 ms.
 
 ### 14.10 New codes
@@ -628,7 +628,7 @@ Each item has an owner chapter and a benchmark that settles it.
 | O2 | The cross fill at index 9 is 947 ns with 07's 142 ns worst-case frame gate, not 880 ns. That leaves 33 ns below the 980 ns threshold | 07, 05 | B3 |
 | O3 | Linux may not allow the boot CPU (core 0, now TX-C) in `nohz_full`. The fallback is to remap TX-C and keep the BSP for housekeeping | 06 | PLT jitter probe |
 | O4 | At sustained peak the archive feed (≤ 25 Gbps) is below ingest (~180 Gbps), so a peak longer than ~7.9 h leaves an archive gap | 06, 07 | B-REP storage test |
-| O5 | 09 counts closed blocks for the finality gate (limit 9.00 ms, margin 0.89 ms), the same way 07 does. Both use `FIN_GATE_BLOCKS` = 8 closed blocks | 07, 09 | B-CHN-3 |
+| O5 | 09 counts closed blocks for the finality gate (limit 10.00 ms from block start, margin 0.16 ms; §14.20 PQ-14), the same way 07 does. Both use `FIN_GATE_BLOCKS` = 9 closed blocks | 07, 09 | B-CHN-3 |
 | O6 | The 5 ns/msg pass-1 budget and the 15 ns BBO step are budgets, not measurements | 05 | B2, B6 |
 | O7 | PTM cross-timestamping on the X2541 / SP5 combination is unconfirmed. If it is missing, the X2541 fails qualification | 06 | PLT-B-PTM |
 
@@ -825,21 +825,22 @@ and the differential tests of 11 §2.5a pass.
   PQ-8), so voter and leader sign the one notarize the view can carry, and in BASE no signature is
   made after the proposal arrives in the fault-free case. `RangeFix` is a hint: no voter rejects a
   proposal for differing from it, so a forged one costs a late signature, never finality. Vote checking costs 0.10 → 0.15 ms (max,
-  budget). BASE finality: typical 2.59 → 2.69 ms, max with no fault 5.65 → 5.70 ms, max with one fault
-  8.65 → 8.70 ms (reserve 1.30 ms). In CHAIN the proposal also carries `excl_root`, known only
-  after the leader's `verify`, so the leader signs its proposal then and hop 2 starts up to 0.75 ms
-  later (07 §6.5a): CHAIN's worst case moves from 8.11 to 8.91 ms from block start
-  (09 §4.8). [Likely: budgets built from the measured figures; the speculative signing is PQ-3's
+  budget). The next leader fixes its range when the previous proposal reaches it, or before its
+  `t_l` fires on the nullify path, and proposes the verified prefix of it (PQ-10). In CHAIN the
+  leader and voters pre-sign with the empty-exclusion `excl_root` (PQ-11). BASE finality, with
+  the next-proposal row 07 §6.6 now carries: typical 2.59 → 2.69 ms, max with no fault 6.99 →
+  6.96 ms, max with a leader fault 9.79 → 9.76 ms; CHAIN 7.04 → 7.01 and 9.84 → 9.81 ms from
+  block start (09 §4.8). A data-box fault, with each client's standing backup copy (PQ-13), is 9.59 → 9.56 ms in BASE and 9.64 → 9.61 ms in CHAIN. Each voter signs its finalize for view v and then its notarize for v + 1 in sequence on four PQ cores at `PQ_HEDGE` = 4, ≤ 0.40 ms each (PQ-15); with two PQ cores the two signatures overlap inside one 0.85 ms hop and the bounds above fail (07 §6.5a). [Likely: budgets built from the measured figures; the speculative signing is PQ-3's
   pre-signed cache behind a hybrid `Scheme` (07 §6.5a)]
-- **The finality gate** keeps `FIN_GATE_BLOCKS` = 8: block h is final ≤ 7.70 ms after it closes
-  (BASE spare 0.30 ms; CHAIN 0.09 ms, accepted by PQ-9; 07 §6.8, 09 §4.6). [Likely]
-- **The cost of a fixed range.** A header that reaches the leader after it sent its `RangeFix`
-  waits for the next view instead of joining the current proposal. Before PQ-8 the cutoff was the
-  leader's `verify` completion, so the window in which that happens grows by at most the leader's
-  `verify` time (≤ 0.81 ms at the maximum); views and blocks both run at ~1 kHz, so normally the
-  leader fixes the range on the arrival of the header it proposes. The 07 §6.6 maxima assume, as
-  before, that a header is in the first proposal after it reaches the leader, so they do not yet
-  include the extra view; open question PQ-10 holds it until B-PQ-2 measures it. [Likely]
+- **The finality gate (PQ-14):** `FIN_GATE_BLOCKS` = 9. With the next-proposal row, block h is
+  final ≤ 8.76 ms after it closes with a leader fault under scheme 1 (8.79 scheme 0, 8.81 / 8.84
+  in CHAIN), inside the 9.00 ms that 9 closed blocks allow: margin 0.16 ms at the worst (07 §6.8,
+  09 §4.6). [Likely]
+- **The wait for the next proposal (PQ-10).** Views take longer than a block at the maximum
+  delays, so a header that misses a proposal waits one view, in either scheme; before PQ-10 the
+  07 §6.6 maxima left that wait out. 07 §6.6 now budgets it: 1.65 ms under scheme 1 (hop 2 + hop 3,
+  with the range fixed when the previous proposal arrives) and 1.73 ms under scheme 0. [Likely:
+  a scratch model of the view pipeline; B-PQ-2 measures it]
 - **Why speculative signing is required (PQ-3).** Without it, the leader's notarize and each
   voter's notarize are signed after `verify`, at ≤ 0.75 ms each, and the one-fault maximum becomes
   ~10.2 ms, above `FINALITY_MAX_MS` = 10. `PQ_HEDGE` = 4 on voters instead (≤ 0.40 ms each) gives
@@ -994,11 +995,14 @@ and nothing that waits for a release upstream. [Reading]
 | PQ-6 | Make key agreement hybrid (X25519 + ML-KEM-768)? | Yes, in full at `E_pq`: session keys `K_seq` and `K_out`, committee keys and their transport, the BASE admin TLS stream and the p2p handshake (G). `libcrux-ml-kem` at tier S. |
 | PQ-7 | Which token holds the release keys' ML-DSA-65 half? | For now, none: each maintainer's Ed25519 half stays on the current hardware token, and the ML-DSA-65 half is held encrypted on that maintainer's air-gapped Linux machine, still 2 of 3 (11 §9.5). The half moves to a token with FIPS 204 firmware when one is chosen. |
 | PQ-12 | Key-agreement parts that depend on code outside VYRN: `commonware-p2p`'s SAKE handshake hardcodes ephemeral X25519, and no TLS 1.3 stack with `X25519MLKEM768` is on the allowlist. | Reading (2026-11-18), recorded in H; neither waits on upstream. |
-| PQ-9 | CHAIN's one-fault case under scheme 1 is 8.91 ms from block start, 0.09 ms inside the 9.00 ms gate (07 §6.5a, 09 §4.8). Accept that margin, or raise CHAIN's gate, add PQ cores or lag `excl_root`? | Accept the 0.09 ms margin: `FIN_GATE_BLOCKS` stays 8 in CHAIN. B-CHN-3 and B-PQ-2 on CHAIN re-check it; PQ-10 and PQ-11 can still move the number. |
+| PQ-9 | CHAIN's one-fault case under scheme 1 is 8.91 ms from block start, 0.09 ms inside the 9.00 ms gate (07 §6.5a, 09 §4.8). Accept that margin, or raise CHAIN's gate, add PQ cores or lag `excl_root`? | Accept the 0.09 ms margin: `FIN_GATE_BLOCKS` stays 8 in CHAIN. B-CHN-3 and B-PQ-2 on CHAIN re-check it; PQ-10 and PQ-11 can still move the number. They did: with the next-proposal row the case is 9.81 ms, and PQ-14 raised the gate to 9. |
+| PQ-10 | A header that misses a proposal waits a whole extra view, and the 07 §6.6 maxima left that view out. | `FINALITY_MAX_MS` stays 10 (user ruling, a hard bound); no upward re-baseline. The next leader fixes its range and pre-signs when the previous proposal reaches it (L1), also on the nullify path, timed to finish when its `t_l` fires (L1′), and proposes the verified prefix of the range, signing late only if it cut it (L1t) (07 §6.3, §6.5a). `t_l` stays 2 ms; the fault row stays 2.8 ms. 07 §6.6 gains the next-proposal row (1.65 ms, 1.73 scheme 0), and the 0.39 ms repair row becomes a reserve outside the sums. BASE 6.96 / 9.76 ms (scheme 1), 6.99 / 9.79 (scheme 0). Late binding (L2) is not adopted: it changes no worst case and adds a mechanism. Pipelined views add nothing: 07 §6.7 already advances views at notarization. |
+| PQ-11 | The CHAIN leader's post-verify signature pushes an honest proposal past `t_l` at the maximum, so every honest view nullifies: a liveness failure. | (a): the CHAIN leader and voters pre-sign with the `excl_root` of empty exclusion lists, and sign late only when `verify` finds exclusions (07 §6.5a). A client forces that late signature only by producing an exclusion, which costs it a bonded session (09 §5.7). With L1′ the fault row stays 2.8 ms at `t_l` = 2 ms. |
+| PQ-13 | The data-box stall at the maximum hops is 4.20 ms on top of the data lag (07 §5.7, corrected): 11.65 ms from block start under scheme 1, over `FINALITY_MAX_MS`. | (A), user ruling 2026-11-18: every client sends a **standing backup copy** (copy 3) of each transmission to the backup data box (04 D6), which stores it and forwards it to the replicas once its primary is marked down (07 §5.7). The stall is 2.60 ms beyond the data lag: 9.59 / 9.56 ms in BASE, 9.64 / 9.61 ms in CHAIN (scheme 0 / 1). Costs: one more copy of every packet (~250 B at the mean), data-box ingress 50 → 100 Gbps (BASE) and 40 → 80 Gbps (CHAIN), the RAM ring 48 → 96 GB (39 → 78 GB) (07 §5.1). `REP_DATA_SILENCE_MS` stays 1 ms. Redirect variant (B), 10.36 ms, rejected. |
+| PQ-14 | With the next-proposal row, the leader-fault case is 8.76–8.84 ms after block close, past the 8.00 ms that `FIN_GATE_BLOCKS` = 8 allows. | `FIN_GATE_BLOCKS` 8 → 9 (user ruling, 2026-11-18), changing the gate depth PQ-9 kept: block h must be final before h + 10 opens, 9.00 ms after h closes; margin 0.16 ms at the worst (CHAIN, scheme 0). `act(C, b)` = `lastb(C, b)` + 10 (09 §4.6). `FINALITY_MAX_MS` stays 10. 09 §5.9's bust timing moves to ≤ 10.84 ms after block start for the `Bust` record; the verdict itself is final with its block. |
+| PQ-15 | Finalize for v and notarize for v + 1 contend for a voter's two PQ cores inside one 0.85 ms hop (no fault 9.16 ms, leader fault 11.11 ms, half of honest views nullify). | **Four PQ cores per voter, `PQ_HEDGE` = 4**, finalize then notarize in sequence, ≤ 0.40 ms each (user ruling, 2026-11-18; hardware). The two extra cores come from a larger voter box, not from data RX (07 §7.2, open question 13). Scheme 1: 6.96 ms no fault, 9.71 silent leader, 9.76 crashed voter, 9.56 data-box fault, no honest nullify. Not adopted: notarize first (10.41 ms with a crashed voter); the finalize's ML-DSA half after classical finality (both parts must verify, A, SG2). |
+| — | Forced inclusion under an honest sequencer with one other fault is 11.48 ms after send with the next-proposal row (09 §7.4), above the 10 ms it had. | Accepted (user ruling, 2026-11-18) as the forced path's own bound, `CHN_FORCED_FINAL_MS` = 11.5 ms (§14.9, 09 §7.4). It is never a relaxation of `FINALITY_MAX_MS` = 10, the hard bound for every normal-path order. |
 
 **Open questions for the owner**
 
-| # | Question | Default if not decided | Settled by |
-|---|---|---|---|
-| PQ-10 | A header that reaches the leader between its `RangeFix` and the end of its `verify` waits a whole extra view (07 §6.3), and the 07 §6.6 maxima do not include that view. How large is the extra view at the maximum, and does it break the 5.70 / 8.70 ms (BASE) or 8.91 ms (CHAIN) budgets? **Model result (2026-11-18):** a scratch discrete-event model of the view pipeline with 1 kHz headers and 07 §6.6's delays shows the wait is not specific to PQ-8. Views take longer than a block at the maximum, so a header that misses a proposal waits up to one view period, 2.2–2.3 ms in either scheme. No-fault worst case, all delays at the maximum: BASE 6.99 ms (scheme 0) and 7.71 ms (scheme 1), against 5.65 / 5.70. With one silent leader injected, the one-fault worst case is 9.78 ms under scheme 0, inside `FINALITY_MAX_MS` = 10 by 0.22 ms, and 10.91 ms under scheme 1, over it. Scheme 1 breaks the bound; scheme 0 does not. [Likely: a model of the budgets, not a run of the protocol] | budget it once B-PQ-2 measures it; if it breaks a budget, let the leader extend its range at `verify` time with one late signature | 07: B-PQ-2 |
-| PQ-11 | In CHAIN, a header late in a view plus the data lag, `verify` and the post-verify leader signature (≤ 0.75 ms) can push an honest proposal past `t_l` = 2 ms, so an honest view can nullify (07 §6.5a). Lengthen CHAIN's `t_l` under scheme 1 (and recompute the one-fault budget), add PQ cores for the CHAIN leader, or lag `excl_root`? **Model result (2026-11-18):** with every delay at its maximum, the CHAIN leader's proposal reaches voters 0.81 + 0.75 + 0.80 = 2.36 ms after they enter the view, so every honest view passes `t_l`. Every voter then nullifies, and a voter that nullified never sends finalize, so finality stops: a liveness failure at the budget, not extra latency. With delays drawn below the maximum, 0.3% of honest CHAIN views nullify, and 0.05% of honest BASE views. [Likely] | unchanged `t_l`; B-PQ-2 on CHAIN counts honest-leader nullifies | 07, 09: B-PQ-2 |
+None open.

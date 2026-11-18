@@ -1307,12 +1307,12 @@ Budget, a maximum under a timely network (01 §14.0 fact 3): block wait ≤ 1 ms
 4 metro hops (header, propose, notarize, finalize, 07) ≤ 2 ms = 3.05 ms. A data miss adds at most
 `ARC_DATA_FETCH_MS` + 1 ms (§6.20), so every accepted order is final ≤ 6.05 ms, inside
 **`FINALITY_MAX_MS` = 10 ms**. A replica votes once it holds the data. It does not wait for replay
-(DESIGN §5). In **both modes** the sequencer never runs more than `FIN_GATE_BLOCKS` = 8 blocks
+(DESIGN §5). In **both modes** the sequencer never runs more than `FIN_GATE_BLOCKS` = 9 blocks
 ahead of finality. If finality lags more, the book halts rather than issue a fill that cannot be
 final in time (01 §14.9). In CHAIN the leader also proposes the client packets it received
 directly (forced packets). Under an honest sequencer a forced packet is positioned at the first
-block boundary after its including block is notarized, and is final ≤ 10 ms after it is sent,
-like any order. `07-replication.md` owns the vote kinds, nullification and the leader schedule.
+block boundary after its including block is notarized, and is final ≤ `CHN_FORCED_FINAL_MS` = 11.5 ms after it is
+sent, the forced path's own bound (09 §7.4); normal-path orders keep `FINALITY_MAX_MS` = 10 ms. `07-replication.md` owns the vote kinds, nullification and the leader schedule.
 
 ### 6.18 Sequencer failover
 

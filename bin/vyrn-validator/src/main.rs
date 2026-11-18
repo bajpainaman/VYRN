@@ -971,7 +971,7 @@ const REP_PATH_DOWN_NS: u64 = 100_000_000;
 
 /// Observer: the most replayed blocks that may wait for finality, and the most certified tips
 /// that may wait for replay, before replay stops. Far above
-/// `FIN_GATE_BLOCKS` (8), past which the sequencer itself halts (07 §6.8).
+/// `FIN_GATE_BLOCKS` (9), past which the sequencer itself halts (07 §6.8).
 const OBS_MAX_UNFINAL: usize = 1024;
 
 /// RANGE fetches sent per data poll.
