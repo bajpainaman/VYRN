@@ -1587,9 +1587,16 @@ interleave in (07 §7.1 fixes only each lane's order). The rules below are readi
    shell, which applies the commands (05 §8.8), reports the `CtlTimerTick` right after its step;
    the tick is encoded after that step, in step order, and drives §7.3's heartbeats.
    \[Guessing\]
+10. **Dependencies.** A dependency TX packet (05 §8.9 role 1) answers ops of the source's packet,
+    matched by `(session, echo_pkt, index)` as in item 2. They are explicit (05 §5.1 F2), so no
+    interval holds them: their effects, read as in item 2, are step-channel events of the step,
+    right after its `MD_STEP`, in index order, before its execs, and a dependency's `MD_ADD` has
+    `via BBO` (the BBO core applied it, 05 §3.7). A Join dependency's own maker `Fill` or
+    `Out(STP)` in that packet is a maker record of the step in TX order (item 4). \[Likely\]
 
 Not rebuilt yet (`SinkError::Unsupported`): `Replace` (local or forwarded) and any step source
-other than `New`, `CancelAll`, dependency TX packets,
+other than `New`, `CancelAll`, a Join dependency that trades on entry (05 §3.7, its own taker
+records in the dependency packet; open question 13),
 unsolicited lane records (expiry, kills), steps without a source that fill (Rescan, Uncross),
 and pooled lanes. A lane-shed packet keeps its LaneSeqs (07 §3.5): its ops resolve by their
 `BUSY` rejects and change nothing, and it leaves the lane's priority clock alone, as it is not
@@ -1673,7 +1680,10 @@ carries its label.
 2. **Lane ops.** An `Ack` of a `New` is `DC_ACK`, a `CancelAck` (of a `Cancel` or a `Reduce`)
    `DC_CANCEL` with `qty` = canceled, a lane `Out` `DC_OUT`. `step` is the op's LaneSeq,
    `ordinal` its message index, `resp_seq` the lane response packet's. A `Reject` changes no
-   order state and has no record; the client's trading session has it. \[Likely\]
+   order state and has no record; the client's trading session has it. A step's dependencies
+   (§7.9 item 10) come to the tap as lane ops, in index order, after the step's interval and
+   before the step, with the dependency packet's `resp_seq`; a Join dependency's maker `Fill`
+   or `Out(STP)` there is a maker record of the step (item 4). \[Likely\]
 3. **Canonical stream.** The canonical stream is the stream's final records: every record except
    `DC_FINAL`, `DC_SETTLED` and `DC_REVERT`, once a `DC_FINAL` covers it (item 7), or at epoch
    end. The first two mark stages of earlier records (§8.2), whose position depends on when the
@@ -2094,3 +2104,4 @@ token takes (`AcctTake`, §14.17 item 4). Still open:
 | 10 | Cross-asset routes (USDT book to USDC book) with a priced conversion and its inventory risk | 10, 09 | v2 product design |
 | 11 | Does the account-token CAS stay ~20 ns when one pooled account sends on several sessions at once, and how much does the `PoolRisk` token add to pooled crosses | 05 | 11's pool token-contention test, then B3's pooled `BUSY` curve |
 | 12 | Does `AcctTake` also order `PoolRisk` takes and settlement of pooled fill events, or do those need their own record (Requests to 01, item 9) | 01, 07 | 11's pooled-lane determinism replay with `AcctTake` checks (B4 on a pool log) |
+| 13 | §7.9: a Join dependency that trades on entry (05 §3.7, F4) puts its own taker records in the dependency TX packet, and `SinkStream` leaves it `Unsupported`: is it an `MD_EXEC` taker of its own (a step with two takers), and which `DC_FILL`s, taker and maker, does it give | 10, 05 | a `vyrn-md` replay test with a crossing join dependency, against `RustReplay` |

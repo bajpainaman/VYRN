@@ -453,6 +453,87 @@ fn the_md_rebuilds_the_book() {
     );
 }
 
+/// [`script_hb`], then a bid, then a crossing sell behind two in-packet dependencies (05 §6.6):
+/// a cancel of that bid and a join bid in the sell's range, which the sell then trades with.
+fn script_deps() -> Vec<Act> {
+    use BSide::{Buy, Sell};
+    use Tif::Day;
+    let pkt = |rx_ts, msgs| Act::Pkt {
+        l: 2,
+        a: 6,
+        rx_ts,
+        now: rx_ts,
+        msgs,
+    };
+    let mut s = script_hb();
+    s.extend([pkt(38_000, vec![new(Buy, Day, 102, 1, 80)]), Act::Run]);
+    let (j, _, _) = live(&s);
+    let h =
+        j.tx.iter()
+            .flat_map(|(_, r)| r.iter().copied())
+            .chain(j.resp.iter().flat_map(|(_, p)| p.records().iter().copied()))
+            .find_map(|r| match r {
+                vyrn_bbo::Record::Ack {
+                    handle,
+                    client_tag: 80,
+                    ..
+                } => Some(handle),
+                _ => None,
+            })
+            .expect("the bid rests");
+    s.extend([
+        pkt(
+            39_000,
+            vec![
+                cancel(h, 81),
+                new(Buy, Day, 101, 2, 82),
+                new(Sell, Day, 100, 3, 83),
+            ],
+        ),
+        Act::Run,
+    ]);
+    s
+}
+
+/// The dependencies' records are step-channel events of the sell's step, before its exec, and
+/// replay gives the live bytes for every block split.
+#[test]
+fn dependencies_replay_to_the_live_md() {
+    let (j, store, live_md) = live(&script_deps());
+    assert!(j.tx.iter().any(|(h, _)| h.role == vyrn_bbo::ROLE_DEPS));
+    let live_md = live_md.unwrap();
+    let recs = records(&live_md);
+    let execs: Vec<_> = recs
+        .iter()
+        .filter_map(|r| match r {
+            Record::Exec { tick, qty, .. } => Some((tick.0, qty.0)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(execs.last(), Some(&(101, 2)), "the sell meets its join");
+    let mut sub = MboSubscriber::new(BOOK, Epoch(0));
+    for p in &live_md {
+        sub.on_packet(p).unwrap();
+    }
+    sub.finish().unwrap();
+    let mut rest: Vec<_> = sub
+        .book()
+        .orders()
+        .values()
+        .map(|x| (x.side, x.tick.0, x.qty.0))
+        .collect();
+    rest.sort_unstable_by_key(|x| x.1);
+    // The bid is canceled and the join filled; the sell's residual rests at its limit.
+    let sell = vyrn_md::Side::Sell;
+    assert_eq!(rest, vec![(sell, 100, 1), (sell, 120, 1)]);
+    for at in std::iter::once(None).chain((0..j.recs.len() - 1).map(Some)) {
+        let cuts: Vec<usize> = at.into_iter().collect();
+        let rep_md = replay_md(&j, &store, &blocks(&j, &store, &cuts))
+            .unwrap_or_else(|e| panic!("split {at:?}: {e}"));
+        assert_eq!(rep_md, live_md, "split {at:?}");
+    }
+}
+
 /// The engine's conformance script whole, as `vyrn-replica`'s replay test runs it since #106:
 /// a forwarded improve whose step runs before lane 0's next packet (a `MID` Advance record), a
 /// packet shed at the lane and its resend (its LaneSeqs kept, 07 §3.5), a `Shed` step, a cancel

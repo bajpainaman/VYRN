@@ -90,9 +90,10 @@
 //! - R9. `--dropcopy`'s timing is the receive time of a drop-copy record at its client minus
 //!   the receive time of the response packet that carried the same client record (its
 //!   `(session, resp_seq)`), both on this host's monotonic clock: REQ-LAT-12's "record after the
-//!   `Fill`", over every record that names a response, since `WL-SMOKE-NOCROSS` has no fills.
-//!   `WL-SMOKE` (crossing) stops the observer's ring at `SinkStream`'s `Unsupported` cases
-//!   (10 §7.9: dependency TX packets), so `--dropcopy` gates CI on `WL-SMOKE-NOCROSS`. REQ-LAT-12 budgets p99 ≤ 50 µs on REF; this build's observer replays per
+//!   `Fill`", over every record that names a response: acks, cancels, outs and the taker's
+//!   `DC_FILL`s (a maker's has no `resp_seq`, 10 §8.4 item 4), which `WL-SMOKE` has and
+//!   `WL-SMOKE-NOCROSS` does not; the line counts the `DC_FILL`s it includes. `--dropcopy` gates
+//!   CI on both workloads. REQ-LAT-12 budgets p99 ≤ 50 µs on REF; this build's observer replays per
 //!   block, after the block closes and its payloads arrive, so the number is bounded below by the
 //!   block interval. It is a DEV number on a shared machine, printed as one, not a latency result.
 //!

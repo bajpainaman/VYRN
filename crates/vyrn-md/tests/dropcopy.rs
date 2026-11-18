@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 use harness::*;
 use vyrn_bbo::admit::{FixedClock, NeverLate};
-use vyrn_bbo::{Bbo, Record as Resp, Side as BSide, Tif};
+use vyrn_bbo::{Bbo, ROLE_DEPS, Record as Resp, Side as BSide, Tif};
 use vyrn_cut::Hw;
 use vyrn_engine::{Engine, OwnedRec, Rec, Shared, Sink};
 use vyrn_lane::{Config, Lane, PathTable, RespPkt, Rx, RxIn, SessionSpec};
@@ -160,11 +160,49 @@ impl EpochView for View {
     }
 }
 
+/// [`base_script`], then a crossing sell behind two in-packet dependencies (05 §6.6): a cancel
+/// of the session's resting bid and a join bid in its range, which its taker then meets.
+fn script() -> Vec<Act> {
+    use BSide::{Buy, Sell};
+    use Tif::Day;
+    let mut s = base_script();
+    let (j, _, _) = live(&s);
+    let h = j
+        .resp
+        .iter()
+        .flat_map(|(_, p)| p.records().iter().copied())
+        .chain(j.tx.iter().flat_map(|(_, r)| r.iter().copied()))
+        .find_map(|r| match r {
+            Resp::Ack {
+                handle,
+                client_tag: 80,
+                ..
+            } => Some(handle),
+            _ => None,
+        })
+        .expect("the bid to cancel rests");
+    s.extend([
+        Act::Pkt {
+            l: 2,
+            a: 6,
+            rx_ts: 39_000,
+            now: 39_000,
+            msgs: vec![
+                cancel(h, 81),
+                new(Buy, Day, 101, 2, 82),
+                new(Sell, Day, 100, 3, 83),
+            ],
+        },
+        Act::Run,
+    ]);
+    s
+}
+
 /// Makers on three accounts (two under one master), a cross, a forwarded IOC that is shed,
 /// a cancel, a sweep over a `CONT` run that leaves a residual, reduces, a shed packet and its
-/// resend, an IOC that partly fills the residual and is `Out` for the rest, and a heartbeat-only
-/// packet and a join behind a heartbeat.
-fn script() -> Vec<Act> {
+/// resend, an IOC that partly fills the residual and is `Out` for the rest, a heartbeat-only
+/// packet and a join behind a heartbeat, and a bid that [`script`] cancels.
+fn base_script() -> Vec<Act> {
     use BSide::{Buy, Sell};
     use Tif::{Day, Ioc};
     let p = |l, a, rx_ts, now, msgs| Act::Pkt {
@@ -240,6 +278,8 @@ fn script() -> Vec<Act> {
             37_100,
             vec![Msg::Heartbeat, new(Sell, Day, 120, 1, 50)],
         ),
+        Act::Run,
+        p(2, 6, 38_000, 38_000, vec![new(Buy, Day, 102, 1, 80)]),
         Act::Run,
     ]
 }
@@ -597,6 +637,20 @@ fn fees(recs: &Recs) -> i128 {
 #[test]
 fn replay_drop_copy_equals_live_and_the_response_stream() {
     let (j, store, live) = live(&script());
+    // The script's last packet makes a dependency TX packet with an Ack and a CancelAck.
+    let deps: Vec<Resp> =
+        j.tx.iter()
+            .filter(|(h, _)| h.role == ROLE_DEPS)
+            .flat_map(|(_, r)| r.iter().copied())
+            .collect();
+    assert!(
+        deps.iter().any(|r| matches!(r, Resp::Ack { .. })),
+        "{deps:?}"
+    );
+    assert!(
+        deps.iter().any(|r| matches!(r, Resp::CancelAck { .. })),
+        "{deps:?}"
+    );
     check_streams(&live.recs);
     reconcile(&j, &live.recs);
     assert_eq!(
