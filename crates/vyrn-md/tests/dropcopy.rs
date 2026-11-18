@@ -308,6 +308,8 @@ impl Sink for Both<'_> {
 
 /// Drop-copy output and the engine's summed `fee_acc`.
 struct Run {
+    /// The `MBO` packets.
+    md: Vec<Vec<u8>>,
     recs: Recs,
     fee_acc: i128,
     /// The statement sections (10 §10) at epoch end.
@@ -315,6 +317,11 @@ struct Run {
 }
 
 fn live(script: &[Act]) -> (Journal, Store, Run) {
+    try_live(script).unwrap()
+}
+
+/// [`live`], with the adapter's or the drop copy's first error.
+fn try_live(script: &[Act]) -> Result<(Journal, Store, Run), String> {
     let (bbo, mut sh) = new_box();
     let mut e = fee_engine(bbo, &mut sh);
     let mut j = Journal::default();
@@ -366,21 +373,23 @@ fn live(script: &[Act]) -> (Journal, Store, Run) {
         }
     }
     let fee_acc = (0..N).map(|l| e.lane(l).unwrap().book_acc().fee_acc).sum();
-    let (_, dc) = m.finish_tap().unwrap();
-    assert_eq!(dc.error(), None);
-    let mut dc = dc;
+    let (md, mut dc) = m.finish_tap().map_err(|e| format!("{e:?}"))?;
+    if let Some(e) = dc.error() {
+        return Err(format!("{e:?}"));
+    }
     dc.end_epoch(|_| Default::default()).unwrap();
     let sections = dc.statement_sections();
     let recs = dc.into_out().unwrap();
-    (
+    Ok((
         j,
         store,
         Run {
+            md,
             recs,
             fee_acc,
             sections,
         },
-    )
+    ))
 }
 
 fn tenure() -> TenureStart {
@@ -497,13 +506,14 @@ fn replay(live_j: &Journal, store: &Store, blocks: &[BlockInputs<N>]) -> Result<
     let fee_acc = (0..N)
         .map(|l| rep.engine().lane(l).unwrap().book_acc().fee_acc)
         .sum();
-    let (_, dc) = rep.into_sink().finish_tap().unwrap();
+    let (md, dc) = rep.into_sink().finish_tap().unwrap();
     assert_eq!(dc.error(), None);
     let mut dc = dc;
     dc.end_epoch(|_| Default::default()).unwrap();
     let sections = dc.statement_sections();
     let recs = dc.into_out().unwrap();
     Ok(Run {
+        md,
         recs,
         fee_acc,
         sections,
@@ -542,8 +552,8 @@ fn check_streams(recs: &Recs) {
     }
 }
 
-/// The live client records against the drop copy (module docs).
-fn reconcile(j: &Journal, recs: &Recs) {
+/// The live client records against the drop copy (module docs); the `DC_FILL`s it matched.
+fn reconcile(j: &Journal, recs: &Recs) -> usize {
     // Client records by (session, resp_seq); maker TX packets (resp_seq 0) by (session, step).
     let mut client: Vec<(u32, u32, u64, Resp, bool)> = Vec::new();
     for (_, p) in &j.resp {
@@ -648,7 +658,7 @@ fn reconcile(j: &Journal, recs: &Recs) {
         left.is_empty(),
         "client records without a drop copy: {left:?}"
     );
-    assert!(n_fills >= 8, "the script fills: {n_fills}");
+    n_fills
 }
 
 /// 10 §10: each account's own stream's four `DC_EOD` records, as served, are its statement
@@ -703,7 +713,8 @@ fn replay_drop_copy_equals_live_and_the_response_stream() {
         "{deps:?}"
     );
     check_streams(&live.recs);
-    reconcile(&j, &live.recs);
+    let n_fills = reconcile(&j, &live.recs);
+    assert!(n_fills >= 8, "the script fills: {n_fills}");
     assert_eq!(
         fees(&live.recs),
         live.fee_acc,
@@ -953,6 +964,84 @@ fn shell_frames_round_trip_through_the_ring() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// 10 §8.6 kind 10: a `Rescan` taker frame round-trips through the codec, with and without
+/// its optional parts. (The fuzz test carries real ones through a ring.)
+#[test]
+fn rescan_taker_frames_round_trip() {
+    use vyrn_types::SessionId;
+    let frames = vec![
+        RingFrame::Rescan {
+            step: StepId(9),
+            lane: LaneId(1),
+            seq: LaneSeq(0x0102_0304_0506),
+            session: SessionId(0x0010_1001),
+            pkt_seq: 3,
+            msg: Some(new(BSide::Buy, Tif::Day, 106, 6, 31)),
+            prior: 2,
+            fills: vec![(
+                4,
+                Resp::Fill {
+                    index: 1,
+                    liq: 1,
+                    handle: Handle::new(2, 1).unwrap(),
+                    tick: Tick(106),
+                    qty: Qty(3),
+                },
+            )],
+            rest: Some((
+                5,
+                Resp::Ack {
+                    index: 1,
+                    handle: Handle::new(2, 1).unwrap(),
+                    tick: Tick(106),
+                    client_tag: 31,
+                },
+            )),
+            makers: vec![(
+                vyrn_bbo::TxEntry {
+                    step: StepId(9),
+                    session: SessionId(0x0010_0001),
+                    lane: LaneId(0),
+                    role: 2,
+                    ..Default::default()
+                },
+                Resp::Fill {
+                    index: 0xFF,
+                    liq: 0,
+                    handle: Handle::new(1, 1).unwrap(),
+                    tick: Tick(106),
+                    qty: Qty(3),
+                },
+                7,
+            )],
+        },
+        RingFrame::Rescan {
+            step: StepId(10),
+            lane: LaneId(0),
+            seq: LaneSeq(2),
+            session: SessionId(1),
+            pkt_seq: 1,
+            msg: None,
+            prior: 0,
+            fills: Vec::new(),
+            rest: None,
+            makers: Vec::new(),
+        },
+    ];
+    for f in frames {
+        let mut b = Vec::new();
+        f.encode(&mut b);
+        let len = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
+        assert_eq!(len, b.len() - 4);
+        assert_eq!(RingFrame::decode(&b[4..]), Some(f.clone()));
+        assert_eq!(
+            RingFrame::decode(&b[4..b.len() - 1]),
+            None,
+            "a short frame is refused"
+        );
+    }
+}
+
 /// 10 §8.4 item 11 and §8.6 item 5: a settlement of epoch 0 that comes after epoch 1 begins
 /// reaches epoch 0's streams in `vyrn-dropcopy`'s store, through `Follower`, the code the
 /// binary runs. The reference is one `DropCopy` that gets the same settlement before any new
@@ -1017,4 +1106,116 @@ fn a_late_settlement_reaches_its_ended_epoch_in_the_follower() {
         assert_eq!(r.step(), last.last_step.0);
     }
     let _ = std::fs::remove_file(&path);
+}
+
+/// A seeded interleaving: joins, IOC crosses, cancels and reduces of earlier handles on three
+/// lanes and four sessions, steps (some late), polls and runs. Live lag makes the BBO core's
+/// band test fire, so `Rescan` steps sweep batch joins as takers (05 §8.6).
+fn interleaving(seed: u64) -> Vec<Act> {
+    let mut r = Rng::new(seed);
+    let (mut s, mut t, mut tag) = (Vec::new(), 1_000u64, 1u32);
+    for _ in 0..30 + r.below(80) {
+        match r.below(14) {
+            0..=5 => {
+                let l = r.below(N as u64) as usize;
+                let a = 1 + r.below(4) as u32;
+                let mut msgs = r.orders(&mut tag, 95);
+                if r.below(4) == 0 {
+                    tag += 1;
+                    let side = if r.below(2) == 0 {
+                        BSide::Buy
+                    } else {
+                        BSide::Sell
+                    };
+                    let (tick, qty) = (95 + r.below(10) as u32, 1 + r.below(4) as u32);
+                    msgs.push(new(side, Tif::Ioc, tick, qty, tag));
+                }
+                if r.below(3) == 0 {
+                    tag += 1;
+                    let h = Handle::new(1 + r.below(12) as u32, 1).unwrap();
+                    msgs.push(if r.below(2) == 0 {
+                        cancel(h, tag)
+                    } else {
+                        Msg::Reduce {
+                            handle: h,
+                            by: Qty(1 + r.below(2) as u32),
+                            client_tag: tag,
+                        }
+                    });
+                }
+                t += 10 + r.below(300);
+                let now = t + r.below(3) * u64::from(FWD_DL);
+                s.push(Act::Pkt {
+                    l,
+                    a,
+                    rx_ts: t,
+                    now,
+                    msgs,
+                });
+            }
+            6..=8 => s.push(Act::Step(None)),
+            9 => s.push(Act::Step(Some(t + u64::from(FWD_DL) + 1 + r.below(1000)))),
+            10..=11 => s.push(Act::Poll),
+            _ => s.push(Act::Run),
+        }
+    }
+    s.push(Act::Run);
+    s
+}
+
+/// Seeds `1..=SEEDS` of [`interleaving`].
+const SEEDS: u64 = 300;
+
+#[test]
+fn rescan_sweeps_replay_to_the_live_md_and_drop_copy() {
+    // The loaded WL-SMOKE `--dropcopy` failure (`SinkError::Book`): a `Rescan` step's batch
+    // takers (05 §8.6) answer their `New` with lane `Fill { liq: 1 }`s, which the adapter did
+    // not rebuild. Every seed's live `MBO` and drop copy must equal replay's, byte for byte,
+    // reconcile with the live responses and sum to the engine's fees; a seed whose Join
+    // dependency trades on entry (open question 13) stops with that named reason.
+    let (mut swept, mut q13) = (0, 0);
+    for seed in 1..=SEEDS {
+        let (j, store, live) = match try_live(&interleaving(seed)) {
+            Ok(x) => x,
+            Err(e) => {
+                assert_eq!(e, r#"Unsupported("dependency that trades")"#, "seed {seed}");
+                q13 += 1;
+                continue;
+            }
+        };
+        let rescan_taker = j.resp.iter().any(|(_, p)| {
+            p.records()
+                .iter()
+                .any(|r| matches!(r, Resp::Fill { liq: 1, .. }))
+        });
+        swept += usize::from(rescan_taker);
+        check_streams(&live.recs);
+        reconcile(&j, &live.recs);
+        assert_eq!(fees(&live.recs), live.fee_acc, "seed {seed}: fees");
+        // One block, or two split mid-run, by seed.
+        let cuts: Vec<usize> = (seed % 2 == 0)
+            .then_some(j.recs.len() / 2)
+            .into_iter()
+            .collect();
+        let bs = blocks(&j, &store, &cuts);
+        let rep = replay(&j, &store, &bs).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert_eq!(rep.md, live.md, "seed {seed} split {cuts:?}: MBO");
+        assert_eq!(
+            canonical(&rep.recs),
+            canonical(&live.recs),
+            "seed {seed} split {cuts:?}: drop copy"
+        );
+        // `vyrn-dropcopy`'s copy, through the observer's ring (10 §8.6 kind 10).
+        if rescan_taker {
+            let path = ring_path(&format!("rescan-{seed}"));
+            replay_ring(&j, &store, &bs, &path, RING_CAP, |_| {});
+            let mut r = RingDc::open(&path);
+            r.poll().unwrap();
+            assert_eq!(r.dc.into_out().unwrap(), rep.recs, "seed {seed}: ring");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    eprintln!("{swept} seeds with a Rescan taker, {q13} at open question 13");
+    assert!(swept >= 20, "{swept} seeds with a Rescan taker");
+    assert!(q13 > 0, "no seed reached open question 13");
 }

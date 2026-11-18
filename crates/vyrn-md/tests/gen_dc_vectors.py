@@ -227,8 +227,14 @@ class Model:
             out = (CANCEL, o["side"], idx, h, o["tick"], c, tag)
         elif r[0] == "out":
             _, idx, _cause, h, q, tag = r
-            o = self.orders.pop((lane, h))
-            out = (OUT, o["side"], idx, h, o["tick"], q, tag)
+            if (lane, h) in self.orders:
+                o = self.orders.pop((lane, h))
+                out = (OUT, o["side"], idx, h, o["tick"], q, tag)
+            else:
+                # A New the lane took out at once (STP CancelNewest) never rested: its own side
+                # and limit tick.
+                assert msg[0] == "new"
+                out = (OUT, msg[1], idx, h, msg[2], q, tag)
         else:
             return
         if acct is not None:
@@ -353,6 +359,50 @@ class Model:
                     self.emit(tacct, OUT, side, True, idx, step, ssess, h[3], th, limit, q, otag,
                               0)
         self.run = ((slane, sseq), filled)
+
+    def rescan_taker(self, step, lane, seq, s, prior, msg, fills, rest, makers):
+        """A join a Rescan step swept as a taker (§7.9 item 11, §8.4 item 4): per match, the
+        taker's and the maker's DC_FILL at the match's (step, ordinal); the taker's step fee on
+        its last one; no message fee (a join, §5.3); then DC_ACK of what rests."""
+        self.rel = step
+        _, side, _limit, qty, tag = msg
+        tacct = self.sess.get(s)
+        first_rs = {}
+        for rs, r in fills:
+            first_rs.setdefault(r[4], rs)
+        lvl = {}
+        for _, r in fills:
+            lvl[r[4]] = lvl.get(r[4], 0) - r[5]
+        for _, r, _ in makers:
+            lvl[r[4]] = lvl.get(r[4], 0) + r[5]
+        assert all(v == 0 for v in lvl.values())
+        th = fills[0][1][3]
+        tn = sum(r[5] * r[4] * self.ts for _, r, _ in makers)
+        tfee = fee(tn, self.accts[tacct]["tp"]) if tacct is not None else 0
+        filled = prior
+        for i, (hdr, r, k) in enumerate(makers):
+            _role, mlane, _msess, mrs = hdr
+            _, _idx, _liq, mh, tick, q = r
+            o = self.orders[(mlane, mh)]
+            o["open"] -= q
+            assert o["open"] >= 0 and o["side"] != side
+            if o["open"] == 0:
+                del self.orders[(mlane, mh)]
+            filled += q
+            if tacct is not None:
+                self.emit(tacct, FILL, side, True, k, step, s, first_rs[tick], th, tick, q, tag,
+                          tfee if i + 1 == len(makers) else 0)
+            if o["acct"] is not None:
+                mp = self.accts[o["acct"]]["mp"]
+                self.emit(o["acct"], FILL, o["side"], False, k, step, o["sess"], mrs, mh, tick,
+                          q, o["tag"], fee(q * tick * self.ts, mp))
+        if rest is not None and rest[1][0] == "ack":
+            rs, (_, idx, rh, tick, atag) = rest
+            left = qty - filled
+            self.orders[(lane, rh)] = dict(acct=tacct, sess=s, side=side, tick=tick, open=left,
+                                           tag=atag)
+            if tacct is not None:
+                self.emit(tacct, ACK, side, False, idx, seq, s, rs, rh, tick, left, atag, 0)
 
     def final(self, height, last):
         self.finals.append((height, last))
@@ -510,11 +560,54 @@ STP_ALLOC_CASE = [
     ("op", 0, 2, S02, 1, ("new", 1, 110, 2, 21), ("ack", 0, h(2), 110, 21)),
     ("step", 4, "idle", 0, None, []),
 ]
+# Rescan batch joins swept as takers (05 §8.6, 10 §7.9 item 11). Step 1: 201's buy join at 106
+# takes 101's 105 x3 and 102's 106 x2 (two levels), and 1 rests. Steps 2-3: a capped sweep of
+# 101's buy join at 110 over 301's 107 x2, then (CONT) 108 x1; 1 rests after step 3. Each
+# ("rescan", step, lane, seq, sess, prior, msg, fills [(resp_seq, fill)], rest, makers
+# [((role, lane, sess, resp_seq), fill, ordinal)]) comes before its step's release.
+RESCAN_CASE = [
+    ("op", 0, 1, S01, 1, ("new", 1, 105, 3, 11), ("ack", 0, h(1), 105, 11)),
+    ("op", 0, 2, S02, 1, ("new", 1, 106, 2, 21), ("ack", 0, h(2), 106, 21)),
+    ("rescan", 1, 1, 1, S11, 0, ("new", 0, 106, 6, 31),
+     [(1, ("fill", 0, 1, h(1), 105, 3)), (1, ("fill", 0, 1, h(1), 106, 2))],
+     (2, ("ack", 0, h(1), 106, 31)),
+     [((MAKER, 0, S01, 0), ("fill", 0xFF, 0, h(1), 105, 3), 0),
+      ((MAKER, 0, S02, 0), ("fill", 0xFF, 0, h(2), 106, 2), 1)]),
+    ("step", 1, "rescan", 0, None, [
+        ((MAKER, 0, S01, 0), ("fill", 0xFF, 0, h(1), 105, 3)),
+        ((MAKER, 0, S02, 0), ("fill", 0xFF, 0, h(2), 106, 2)),
+    ]),
+    ("final", 1, 1),
+    ("op", 2, 1, S21, 1, ("new", 1, 107, 2, 41), ("ack", 0, h(1), 107, 41)),
+    ("op", 2, 2, S21, 2, ("new", 1, 108, 1, 42), ("ack", 0, h(2), 108, 42)),
+    ("rescan", 2, 0, 3, S01, 0, ("new", 0, 110, 4, 12),
+     [(2, ("fill", 0, 1, h(3), 107, 2))], None,
+     [((MAKER, 2, S21, 0), ("fill", 0xFF, 0, h(1), 107, 2), 0)]),
+    ("step", 2, "rescan", 0, None, [((MAKER, 2, S21, 0), ("fill", 0xFF, 0, h(1), 107, 2))]),
+    ("rescan", 3, 0, 3, S01, 2, ("new", 0, 110, 4, 12),
+     [(3, ("fill", 0, 1, h(3), 108, 1))], (4, ("ack", 0, h(3), 110, 12)),
+     [((MAKER, 2, S21, 0), ("fill", 0xFF, 0, h(2), 108, 1), 0)]),
+    ("step", 3, "rescan", CONT, None, [((MAKER, 2, S21, 0), ("fill", 0xFF, 0, h(2), 108, 1))]),
+    ("op", 0, 4, S01, 5, ("cancel", h(3), 13), ("cxl", 0, h(3), 1, 12)),
+    ("step", 4, "idle", 0, None, []),
+    ("final", 2, 4),
+]
+# A lane New that would trade with its own account's resting order is taken out at once
+# (STP CancelNewest, 05 §2.4) with no Ack: a DC_OUT at its side and limit tick, after the
+# packet's other message, a Cancel the lane rejects. The resting order stays.
+LANE_STP_CASE = [
+    ("op", 1, 1, S11, 1, ("new", 1, 101, 2, 31), ("ack", 0, h(1), 101, 31)),
+    ("op", 1, 2, S11, 2, ("cancel", h(8), 32), ("rej", 0, 3)),
+    ("op", 1, 3, S11, 2, ("new", 0, 101, 1, 33), ("out", 1, OUT_STP, h(2), 1, 33)),
+    ("op", 1, 4, S11, 3, ("cancel", h(1), 34), ("cxl", 0, h(1), 2, 31)),
+    ("step", 1, "idle", 0, None, []),
+    ("final", 1, 1),
+]
 BAL = {101: (1000, 20, 7, 0), 102: (5, 0, 3, 1), 201: (77, 0, 0, 0)}
 
 
 def kind_code(k):
-    return {"cross": 1, "improve": 2, "shed": 6, "idle": 5}[k]
+    return {"cross": 1, "improve": 2, "rescan": 3, "shed": 6, "idle": 5}[k]
 
 
 def fmt_msg(m):
@@ -549,6 +642,17 @@ def run_case(lines, name, tick_size, events, bal, post_settled=()):
                 lines.append(f"tx {role} {lane} {s:#x} {rs} | {fmt_rec(r)}")
             lines.append("release")
             m.step(sid, kind, flags, src, tx)
+        elif ev[0] == "rescan":
+            _, step, lane, seq, s, prior, msg, fills, rest, makers = ev
+            lines.append(f"rescan {step} {lane} {seq} {s:#x} {prior} | {fmt_msg(msg)}")
+            for rs, r in fills:
+                lines.append(f"tfill {rs} | {fmt_rec(r)}")
+            if rest is not None:
+                lines.append(f"trest {rest[0]} | {fmt_rec(rest[1])}")
+            for (role, ml, ms, mrs), r, k in makers:
+                lines.append(f"tmaker {role} {ml} {ms:#x} {mrs} {k} | {fmt_rec(r)}")
+            lines.append("taken")
+            m.rescan_taker(step, lane, seq, s, prior, msg, fills, rest, makers)
         elif ev[0] == "alloc":
             _, step, acct, asset, debit, amount = ev
             lines.append(f"alloc {step} {acct} {asset} {int(debit)} {amount}")
@@ -601,7 +705,8 @@ def main(out_dir):
         "# Written by gen_dc_vectors.py, an independent model packing bytes with struct.",
         "# `case` blocks: config (`tick_size`, `acct <id> <master|-> <session> <taker_ppm>",
         "# <maker_ppm> <msg_improve> <msg_cross>`), inputs in release order (`op`, `step` + its",
-        "# `tx` lines + `release`, `final`, `bal`), `end`, then the expected `rec <account>",
+        "# `tx` lines + `release`, `final`, `bal`; a `rescan` taker's `tfill`, `trest` and",
+        "# `tmaker` lines up to `taken`), `end`, then the expected `rec <account>",
         "# <master> <seq> <hex>` in output order. `session` blocks: `store`, `key`, `hello`,",
         "# `login` and the expected frames.",
     ]
@@ -610,6 +715,8 @@ def main(out_dir):
     run_case(lines, "late_final", 10, LATE_FINAL_CASE, {})
     run_case(lines, "revert_settle", 100, REVERT_CASE, BAL, post_settled=[(9, 2)])
     run_case(lines, "stp_alloc", 100, STP_ALLOC_CASE, BAL, post_settled=[(3, 4)])
+    run_case(lines, "rescan", 100, RESCAN_CASE, BAL)
+    run_case(lines, "lane_stp", 100, LANE_STP_CASE, BAL)
     # Sessions over a store of epoch 5 (case cross, ended) and epoch 6 (case quiet, open).
     E0, E1 = 5, 6
     seeds = {101: bytes([1]) * 32, 102: bytes([2]) * 32, 900: bytes([9]) * 32,

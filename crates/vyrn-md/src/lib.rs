@@ -150,7 +150,7 @@ pub use mboc::{MboCError, WithMboC, mbo_c_decode, mbo_c_encode};
 pub use mbow::{MD_MBO_W_TICKS, MboWEncoder, MboWindow};
 pub use packet::{Channel, Feed, HEADER_BYTES, Header, NO_WATERMARK, Packet, PacketError};
 pub use record::{AttestKind, BookStatus, DeleteCause, REC_BYTES, Record, RecordError, Side};
-pub use replay::{SinkError, SinkStream, Tap, TapOp, TapSrc, TapStep};
+pub use replay::{SinkError, SinkStream, Tap, TapOp, TapSrc, TapStep, TapTaker};
 pub use retx::{MD_RETX_SECS, RETX_REQ_BYTES, RetxRequest, RetxStore, retx_fetch};
 pub use snap::{
     MD_SNAP_EVERY_BLOCKS, SnapEncoder, SnapError, SnapReader, is_snapshot_height, snapshot_records,

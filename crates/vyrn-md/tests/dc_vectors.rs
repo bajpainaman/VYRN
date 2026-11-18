@@ -19,7 +19,7 @@ use vyrn_md::dropcopy::{
     Alloc, AllocAsset, Balances, DC_REC_BYTES, DcAccount, DcConfig, DcOut, DcRecord, DcRoute,
     DropCopy, StreamId,
 };
-use vyrn_md::{Tap, TapOp, TapSrc, TapStep};
+use vyrn_md::{Tap, TapOp, TapSrc, TapStep, TapTaker};
 use vyrn_types::{
     AccountId, BookId, Epoch, Handle, Height, LaneId, LaneSeq, Qty, RejectReason, SessionId,
     StepId, StepKind, Tick,
@@ -124,6 +124,20 @@ fn parts(line: &str) -> Vec<Vec<&str>> {
 
 type Recs = Vec<(StreamId, u64, DcRecord)>;
 
+/// A `rescan` taker being read, up to `taken`.
+#[derive(Default)]
+struct Taker {
+    step: StepId,
+    lane: LaneId,
+    seq: LaneSeq,
+    session: SessionId,
+    prior: u32,
+    msg: Option<Msg>,
+    fills: Vec<(u32, Resp)>,
+    rest: Option<(u32, Resp)>,
+    makers: Vec<(TxEntry, Resp, u16)>,
+}
+
 struct Pending {
     step: StepId,
     kind: StepKind,
@@ -161,6 +175,7 @@ fn run_case(lines: &[&str]) -> Recs {
     }
     let mut dc = DropCopy::new(&cfg, Recs::new());
     let mut pend: Option<Pending> = None;
+    let mut taker = Taker::default();
     let mut bal: BTreeMap<AccountId, Balances> = BTreeMap::new();
     let mut want = Recs::new();
     for line in &lines[i..] {
@@ -211,6 +226,46 @@ fn run_case(lines: &[&str]) -> Recs {
                     flags: st.flags,
                     src: st.src,
                     tx: &st.tx,
+                });
+            }
+            "rescan" => {
+                taker = Taker {
+                    step: StepId(num(h[1])),
+                    lane: LaneId(u8::try_from(num(h[2])).unwrap()),
+                    seq: LaneSeq(num(h[3])),
+                    session: SessionId(n32(h[4])),
+                    prior: n32(h[5]),
+                    msg: Some(msg(&p[1])),
+                    ..Taker::default()
+                };
+            }
+            "tfill" => taker.fills.push((n32(h[1]), rec(&p[1]))),
+            "trest" => taker.rest = Some((n32(h[1]), rec(&p[1]))),
+            "tmaker" => taker.makers.push((
+                TxEntry {
+                    step: taker.step,
+                    session: SessionId(n32(h[3])),
+                    resp_seq: n32(h[4]),
+                    lane: LaneId(u8::try_from(num(h[2])).unwrap()),
+                    role: u8::try_from(num(h[1])).unwrap(),
+                    ..TxEntry::default()
+                },
+                rec(&p[1]),
+                u16::try_from(num(h[5])).unwrap(),
+            )),
+            "taken" => {
+                let t = std::mem::take(&mut taker);
+                dc.rescan_taker(&TapTaker {
+                    step: t.step,
+                    lane: t.lane,
+                    seq: t.seq,
+                    session: t.session,
+                    pkt_seq: 0,
+                    msg: t.msg,
+                    prior: t.prior,
+                    fills: &t.fills,
+                    rest: t.rest,
+                    makers: &t.makers,
                 });
             }
             "final" => dc.final_block(Height(num(h[1])), StepId(num(h[2]))),
@@ -294,7 +349,7 @@ fn blocks(kind: &str) -> Vec<Vec<&'static str>> {
 #[test]
 fn streams_match_the_vectors() {
     let cases = blocks("case ");
-    assert_eq!(cases.len(), 5);
+    assert_eq!(cases.len(), 7);
     for c in &cases {
         run_case(&c[1..]);
     }

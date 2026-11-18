@@ -102,6 +102,9 @@ struct Op {
     res: Option<Resp>,
     /// The `resp_seq` of the response packet that carried `res`.
     resp_seq: u32,
+    /// A `Rescan` batch taker's (05 §8.6): the qty of its `liq = 1` lane `Fill`s so far, whose
+    /// records are in `SinkStream::tfills`.
+    tfill: u32,
 }
 
 /// A packet's numbered ops: lane, first LaneSeq, and each index's offset (`None`: unnumbered).
@@ -155,6 +158,9 @@ pub trait Tap {
     /// A lane op with its response record, in the interval's `(prio_ts, lane, LaneSeq)` order;
     /// then a step's dependencies (explicit at the step, 10 §7.9 item 10), in index order.
     fn lane_op(&mut self, _op: &TapOp) {}
+    /// A `Rescan` batch taker of the step about to be released (10 §7.9 item 11): after the
+    /// interval's lane ops and every batch op before it in key order, before the step.
+    fn rescan_taker(&mut self, _t: &TapTaker<'_>) {}
     /// A released step, after its interval's lane ops.
     fn step(&mut self, _st: &TapStep<'_>) {}
 }
@@ -173,6 +179,28 @@ pub struct TapOp {
     /// The request message (`None`: it did not parse).
     pub msg: Option<Msg>,
     pub rec: Resp,
+}
+
+/// A join that a `Rescan` step swept as a taker (05 §8.6, 10 §7.9 item 11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapTaker<'a> {
+    /// The `Rescan` step.
+    pub step: StepId,
+    pub lane: LaneId,
+    pub seq: LaneSeq,
+    pub session: SessionId,
+    pub pkt_seq: u32,
+    pub msg: Option<Msg>,
+    /// The qty it filled in this sweep's earlier steps (a capped sweep's `CONT` steps).
+    pub prior: u32,
+    /// Its `liq = 1` lane `Fill` records of this step, one per level, each with its packet's
+    /// `resp_seq`.
+    pub fills: &'a [(u32, Resp)],
+    /// In its sweep's last step, the lane's last record for it, if any (an `Ack` of what
+    /// rests), with its `resp_seq`.
+    pub rest: Option<(u32, Resp)>,
+    /// The step's maker `Fill`s it matched, with their TX headers and exec ordinals.
+    pub makers: &'a [(TxEntry, Resp, u16)],
 }
 
 /// A step's source op.
@@ -211,6 +239,15 @@ pub struct SinkStream<K: PacketSink, T: Tap = ()> {
     prio: Vec<u64>,
     cut: Vec<u64>,
     steps: VecDeque<PendStep>,
+    /// `Rescan` batch takers' `liq = 1` lane `Fill`s, by `(lane, LaneSeq)`, each with its
+    /// packet's `resp_seq`, in record order. A fill's gate names the step whose boundary sent
+    /// it, not the step that made it, so the steps of a capped sweep take them by their makers.
+    tfills: BTreeMap<(u8, u64), VecDeque<(u32, Resp)>>,
+    /// A `Rescan`'s batch from its first taker on, in key order, that its steps have not
+    /// swept yet: a capped sweep goes on in its `CONT` steps (05 §8.6), and so does the rest.
+    rescan: VecDeque<(u64, u8, u64, Op)>,
+    /// The qty the front taker of `rescan` filled in earlier steps.
+    rescan_prior: u32,
     book: BTreeMap<u32, Resting>,
     newest: u64,
     /// The source of the last step and its taker fills so far (a `CONT` run).
@@ -243,6 +280,9 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
             prio: vec![0; n_lanes],
             cut: vec![0; n_lanes],
             steps: VecDeque::new(),
+            tfills: BTreeMap::new(),
+            rescan: VecDeque::new(),
+            rescan_prior: 0,
             book: BTreeMap::new(),
             newest: 0,
             taker_acc: None,
@@ -388,6 +428,7 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
                     fwd: false,
                     res: None,
                     resp_seq: 0,
+                    tfill: 0,
                 });
             }
         }
@@ -454,6 +495,24 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
         };
         let (l, seq) = (usize::from(pk.lane), pk.first + u64::from(off));
         let op = self.op_mut(l, seq).ok_or(SinkError::Book)?;
+        // A `Rescan` batch taker's fills come first, one per level, then the `Ack` of what
+        // rests, if anything does (05 §8.10 rule 4).
+        if let Resp::Fill {
+            liq: LIQ_TAKER,
+            qty,
+            ..
+        } = r
+        {
+            if op.fwd || op.res.is_some() || !matches!(op.msg, Some(Msg::New { .. })) {
+                return Err(SinkError::Unsupported(
+                    "taker fill of a settled or forwarded op",
+                ));
+            }
+            op.tfill = op.tfill.checked_add(qty.0).ok_or(SinkError::Book)?;
+            let key = (u8::try_from(l).map_err(|_| SinkError::Book)?, seq);
+            self.tfills.entry(key).or_default().push_back((rs, r));
+            return Ok(());
+        }
         if op.res.is_some() {
             return Err(SinkError::Unsupported("several records for one op"));
         }
@@ -603,8 +662,26 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
                 return Ok(());
             }
             let st = self.steps.pop_front().ok_or(SinkError::Book)?;
-            self.emit_interval(&st.covers)?;
-            self.emit_step(&st)?;
+            let batch = self.take_interval(&st.covers)?;
+            // A `Rescan` sweeps its batch in key order (05 §3.4, §8.6): from its first taker on,
+            // the batch is the step's (10 §7.9 item 11).
+            let split = batch
+                .iter()
+                .position(|x| x.3.tfill > 0)
+                .unwrap_or(batch.len());
+            if split < batch.len() && (st.kind != StepKind::Rescan || st.src.is_some()) {
+                return Err(SinkError::Unsupported("taker fills outside a Rescan step"));
+            }
+            let (head, rest) = batch.split_at(split);
+            if !rest.is_empty() && !self.rescan.is_empty() {
+                return Err(SinkError::Unsupported("Rescan before the last one ended"));
+            }
+            self.rescan.extend(rest.iter().copied());
+            let r = self
+                .emit_ops(head, false)
+                .and_then(|()| self.emit_step(&st));
+            self.scratch = batch;
+            r?;
             for &(lc, seq, op) in &st.deps {
                 if let Some(rec) = op.res {
                     self.tap.lane_op(&TapOp {
@@ -645,12 +722,15 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
             base + q.len() as u64 > hi
                 && q.iter()
                     .take((hi + 1 - base) as usize)
-                    .all(|o| o.fwd || o.res.is_some())
+                    .all(|o| o.fwd || o.res.is_some() || o.tfill > 0 && Some(o.tfill) == new_qty(o))
         })
     }
 
-    /// The lane ops a step's cut covers, popped and pushed in `(prio_ts, lane, seq)` order.
-    fn emit_interval(&mut self, covers: &[(u8, u64)]) -> Result<(), SinkError> {
+    /// The lane ops a step's cut covers, popped, in `(prio_ts, lane, seq)` order.
+    fn take_interval(
+        &mut self,
+        covers: &[(u8, u64)],
+    ) -> Result<Vec<(u64, u8, u64, Op)>, SinkError> {
         let mut out = std::mem::take(&mut self.scratch);
         out.clear();
         for &(lc, hi) in covers {
@@ -671,7 +751,7 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
                 if op.fwd {
                     continue;
                 }
-                if op.res.is_none() {
+                if op.res.is_none() && op.tfill == 0 {
                     return Err(SinkError::Book);
                 }
                 out.push((op.prio_ts, lc, seq, op));
@@ -680,34 +760,44 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
         // Ops on one order are of one lane, so this keeps their LaneSeq order; each effect is
         // derived from the book after the ones before it.
         out.sort_unstable_by_key(|x| (x.0, x.1, x.2));
-        let mut res = Ok(());
-        for (ts, lc, seq, op) in &out {
-            res = self.lane_effect(*ts, *lc, op);
-            if res.is_err() {
-                break;
-            }
-            if let Some(rec) = op.res {
-                self.tap.lane_op(&TapOp {
-                    lane: LaneId(*lc),
-                    seq: LaneSeq(*seq),
-                    session: op.pkt.0,
-                    pkt_seq: op.pkt.1,
-                    resp_seq: op.resp_seq,
-                    msg: op.msg,
-                    rec,
-                });
-            }
-        }
-        self.scratch = out;
-        res
+        Ok(out)
     }
 
-    fn lane_effect(&mut self, ts: u64, lane: u8, op: &Op) -> Result<(), SinkError> {
-        let r = op.res.ok_or(SinkError::Book)?;
-        match self.lane_op(lane, op, &r)? {
-            Some(b) => self.push(ts, EventKind::LaneOp(b)),
-            None => Ok(()),
+    /// Pushes lane ops, as lane-channel events or (`on_step`) step-channel ones, and taps them.
+    fn emit_ops(&mut self, ops: &[(u64, u8, u64, Op)], on_step: bool) -> Result<(), SinkError> {
+        for (ts, lc, seq, op) in ops {
+            self.emit_op(*ts, *lc, *seq, op, on_step)?;
         }
+        Ok(())
+    }
+
+    fn emit_op(
+        &mut self,
+        ts: u64,
+        lc: u8,
+        seq: u64,
+        op: &Op,
+        on_step: bool,
+    ) -> Result<(), SinkError> {
+        let r = op.res.ok_or(SinkError::Book)?;
+        if let Some(b) = self.lane_op(lc, op, &r)? {
+            let kind = if on_step {
+                EventKind::StepOp(b)
+            } else {
+                EventKind::LaneOp(b)
+            };
+            self.push(ts, kind)?;
+        }
+        self.tap.lane_op(&TapOp {
+            lane: LaneId(lc),
+            seq: LaneSeq(seq),
+            session: op.pkt.0,
+            pkt_seq: op.pkt.1,
+            resp_seq: op.resp_seq,
+            msg: op.msg,
+            rec: r,
+        });
+        Ok(())
     }
 
     /// The book change of one resolved lane op (module docs). The book is read after the
@@ -774,7 +864,16 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
                 return Err(SinkError::Unsupported("CancelAll"));
             }
             (_, Resp::Reject { .. } | Resp::Out { .. }) => None,
-            _ => return Err(SinkError::Book),
+            // Every other pair is a case this version does not rebuild, named, never `Book`.
+            (_, Resp::Fill { .. }) => return Err(SinkError::Unsupported("lane Fill of an op")),
+            (_, Resp::Ack { .. }) => {
+                return Err(SinkError::Unsupported("Ack of a message other than New"));
+            }
+            (_, Resp::CancelAck { .. }) => {
+                return Err(SinkError::Unsupported(
+                    "CancelAck of a message other than Cancel or Reduce",
+                ));
+            }
         })
     }
 
@@ -791,17 +890,30 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
             .iter()
             .filter(|(_, r)| matches!(r, Resp::Fill { .. }))
             .count();
-        if st.src.is_none() && !st.maker.is_empty() {
+        if !self.rescan.is_empty() && (st.kind != StepKind::Rescan || st.src.is_some()) {
+            return Err(SinkError::Unsupported("Rescan sweep left unfinished"));
+        }
+        if st.src.is_none() && !st.maker.is_empty() && self.rescan.is_empty() {
             return Err(SinkError::Unsupported("fills without a source step"));
         }
-        let taker = st.src.and_then(|s| {
-            st.taker.iter().find_map(|r| match *r {
-                Resp::Ack { handle, .. } | Resp::Fill { handle, .. } => {
-                    Some(oid(s.lane, handle.slot()))
-                }
-                _ => None,
+        let taker = st
+            .src
+            .and_then(|s| {
+                st.taker.iter().find_map(|r| match *r {
+                    Resp::Ack { handle, .. } | Resp::Fill { handle, .. } => {
+                        Some(oid(s.lane, handle.slot()))
+                    }
+                    _ => None,
+                })
             })
-        });
+            .or_else(|| {
+                // A `Rescan`'s first taker still to sweep (10 §7.9 item 11).
+                let (_, l, q, _) = self.rescan.iter().find(|x| x.3.tfill > 0)?;
+                match self.tfills.get(&(*l, *q))?.front()? {
+                    (_, Resp::Fill { handle, .. }) => Some(oid(LaneId(*l), handle.slot())),
+                    _ => None,
+                }
+            });
         self.push(
             ts,
             EventKind::Step {
@@ -821,6 +933,9 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
                 }
                 self.push(ts, EventKind::StepOp(b))?;
             }
+        }
+        if !self.rescan.is_empty() {
+            return self.emit_rescan(st);
         }
         let mut ordinal = 0u16;
         for &(lane, r) in &st.maker {
@@ -898,6 +1013,170 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
         Ok(())
     }
 
+    /// The `Rescan` queue in step `st` (05 §8.6, 10 §7.9 item 11). Each op of it in key order:
+    /// a taker's execs in this step are the step's maker `Fill`s at each of its levels gated
+    /// to this step whose maker is on the other side, in TX order until they sum to the
+    /// level. A taker with fills gated to a later step (a capped sweep) stops the queue
+    /// there; otherwise what rests is a step-channel `MD_ADD` with `via BBO`, right after its
+    /// last execs, so a later taker can match it. Every other op is its lane effect, on the
+    /// step channel.
+    fn emit_rescan(&mut self, st: &PendStep) -> Result<(), SinkError> {
+        let mut makers: Vec<(TxEntry, Resp, u16)> = Vec::new();
+        for (h, r) in &st.tx {
+            match (h.role, *r) {
+                (ROLE_MAKER, Resp::Fill { .. }) => {
+                    let k = u16::try_from(makers.len()).map_err(|_| SinkError::Book)?;
+                    makers.push((*h, *r, k));
+                }
+                (_, Resp::Reject { .. }) => {}
+                (ROLE_MAKER, Resp::Out { .. }) => {
+                    return Err(SinkError::Unsupported("STP in a Rescan step"));
+                }
+                _ => {
+                    return Err(SinkError::Unsupported(
+                        "Rescan TX record other than a maker Fill",
+                    ));
+                }
+            }
+        }
+        let mut used = vec![false; makers.len()];
+        let mut mine: Vec<(TxEntry, Resp, u16)> = Vec::new();
+        while let Some((ts, lc, seq, op)) = self.rescan.front().copied() {
+            if op.tfill == 0 {
+                self.rescan.pop_front();
+                self.emit_op(ts, lc, seq, &op, true)?;
+                continue;
+            }
+            let Some(Msg::New { flags, qty, .. }) = op.msg else {
+                return Err(SinkError::Book); // `resolve` takes taker fills only for a New
+            };
+            let aside = side(flags.side);
+            let mut pend = self.tfills.remove(&(lc, seq)).unwrap_or_default();
+            let mut fills: Vec<(u32, Resp)> = Vec::new();
+            mine.clear();
+            let mut got = 0u32;
+            // Its fills in record order, while this step's makers cover them; a fill with no
+            // maker here is a later step's (a capped sweep, 05 §8.5).
+            while let Some(&(rs, f)) = pend.front() {
+                let Resp::Fill { tick, qty: lq, .. } = f else {
+                    return Err(SinkError::Book);
+                };
+                let mut left = lq.0;
+                let at = mine.len();
+                for (m, u) in makers.iter().zip(used.iter_mut()) {
+                    if left == 0 {
+                        break;
+                    }
+                    let (
+                        h,
+                        Resp::Fill {
+                            handle,
+                            tick: mt,
+                            qty: mq,
+                            ..
+                        },
+                        _,
+                    ) = *m
+                    else {
+                        continue;
+                    };
+                    let maker = oid(h.lane, handle.slot());
+                    if *u
+                        || mt != tick
+                        || mq.0 > left
+                        || self
+                            .book
+                            .get(&maker)
+                            .is_none_or(|o| opposite(o.side) != aside)
+                    {
+                        continue;
+                    }
+                    *u = true;
+                    left -= mq.0;
+                    mine.push(*m);
+                }
+                if left == lq.0 {
+                    break;
+                }
+                if left != 0 {
+                    return Err(SinkError::Book);
+                }
+                for &(h, r, k) in &mine[at..] {
+                    let Resp::Fill {
+                        handle,
+                        tick,
+                        qty: mq,
+                        ..
+                    } = r
+                    else {
+                        return Err(SinkError::Book);
+                    };
+                    self.push(
+                        ts,
+                        EventKind::Exec {
+                            aggressor: aside,
+                            ordinal: k,
+                            maker: oid(h.lane, handle.slot()),
+                            tick,
+                            qty: mq,
+                        },
+                    )?;
+                }
+                pend.pop_front();
+                fills.push((rs, f));
+                got = got.checked_add(lq.0).ok_or(SinkError::Book)?;
+            }
+            let later = pend;
+            let prior = self.rescan_prior;
+            let done = later.is_empty();
+            if done {
+                self.rescan.pop_front();
+                self.rescan_prior = 0;
+                if let Some(Resp::Ack { handle, tick, .. }) = op.res {
+                    let left = qty.0.checked_sub(op.tfill).ok_or(SinkError::Book)?;
+                    self.push(
+                        ts,
+                        EventKind::StepOp(BookOp::Add {
+                            oid: oid(LaneId(lc), handle.slot()),
+                            side: aside,
+                            tick,
+                            qty: Qty(left),
+                            prio_ts: Nanos(op.prio_ts),
+                            via_bbo: true,
+                            auction: false,
+                        }),
+                    )?;
+                }
+            } else {
+                self.rescan_prior = prior.checked_add(got).ok_or(SinkError::Book)?;
+                self.tfills.insert((lc, seq), later);
+            }
+            self.tap.rescan_taker(&TapTaker {
+                step: st.step,
+                lane: LaneId(lc),
+                seq: LaneSeq(seq),
+                session: op.pkt.0,
+                pkt_seq: op.pkt.1,
+                msg: op.msg,
+                prior,
+                fills: &fills,
+                rest: if done {
+                    op.res.map(|r| (op.resp_seq, r))
+                } else {
+                    None
+                },
+                makers: &mine,
+            });
+            if !done {
+                break;
+            }
+        }
+        if used.iter().any(|u| !u) {
+            return Err(SinkError::Book);
+        }
+        Ok(())
+    }
+
     /// Hands one event to the encoder and applies it to the rebuilt book.
     fn push(&mut self, ts: u64, kind: EventKind) -> Result<(), SinkError> {
         let ts = ts.max(self.newest);
@@ -944,6 +1223,17 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
             }
         }
         Ok(())
+    }
+}
+
+/// `Fill.liq` of a taker fill (01 §6.4).
+const LIQ_TAKER: u8 = 1;
+
+/// The qty of a `New` op.
+fn new_qty(o: &Op) -> Option<u32> {
+    match o.msg {
+        Some(Msg::New { qty, .. }) => Some(qty.0),
+        _ => None,
     }
 }
 
@@ -997,5 +1287,57 @@ impl<K: PacketSink, T: Tap> Sink for SinkStream<K, T> {
 
     fn take(&mut self, _: &vyrn_types::AcctTake) {
         self.fail(SinkError::Unsupported("pooled lane"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn op(msg: Msg) -> Op {
+        Op {
+            pkt: (SessionId(1), 1),
+            pkt_first: 1,
+            last: true,
+            msg: Some(msg),
+            prio_ts: 0,
+            fwd: false,
+            res: None,
+            resp_seq: 1,
+            tfill: 0,
+        }
+    }
+
+    #[test]
+    fn an_unbuilt_lane_record_is_unsupported_by_name_not_book() {
+        // Before, every pair without an arm was `Book`, as if the book were wrong.
+        let s = SinkStream::new(BookId(1), Epoch(0), 1, Vec::<Vec<u8>>::new());
+        let h = Handle::new(1, 1).unwrap();
+        let cancel = op(Msg::Cancel {
+            handle: h,
+            client_tag: 0,
+        });
+        let ack = Resp::Ack {
+            index: 0,
+            handle: h,
+            tick: Tick(100),
+            client_tag: 0,
+        };
+        assert_eq!(
+            s.lane_op(0, &cancel, &ack),
+            Err(SinkError::Unsupported("Ack of a message other than New"))
+        );
+        let fill = Resp::Fill {
+            index: 0,
+            liq: 0,
+            handle: h,
+            tick: Tick(100),
+            qty: Qty(1),
+        };
+        assert_eq!(
+            s.lane_op(0, &cancel, &fill),
+            Err(SinkError::Unsupported("lane Fill of an op"))
+        );
     }
 }
