@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { figureKey, getFigures } from "./diagrams";
@@ -20,6 +21,16 @@ describe("getFigures", () => {
       expect(existsSync(path.join("diagrams", `${f.file}.excalidraw`)), f.file).toBe(true);
       expect(f.width).toBeLessThanOrEqual(1200);
       expect(f.alt.length).toBeGreaterThan(40);
+    }
+  });
+
+  it("points every figure at a diagram block the inventory lists", async () => {
+    const inventory: Record<string, { asciiIndex: number }[]> = JSON.parse(
+      await readFile(path.join("diagrams", "inventory.json"), "utf8"),
+    );
+    for (const f of await getFigures()) {
+      const listed = (inventory[f.slug] ?? []).some((b) => b.asciiIndex === f.asciiIndex);
+      expect(listed, figureKey(f.slug, f.asciiIndex)).toBe(true);
     }
   });
 });
