@@ -39,8 +39,8 @@ pub const QUIESCE_ROUNDS: usize = 4096;
 /// Virtual cost of one lane packet and of one BBO run.
 const LANE_COST: u64 = 150;
 const BBO_COST: u64 = 100;
-const BOOK: BookId = BookId(7);
-const TICK_MAX: u32 = 512;
+pub const BOOK: BookId = BookId(7);
+pub const TICK_MAX: u32 = 512;
 /// Events kept for a failure report (11 §6.4: "the last 10,000 events").
 pub const TAIL: usize = 10_000;
 
@@ -322,6 +322,13 @@ impl Sink for Out {
 #[derive(Default, Debug)]
 pub struct Store(BTreeMap<(u8, u32, u32, u64), Vec<u8>>);
 
+impl Store {
+    /// Every packet, keyed by `(lane, session, pkt_seq, rx_ts)`.
+    pub fn iter(&self) -> impl Iterator<Item = (&(u8, u32, u32, u64), &Vec<u8>)> {
+        self.0.iter()
+    }
+}
+
 impl Payloads for Store {
     fn get(&self, r: &PacketRecord) -> Option<&[u8]> {
         self.0
@@ -330,11 +337,13 @@ impl Payloads for Store {
     }
 }
 
-fn sid(l: usize, a: u32) -> SessionId {
+/// Session `a` of lane `l`.
+pub fn sid(l: usize, a: u32) -> SessionId {
     SessionId((1 << 20) | (u32::try_from(l).unwrap_or(0) << 12) | a)
 }
 
-fn kseq(l: usize, a: u32) -> [u8; 16] {
+/// Session `a` of lane `l`'s request key.
+pub fn kseq(l: usize, a: u32) -> [u8; 16] {
     let mut k = [0x5Au8; 16];
     k[0] = u8::try_from(l).unwrap_or(0);
     k[1] = u8::try_from(a).unwrap_or(0);
@@ -389,14 +398,15 @@ fn lane_cfgs(n: usize) -> Vec<LaneConfig> {
 
 /// A box: `cfg.lanes` lanes, sessions `1..=cfg.sessions` on each, every account funded.
 /// The sequencer and every replica build the same box (07: replicas start from the same state).
-fn new_box(n: usize) -> (Bbo, Box<Shared<Hw>>) {
+pub fn new_box(n: usize) -> (Bbo, Box<Shared<Hw>>) {
     let bbo = Bbo::new(bbo_cfg(n));
     let sh = Shared::new(&Hw, n, arena_cfg(), &bbo.initial_snapshot())
         .unwrap_or_else(|| unreachable!("lane count is 1..=8"));
     (bbo, sh)
 }
 
-fn engine<'a>(bbo: Bbo, sh: &'a mut Shared<Hw>, cfg: &Config) -> Engine<'a, Hw, NA> {
+/// The box's engine: what the sequencer and every replica start from.
+pub fn engine<'a>(bbo: Bbo, sh: &'a mut Shared<Hw>, cfg: &Config) -> Engine<'a, Hw, NA> {
     let sessions = cfg.sessions;
     Engine::new(&Hw, sh, bbo, &lane_cfgs(cfg.lanes), |lc, aw, ports| {
         let l = usize::from(lc.lane.0);
@@ -547,6 +557,12 @@ pub fn run_seed(seed: u64) -> Report {
 
 /// Runs `seed`'s configuration and workload under `schedule` (crate docs, "Run").
 pub fn run(seed: u64, schedule: &Schedule) -> Report {
+    run_log(seed, schedule).0
+}
+
+/// [`run`], also returning the sequencer's live outputs and the packet bytes, the order stream
+/// a replica replays (for replay engines outside this crate, such as the Vx client's tests).
+pub fn run_log(seed: u64, schedule: &Schedule) -> (Report, Out, Store) {
     let cfg = Config::from_seed(seed);
     let faults = &schedule.0;
     let mut wl = stream(seed, "workload");
@@ -1002,7 +1018,7 @@ pub fn run(seed: u64, schedule: &Schedule) -> Report {
     if let Some(v) = &violation {
         trace.update(format!("{v:?}\n").as_bytes());
     }
-    Report {
+    let report = Report {
         seed,
         config: cfg,
         schedule: schedule.clone(),
@@ -1014,7 +1030,8 @@ pub fn run(seed: u64, schedule: &Schedule) -> Report {
             Vec::new()
         },
         violation,
-    }
+    };
+    (report, out, store)
 }
 
 /// Delta debugging over the schedule (11 §6.4 `shrink`): drops faults one at a time while the

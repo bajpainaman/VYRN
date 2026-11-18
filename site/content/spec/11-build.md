@@ -1079,7 +1079,8 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   4. STP that triggers (currently `PBV_E_UNSUPPORTED` in a forwarded or batch sweep and the FOK
      dry run).
   5. In-packet dependencies (05 §3.7: Join and Cancel dependencies; the CancelAll and Reduce
-     pass barriers are done in 3a).
+     pass barriers are done in 3a). Done means `vx_golden.rs`'s seed 6f is strict and fails
+     with the LOWVER mask ignored, and a mutant that drops the 3a pass barrier fails a test.
   6. `engine.client` wiring in `vyrn-validator` (nothing constructs `VxReplay` today).
   7. Then a write-up of what a Vx default (`engine.client = vx`) needs; the default stays `rust`.
 - *Pooled lanes (`AcctTake`, 05 §6.9, 07 §7.1).* `pbv_config` byte 48 is the pool mask,
@@ -1122,13 +1123,19 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   (`Engine::step_call`). The client no longer reads lane counters for `lowver`. **[Reading]**
   "The version of the packet holding `cut[l]`" is the version of the lane call that applied the
   op, as `Engine::low_hist` records it, not the op's own packet's when pass 2 runs in a later
-  call. In replay, `lowver` reaches the outputs only through `band_env`. Since a wider envelope
-  only starts searches further out, no script found so far shows different bytes for any
-  `lowver`, including 0 on every lane. So `tests/replay.rs` checks LOWVER steps byte for byte at
-  every split and the `BadRecord` case against `RustReplay`, but no test can isolate the value
-  itself. `tests/replay.rs` checks this
-  against `RustReplay` byte for byte: the band and `snap_lag` scripts at every block boundary,
-  a lane's catch-up past the 4095-version window, and an evicted version.
+  call. The value matters (engine thread, #199): replay resets the band bounds to the envelope
+  each step, and those bounds are published and versioned, so a wrong `lowver` gives snapshot
+  versions live never had. Under a no-mask mutant, sim-swarm seeds 1–300 fail 10/300 with
+  INV-DET `NoSnapshot`; seed 6f with faults `drop 31` is pinned in `tests/seeds.toml`.
+  `vyrn-sim/tests/vx_golden.rs` frames that seed's live order stream as 07 (`cluster::run_log`)
+  and replays it with `RustReplay` and the Vx client. That log has in-packet dependencies, so
+  until gap item 5 the Vx client stops there with `PBV_E_UNSUPPORTED`, and the test requires a
+  match or UNSUPPORTED, never different bytes. A client that ignores the mask is therefore not
+  caught yet; gap item 5 makes the test strict, and its PR checks that the no-mask mutant fails
+  it. Only 3 of the first 149 swarm seeds fall inside the current subset, and none of them
+  separates the mask. The scripted `tests/replay.rs` checks still compare LOWVER steps byte for
+  byte with `RustReplay`: the band and `snap_lag` scripts at every block boundary, a lane's
+  catch-up past the 4095-version window, an evicted version, and the `BadRecord` cases.
 - *Capacity.* The op log (`OPLOG_CAP`) and the forwarded queue (`FWDQ_CAP` = 1024 per lane) are
   fixed. A live lane can have up to `ENG_FWD_RING` + the BBO's lane buffer forwarded ops in
   flight, so more than `FWDQ_CAP` forwarded ops due before one step (or an op log full before
