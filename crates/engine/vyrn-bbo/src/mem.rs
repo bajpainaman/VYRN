@@ -127,12 +127,15 @@ impl MemBook {
         let Some(v) = self.slot(lane, old) else {
             return 0;
         };
+        // 05 §4.3: `pred_total` in bytes 16–19, `pred_pos` (the replaced version's position
+        // slot) in bytes 20–23.
+        let pos = self.ver_pos.get(&(lane.0, old)).copied().unwrap_or(old);
         self.write_slot(
             lane,
             OrderSlot {
                 prio_ts: ts,
                 ins_seq: seq,
-                ins_ts: u64::from(v.total),
+                ins_ts: u64::from(v.total) | (u64::from(pos) << 32),
                 tick,
                 total: qty,
                 acct_ix: v.acct_ix,
