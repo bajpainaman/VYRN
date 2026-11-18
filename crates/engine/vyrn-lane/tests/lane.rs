@@ -1518,4 +1518,55 @@ fn a_reduce_admitted_after_the_freeze_does_not_keep_the_auction_reservation() {
         "{recs:?}"
     );
     assert_eq!(base_resv(&mut x, 0, 1), 0, "nothing stays reserved");
+    // The reduced version (ins_seq > C*) is dead to the BBO too: the next auction fills the
+    // lane-1 sell behind it at 110, not the ended order.
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Auction,
+        lo: Tick(0),
+        hi: Tick(0),
+    });
+    x.settle(&mut bbo);
+    x.send(
+        1,
+        1,
+        4_000,
+        &[
+            new(day(Side::Sell), 110, 6, 8),
+            new(day(Side::Buy), 110, 6, 9),
+        ],
+    );
+    x.settle(&mut bbo);
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Frozen,
+        lo: Tick(1),
+        hi: Tick(u32::MAX - 1),
+    });
+    x.command(&ControlCmd::Uncross {
+        price: Tick(110),
+        qty: 6,
+    });
+    x.settle(&mut bbo);
+    assert!(
+        x.records(0, 1)
+            .iter()
+            .all(|r| !matches!(r, Record::Fill { .. })),
+        "the ended order does not trade"
+    );
+    let at_110: Vec<_> = x
+        .records(1, 1)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Fill {
+                tick: Tick(110),
+                qty,
+                ..
+            } => Some(qty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        at_110,
+        vec![Qty(6), Qty(6)],
+        "the lane-1 sell fills instead"
+    );
 }

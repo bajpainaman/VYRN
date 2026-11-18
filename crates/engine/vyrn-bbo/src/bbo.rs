@@ -2206,7 +2206,7 @@ impl Bbo {
         };
         if self
             .ctx(src, c, prev, Some(after))
-            .live(l, slot, &v)
+            .live(l, slot, &v, v.ins_seq)
             .is_none()
         {
             return Sweep::Skipped;
