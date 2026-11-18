@@ -25,7 +25,7 @@ use vyrn_cut::Visibility;
 use vyrn_lane::{Mid, RespPkt, RxIn};
 use vyrn_risk::Route;
 use vyrn_types::{
-    LaneId, LaneSeq, PacketFlags, PacketRecord, RouteRecord, StepFlags, StepId, StepKind,
+    AcctTake, LaneId, LaneSeq, PacketFlags, PacketRecord, RouteRecord, StepFlags, StepId, StepKind,
     StepRecord, Tick,
 };
 
@@ -39,6 +39,9 @@ pub enum OwnedRec {
     Packet(PacketRecord),
     Step(StepEntry, [CutDelta; MAX_LANES]),
     Route(RouteRecord),
+    /// A pooled lane's account take (01 §14.17.4, 05 §6.9), logged right before the record it
+    /// covers. [`Engine::replay`] checks it as part of that record's lane call.
+    Take(AcctTake),
 }
 
 impl OwnedRec {
@@ -55,13 +58,15 @@ impl OwnedRec {
             }
         }
     }
-    /// The borrowed form; a step's deltas are its first `n_delta`.
-    pub fn as_rec(&self) -> Rec<'_> {
-        match self {
+    /// The borrowed form; a step's deltas are its first `n_delta`. `None` for an `AcctTake`,
+    /// which a [`Sink`] receives through [`Sink::take`], not [`Sink::record`].
+    pub fn as_rec(&self) -> Option<Rec<'_>> {
+        Some(match self {
             Self::Packet(p) => Rec::Packet(*p),
             Self::Route(x) => Rec::Route(*x),
             Self::Step(e, d) => Rec::Step(*e, d.get(..usize::from(e.n_delta)).unwrap_or(&[])),
-        }
+            Self::Take(_) => return None,
+        })
     }
 }
 
@@ -139,6 +144,10 @@ struct Tee<'s, S, R> {
     /// The call's route records, in output order.
     routes: [RouteRecord; MAX_ROUTES],
     n_routes: usize,
+    /// The call's `AcctTake` records in output order, each with the number of the call's
+    /// packet records output before it (its place among them).
+    takes: [Option<(usize, AcctTake)>; MAX_TAKES],
+    n_takes: usize,
     step: Option<OwnedRec>,
     bad_resp: bool,
 }
@@ -152,6 +161,8 @@ impl<'s, S, R> Tee<'s, S, R> {
             pkts,
             routes: [NO_ROUTE; MAX_ROUTES],
             n_routes: 0,
+            takes: [None; MAX_TAKES],
+            n_takes: 0,
             step: None,
             bad_resp: false,
         }
@@ -201,7 +212,15 @@ impl<S: Sink, R: Responses> Sink for Tee<'_, S, R> {
         }
         self.inner.tx(h, recs);
     }
-    fn take(&mut self, t: &vyrn_types::AcctTake) {
+    fn take(&mut self, t: &AcctTake) {
+        // More than one per packet record is a fault that the compare reports.
+        match self.takes.get_mut(self.n_takes) {
+            Some(d) => {
+                *d = Some((self.pkts.len(), *t));
+                self.n_takes = self.n_takes.saturating_add(1);
+            }
+            None => self.bad_resp = true,
+        }
         self.inner.take(t);
     }
 }
@@ -219,7 +238,7 @@ fn same_step(a: &OwnedRec, b: &OwnedRec) -> bool {
             },
             d,
         )),
-        OwnedRec::Packet(_) | OwnedRec::Route(_) => None,
+        OwnedRec::Packet(_) | OwnedRec::Route(_) | OwnedRec::Take(_) => None,
     };
     let (x, y) = (strip(a), strip(b));
     x.is_some() && x == y
@@ -228,7 +247,7 @@ fn same_step(a: &OwnedRec, b: &OwnedRec) -> bool {
 fn packet_of(r: &OwnedRec) -> Option<&PacketRecord> {
     match r {
         OwnedRec::Packet(p) => Some(p),
-        OwnedRec::Step(..) | OwnedRec::Route(_) => None,
+        OwnedRec::Step(..) | OwnedRec::Route(_) | OwnedRec::Take(_) => None,
     }
 }
 
@@ -236,6 +255,9 @@ fn packet_of(r: &OwnedRec) -> Option<&PacketRecord> {
 const MAX_MIDS: usize = 20;
 /// Forwarded ops one packet can hold.
 const MAX_ROUTES: usize = 10;
+/// `AcctTake` records one lane call can log: one for its packet record (05 §6.9); the rest of
+/// the call's records are Advance records, which take no token.
+const MAX_TAKES: usize = 2;
 
 /// The routes of packet `pk`'s classified ops (05 §10 row 7, 07 §3.6): one route record per op
 /// the lane classified `Cross` or `Improve`, forwarded or rejected by the lane itself. Every
@@ -834,10 +856,11 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     }
                     1
                 }
-                OwnedRec::Packet(_) | OwnedRec::Route(_) => {
+                OwnedRec::Packet(_) | OwnedRec::Route(_) | OwnedRec::Take(_) => {
                     let lane = match r {
                         OwnedRec::Packet(p) => p.lane,
                         OwnedRec::Route(x) => x.lane,
+                        OwnedRec::Take(t) => t.lane,
                         OwnedRec::Step(..) => LaneId(0),
                     };
                     let l = usize::from(lane.0);
@@ -848,6 +871,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     let lane_run = run.iter().map_while(|x| match x {
                         OwnedRec::Packet(q) if q.lane == lane => Some(Some(q)),
                         OwnedRec::Route(q) if q.lane == lane => Some(None),
+                        OwnedRec::Take(q) if q.lane == lane => Some(None),
                         _ => None,
                     });
                     let (k, pk) = match r {
@@ -863,6 +887,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     let span = run.iter().take_while(|x| match x {
                         OwnedRec::Packet(q) => q.lane == lane && (is_mid(q) || !is_advance(q)),
                         OwnedRec::Route(q) => q.lane == lane,
+                        OwnedRec::Take(q) => q.lane == lane,
                         OwnedRec::Step(..) => false,
                     });
                     let mut mids = [NO_REC; MAX_MIDS];
@@ -874,6 +899,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                             .map_while(|x| match x {
                                 OwnedRec::Packet(q) if q.lane == lane && is_mid(q) => Some(Some(q)),
                                 OwnedRec::Route(q) if q.lane == lane => Some(None),
+                                OwnedRec::Take(q) if q.lane == lane => Some(None),
                                 _ => None,
                             })
                             .flatten();
@@ -897,18 +923,25 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     if tee.bad_resp {
                         return Err(at(Why::Response));
                     }
-                    // The call's output, packets and route records in output order, must be
-                    // the next records of the input.
-                    let (n_pk, n_rt) = (tee.pkts.len(), tee.n_routes);
-                    let used = n_pk.saturating_add(n_rt);
+                    // The call's output, packets, route and `AcctTake` records in output order,
+                    // must be the next records of the input: a take sits right before the
+                    // record it covers, and its `ver` is the pool's next (05 §6.9).
+                    let (n_pk, n_rt, n_tk) = (tee.pkts.len(), tee.n_routes, tee.n_takes);
+                    let used = n_pk.saturating_add(n_rt).saturating_add(n_tk);
                     let want = recs.get(i..i.saturating_add(used)).unwrap_or(&[]);
                     let mut gp = tee.pkts.iter();
                     let mut gr = tee.routes().iter();
+                    let mut gt = tee.takes.iter().flatten();
+                    let mut seen = 0usize;
                     let same = n_pk > 0
                         && want.len() == used
                         && want.iter().all(|w| match w {
-                            OwnedRec::Packet(p) => gp.next() == Some(p),
+                            OwnedRec::Packet(p) => {
+                                seen = seen.saturating_add(1);
+                                gp.next() == Some(p)
+                            }
                             OwnedRec::Route(x) => gr.next() == Some(x),
+                            OwnedRec::Take(t) => gt.next() == Some(&(seen, *t)),
                             OwnedRec::Step(..) => false,
                         });
                     if !same {

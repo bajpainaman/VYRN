@@ -14,7 +14,7 @@ use harness::*;
 use vyrn_bbo::admit::{FixedClock, NeverLate};
 use vyrn_bbo::{Bbo, ControlCmd, OrderFlags, Phase, Record, Side, Stp, Tif, TxEntry};
 use vyrn_cut::{Hw, PoolTok};
-use vyrn_engine::{Engine, Fault, NoResponses, OwnedRec, Rec, Shared, Sink};
+use vyrn_engine::{Diverged, Engine, Fault, NoResponses, OwnedRec, Rec, Shared, Sink, Why};
 use vyrn_lane::{RespPkt, RxIn};
 use vyrn_risk::AcctSlot;
 use vyrn_types::{AccountId, AcctTake, Epoch, LaneId, MAX_REQ_PAYLOAD, Nanos, Qty, StepKind, Tick};
@@ -39,6 +39,7 @@ impl Sink for Takes {
     }
     fn take(&mut self, t: &AcctTake) {
         self.takes.push((self.j.recs.len(), *t));
+        self.j.take(t);
     }
 }
 
@@ -146,7 +147,12 @@ fn a_pooled_session_logs_one_take_before_each_of_its_records() {
         vec![(1, POOLED, 1, 1), (2, POOLED, 2, 1), (1, POOLED, 3, 2)]
     );
     for (at, t) in &s.takes {
-        let OwnedRec::Packet(p) = s.j.recs[*at] else {
+        assert_eq!(
+            s.j.recs[*at],
+            OwnedRec::Take(*t),
+            "the journal holds the take"
+        );
+        let OwnedRec::Packet(p) = s.j.recs[*at + 1] else {
             panic!("take {t:?} is not followed by a packet record");
         };
         assert_eq!(
@@ -166,6 +172,34 @@ fn a_pooled_session_logs_one_take_before_each_of_its_records() {
         Ok(())
     );
     assert_eq!(rs.takes, s.takes);
+
+    // F4a: each `AcctTake` is part of its record's lane call and must be reproduced in place
+    // (05 §6.9, 01 §14.17.4). A changed `ver`, a dropped take, or a take moved after its record
+    // diverges at the take's index.
+    let (first, _) = s.takes[0];
+    let replay = |recs: &[OwnedRec]| {
+        let rtok = PoolTok::new();
+        let mut rsh = box_shared();
+        let mut r = pooled_engine(&mut rsh, &rtok, true);
+        r.replay(recs, &store, &mut NoResponses, &mut Journal::default())
+    };
+    let mismatch = |index| {
+        Err(Diverged {
+            index,
+            why: Why::Mismatch,
+        })
+    };
+    let mut bad_ver = s.j.recs.clone();
+    if let OwnedRec::Take(t) = &mut bad_ver[first] {
+        t.ver += 1;
+    }
+    assert_eq!(replay(&bad_ver), mismatch(first));
+    let mut dropped = s.j.recs.clone();
+    dropped.remove(first);
+    assert_eq!(replay(&dropped), mismatch(first));
+    let mut moved = s.j.recs.clone();
+    moved.swap(first, first + 1);
+    assert_eq!(replay(&moved), mismatch(first));
 }
 
 #[test]
@@ -273,7 +307,7 @@ fn an_auction_runs_through_control_steps_and_replays() {
         .iter()
         .filter_map(|r| match r {
             OwnedRec::Step(s, _) => StepKind::from_code(s.kind),
-            OwnedRec::Packet(_) | OwnedRec::Route(_) => None,
+            OwnedRec::Packet(_) | OwnedRec::Route(_) | OwnedRec::Take(_) => None,
         })
         .filter(|k| matches!(k, StepKind::Control | StepKind::Uncross))
         .collect();

@@ -177,6 +177,9 @@ impl Sink for Journal {
     fn tx(&mut self, h: &TxEntry, recs: &[Record]) {
         self.tx.push((*h, recs.to_vec()));
     }
+    fn take(&mut self, t: &vyrn_types::AcctTake) {
+        self.recs.push(OwnedRec::Take(*t));
+    }
 }
 
 /// Packet bytes keyed by `(lane, session, pkt_seq, rx_ts)`.
@@ -345,6 +348,8 @@ pub fn to_wire(recs: &[OwnedRec]) -> (Vec<PacketRecord>, Vec<vyrn_types::RouteRe
         match r {
             OwnedRec::Packet(p) => lanes.push(*p),
             OwnedRec::Route(x) => routes.push(*x),
+            // `replay_wire` does not take `AcctTake`s yet (PR follow-up F4b).
+            OwnedRec::Take(_) => {}
             OwnedRec::Step(e, d) => {
                 for x in &d[..usize::from(e.n_delta)] {
                     cut[usize::from(x.lane.0)] = x.seq;
@@ -457,6 +462,10 @@ pub fn rec_line(r: &OwnedRec) -> String {
         OwnedRec::Route(x) => format!(
             "R lane={} lane_seq={} cross={}",
             x.lane.0, x.lane_seq.0, x.cross as u8
+        ),
+        OwnedRec::Take(t) => format!(
+            "T lane={} account={} ver={} lane_seq={}",
+            t.lane.0, t.account.0, t.ver, t.lane_seq.0
         ),
         OwnedRec::Step(e, d) => {
             let ds: Vec<String> = d[..usize::from(e.n_delta)]
