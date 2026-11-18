@@ -5,7 +5,8 @@
 //!
 //! 1. the client receives a response with an `Ack`, tagged with the session's `k_out`;
 //! 2. a replica socket receives ORDER, HASH and HEADER frames that `vyrn-replica`'s order core
-//!    accepts: block 0 is ready, carries the packet with its `pkt_hash`, and its verdict is `Valid`;
+//!    accepts: block 0 is ready, carries the packet with its `pkt_hash` and, right after it, its
+//!    op's `RouteRecord` (07 §3.6), and its verdict is `Valid`;
 //! 3. on stdin EOF the box prints `STATS` with one TX packet sent and zero seal violations.
 #![allow(
     clippy::unwrap_used,
@@ -240,6 +241,23 @@ fn one_order_end_to_end() {
             && p.pkt_hash == vyrn_crypto::pkt_hash(signed))
     });
     assert!(ours, "packet not in block 0: {:?}", block.lanes);
+    // Its route (07 §3.6, Improve) follows it in the same block: replay of block 0 needs it.
+    let at = block
+        .lanes
+        .iter()
+        .position(|r| matches!(r, LaneRec::Pkt(p) if p.session == session && p.pkt_seq == 1))
+        .unwrap();
+    let route = vyrn_types::RouteRecord {
+        lane: LaneId(0),
+        lane_seq: vyrn_types::LaneSeq(1),
+        cross: false,
+    };
+    assert_eq!(
+        block.lanes.get(at + 1),
+        Some(&LaneRec::Route(route)),
+        "{:?}",
+        block.lanes
+    );
     assert!(!block.steps.is_empty(), "block 0 has no step");
     // The resting buy is an improve: its step names our op and its route bit (07 §3.8 src byte
     // bit 7, StepFlags::CROSS) is clear, end to end through the 07 wire.

@@ -91,8 +91,8 @@ use vyrn_nic::{
 };
 use vyrn_risk::{AcctRisk, AcctSlot, BookSpec, SessionBuckets};
 use vyrn_types::{
-    AccountId, BookId, Epoch, Hash, HomeCode, LaneId, LaneSeq, Nanos, PacketRecord, PktHash,
-    RouteRecord, SessionId, StepFlags, StepId, StepKind, TAG_BYTES,
+    AccountId, BookId, Epoch, Hash, HomeCode, LaneId, LaneSeq, MAX_MSGS_PER_PKT, Nanos,
+    PacketRecord, PktHash, RouteRecord, SessionId, StepFlags, StepId, StepKind, TAG_BYTES,
 };
 use vyrn_wire::{PROTO_RESP_MAX_BYTES, RX_BURST, RespHeader, RxPkt, RxRing, TxRing};
 
@@ -128,8 +128,9 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy)]
 enum Out {
-    Pkt(PacketRecord, Option<Hash>),
-    Route(RouteRecord),
+    /// A lane record and the `RouteRecord`s the lane logged right after it (07 §3.6), in one
+    /// element so the stream core never closes a block between them.
+    Pkt(PacketRecord, Option<Hash>, Routes),
     Step(StepEntry, u8, [CutDelta; MAX_LANES]),
     Resp(LaneId, Endpoint, RespPkt),
     /// A fill TX packet (05 §8.10 rules 1 and 2), its records cut to one response's worth.
@@ -137,6 +138,28 @@ enum Out {
     /// A TX packet this release cannot send (see `EngineSink::tx`).
     Unsent,
     Notice(LaneId, EpochNotice),
+}
+
+/// The routes of one packet's ops, at most one per op.
+#[derive(Clone, Copy)]
+struct Routes {
+    n: u8,
+    r: [RouteRecord; MAX_MSGS_PER_PKT as usize],
+}
+
+impl Routes {
+    const NONE: Self = Self {
+        n: 0,
+        r: [RouteRecord {
+            lane: LaneId(0),
+            lane_seq: LaneSeq(0),
+            cross: false,
+        }; MAX_MSGS_PER_PKT as usize],
+    };
+
+    fn iter(&self) -> impl Iterator<Item = &RouteRecord> {
+        self.r.iter().take(usize::from(self.n))
+    }
 }
 
 #[derive(Default)]
@@ -535,9 +558,20 @@ struct EngineSink<'a> {
     peers: Vec<(SessionId, Endpoint)>,
     notifiers: Vec<Notifier>,
     stats: Arc<Stats>,
+    /// The newest packet, held until the records after it are known to be other than its
+    /// routes (see [`EngineSink::flush`]).
+    held: Option<(PacketRecord, Option<Hash>, Routes)>,
 }
 
 impl EngineSink<'_> {
+    /// Sends the held packet with its routes. Called before any other element and after each
+    /// engine call: the engine sends a packet's routes right after it in the same lane drain.
+    fn flush(&mut self) {
+        if let Some((p, full, r)) = self.held.take() {
+            self.send(Out::Pkt(p, full, r));
+        }
+    }
+
     /// Pushes `o`; on a full ring waits for the stream thread (back-pressure, never an
     /// allocation or a drop). Only a stream thread that has exited ends the wait: fail-stop.
     fn send(&mut self, o: Out) {
@@ -566,6 +600,7 @@ impl Sink for EngineSink<'_> {
     fn record(&mut self, r: &Rec<'_>) {
         match r {
             Rec::Packet(p) => {
+                self.flush();
                 let full = self
                     .recent
                     .iter()
@@ -581,9 +616,10 @@ impl Sink for EngineSink<'_> {
                     self.send(Out::Notice(p.lane, n));
                 }
                 self.stats.records.fetch_add(1, Ordering::Relaxed);
-                self.send(Out::Pkt(*p, full));
+                self.held = Some((*p, full, Routes::NONE));
             }
             Rec::Step(e, d) => {
+                self.flush();
                 let mut ds = [CutDelta::default(); MAX_LANES];
                 for (o, i) in ds.iter_mut().zip(d.iter()) {
                     *o = *i;
@@ -591,10 +627,22 @@ impl Sink for EngineSink<'_> {
                 self.stats.steps.fetch_add(1, Ordering::Relaxed);
                 self.send(Out::Step(*e, e.n_delta, ds));
             }
-            Rec::Route(t) => self.send(Out::Route(*t)),
+            Rec::Route(t) => {
+                let slot = self.held.as_mut().and_then(|(_, _, r)| {
+                    let s = r.r.get_mut(usize::from(r.n))?;
+                    r.n = r.n.wrapping_add(1);
+                    Some(s)
+                });
+                match slot {
+                    Some(s) => *s = *t,
+                    // The engine sends a route only after its packet, one per op.
+                    None => self.tx.dead = true,
+                }
+            }
         }
     }
     fn lane_resp(&mut self, lane: LaneId, p: &RespPkt) {
+        self.flush();
         if let Some((_, ep)) = self.peers.iter().find(|(s, _)| *s == p.session) {
             let ep = *ep;
             self.send(Out::Resp(lane, ep, *p));
@@ -603,6 +651,7 @@ impl Sink for EngineSink<'_> {
     /// Only packets with a `resp_seq` are sent: maker packets take theirs from the lane's
     /// `MakerSeq` line (05 §4.15), which `vyrn-engine` does not expose yet (follow-up).
     fn tx(&mut self, h: &TxEntry, recs: &[Record]) {
+        self.flush();
         let peer = self
             .peers
             .iter()
@@ -684,6 +733,7 @@ fn engine_loop<R: RxRing>(
         peers,
         notifiers: plan.notifier.map_or_else(Vec::new, |x| vec![x; n]),
         stats: Arc::clone(stats),
+        held: None,
     };
     // Deadline admission needs a class A or C clock (06 §6.8); DEV backends run without it.
     if !matches!(class, LatencyClass::E | LatencyClass::S) {
@@ -716,6 +766,7 @@ fn engine_loop<R: RxRing>(
         if let Err(f) = engine.run(&dev_clock(newest), &mut sink, 64) {
             out = Err(format!("engine fault {f:?}"));
         }
+        sink.flush();
         if out.is_err() {
             break;
         }
@@ -853,8 +904,13 @@ impl<T: TxRing> StreamCore<T> {
 
     fn take(&mut self, o: Out) -> Result<(), String> {
         let frames = match o {
-            Out::Pkt(p, full) => self.writer.packet(p, full),
-            Out::Route(t) => self.writer.route(t),
+            Out::Pkt(p, full, routes) => {
+                let mut frames = self.writer.packet(p, full).map_err(|e| e.to_string())?;
+                for t in routes.iter() {
+                    frames.extend(self.writer.route(*t).map_err(|e| e.to_string())?);
+                }
+                Ok(frames)
+            }
             Out::Step(e, n, ds) => {
                 for d in ds.iter().take(usize::from(n)) {
                     if let Some(c) = self.cut.get_mut(usize::from(d.lane.0)) {

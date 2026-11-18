@@ -69,7 +69,8 @@ fn frames_decode_and_headers_chain() {
         pkt(0, 0x22, 9, 1, 1),
     ];
     // Routes (07 §3.6) follow their packet: one inside lane 2's run, naming its first op, and
-    // one for lane 0's op pushed in the next block.
+    // one for lane 0's op framed after a block close. The encoding allows that; vyrn-seq never
+    // does it, because a packet and its routes reach the stream core as one element.
     let r2 = RouteRecord {
         lane: LaneId(2),
         lane_seq: LaneSeq(1),
