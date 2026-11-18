@@ -211,6 +211,53 @@ fn replay_takes_kind_and_source_from_the_record() {
 }
 
 #[test]
+fn replay_routes_a_forwarded_op_by_its_cross_bit_not_its_step_kind() {
+    // #69: the live BBO copies the lane's route into StepEntry.flags (STEP_CROSS) and
+    // replay_step compares it. Lanes 1 and 2 both see ask 105 in their snapshot and classify a
+    // buy @ 105 as Cross. The first takes the ask; the second finds nothing left and rests, so
+    // it logs as an Improve step with STEP_CROSS set. Replay must route it Cross from the bit.
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let s = vec![
+        Act::Pkt {
+            l: 0,
+            a: 1,
+            rx_ts: 1_000,
+            now: 1_000,
+            msgs: vec![new(Sell, Day, 105, 1, 11)],
+        },
+        Act::Run,
+        Act::Pkt {
+            l: 1,
+            a: 1,
+            rx_ts: 2_000,
+            now: 2_000,
+            msgs: vec![new(Buy, Day, 105, 1, 21)],
+        },
+        Act::Pkt {
+            l: 2,
+            a: 1,
+            rx_ts: 3_000,
+            now: 3_000,
+            msgs: vec![new(Buy, Day, 105, 1, 31)],
+        },
+        Act::Run,
+    ];
+    let (j, store, _, _) = live(&s);
+    assert!(
+        steps(&j.recs)
+            .any(|e| e.kind == StepKind::Improve.code() && e.flags & vyrn_bbo::STEP_CROSS != 0),
+        "the script must log a Cross-classified op as an Improve step: {:?}",
+        steps(&j.recs)
+            .map(|e| (e.kind, e.flags))
+            .collect::<Vec<_>>()
+    );
+    let (r, rep) = replay(&j.recs, &store);
+    assert_eq!(r, Ok(()));
+    assert_eq!(logical(&rep.recs), logical(&j.recs));
+}
+
+#[test]
 fn replay_rejects_a_changed_record_at_its_index() {
     let (j, store, _, _) = live(&script());
     // A packet record whose fills_applied differs from the replayed lane's.

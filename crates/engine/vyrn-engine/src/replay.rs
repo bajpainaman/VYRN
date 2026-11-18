@@ -15,7 +15,7 @@
 //!   3), and its forwarded ops taken from the later `StepRecord`s that name them (§10 row 7).
 
 use vyrn_bbo::admit::{FixedClock, NeverLate};
-use vyrn_bbo::{CutDelta, Diverge, MAX_LANES, ReplayStep, STEP_CONT, StepEntry};
+use vyrn_bbo::{CutDelta, Diverge, MAX_LANES, ReplayStep, STEP_CONT, STEP_CROSS, StepEntry};
 use vyrn_cut::LaneCutEntry;
 use vyrn_cut::Visibility;
 use vyrn_lane::Mid;
@@ -155,17 +155,20 @@ const MAX_ROUTES: usize = 10;
 /// `StepRecord` has `src = (l, q)`), from the steps after it in `recs`. A lane's sources come
 /// in `LaneSeq` order (its `FwdRing` is FIFO), so the scan stops at the first later one.
 ///
-/// TEMPORARY (lane follow-up 18): the route comes from [`route_of_kind`] until the log carries
-/// the route the live lane classified (a `FwdEntry` route bit copied into a `StepRecord` flag,
-/// in progress). Switching is a change to that one function.
-/// TEMPORARY: the route of a step's source, from the step's kind (`Improve` → `Improve`,
-/// `Cross` and `Shed` → `Cross`); `None` for kinds that have no forwarded source. A `Cross`
-/// that STP stops before any fill is logged as `Improve`, and a shed `Improve` as `Shed`, so
-/// both replay with the other route's risk bucket: a known divergence (PR gap G7).
+/// The route of a step's source: the route the live lane classified, which the BBO core copies
+/// into `StepEntry.flags` as `STEP_CROSS` (05 §4.15, #69): `Cross` iff the bit is set, `Improve`
+/// otherwise. `None` for kinds that have no forwarded source. The step kind is not the route: a
+/// `Cross`-classified op that STP stops before any fill logs as an `Improve` step, and a shed
+/// `Improve` as `Shed`.
 fn route_of_kind(e: &StepEntry) -> Option<Route> {
     match StepKind::from_code(e.kind)? {
-        StepKind::Improve => Some(Route::Improve),
-        StepKind::Cross | StepKind::Shed => Some(Route::Cross),
+        StepKind::Improve | StepKind::Cross | StepKind::Shed => {
+            Some(if e.flags & STEP_CROSS != 0 {
+                Route::Cross
+            } else {
+                Route::Improve
+            })
+        }
         _ => None,
     }
 }
