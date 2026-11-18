@@ -92,7 +92,7 @@ use vyrn_nic::{
 use vyrn_risk::{AcctRisk, AcctSlot, BookSpec, SessionBuckets};
 use vyrn_types::{
     AccountId, BookId, Epoch, Hash, HomeCode, LaneId, LaneSeq, Nanos, PacketRecord, PktHash,
-    SessionId, StepFlags, StepId, StepKind, TAG_BYTES,
+    RouteRecord, SessionId, StepFlags, StepId, StepKind, TAG_BYTES,
 };
 use vyrn_wire::{PROTO_RESP_MAX_BYTES, RX_BURST, RespHeader, RxPkt, RxRing, TxRing};
 
@@ -129,6 +129,7 @@ struct Cli {
 #[derive(Clone, Copy)]
 enum Out {
     Pkt(PacketRecord, Option<Hash>),
+    Route(RouteRecord),
     Step(StepEntry, u8, [CutDelta; MAX_LANES]),
     Resp(LaneId, Endpoint, RespPkt),
     /// A fill TX packet (05 §8.10 rules 1 and 2), its records cut to one response's worth.
@@ -590,10 +591,7 @@ impl Sink for EngineSink<'_> {
                 self.stats.steps.fetch_add(1, Ordering::Relaxed);
                 self.send(Out::Step(*e, e.n_delta, ds));
             }
-            // Follow-up: the stream core does not encode 07 route records (§3.6) yet. Before
-            // the engine journalled them they were dropped in the lane drain, so this keeps
-            // the stream unchanged.
-            Rec::Route(_) => {}
+            Rec::Route(t) => self.send(Out::Route(*t)),
         }
     }
     fn lane_resp(&mut self, lane: LaneId, p: &RespPkt) {
@@ -856,6 +854,7 @@ impl<T: TxRing> StreamCore<T> {
     fn take(&mut self, o: Out) -> Result<(), String> {
         let frames = match o {
             Out::Pkt(p, full) => self.writer.packet(p, full),
+            Out::Route(t) => self.writer.route(t),
             Out::Step(e, n, ds) => {
                 for d in ds.iter().take(usize::from(n)) {
                     if let Some(c) = self.cut.get_mut(usize::from(d.lane.0)) {

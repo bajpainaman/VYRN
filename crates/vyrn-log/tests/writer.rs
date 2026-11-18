@@ -11,7 +11,7 @@ use vyrn_log::{
 };
 use vyrn_types::{
     BookId, Epoch, Hash, Height, LaneId, LaneSeq, Nanos, PacketFlags, PacketRecord, PktHash,
-    SessionId, StepFlags, StepId, StepKind,
+    RouteRecord, SessionId, StepFlags, StepId, StepKind,
 };
 
 const SEED: [u8; 32] = [7; 32];
@@ -68,11 +68,26 @@ fn frames_decode_and_headers_chain() {
         pkt(2, 0x11, 2, 3, 1),
         pkt(0, 0x22, 9, 1, 1),
     ];
-    for p in pushed {
+    // Routes (07 §3.6) follow their packet: one inside lane 2's run, naming its first op, and
+    // one for lane 0's op pushed in the next block.
+    let r2 = RouteRecord {
+        lane: LaneId(2),
+        lane_seq: LaneSeq(1),
+        cross: true,
+    };
+    let r0 = RouteRecord {
+        lane: LaneId(0),
+        lane_seq: LaneSeq(1),
+        cross: false,
+    };
+    for (i, p) in pushed.into_iter().enumerate() {
         frames.extend(
             w.packet(p, Some(Hash([p.first_lane_seq.0 as u8; 32])))
                 .unwrap(),
         );
+        if i == 0 {
+            frames.extend(w.route(r2).unwrap());
+        }
     }
     let cut = [LaneSeq(1), LaneSeq(0), LaneSeq(3)];
     frames.extend(
@@ -100,7 +115,8 @@ fn frames_decode_and_headers_chain() {
     frames.extend(w.packet(adv, None).unwrap());
     let (f0, h0) = w.close_block().unwrap();
     frames.extend(f0);
-    // Block 1: one step, no packets.
+    // Block 1: lane 0's route, then one step, no packets.
+    frames.extend(w.route(r0).unwrap());
     frames.extend(
         w.step(StepId(2), StepKind::Idle, None, 0, Vec::new(), &cut)
             .unwrap(),
@@ -137,7 +153,7 @@ fn frames_decode_and_headers_chain() {
             Body::Heartbeat(_) => panic!("no heartbeats"),
         }
     }
-    let want: Vec<LaneRec> = pushed
+    let mut want: Vec<LaneRec> = pushed
         .iter()
         .map(|p| {
             LaneRec::Pkt(PacketRecord {
@@ -145,8 +161,9 @@ fn frames_decode_and_headers_chain() {
                 ..*p
             })
         })
-        .chain([LaneRec::Pkt(adv)])
+        .chain([LaneRec::Pkt(adv), LaneRec::Route(r0)])
         .collect();
+    want.insert(1, LaneRec::Route(r2));
     assert_eq!(recs, want);
     // The route bit survives the wire (07 §3.8 src byte bit 7): set on the Cross, clear on Idle.
     assert_eq!(homes, vec![StepFlags::CROSS, 0]);
