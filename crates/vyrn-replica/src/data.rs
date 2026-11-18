@@ -67,15 +67,24 @@ fn signed(bytes: &[u8]) -> &[u8] {
         .unwrap_or(bytes)
 }
 
-/// Whether a record's `count` fits its payload (07 §5.4, 05 §3.1). As the merged lane assigns
-/// them (`vyrn-lane` pass 1), every message takes a LaneSeq except a Heartbeat or ResendReq in a
-/// packet with no header-level reject; a header reject numbers every message. The replica cannot
-/// see that reject, so either count is accepted [Likely: spec gap, PR body].
+/// Whether a record's `count` fits its payload (07 §5.4, 05 §3.1). As the lane assigns them
+/// (`vyrn-lane` pass 1), every message takes a LaneSeq except one that decodes as a Heartbeat or
+/// ResendReq, in a packet with no packet-level reject; a malformed one is answered with a reject
+/// and takes a LaneSeq. A packet-level reject numbers every message. The replica cannot see that
+/// reject, so either count is accepted [Likely: spec gap, PR body].
 pub fn count_fits(count: u8, bytes: &[u8]) -> bool {
     let n = bytes.get(8).copied().unwrap_or(0);
     let unnumbered = (0..usize::from(n))
-        .filter_map(|i| bytes.get(i.saturating_mul(16).saturating_add(16)))
-        .filter(|&&k| k == vyrn_wire::Msg::HEARTBEAT || k == vyrn_wire::Msg::RESEND_REQ)
+        .filter_map(|i| {
+            let at = i.saturating_mul(16).saturating_add(16);
+            bytes.get(at..at.saturating_add(16))?.try_into().ok()
+        })
+        .filter(|m: &&[u8; 16]| {
+            matches!(
+                vyrn_wire::Msg::decode(m),
+                Ok(vyrn_wire::Msg::Heartbeat) | Ok(vyrn_wire::Msg::ResendReq { .. })
+            )
+        })
         .count();
     let numbered = usize::from(n).saturating_sub(unnumbered);
     usize::from(count) == numbered || count == n
