@@ -39,6 +39,11 @@ pub enum StreamError {
     OutsideStep,
     /// An event after [`MboEncoder::finish`].
     Finished,
+    /// A bust of a step that has not opened yet.
+    BustAhead,
+    /// A book op or exec that does not apply to the book a derived encoder keeps (duplicate
+    /// oid, unknown oid, wrong tick or quantity, over-fill). The `MBO` encoder keeps no book.
+    Book,
 }
 
 struct Chan {
@@ -78,6 +83,7 @@ impl Chan {
 
 /// Encodes one book's `MBO` feed for one epoch.
 pub struct MboEncoder {
+    feed: Feed,
     book: BookId,
     epoch16: u16,
     open_step: u64,
@@ -90,7 +96,13 @@ pub struct MboEncoder {
 
 impl MboEncoder {
     pub fn new(book: BookId, epoch: Epoch) -> Self {
+        Self::with_feed(Feed::Mbo, book, epoch)
+    }
+
+    /// The `MBO` structure under another feed code: `MBO-W` (10 §7.7) uses it.
+    pub fn with_feed(feed: Feed, book: BookId, epoch: Epoch) -> Self {
         MboEncoder {
+            feed,
             book,
             epoch16: epoch.low16(),
             open_step: 0,
@@ -137,6 +149,9 @@ impl MboEncoder {
                 return Err(StreamError::ExecCount);
             }
             EventKind::StepOp(_) if self.open_step == 0 => return Err(StreamError::OutsideStep),
+            EventKind::Bust { step, .. } if step.0 > self.open_step => {
+                return Err(StreamError::BustAhead);
+            }
             _ => {}
         }
         self.newest = ts;
@@ -206,6 +221,9 @@ impl MboEncoder {
                     last_step,
                 };
                 self.put(STEP, &rec, ts, sink);
+            }
+            EventKind::Bust { step, ordinal, .. } => {
+                self.put(STEP, &Record::Bust { ordinal, step }, ts, sink);
             }
             EventKind::TimerTick => {
                 let w = self.mid_watermark();
@@ -357,7 +375,7 @@ impl MboEncoder {
         let ch = &mut self.chans[c];
         let header = Header {
             channel: Channel {
-                feed: Feed::Mbo,
+                feed: self.feed,
                 index: ch.index,
             },
             count: u16::try_from(ch.count).unwrap_or(u16::MAX),

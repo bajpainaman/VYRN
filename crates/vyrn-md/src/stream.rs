@@ -81,6 +81,16 @@ pub enum EventKind {
     },
     /// The `CtlTimerTick` boundary (every `MD_HEARTBEAT_MS`).
     TimerTick,
+    /// Exec `ordinal` of the earlier step `step` is busted: a `CHAIN` bust or a revert whose
+    /// final log differs from what was published (10 §7.5). `tick` and `qty` are the busted
+    /// exec's, so `TRADES` can print `MD_TRADE_BUST` without keeping every trade.
+    /// Book corrections that follow from the revert arrive as ordinary ops. \[Guessing\]
+    Bust {
+        step: StepId,
+        ordinal: u16,
+        tick: Tick,
+        qty: Qty,
+    },
 }
 
 /// One replayed event. `rx_ts` is order-stream time and never decreases.

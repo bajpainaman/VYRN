@@ -3674,11 +3674,13 @@ dependencies = [
 name = "vyrn-md"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clap",
  "tracing",
  "tracing-subscriber",
  "vyrn-nic",
  "vyrn-types",
+ "vyrn-wire",
 ]
 
 [[package]]

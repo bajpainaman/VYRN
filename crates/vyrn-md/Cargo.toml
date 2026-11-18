@@ -20,6 +20,8 @@ vyrn-types = { workspace = true }
 # vyrn-replica (11 §1.4 layer 6) returns when its replay core lands; until then the replica
 # implements `ReplayStream` (src/stream.rs) and nothing here links it.
 vyrn-nic = { workspace = true }
+vyrn-wire = { workspace = true }
+blake3 = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -69,6 +69,38 @@
 //!    step, so readers can apply the last steps. 10 §7.3 does not say this. \[Guessing\]
 //! 5. `ts_base` choice and the step-channel `step_base` at a packet that starts with `MD_STEP(T)`
 //!    (here `T`) are not fixed by 10 §7.3. \[Guessing\]
+//! 6. A channel heartbeats on a tick only when it has no open packet and sent nothing since the
+//!    last tick. \[Guessing\]
+//! 7. `MD_SNAP_RESUME` for a lane channel with nothing buffered after the snapshot point names
+//!    the last packet taken with `record` = its count: the joiner skips its records but reads
+//!    its watermark. \[Guessing\]
+//! 8. Busts: [`EventKind::Bust`] carries the busted exec's tick and qty; the book corrections a
+//!    revert implies arrive as ordinary ops. `MD_BUST` goes on the step channel at the bust's
+//!    position. \[Guessing\]
+//! 9. Feed-specific readings are labeled in their modules: `MBO-C` varint layout and
+//!    `prev_tick` in place of the touch ([`mbo_c_encode`]); conflation evaluation points and
+//!    windows ([`LevelEncoder`]); `TRADES` auction flag ([`TradesEncoder`]); `STATS` ids, VWAP
+//!    format and second boundaries ([`StatId`], [`StatsEncoder`]); the `MBO-W` touch and where
+//!    synthetic ops go ([`MboWindow`]); the `SNAP` channel, body hash and packet bases
+//!    ([`SnapEncoder`]); the retransmit wire and age clock ([`RetxStore`]).
+//!
+//! ## Derived feeds (10 §7.2)
+//!
+//! Each derived encoder takes the same [`ReplayStream`], checks the same input ordering, and
+//! writes one channel (index 0) with the §7.3 header and flush rules; `step_base` is the step
+//! open at the packet's first record (`TRADES`: the base of `step_delta`). Conflated feeds are
+//! evaluated at *group ends*: every event except an `Exec` or `StepOp`, which belong to the open
+//! step, so a published level is always a state the replica held between groups. The book is
+//! read just before that event applies.
+//!
+//! - [`MboEncoder`] + [`WithMboC`]: `MBO` and its `MBO-C` transcoding, packet for packet.
+//! - [`LevelEncoder`]: `MBP-10` and `TOB` as `MD_LEVEL`.
+//! - [`TradesEncoder`]: `MD_TRADE` per exec, `MD_TRADE_BUST` per bust.
+//! - [`StatsEncoder`]: `MD_STAT` per second.
+//! - [`MboWEncoder`]: `MBO-W`, the `MBO` structure over a windowed stream.
+//! - [`SnapEncoder`] / [`SnapReader`]: `MD_SNAP_*` from a [`Snapshot`] that
+//!   [`MboSubscriber::take_snapshot`] cuts; [`MboSubscriber::from_snapshot`] joins mid-stream.
+//! - [`RetxStore`]: the retransmit service.
 #![forbid(unsafe_code)]
 
 /// A `u8`-coded enum with `code` and `from_code`.
@@ -93,18 +125,33 @@ macro_rules! code_enum {
     };
 }
 
+mod chan;
 pub mod dropcopy;
+mod levels;
 mod mbo;
+mod mboc;
+mod mbow;
 mod packet;
 mod record;
+mod retx;
+mod snap;
 mod stream;
 mod subscriber;
+mod trades;
 
+pub use levels::{Level, LevelBook, LevelEncoder, MBP_DEPTH, MD_MBP_WINDOW_NS, MD_TOB_WINDOW_NS};
 pub use mbo::{MboEncoder, PacketSink, StreamError};
+pub use mboc::{MboCError, WithMboC, mbo_c_decode, mbo_c_encode};
+pub use mbow::{MD_MBO_W_TICKS, MboWEncoder, MboWindow};
 pub use packet::{Channel, Feed, HEADER_BYTES, Header, NO_WATERMARK, Packet, PacketError};
 pub use record::{AttestKind, BookStatus, DeleteCause, REC_BYTES, Record, RecordError, Side};
+pub use retx::{MD_RETX_SECS, RETX_REQ_BYTES, RetxRequest, RetxStore, retx_fetch};
+pub use snap::{
+    MD_SNAP_EVERY_BLOCKS, SnapEncoder, SnapError, SnapReader, is_snapshot_height, snapshot_records,
+};
 pub use stream::{BookOp, Event, EventKind, ReplayStream, oid};
-pub use subscriber::{Book, BookError, MboSubscriber, Order, SubError};
+pub use subscriber::{Book, BookError, MboSubscriber, Order, Resume, Snapshot, SubError};
+pub use trades::{StatId, StatsEncoder, TradesEncoder};
 
 /// Records per packet (10 §7.3).
 pub const MD_MAX_RECS_PER_PKT: usize = 88;
