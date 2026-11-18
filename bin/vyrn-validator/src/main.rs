@@ -1143,7 +1143,11 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 fo.released(
                     h.0,
                     b.lanes.iter().filter_map(|r| match r {
-                        LaneRec::Pkt(p) if p.flags & PacketFlags::ADVANCE == 0 => {
+                        // A shed record was never accepted: it moves no watermark (Codex
+                        // r4612821627).
+                        LaneRec::Pkt(p)
+                            if p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) == 0 =>
+                        {
                             Some((p.session, p.pkt_seq))
                         }
                         _ => None,

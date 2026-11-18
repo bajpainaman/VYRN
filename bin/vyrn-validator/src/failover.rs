@@ -88,11 +88,14 @@ impl DownAuth {
         self.keys = Some(keys);
     }
 
-    /// Whether `voter` sent this `body` and `tag` from `from`.
+    /// Whether `voter` sent this `body` and `tag` from `from`. The voter must be a configured
+    /// peer: the roster's peer keys also cover its `vyrn-seq` boxes (requester indices after the
+    /// voters), which cast no vote (Vercel r4612778821).
     pub fn authentic(&self, from: Ipv4Addr, voter: u8, body: &[u8], tag: u64) -> bool {
         let configured = self.peers.contains(&(voter, from));
         match &self.keys {
             None => configured && tag == 0,
+            Some(_) if !self.peers.iter().any(|(v, _)| *v == voter) => false,
             Some(keys) => {
                 (configured && tag == 0 && self.open.contains(&voter))
                     || keys.iter().any(|(v, ip, k)| {
@@ -189,6 +192,10 @@ pub struct Failover {
     /// Queued REDIRECTs `(session, resend_from, down, to)`, and when the next batch may leave.
     outbox: VecDeque<(SessionId, u32, u8, u8)>,
     next_batch: u64,
+    /// The sessions' last home move `(down, to)`, and the sessions queued a REDIRECT for it: a
+    /// session first released after its rounds is queued then (Codex r4612821618).
+    moved: Option<(u8, u8)>,
+    redirected: BTreeSet<SessionId>,
     /// The highest `pkt_seq` per session in a final block.
     final_max: BTreeMap<SessionId, u32>,
     /// Released blocks not final yet: height and each session's lowest and highest `pkt_seq`.
@@ -211,6 +218,8 @@ impl Failover {
             rounds: Vec::new(),
             outbox: VecDeque::new(),
             next_batch: 0,
+            moved: None,
+            redirected: BTreeSet::new(),
             final_max: BTreeMap::new(),
             unfinal: VecDeque::new(),
             counts: Counts::default(),
@@ -290,6 +299,8 @@ impl Failover {
                 if let Some(to) = vyrn_data::redirect::backup_home(d, &live) {
                     self.home = to;
                     self.rounds.push((d, to, REDIRECT_ROUNDS, now));
+                    self.moved = Some((d, to));
+                    self.redirected.clear();
                 }
             }
         }
@@ -307,6 +318,7 @@ impl Failover {
 
     /// Queues one round of REDIRECTs for `list`.
     pub fn queue(&mut self, down: u8, to: u8, list: &[(SessionId, u32)]) {
+        self.redirected.extend(list.iter().map(|&(s, _)| s));
         self.outbox
             .extend(list.iter().map(|&(s, r)| (s, r, down, to)));
     }
@@ -327,6 +339,17 @@ impl Failover {
         for (s, p) in recs {
             let e = m.entry(s).or_insert((p, p));
             *e = (e.0.min(p), e.1.max(p));
+        }
+        // After a home move, a session not redirected yet gets its rounds now, from its lowest
+        // `pkt_seq` in this block, which is not final yet (reading t).
+        if let Some((down, to)) = self.moved {
+            for (s, (lo, _)) in &m {
+                if self.redirected.insert(*s) {
+                    for _ in 0..REDIRECT_ROUNDS {
+                        self.outbox.push_back((*s, *lo, down, to));
+                    }
+                }
+            }
         }
         self.unfinal.push_back((height, m));
     }
@@ -473,6 +496,14 @@ mod tests {
             auth.authentic(a, 3, &body3, 0),
             "an unusable-key peer in DEV"
         );
+        // Vercel r4612778821: a keyed seq box (requester 4, after the voters) is not a voter.
+        let ks = [4u8; 16];
+        auth.set_keys(
+            vec![(1, a, ka), (2, b, kb), (4, b, ks)],
+            &[Some(ka), Some(kb), None],
+        );
+        let (body4, tag4) = tagged(4, &ks);
+        assert!(!auth.authentic(b, 4, &body4, tag4), "a seq box's DataDown");
     }
 
     /// Codex r4612686954: rounds queue; each period sends at most a batch, oldest first, so a
@@ -495,6 +526,28 @@ mod tests {
             Some(SessionId(0)),
             "round 2 after round 1"
         );
+    }
+
+    /// Codex r4612821618: a session first released after the home moved is queued then, once.
+    #[test]
+    fn a_late_session_is_redirected() {
+        let mut f = Failover::new(2, 0, 1, 0, 1);
+        f.released(1, [(SessionId(5), 3)]);
+        f.silent(&[0], 0);
+        assert_eq!(f.step(0).1, vec![(0, 1)]);
+        f.queue(0, 1, &f.resend_from(&BTreeMap::new()));
+        f.released(2, [(SessionId(9), 7), (SessionId(9), 6), (SessionId(5), 4)]);
+        let sent = f.batch(0);
+        let late: Vec<_> = sent.iter().filter(|r| r.0 == SessionId(9)).collect();
+        assert_eq!(late.len(), usize::from(REDIRECT_ROUNDS));
+        assert!(late.iter().all(|r| (r.1, r.2, r.3) == (6, 0, 1)));
+        assert_eq!(
+            sent.len(),
+            1 + usize::from(REDIRECT_ROUNDS),
+            "session 5 not again"
+        );
+        f.released(3, [(SessionId(9), 8)]);
+        assert!(f.batch(GOSSIP_EVERY_NS).is_empty(), "queued once");
     }
 
     /// Session 5 is final through 9, so past it; 6 has a released block not final yet below
