@@ -155,6 +155,8 @@ jobs:
           for v in proto log session data admin reject; do
             python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_${v}_vectors.py" --json | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_${v}_vectors.json"
           done
+      - name: derive_key and signing contexts are spelled the same in spec and code
+        run: python3 -I tools/check-contexts.py
       # gen_dc_vectors.py and gen_feed_vectors.py take BLAKE3 from the b3sum CLI, which the
       # runner lacks; .agents/setup installs the same tool for orbs.
       - name: install b3sum
