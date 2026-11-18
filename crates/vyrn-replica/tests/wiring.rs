@@ -238,10 +238,35 @@ fn release_keeps_what_a_shed_retry_still_needs() {
     assert!(j.resolve(&retry).is_ok());
     j.release(Height(10 + REP_SHED_KEEP_BLOCKS), &[]);
     assert!(j.resolve(&retry).is_err());
+    // A retry shed again: the first shed entry's expiry keeps the payload for the second's window.
+    j.put(SessionId(7), 1, p.clone());
+    j.release(Height(300), &[LaneRec::Pkt(shed)]);
+    j.release(Height(350), &[LaneRec::Pkt(shed)]);
+    j.release(Height(300 + REP_SHED_KEEP_BLOCKS), &[]);
+    assert!(
+        j.resolve(&retry).is_ok(),
+        "the second shed record's window is still open"
+    );
+    j.release(Height(350 + REP_SHED_KEEP_BLOCKS), &[]);
+    assert!(j.resolve(&retry).is_err());
+    // An accepted packet's unused resend variant expires instead of staying forever.
+    let mut j2 = DataJoin::default();
+    j2.put(SessionId(8), 1, p.clone());
+    j2.put(SessionId(8), 1, other.clone());
+    let accepted = packet(8, 1, &p, 0);
+    let unused = packet(8, 1, &other, 0);
+    j2.release(Height(600), &[LaneRec::Pkt(accepted)]);
+    assert!(j2.resolve(&accepted).is_err());
+    assert!(j2.resolve(&unused).is_ok(), "kept for the window");
+    j2.release(Height(600 + REP_SHED_KEEP_BLOCKS), &[]);
+    assert!(
+        j2.resolve(&unused).is_err(),
+        "no record ever releases it, so it expires"
+    );
     // A retry released in a later block frees it at once.
     j.put(SessionId(7), 1, p);
-    j.release(Height(200), &[LaneRec::Pkt(shed)]);
-    j.release(Height(201), &[LaneRec::Pkt(retry)]);
+    j.release(Height(500), &[LaneRec::Pkt(shed)]);
+    j.release(Height(501), &[LaneRec::Pkt(retry)]);
     assert!(j.resolve(&retry).is_err());
 }
 

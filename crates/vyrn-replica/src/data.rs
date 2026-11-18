@@ -49,7 +49,8 @@ pub enum DataErr {
 #[derive(Clone, Debug, Default)]
 pub struct DataJoin {
     by_key: BTreeMap<(SessionId, u32), Vec<Variant>>,
-    /// Variants a released `SHED` record named, kept for a retry: `(height released, key, hash)`.
+    /// Variants kept for a bounded window after a release, `(height released, key, hash)`: a
+    /// `SHED` record's variant (for its retry), and the unused variants of an accepted packet.
     shed: VecDeque<(Height, (SessionId, u32), PktHash)>,
 }
 
@@ -150,7 +151,9 @@ impl DataJoin {
     /// stored. Only the variant each record names (by `pkt_hash`) goes, so other variants of its
     /// `(session, pkt_seq)` stay. A `SHED` record's variant stays [`REP_SHED_KEEP_BLOCKS`] more
     /// blocks, for the retry that reuses its `pkt_seq`; a retry released in a later block frees
-    /// it at once. Calls come in non-decreasing `height`.
+    /// it at once, and a later `SHED` record of the same variant extends the window. The other
+    /// variants of an accepted packet expire after the same window. Calls come in non-decreasing
+    /// `height`.
     pub fn release<'a>(&mut self, height: Height, recs: impl IntoIterator<Item = &'a LaneRec>) {
         for r in recs {
             let LaneRec::Pkt(p) = r else { continue };
@@ -162,6 +165,18 @@ impl DataJoin {
                 self.shed.push_back((height, key, p.pkt_hash));
             } else {
                 self.evict(key, p.pkt_hash);
+                // Other variants of an accepted packet (resends the sequencer did not take) have
+                // no record left to release them: they expire after the same window.
+                let rest: Vec<PktHash> = self
+                    .by_key
+                    .get(&key)
+                    .map(|vs| vs.iter().map(|v| prefix(&v.full)).collect())
+                    .unwrap_or_default();
+                for h in rest {
+                    if !self.shed.iter().any(|&(_, k, x)| k == key && x == h) {
+                        self.shed.push_back((height, key, h));
+                    }
+                }
             }
         }
         while let Some(&(h, key, hash)) = self.shed.front() {
@@ -169,7 +184,10 @@ impl DataJoin {
                 break;
             }
             self.shed.pop_front();
-            self.evict(key, hash);
+            // A later SHED record of the same variant (the retry was shed again) keeps it.
+            if !self.shed.iter().any(|&(_, k, x)| k == key && x == hash) {
+                self.evict(key, hash);
+            }
         }
     }
 
