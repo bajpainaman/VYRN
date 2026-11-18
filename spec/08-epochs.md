@@ -1321,6 +1321,12 @@ K_fetch(e, i, d) = derive_key("vyrn      v1 fetch",
                               X25519(requester xchg, box xchg) ‖ genesis_hash ‖ mode ‖ le(e) ‖ [i] ‖ [d])[0..16]
 ```
 
+*Targets (reading).* The same derivation keys fetches to the home's other servers: `d` in
+0x00..=0x7F is data box `d`, 0x80 + `j` is `vyrn-seq` box `j` (07 §5.5 source 3), and 0xC0 + `j`
+is voter `j`, whose peer fetches use the context `"vyrn      v1 peerfetch"` in place of
+`"vyrn      v1 fetch"`. A requester seals with `seal_fetch` (`vyrn-data` frame), the 40-byte form
+of 07 §5.5.
+
 Each side computes it from its own X25519 private key and the other's public half in the roster,
 so nothing is provisioned and it holds in both modes. The box keys each requester's `K_fetch` by
 the IPv4 address of its `repl_addr`. A requester whose X25519 half is a low-order point gets no

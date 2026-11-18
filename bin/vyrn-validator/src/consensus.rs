@@ -317,8 +317,15 @@ impl Plan {
     /// unusable.
     pub fn fetch_key(&self, d: u8, secret: &[u8; 32]) -> Option<[u8; 16]> {
         let i = u8::try_from(self.me).ok()?;
-        self.roster
-            .requester_fetch_key(&self.domain, self.epoch, self.home, i, d, secret)
+        self.roster.requester_fetch_key(
+            vyrn_epoch::FETCH_CONTEXT,
+            &self.domain,
+            self.epoch,
+            self.home,
+            i,
+            d,
+            secret,
+        )
     }
 
     pub fn repl_addr(&self) -> SocketAddr {

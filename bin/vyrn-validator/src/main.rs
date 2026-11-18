@@ -622,7 +622,7 @@ fn send(repair: &UdpSocket, boxes: &[SocketAddrV4], keys: &[[u8; 16]], q: &Fetch
         return;
     };
     let _ = match keys.get(d) {
-        Some(k) => repair.send_to(&q.seal(k), to),
+        Some(k) => repair.send_to(&vyrn_data::frame::seal_fetch(k, q), to),
         None => repair.send_to(&q.encode(), to),
     };
 }

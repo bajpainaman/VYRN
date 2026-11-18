@@ -273,6 +273,7 @@ fn fetch_keys(cfg: &Config) -> Result<BTreeMap<Ipv4Addr, [u8; 16]>, String> {
     let secret = cfg.resolve::<32>(&r.xchg_secret)?;
     let keys = roster
         .box_fetch_keys(
+            vyrn_epoch::FETCH_CONTEXT,
             &domain,
             vyrn_types::Epoch(r.epoch),
             home,

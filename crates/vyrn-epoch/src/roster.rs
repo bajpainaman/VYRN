@@ -393,17 +393,25 @@ impl Roster {
     }
 }
 
-/// `K_fetch(e, i, d)` (08 §9.6): `derive_key(FETCH_CONTEXT, shared ‖ genesis_hash ‖ mode ‖
-/// le(e) ‖ [i] ‖ [d])[0..16]`, where `shared` is X25519 of requester `i`'s and data box `d`'s
-/// `xchg_key` X25519 halves. Both ends compute it: the box from its secret and `i`'s public key,
-/// the requester from its secret and `d`'s.
-pub fn fetch_key(domain: &Domain, epoch: Epoch, i: u8, d: u8, shared: &[u8; 32]) -> [u8; 16] {
+/// `K_fetch(e, i, d)` (08 §9.6): `derive_key(context, shared ‖ genesis_hash ‖ mode ‖ le(e) ‖
+/// [i] ‖ [d])[0..16]`, where `shared` is X25519 of requester `i`'s and target `d`'s `xchg_key`
+/// X25519 halves ([`Roster::fetch_target`]). Both ends compute it: the target from its secret
+/// and `i`'s public key, the requester from its secret and `d`'s. `context` is
+/// [`FETCH_CONTEXT`] for data and `vyrn-seq` fetches; peer fetches pass their own.
+pub fn fetch_key(
+    context: &str,
+    domain: &Domain,
+    epoch: Epoch,
+    i: u8,
+    d: u8,
+    shared: &[u8; 32],
+) -> [u8; 16] {
     let mut m = Vec::with_capacity(32 + 33 + 6);
     m.extend_from_slice(shared);
     m.extend_from_slice(&domain.prefix());
     m.extend_from_slice(&epoch.0.to_le_bytes());
     m.extend_from_slice(&[i, d]);
-    let k = vyrn_crypto::hash::derive_key(FETCH_CONTEXT, &m);
+    let k = vyrn_crypto::hash::derive_key(context, &m);
     core::array::from_fn(|j| k[j])
 }
 
@@ -412,13 +420,33 @@ fn x25519_half(k: &[u8]) -> Option<[u8; 32]> {
     k.get(..32)?.try_into().ok()
 }
 
+/// Fetch targets 0x80..=0xBF are `vyrn-seq` box `d - SEQ_TARGET` of the home (08 §9.6, reading).
+pub const SEQ_TARGET: u8 = 0x80;
+/// Fetch targets 0xC0..=0xFF are voter `d - VOTER_TARGET` of the home, for peer fetches.
+pub const VOTER_TARGET: u8 = 0xC0;
+
 impl Roster {
-    /// Data box `d` of `home`: `K_fetch(e, i, d)` for every requester `i` of `home` (its voters,
-    /// then its `vyrn-seq` boxes, by roster index), with the requester's `repl_addr`. `secret` is
-    /// box `d`'s X25519 private key. `None` if `d` is not a data box of `home`, or its secret does
-    /// not match its roster key. A requester whose key is a low-order point is left out.
+    /// The `xchg_key` of fetch target `d` of `home` (08 §9.6, reading): `0..SEQ_TARGET` is data
+    /// box `d`, `SEQ_TARGET..VOTER_TARGET` its `vyrn-seq` box `d - SEQ_TARGET`, and from
+    /// `VOTER_TARGET` its voter `d - VOTER_TARGET` (peer fetch). `None` if there is no such entry.
+    pub fn fetch_target(&self, home: HomeCode, d: u8) -> Option<&[u8]> {
+        let h = self.home(home);
+        let k = match d {
+            VOTER_TARGET.. => &h.voters.get(usize::from(d - VOTER_TARGET))?.xchg_key,
+            SEQ_TARGET.. => &h.seq.get(usize::from(d - SEQ_TARGET))?.xchg_key,
+            _ => &h.data.get(usize::from(d))?.xchg_key,
+        };
+        Some(k)
+    }
+
+    /// Target `d` of `home` ([`Roster::fetch_target`]): `K_fetch(e, i, d)` under `context` for
+    /// every requester `i` of `home` (its voters, then its `vyrn-seq` boxes, by roster index),
+    /// with the requester's `repl_addr`. `secret` is target `d`'s X25519 private key. `None` if
+    /// `d` is not a target of `home`, or its secret does not match its roster key. A requester
+    /// whose key is a low-order point is left out.
     pub fn box_fetch_keys(
         &self,
+        context: &str,
         domain: &Domain,
         epoch: Epoch,
         home: HomeCode,
@@ -426,8 +454,7 @@ impl Roster {
         secret: &[u8; 32],
     ) -> Option<Vec<(u8, Addr, [u8; 16])>> {
         let h = self.home(home);
-        let me = h.data.get(usize::from(d))?;
-        if x25519_half(&me.xchg_key)? != vyrn_crypto::x25519::public_key(secret) {
+        if x25519_half(self.fetch_target(home, d)?)? != vyrn_crypto::x25519::public_key(secret) {
             return None;
         }
         let requesters = h
@@ -441,16 +468,19 @@ impl Roster {
                 .filter_map(|(i, (pk, addr))| {
                     let i = u8::try_from(i).ok()?;
                     let shared = vyrn_crypto::x25519::shared_secret(secret, &x25519_half(pk)?)?;
-                    Some((i, addr, fetch_key(domain, epoch, i, d, &shared)))
+                    Some((i, addr, fetch_key(context, domain, epoch, i, d, &shared)))
                 })
                 .collect(),
         )
     }
 
-    /// Requester `i` of `home` (roster index): its `K_fetch(e, i, d)` for data box `d`, from its
-    /// own X25519 private key. `None` if `d` is unknown or its key is a low-order point.
+    /// Requester `i` of `home` (roster index): its `K_fetch(e, i, d)` under `context` for target
+    /// `d` ([`Roster::fetch_target`]), from its own X25519 private key. `None` if `d` is unknown
+    /// or its key is a low-order point.
+    #[allow(clippy::too_many_arguments)] // each is one input of the 08 §9.6 formula
     pub fn requester_fetch_key(
         &self,
+        context: &str,
         domain: &Domain,
         epoch: Epoch,
         home: HomeCode,
@@ -458,9 +488,9 @@ impl Roster {
         d: u8,
         secret: &[u8; 32],
     ) -> Option<[u8; 16]> {
-        let pk = x25519_half(&self.home(home).data.get(usize::from(d))?.xchg_key)?;
+        let pk = x25519_half(self.fetch_target(home, d)?)?;
         let shared = vyrn_crypto::x25519::shared_secret(secret, &pk)?;
-        Some(fetch_key(domain, epoch, i, d, &shared))
+        Some(fetch_key(context, domain, epoch, i, d, &shared))
     }
 }
 
@@ -618,39 +648,77 @@ mod tests {
         r.homes[1].voters[2].xchg_key = vyrn_crypto::x25519::public_key(&req_secret).to_vec();
         let (e, ldn) = (Epoch(8), HomeCode::Ldn);
         let box0 = testkit::data_seed(2, 0);
-        let keys = r.box_fetch_keys(&domain, e, ldn, 0, &box0).unwrap();
+        let keys = r
+            .box_fetch_keys(FETCH_CONTEXT, &domain, e, ldn, 0, &box0)
+            .unwrap();
         let n = r.homes[1].voters.len() + r.homes[1].seq.len();
         assert_eq!(keys.len(), n);
         let (_, addr, k) = keys.iter().find(|(i, _, _)| *i == 2).copied().unwrap();
         assert_eq!(addr, r.homes[1].voters[2].repl_addr);
-        let mine = r.requester_fetch_key(&domain, e, ldn, 2, 0, &req_secret);
+        let mine = r.requester_fetch_key(FETCH_CONTEXT, &domain, e, ldn, 2, 0, &req_secret);
         assert_eq!(mine, Some(k));
         // Every other binding changes the key.
         assert_ne!(
-            r.requester_fetch_key(&domain, Epoch(9), ldn, 2, 0, &req_secret),
+            r.requester_fetch_key(FETCH_CONTEXT, &domain, Epoch(9), ldn, 2, 0, &req_secret),
             Some(k)
         );
         assert_ne!(
-            r.requester_fetch_key(&domain, e, ldn, 3, 0, &req_secret),
+            r.requester_fetch_key(FETCH_CONTEXT, &domain, e, ldn, 3, 0, &req_secret),
             Some(k)
         );
         assert_ne!(
-            r.requester_fetch_key(&domain, e, ldn, 2, 1, &req_secret),
+            r.requester_fetch_key(FETCH_CONTEXT, &domain, e, ldn, 2, 1, &req_secret),
             Some(k)
         );
         assert_ne!(
-            r.requester_fetch_key(&domain, e, ldn, 2, 0, &[0x5b; 32]),
+            r.requester_fetch_key(FETCH_CONTEXT, &domain, e, ldn, 2, 0, &[0x5b; 32]),
             Some(k)
         );
         let chain = testkit::domain(Mode::Chain);
         assert_ne!(
-            r.requester_fetch_key(&chain, e, ldn, 2, 0, &req_secret),
+            r.requester_fetch_key(FETCH_CONTEXT, &chain, e, ldn, 2, 0, &req_secret),
             Some(k)
         );
         // Keys differ between requesters, and a box with the wrong secret gets none.
         assert!(keys.iter().all(|(i, _, x)| *i == 2 || *x != k));
-        assert!(r.box_fetch_keys(&domain, e, ldn, 0, &[0x11; 32]).is_none());
-        assert!(r.box_fetch_keys(&domain, e, ldn, 9, &box0).is_none());
+        assert!(
+            r.box_fetch_keys(FETCH_CONTEXT, &domain, e, ldn, 0, &[0x11; 32])
+                .is_none()
+        );
+        assert!(
+            r.box_fetch_keys(FETCH_CONTEXT, &domain, e, ldn, 9, &box0)
+                .is_none()
+        );
+        // Another context (peer fetch) gives another key.
+        assert_ne!(
+            r.requester_fetch_key("vyrn      v1 peerfetch", &domain, e, ldn, 2, 0, &req_secret),
+            Some(k)
+        );
+        // A `vyrn-seq` requester sits at index voters.len() + j.
+        let seq_req = [0x78; 32];
+        r.homes[1].seq[1].xchg_key = vyrn_crypto::x25519::public_key(&seq_req).to_vec();
+        let j = u8::try_from(r.homes[1].voters.len() + 1).unwrap();
+        let keys = r
+            .box_fetch_keys(FETCH_CONTEXT, &domain, e, ldn, 0, &box0)
+            .unwrap();
+        let (_, addr, k) = keys.iter().find(|(i, _, _)| *i == j).copied().unwrap();
+        assert_eq!(addr, r.homes[1].seq[1].repl_addr);
+        assert_eq!(
+            r.requester_fetch_key(FETCH_CONTEXT, &domain, e, ldn, j, 0, &seq_req),
+            Some(k)
+        );
+        // A `vyrn-seq` box as the target (SEQ_TARGET + j) agrees with voter 2.
+        let seq_box = [0x77; 32];
+        r.homes[1].seq[0].xchg_key = vyrn_crypto::x25519::public_key(&seq_box).to_vec();
+        let keys = r
+            .box_fetch_keys(FETCH_CONTEXT, &domain, e, ldn, SEQ_TARGET, &seq_box)
+            .unwrap();
+        let (_, _, k) = keys.iter().find(|(i, _, _)| *i == 2).copied().unwrap();
+        assert_eq!(
+            r.requester_fetch_key(FETCH_CONTEXT, &domain, e, ldn, 2, SEQ_TARGET, &req_secret),
+            Some(k)
+        );
+        assert!(r.fetch_target(ldn, SEQ_TARGET + 9).is_none());
     }
 
     #[test]

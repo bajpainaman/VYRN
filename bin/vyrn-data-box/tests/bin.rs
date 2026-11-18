@@ -185,7 +185,17 @@ fn serves_a_replica_exports_metrics_and_stops() {
     };
     let r = roster();
     let ldn = vyrn_types::HomeCode::Ldn;
-    let key = |e| r.requester_fetch_key(&domain(), vyrn_types::Epoch(e), ldn, 0, 0, &REQ_SECRET);
+    let key = |e| {
+        r.requester_fetch_key(
+            vyrn_epoch::FETCH_CONTEXT,
+            &domain(),
+            vyrn_types::Epoch(e),
+            ldn,
+            0,
+            0,
+            &REQ_SECRET,
+        )
+    };
     client
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
