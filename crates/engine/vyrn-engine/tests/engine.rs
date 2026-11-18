@@ -1079,3 +1079,74 @@ fn core_role_table() {
     assert_eq!(role_of(51), Role::Spare);
     assert_eq!(role_of(63), Role::Spare);
 }
+
+/// Packets on lanes 0 and 1 interleaved with single steps and idle polls in a seeded order,
+/// then steps and polls until quiet.
+fn interleaved(seed: u64) -> Vec<Act> {
+    let mut r = Rng::new(seed);
+    let (mut s, mut t, mut tag) = (Vec::new(), 1_000u64, 1u32);
+    for _ in 0..20 + r.below(40) {
+        match r.below(10) {
+            0..=4 => {
+                let l = r.below(2) as usize;
+                let msgs = r.orders(&mut tag, 95);
+                t += 100;
+                s.push(Act::Pkt {
+                    l,
+                    a: 1,
+                    rx_ts: t,
+                    now: t,
+                    msgs,
+                });
+            }
+            5..=7 => s.push(Act::Step(None)),
+            _ => s.push(Act::Poll),
+        }
+    }
+    for _ in 0..200 {
+        s.push(Act::Step(None));
+        s.push(Act::Poll);
+    }
+    s
+}
+
+#[test]
+fn a_rescan_never_runs_between_a_capped_sweep_and_its_continuation() {
+    // The WL-SMOKE replay flake: live ran the band test before a pending continuation, so a
+    // capped forwarded sweep logged `[Cross l#q, Rescan, Cross CONT l#q]`. 07 has no CONT
+    // bit; replay takes the next step to be the continuation (07 §7.1) and refused the Rescan
+    // with Step(Kind). A continuation comes first (05 §8.6, D14): its cut holds at C_{s−1}.
+    // Before the fix most of these seeds failed that way.
+    let mut conts = 0;
+    for seed in 1..=24 {
+        let (j, store, _, _) = live(&interleaved(seed));
+        let steps: Vec<_> = j
+            .recs
+            .iter()
+            .filter_map(|r| match r {
+                OwnedRec::Step(e, _) => Some(*e),
+                _ => None,
+            })
+            .collect();
+        for w in steps.windows(2) {
+            // A forwarded continuation follows a step of the same source (a capped Rescan
+            // batch taker continues as a Rescan, which has none).
+            if w[1].flags & vyrn_bbo::STEP_CONT != 0 && w[1].src_lane_seq.0 != 0 {
+                conts += 1;
+                assert_eq!(
+                    (w[0].src_lane, w[0].src_lane_seq),
+                    (w[1].src_lane, w[1].src_lane_seq),
+                    "seed {seed}: step {} came between a sweep and its continuation",
+                    w[0].step.0
+                );
+            }
+        }
+        let (lanes, routes, steps) = to_wire(&j.recs);
+        assert_eq!(
+            replay_wire(&lanes, &routes, &steps, &store, Some(&j)).0,
+            Ok(()),
+            "seed {seed}"
+        );
+    }
+    assert!(conts > 0, "the scripts cap some sweeps");
+}

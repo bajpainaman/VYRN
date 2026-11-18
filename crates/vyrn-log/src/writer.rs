@@ -266,7 +266,9 @@ impl SeqWriter {
 
     /// One step: `src` is the source op for Cross, Improve and Shed, `flags` its
     /// `StepRecord.flags` (`StepFlags::CROSS` or 0; must be 0 without a source), `cut` the whole
-    /// box's cut after the step.
+    /// box's cut after the step, `lowver` its `StepEntry.lowver` (bit `l`: lane `l` took its
+    /// `lowver`, 07 §3.8 `LOWVER`; only lanes whose cut moved, else `RepErr::Cut`).
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         step: StepId,
@@ -275,9 +277,16 @@ impl SeqWriter {
         flags: u8,
         payload: Vec<u8>,
         cut: &[LaneSeq],
+        lowver: u64,
     ) -> Result<Frames, RepErr> {
         let new_run = !matches!(self.sections.last(), Some(Section::StepRun(_)));
+        let low = if lowver != 0 {
+            self.half.div_ceil(8)
+        } else {
+            0
+        };
         let need = (1 + LEB + 1 + LEB + LEB)
+            .saturating_add(low)
             .saturating_add(payload.len())
             .saturating_add(self.cut_bound())
             .saturating_add(if new_run { RUN } else { 0 });
@@ -293,6 +302,7 @@ impl SeqWriter {
                 payload,
             }),
             cut: cut.to_vec(),
+            lowver,
         };
         match self.sections.last_mut() {
             Some(Section::StepRun(v)) => v.push(half),

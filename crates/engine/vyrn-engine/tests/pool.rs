@@ -493,13 +493,14 @@ fn replay_wire_pooled(
         let ws: Vec<vyrn_engine::WireStep<'_>> = steps
             .iter()
             .map(
-                |(step, kind, src, cross, cut, payload)| vyrn_engine::WireStep {
+                |(step, kind, src, cross, cut, payload, lowver)| vyrn_engine::WireStep {
                     step: *step,
                     kind: *kind,
                     src: *src,
                     cross: *cross,
                     cut,
                     payload,
+                    lowver: *lowver,
                 },
             )
             .collect();
@@ -718,13 +719,14 @@ fn takes_of_two_accounts_sharing_a_lane_seq_bind_to_their_own_packets() {
     let ws: Vec<vyrn_engine::WireStep<'_>> = steps
         .iter()
         .map(
-            |(step, kind, src, cross, cut, payload)| vyrn_engine::WireStep {
+            |(step, kind, src, cross, cut, payload, lowver)| vyrn_engine::WireStep {
                 step: *step,
                 kind: *kind,
                 src: *src,
                 cross: *cross,
                 cut,
                 payload,
+                lowver: *lowver,
             },
         )
         .collect();

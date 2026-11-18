@@ -197,6 +197,7 @@ fn blocks(n: u32) -> Vec<Vec<Vec<u8>>> {
                     0,
                     Vec::new(),
                     &cut,
+                    0,
                 )
                 .unwrap(),
             );

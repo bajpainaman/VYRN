@@ -116,6 +116,7 @@ fn pkt(lane: u8, session: u32, count: u8, flags: u8) -> Section {
 
 fn step(n: u64, kind: StepKind, src: Option<(u8, u64)>, other: bool, cut: [u64; 2]) -> StepHalf {
     StepHalf {
+        lowver: 0,
         step: StepId(n),
         kind,
         other,
@@ -131,6 +132,7 @@ fn step(n: u64, kind: StepKind, src: Option<(u8, u64)>, other: bool, cut: [u64; 
 
 fn cut_only(n: u64, kind: StepKind, cut: [u64; 2]) -> StepHalf {
     StepHalf {
+        lowver: 0,
         step: StepId(n),
         kind,
         other: true,

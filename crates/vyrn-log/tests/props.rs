@@ -272,6 +272,7 @@ impl Model {
         self.prev_step = step;
         self.prev_cut.clone_from(&cut);
         StepHalf {
+            lowver: 0,
             step: StepId(step),
             kind,
             other: cut_only || (two && p.n(3) == 0),

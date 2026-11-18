@@ -126,6 +126,7 @@ fn block(seed: [u8; 32]) -> Vec<Vec<u8>> {
             0,
             Vec::new(),
             &cut,
+            0,
         )
         .unwrap(),
     );

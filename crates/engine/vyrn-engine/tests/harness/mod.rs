@@ -163,6 +163,39 @@ pub fn new(side: Side, tif: Tif, tick: u32, qty: u32, tag: u32) -> Msg {
     }
 }
 
+/// A seeded xorshift64 stream for generated interleavings: a seed gives the same script on
+/// every host.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+    /// Uniform-ish in `0..m`.
+    pub fn below(&mut self, m: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % m
+    }
+    /// 1 to 3 Day orders, either side, ticks 96..=104 (or 95..=104), qty 1..=3, tags from `tag`.
+    pub fn orders(&mut self, tag: &mut u32, lo: u32) -> Vec<Msg> {
+        let k = 1 + self.below(3);
+        (0..k)
+            .map(|_| {
+                *tag += 1;
+                let side = if self.below(2) == 0 {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                };
+                let tick = lo + self.below(u64::from(105 - lo)) as u32;
+                new(side, Tif::Day, tick, 1 + self.below(3) as u32, *tag)
+            })
+            .collect()
+    }
+}
+
 pub fn cancel(h: Handle, tag: u32) -> Msg {
     Msg::Cancel {
         handle: h,
@@ -389,6 +422,18 @@ pub fn to_wire(recs: &[OwnedRec]) -> (Vec<PacketRecord>, Vec<vyrn_types::RouteRe
             // `AcctTake`s are a separate input (`takes_of`); the harness box logs none.
             OwnedRec::Take(_) => {}
             OwnedRec::Step(e, d) => {
+                // 07 §3.8: a `LOWVER` bit names a lane whose cut moved, or the encoder refuses
+                // the step (`RepErr::Cut`) and the live stream stops.
+                for l in (0..64).filter(|l| e.lowver >> l & 1 != 0) {
+                    let moved = d[..usize::from(e.n_delta)].iter().any(|x| {
+                        usize::from(x.lane.0) == l && cut.get(l).is_some_and(|c| x.seq > *c)
+                    });
+                    assert!(
+                        moved,
+                        "step {}: LOWVER bit on lane {l}, whose cut did not move",
+                        e.step.0
+                    );
+                }
                 for x in &d[..usize::from(e.n_delta)] {
                     cut[usize::from(x.lane.0)] = x.seq;
                 }
@@ -400,7 +445,7 @@ pub fn to_wire(recs: &[OwnedRec]) -> (Vec<PacketRecord>, Vec<vyrn_types::RouteRe
                 }
                 let src = (e.src_lane_seq.0 != 0).then_some((e.src_lane, e.src_lane_seq));
                 let cross = e.flags & vyrn_bbo::STEP_CROSS != 0;
-                steps.push((e.step, kind, src, cross, cut.clone(), payload));
+                steps.push((e.step, kind, src, cross, cut.clone(), payload, e.lowver));
             }
         }
     }
@@ -422,7 +467,7 @@ pub fn takes_of(recs: &[OwnedRec]) -> Vec<(usize, vyrn_types::AcctTake)> {
     out
 }
 
-/// One step as `to_wire` gives it: step, kind, source, `CROSS`, cut, payload.
+/// One step as `to_wire` gives it: step, kind, source, `CROSS`, cut, payload, `lowver`.
 pub type Wire = (
     vyrn_types::StepId,
     vyrn_types::StepKind,
@@ -430,6 +475,7 @@ pub type Wire = (
     bool,
     Vec<vyrn_types::LaneSeq>,
     Vec<u8>,
+    u64,
 );
 
 /// One block of 07 inputs: packet records, route records, steps.
@@ -465,13 +511,14 @@ pub fn replay_blocks(
     for (lanes, routes, steps) in blocks {
         let ws: Vec<WireStep<'_>> = steps
             .iter()
-            .map(|(step, kind, src, cross, cut, payload)| WireStep {
+            .map(|(step, kind, src, cross, cut, payload, lowver)| WireStep {
                 step: *step,
                 kind: *kind,
                 src: *src,
                 cross: *cross,
                 cut,
                 payload,
+                lowver: *lowver,
             })
             .collect();
         let r = match &mut rl {

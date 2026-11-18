@@ -2,6 +2,7 @@
 //! core over them, and the roles the engine plays itself: both cut cores, the stream core's
 //! `LaneCut` writes, the snapshot fan-out and the fill TX cores' ring reads.
 
+use std::collections::VecDeque;
 use vyrn_bbo::admit::{Clock, NeverLate};
 use vyrn_bbo::{
     Bbo, ControlCmd, ControlCons, ControlRing, Cut, CutDelta, Diverge, ENG_CONTROL_RING, FillProd,
@@ -201,6 +202,10 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     pub(crate) take_at: Vec<Option<AcctTake>>,
     pub(crate) take_order: Vec<(AccountId, u32)>,
     pub(crate) take_pos: Vec<(AccountId, usize)>,
+    /// Per lane: the ops `(first, last)` each replayed packet applied, and the version they were
+    /// classified against (`Lane::applied_ver`), from the step cut on. A step's `LOWVER` lane
+    /// takes the version of the range holding its cut (05 §8.6, 07 §3.8, §7.1).
+    pub(crate) low_hist: Vec<VecDeque<(u64, u64, u64)>>,
 }
 
 impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
@@ -314,6 +319,7 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             take_at: Vec::new(),
             take_order: Vec::new(),
             take_pos: Vec::new(),
+            low_hist: Vec::new(),
         })
     }
 

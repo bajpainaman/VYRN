@@ -18,6 +18,8 @@
 //!   fetched: a shed packet's `BUSY` responses carry `client_tag` 0 (05 §6.8, §18 Q17).
 //!   A `Route` record is part of its packet's lane call and is compared like the packet's.
 
+use std::collections::VecDeque;
+
 use vyrn_bbo::admit::NeverLate;
 use vyrn_bbo::{
     ControlCmd, Cut, CutDelta, Diverge, MAX_LANES, Phase, Record, ReplayStep, StepEntry, TxEntry,
@@ -404,6 +406,26 @@ pub fn control_of_payload(b: &[u8]) -> Option<ControlCmd> {
     }
 }
 
+/// Bytes of a `Rescan` step's payload (07 §3.8): `band_lo` u32 LE, then `band_hi` u32 LE. An
+/// empty payload means every tick of the arena.
+pub const RESCAN_PAYLOAD_LEN: usize = 8;
+
+/// A `Rescan` step's band `(lo, hi)` as its payload.
+pub fn rescan_payload(lo: Tick, hi: Tick) -> [u8; RESCAN_PAYLOAD_LEN] {
+    let ([l0, l1, l2, l3], [h0, h1, h2, h3]) = (lo.0.to_le_bytes(), hi.0.to_le_bytes());
+    [l0, l1, l2, l3, h0, h1, h2, h3]
+}
+
+/// The band a non-empty `Rescan` payload names ([`rescan_payload`]'s inverse).
+pub fn rescan_of_payload(b: &[u8]) -> Option<(Tick, Tick)> {
+    let b: &[u8; RESCAN_PAYLOAD_LEN] = b.try_into().ok()?;
+    let [l0, l1, l2, l3, h0, h1, h2, h3] = *b;
+    Some((
+        Tick(u32::from_le_bytes([l0, l1, l2, l3])),
+        Tick(u32::from_le_bytes([h0, h1, h2, h3])),
+    ))
+}
+
 /// One whole step as 07 delivers it (§3.8, merged by StepId): kind, source, cut, kind payload.
 /// Every other `StepEntry` field is an output of replay (07 §7.1 "Fields replay derives").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -420,6 +442,10 @@ pub struct WireStep<'p> {
     /// The kind payload; for `Rescan`, `band_lo` u32 LE then `band_hi` u32 LE, or empty for all
     /// ticks (07 §3.8, §7.1); for `Control`, [`control_payload`]'s bytes.
     pub payload: &'p [u8],
+    /// `StepRecord.lowver` (07 §3.8 `LOWVER`): bit `l`, the step took lane `l`'s `lowver` from
+    /// its half-cut entry. Replay takes the version of its own op at `cut[l]` (`BadRecord` when
+    /// it has applied none there).
+    pub lowver: u64,
 }
 
 impl<'p> WireStep<'p> {
@@ -432,6 +458,7 @@ impl<'p> WireStep<'p> {
             cross: rec.flags & StepFlags::CROSS != 0,
             cut: &rec.cut,
             payload,
+            lowver: rec.lowver,
         }
     }
 }
@@ -737,11 +764,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             let band = if w.kind == StepKind::Rescan {
                 match w.payload {
                     [] => (lo, hi),
-                    [a, b, c, d, e, f, g, h] => (
-                        Tick(u32::from_le_bytes([*a, *b, *c, *d])),
-                        Tick(u32::from_le_bytes([*e, *f, *g, *h])),
-                    ),
-                    _ => return Err(at(Why::BadStep)),
+                    b => rescan_of_payload(b).ok_or(at(Why::BadStep))?,
                 }
             } else {
                 (Tick(0), Tick(0))
@@ -754,6 +777,8 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 cont: self.bbo.continuing(),
                 band,
                 cut,
+                lowver: w.lowver,
+                lowver_ver: [0; MAX_LANES],
             };
             let mut tee = Tee::new(sink, log, buf);
             // An uncross the frozen book cannot fill (the BBO's "histograms disagree" fault) is
@@ -1018,6 +1043,25 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
 
     /// One replayed step: `replay_step` until it publishes.
     fn step_call<S: Sink>(&mut self, rs: &ReplayStep, sink: &mut S) -> Result<(), Why> {
+        // 07 §3.8 `LOWVER`: each logged lane takes the version its op at `cut[l]` was classified
+        // against. A bit on a lane whose cut names no op replay has applied is `BadRecord`.
+        let mut rs = *rs;
+        for l in 0..self.lanes.len() {
+            if rs.lowver & (1u64 << l) == 0 {
+                continue;
+            }
+            let c = rs.cut.get(l).map_or(0, |x| x.0);
+            let v = self
+                .low_hist
+                .get(l)
+                .and_then(|h| h.iter().find(|(a, b, _)| *a <= c && c <= *b))
+                .map(|(_, _, v)| *v)
+                .ok_or(Why::BadRecord)?;
+            if let Some(x) = rs.lowver_ver.get_mut(l) {
+                *x = u32::try_from(v & 0xFFFF_FFFF).unwrap_or(0);
+            }
+        }
+        let rs = &rs;
         let got = self
             .drive(sink, |bbo, vis, ports, book| {
                 bbo.replay_step(vis, ports, book, rs)
@@ -1029,6 +1073,38 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         if got.is_none() {
             return Err(Why::NoStep);
         }
+        // Later cuts never go below this one, so ranges wholly under it are not looked up again.
+        for (h, c) in self.low_hist.iter_mut().zip(rs.cut.iter()) {
+            while h.front().is_some_and(|(_, b, _)| *b < c.0) {
+                h.pop_front();
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::lane_call_in`], recording the ops the call applied and their version.
+    fn lane_call<P: Payloads, S: Sink>(
+        &mut self,
+        l: usize,
+        rec: &PacketRecord,
+        mids: &[PacketRecord],
+        routes_in: impl Iterator<Item = RouteRecord>,
+        payloads: &P,
+        sink: &mut S,
+    ) -> Result<(), Why> {
+        let before = self.lanes.get(l).map_or(0, |x| x.applied().0);
+        self.lane_call_in(l, rec, mids, routes_in, payloads, sink)?;
+        if let Some(lane) = self.lanes.get(l) {
+            let after = lane.applied().0;
+            if after > before {
+                if self.low_hist.len() <= l {
+                    self.low_hist.resize_with(self.lanes.len(), VecDeque::new);
+                }
+                if let Some(h) = self.low_hist.get_mut(l) {
+                    h.push_back((before.saturating_add(1), after, lane.applied_ver()));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1036,7 +1112,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
     /// `(f, C_f[l])`; a packet goes
     /// through `Lane::replay_packet` with `mids` as its boundaries and the routes its route
     /// records `routes` give.
-    fn lane_call<P: Payloads, S: Sink>(
+    fn lane_call_in<P: Payloads, S: Sink>(
         &mut self,
         l: usize,
         rec: &PacketRecord,

@@ -146,6 +146,19 @@ out("ex311.cross_route.sections", hx(
     " 40 01"
     " 51 00 87 00"     # Improve | HOME | SPARSE; gap 0; src 0x87 = CROSS | lane 7; zigzag(0)
     " 88100000 02 0a 01"))
+# LOWVER (07 §3.8): the same Cross step, where lane 7's cut landed on its half-cut entry and the
+# step took lane 7's lowver (05 §8.6). Mode 3 (b0 0x70): SPARSE's bitmap, the lowver bitmap
+# (bit 7 = lane 7), then SPARSE's deltas: 4 bytes more than ex311.sections.
+out("ex311.lowver.sections", hx(
+    "07 01 0a ac02 8008 00"
+    " 40 01"
+    " 70 00 07 00"     # Cross | HOME | LOWVER; gap 0; src 7; zigzag(0)
+    " 88100000"        # changed lanes 3, 7, 12
+    " 80000000"        # lowver lanes: 7
+    " 02 0a 01"))
+# An empty lowver bitmap, and one naming lane 4, whose cut did not move: both REP_E_CUT.
+out("ex311.bad_lowver_empty.sections", hx("07 01 0a ac02 8008 00 40 01 70 00 07 00 88100000 00000000 02 0a 01"))
+out("ex311.bad_lowver_unchanged.sections", hx("07 01 0a ac02 8008 00 40 01 70 00 07 00 88100000 90000000 02 0a 01"))
 # RouteRecord (07 §3.6) after lane 7's packet (LaneSeqs 1..10): op 8 was classified Cross and
 # rejected by the lane. h = CROSS (bit 7) | back 2 (10 - 8); slot 4098 = LEB 82 20.
 out("ex311.route.sections", hx(

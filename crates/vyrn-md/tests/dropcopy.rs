@@ -445,7 +445,10 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
                 } else {
                     0
                 };
-                out.extend(w.step(e.step, kind, src, flags, payload, &cut).unwrap());
+                out.extend(
+                    w.step(e.step, kind, src, flags, payload, &cut, e.lowver)
+                        .unwrap(),
+                );
             }
         }
         let route_next = matches!(j.recs.get(i + 1), Some(OwnedRec::Route(_)))

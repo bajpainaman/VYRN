@@ -314,7 +314,10 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
                 } else {
                     0
                 };
-                out.extend(w.step(e.step, kind, src, flags, payload, &cut).unwrap());
+                out.extend(
+                    w.step(e.step, kind, src, flags, payload, &cut, e.lowver)
+                        .unwrap(),
+                );
             }
         }
         // A packet's routes and `MID` records stay in its block (07 §3.6, §7.1), as vyrn-seq

@@ -220,6 +220,13 @@ pub struct ReplayStep {
     pub band: (Tick, Tick),
     /// `C_s`, every lane.
     pub cut: Cut,
+    /// `StepEntry.lowver`: bit `l`, the live step set lane `l`'s `lowver` from its half-cut
+    /// entry (05 §8.6, 07 §3.8 `LOWVER`).
+    pub lowver: u64,
+    /// For each bit of `lowver`, the `CounterLine.snap_ver` of the entry at `cut[l]`: the
+    /// version its op was classified against, which the replayer derives from its own packet
+    /// records (07 §7.1). Others are not read.
+    pub lowver_ver: [u32; MAX_LANES],
 }
 
 impl ReplayStep {
@@ -242,6 +249,8 @@ impl ReplayStep {
             cross: e.flags & STEP_CROSS != 0,
             band: (e.band_lo, e.band_hi),
             cut,
+            lowver: e.lowver,
+            lowver_ver: [0; MAX_LANES],
         })
     }
 }
@@ -274,6 +283,9 @@ pub struct Bbo {
     last_pub: (Tick, Tick, Phase),
     hist: Vec<(u64, Tick, Tick, bool)>,
     lowver: [u64; MAX_LANES],
+    /// Replay: the logged `lowver` decision of the step being replayed (`ReplayStep::lowver`
+    /// and its versions), used by `finish` instead of the half-cut entries.
+    rlow: Option<(u64, [u32; MAX_LANES])>,
     q: Vec<LaneQ>,
     ctl: Option<ControlCmd>,
     cont: Option<Fwd>,
@@ -313,6 +325,7 @@ impl Bbo {
             last_pub: (NO_BID, NO_ASK, cfg.phase),
             hist,
             lowver: [0; MAX_LANES],
+            rlow: None,
             q: vec![LaneQ::default(); n],
             ctl: None,
             cont: None,
@@ -471,7 +484,14 @@ impl Bbo {
         if self.st.fault {
             return Ok(Poll::Fault);
         }
-        if let Err(d) = self.replay_decide(src, rec) {
+        if rec.lowver & !lanes_mask(self.n) != 0 {
+            self.st.fault = true;
+            return Err(Diverge::Cut);
+        }
+        self.rlow = Some((rec.lowver, rec.lowver_ver));
+        let res = self.replay_decide(src, rec);
+        self.rlow = None;
+        if let Err(d) = res {
             self.st.fault = true;
             self.held = false;
             return Err(d);
@@ -702,12 +722,18 @@ impl Bbo {
             a: LaneSeq(f.e.lane_seq.0.saturating_sub(u64::from(f.e.applied_back))),
             next_floor: floors.get(f.lane).copied().flatten(),
         });
-        let c = step_cut(&prev, &k, &floors, rule);
+        let mut c = step_cut(&prev, &k, &floors, rule);
         if self.phase == Phase::Continuous
             && let Some(band) = self.band_test(&c, &prev)
         {
-            self.exec_rescan::<false, S>(src, c, band);
-            return;
+            // A continuation takes precedence over every other step (05 §8.6, D14), and 07
+            // replay takes the next step to be it (07 §7.1). Its cut holds at `C_{s−1}`, where
+            // the band test has nothing to test, instead of rescanning first.
+            if !matches!(chosen, Some((_, true))) {
+                self.exec_rescan::<false, S>(src, c, band);
+                return;
+            }
+            c = prev;
         }
         if let Some((f, cont)) = chosen {
             if !cont && admit::late(clock, f.e.deadline) {
@@ -852,15 +878,39 @@ impl Bbo {
         e.pub_a = u32::try_from(self.pair.a.0 & 0xFFFF_FFFF).unwrap_or(0);
         e.pub_b = u32::try_from(self.pair.b.0 & 0xFFFF_FFFF).unwrap_or(0);
         self.out.set_deltas(&prev, &c, self.n);
-        for l in 0..self.n {
-            let ent = self.pair.entry(l);
-            if c.get(l) == Some(&ent.seq) {
-                let v = self.expand(ent.snap_ver);
-                if let Some(x) = self.lowver.get_mut(l) {
-                    *x = v;
+        // 05 §8.6: a lane whose cut moves onto its half-cut entry takes the entry's `snap_ver`.
+        // Which entry live saw is physical, so live logs the lanes it updated and replay applies
+        // the logged ones with the versions it derives (07 §3.8 `LOWVER`, §7.1). A lane whose
+        // cut did not move takes nothing: 07 has no bit for it, so replay could not follow.
+        let mut mask = 0u64;
+        match self.rlow.take() {
+            Some((m, vers)) => {
+                for l in 0..self.n {
+                    if m & crate::book::bit(l) != 0 {
+                        let v = self.expand(vers.get(l).copied().unwrap_or(0));
+                        if let Some(x) = self.lowver.get_mut(l) {
+                            *x = v;
+                        }
+                    }
+                }
+                mask = m;
+            }
+            None => {
+                for l in 0..self.n {
+                    let ent = self.pair.entry(l);
+                    if ent.seq.0 != 0 && c.get(l) == Some(&ent.seq) && c.get(l) > prev.get(l) {
+                        let v = self.expand(ent.snap_ver);
+                        if let Some(x) = self.lowver.get_mut(l)
+                            && *x != v
+                        {
+                            *x = v;
+                            mask |= crate::book::bit(l);
+                        }
+                    }
                 }
             }
         }
+        self.out.entry.lowver = mask;
         // 05 §8.6: the source lane's ops up to its cut were classified against ≥ the entry's
         // `snap_ver`.
         if let Some((l, f)) = src {

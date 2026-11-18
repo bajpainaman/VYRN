@@ -446,6 +446,10 @@ pub struct StepEntry {
     /// Bit `l`: lane `l` received fill events in this step.
     pub fill_lanes: u64,
     pub flags: u8,
+    /// Bit `l`: this step set lane `l`'s `lowver` from its half-cut entry (05 §8.6), because
+    /// the cut landed on the entry and its `snap_ver` changed `lowver`. The entry is physical
+    /// state, so the step logs the decision (07 §3.8 `LOWVER`); replay derives the version.
+    pub lowver: u64,
 }
 
 /// One changed cut entry of a `StepEntry` (16 B, 4 per line).
@@ -468,6 +472,7 @@ impl StepEntry {
         b.put(36, self.band_hi.0.to_le_bytes());
         b.put(40, self.fill_lanes.to_le_bytes());
         b.put(48, [self.flags]);
+        b.put(56, self.lowver.to_le_bytes());
         words_from_img(&b)
     }
     pub fn decode(line: &Line64) -> Self {
@@ -486,6 +491,7 @@ impl StepEntry {
             band_hi: Tick(b.u32(36)),
             fill_lanes: b.u64(40),
             flags: b.u8(48),
+            lowver: b.u64(56),
         }
     }
 }
