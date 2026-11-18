@@ -20,12 +20,15 @@
 //! | 8 | 8 | `cap`, the data region's size |
 //! | 16 | 8 | `head`: bytes ever written |
 //! | 24 | 8 | `!head` |
+//! | 32 | 8 | `resv`: bytes written once the batch in flight lands |
+//! | 40 | 8 | `!resv` |
 //! | 64 | `cap` | data, byte `i` of the stream at `64 + i % cap` |
 //!
-//! The writer writes a batch of whole frames, then `head` and `!head` in one `pwrite`. A reader
-//! that sees `head != !(!head)` read a torn header and reads it again. A reader whose `tail` is
-//! more than `cap` behind `head`, before or after it copies the bytes, has lost data and stops
-//! with [`RingError::Lagged`]: the writer never waits for a reader (03 §4.5), and a lagged drop
+//! The writer first publishes `resv` and `!resv` in one `pwrite`, then writes a batch of whole
+//! frames, then `head` and `!head` in one `pwrite`. A reader that sees a pair disagree read a
+//! torn header and reads it again. A reader whose `tail` is more than `cap` behind `head` before
+//! it copies the bytes, or behind `resv` after, has lost data and stops with
+//! [`RingError::Lagged`]: the writer never waits for a reader (03 §4.5), and a lagged drop
 //! copy is rebuilt from the final log (03 §7).
 //!
 //! A frame is `len: u32` then `len` bytes: a kind byte and its fields ([`RingFrame`], 10 §8.6
@@ -442,6 +445,7 @@ impl RingTap {
         h[8..16].copy_from_slice(&cap.to_le_bytes());
         h[24..32].copy_from_slice(&(!0u64).to_le_bytes());
         file.write_all_at(&h, 0).map_err(io)?;
+        file.write_all_at(&pair(0), 32).map_err(io)?;
         Ok(Self {
             file,
             cap,
@@ -504,6 +508,10 @@ impl RingTap {
         if n > self.cap {
             return Err(RingError::TooBig(self.buf.len()));
         }
+        // Readers see the batch's end before any byte it overwrites (module docs).
+        self.file
+            .write_all_at(&pair(self.head + n), 32)
+            .map_err(io)?;
         let at = self.head % self.cap;
         let first = usize::try_from((self.cap - at).min(n)).map_err(|_| RingError::TooBig(0))?;
         let (a, b) = self.buf.split_at(first);
@@ -512,10 +520,7 @@ impl RingTap {
             self.file.write_all_at(b, RING_HEADER).map_err(io)?;
         }
         self.head += n;
-        let mut h = [0u8; 16];
-        h[..8].copy_from_slice(&self.head.to_le_bytes());
-        h[8..].copy_from_slice(&(!self.head).to_le_bytes());
-        self.file.write_all_at(&h, 16).map_err(io)
+        self.file.write_all_at(&pair(self.head), 16).map_err(io)
     }
 }
 
@@ -537,6 +542,14 @@ impl Tap for RingTap {
         };
         self.send(&f);
     }
+}
+
+/// `x` then `!x`, the torn-read check of a header word.
+fn pair(x: u64) -> [u8; 16] {
+    let mut h = [0u8; 16];
+    h[..8].copy_from_slice(&x.to_le_bytes());
+    h[8..].copy_from_slice(&(!x).to_le_bytes());
+    h
 }
 
 /// The reading end, in `vyrn-dropcopy`. It starts at offset 0: a ring that has wrapped before
@@ -575,9 +588,14 @@ impl RingReader {
 
     /// `head`, read again until `head` and `!head` agree.
     fn head(&self) -> Result<u64, RingError> {
+        self.word(16)
+    }
+
+    /// The header word pair at `off`, read again until the pair agrees.
+    fn word(&self, off: u64) -> Result<u64, RingError> {
         let mut h = [0u8; 16];
         for _ in 0..TORN_RETRIES {
-            self.file.read_exact_at(&mut h, 16).map_err(io)?;
+            self.file.read_exact_at(&mut h, off).map_err(io)?;
             let a = u64::from_le_bytes(h[..8].try_into().map_err(|_| RingError::Torn)?);
             let b = u64::from_le_bytes(h[8..].try_into().map_err(|_| RingError::Torn)?);
             if a == !b {
@@ -614,8 +632,8 @@ impl RingReader {
         if !b.is_empty() {
             self.file.read_exact_at(b, RING_HEADER).map_err(io)?;
         }
-        // The writer may have lapped the bytes while they were copied.
-        self.lagged(self.head()?)?;
+        // The writer may have lapped the bytes while they were copied, published or not.
+        self.lagged(self.word(32)?)?;
         let mut frames = Vec::new();
         let mut c = Cur(&self.buf);
         while !c.0.is_empty() {

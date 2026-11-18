@@ -1801,7 +1801,8 @@ makes, byte for byte. That equality is tested against `RustReplay` at every spli
    memory. The writer never waits for a reader, so a reader crash or stall cannot stop replay
    or voting. \[Guessing\]
 2. **Layout.** All fields little-endian. Header (64 bytes): magic `VYRNDCR1`, `cap` (u64),
-   `head` (u64, bytes ever written), `!head`. Data byte `i` is at `64 + i % cap`. A frame is a
+   `head` (u64, bytes ever written), `!head`, `resv` (u64, `head` once the batch in flight lands),
+   `!resv`. Data byte `i` is at `64 + i % cap`. A frame is a
    `len: u32` and then `len` bytes: a kind byte and its fixed fields. The kinds are:
    - 1 lane op (lane, LaneSeq, session, pkt_seq, resp_seq, message, response record);
    - 2 step (StepId, `StepKind` code, flags, source op, then `n: u16` TX entries, each with its
@@ -1816,11 +1817,14 @@ makes, byte for byte. That equality is tested against `RustReplay` at every spli
 
    A message and a source op are a presence byte followed by zeroes when absent. \[Guessing\]
 3. **Publication.** The writer buffers lane ops. A step, a shell input, or a buffer over
-   `cap / 4` publishes the buffer: the data, then `head` and `!head` in one `pwrite`.
+   `cap / 4` publishes the buffer: `resv` and `!resv` in one `pwrite`, the data, then `head`
+   and `!head` in one `pwrite`.
    `cap` defaults to 64 MiB. \[Guessing\]
-4. **Reading.** A header where `head ≠ !(!head)` is torn, and the reader reads it again. If
-   `tail` is more than `cap` behind `head`, before or after the copy, the reader stops with
-   `Lagged`. A reader starts at offset 0, so a ring that has already wrapped is `Lagged` too.
+4. **Reading.** A header pair that disagrees (`head ≠ !(!head)`) is torn, and the reader reads
+   it again. If `tail` is more than `cap` behind `head` before the copy, or behind `resv` after
+   it (a batch that overwrote the copied bytes but is not yet published), the reader stops with
+   `Lagged`. When a new epoch begins, every configured stream exists, so it can subscribe before
+   its first record. A reader starts at offset 0, so a ring that has already wrapped is `Lagged` too.
    A lagged or failed `vyrn-dropcopy` exits; its positions are rebuilt from the final log
    (03 §7). Its sessions keep the gap rules of §8.5 item 4. \[Guessing\]
 5. **Shell inputs.** The observer's shell writes the inputs that no replay output carries:

@@ -746,9 +746,21 @@ fn a_reader_the_writer_laps_stops_and_a_torn_head_is_refused() {
     assert!(*heads.last().unwrap() > 512);
     let mut r = RingDc::open(&path);
     assert!(matches!(r.poll(), Err(RingError::Lagged { tail: 0, .. })));
-    // `!head` that disagrees with `head`: a torn header, read again, never taken.
     use std::os::unix::fs::FileExt;
+    // A writer that overwrote the reader's bytes but has not published `head` yet: its `resv`
+    // stops the reader after the copy.
+    let mut w = RingTap::create(&path, 512).unwrap();
+    w.final_block(Height(1), StepId(1));
     let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let mut resv = [0u8; 16];
+    resv[..8].copy_from_slice(&600u64.to_le_bytes());
+    resv[8..].copy_from_slice(&(!600u64).to_le_bytes());
+    f.write_all_at(&resv, 32).unwrap();
+    assert!(matches!(
+        RingDc::open(&path).poll(),
+        Err(RingError::Lagged { tail: 0, head: 600 })
+    ));
+    // `!head` that disagrees with `head`: a torn header, read again, never taken.
     f.write_all_at(&0u64.to_le_bytes(), 24).unwrap();
     assert_eq!(RingDc::open(&path).poll(), Err(RingError::Torn));
     let _ = std::fs::remove_file(&path);

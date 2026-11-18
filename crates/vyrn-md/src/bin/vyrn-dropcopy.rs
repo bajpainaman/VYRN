@@ -131,7 +131,12 @@ fn follow(path: &std::path::Path, cfg: &DcConfig, out: &StoreOut) -> String {
                 if let Ok(mut s) = out.store.write() {
                     s.begin_epoch(e);
                 }
-                dc = Some(DropCopy::new(cfg, out.clone()));
+                let d = DropCopy::new(cfg, out.clone());
+                // Every configured stream can subscribe from the epoch's start.
+                if let Ok(mut s) = out.store.write() {
+                    d.streams().for_each(|id| s.open(id));
+                }
+                dc = Some(d);
             }
             let Some(d) = dc.as_mut() else {
                 err = Some("ring frame before its epoch's Begin".into());
