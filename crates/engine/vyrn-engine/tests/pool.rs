@@ -203,6 +203,51 @@ fn a_pooled_session_logs_one_take_before_each_of_its_records() {
 }
 
 #[test]
+fn a_take_must_sit_right_before_its_record_not_before_its_route() {
+    // A pooled IOC that crosses the resting ask is forwarded with a route record (07 §3.6),
+    // logged as `[Take, Packet, Route]`. Moving the route between the take and its packet
+    // record keeps every record and each kind's order, but breaks "right before the record it
+    // covers" (05 §6.9), so replay diverges at the take (#135 review).
+    let tok = PoolTok::new();
+    let mut sh = box_shared();
+    let mut e = pooled_engine(&mut sh, &tok, true);
+    let mut s = Takes::default();
+    let store = feed(
+        &mut e,
+        &[
+            (0, 1, order(Side::Sell, Tif::Day, Stp::None, 200, 1, 1)),
+            (1, 1, order(Side::Buy, Tif::Ioc, Stp::None, 200, 1, 2)),
+        ],
+        &mut s,
+    );
+    let recs = &s.j.recs;
+    let at = (0..recs.len() - 2)
+        .find(|&i| {
+            matches!(
+                (&recs[i], &recs[i + 1], &recs[i + 2]),
+                (OwnedRec::Take(_), OwnedRec::Packet(_), OwnedRec::Route(_))
+            )
+        })
+        .expect("the pooled IOC logs [Take, Packet, Route]");
+    let replay = |recs: &[OwnedRec]| {
+        let rtok = PoolTok::new();
+        let mut rsh = box_shared();
+        let mut r = pooled_engine(&mut rsh, &rtok, true);
+        r.replay(recs, &store, &mut NoResponses, &mut Journal::default())
+    };
+    assert_eq!(replay(recs), Ok(()));
+    let mut moved = recs.clone();
+    moved.swap(at + 1, at + 2);
+    assert_eq!(
+        replay(&moved),
+        Err(Diverged {
+            index: at,
+            why: Why::Mismatch
+        })
+    );
+}
+
+#[test]
 fn a_held_token_fail_stops_the_lane() {
     let tok = PoolTok::new();
     let mut sh = box_shared();

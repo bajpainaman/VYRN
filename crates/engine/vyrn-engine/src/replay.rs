@@ -144,10 +144,15 @@ struct Tee<'s, S, R> {
     /// The call's route records, in output order.
     routes: [RouteRecord; MAX_ROUTES],
     n_routes: usize,
-    /// The call's `AcctTake` records in output order, each with the number of the call's
-    /// packet records output before it (its place among them).
-    takes: [Option<(usize, AcctTake)>; MAX_TAKES],
+    /// The call's `AcctTake` records, in output order.
+    takes: [Option<AcctTake>; MAX_TAKES],
     n_takes: usize,
+    /// The kind of each record the call output, in output order: the compare checks the
+    /// order across kinds, so a take must sit right before the record it covers.
+    order: [Kind; MAX_OUT],
+    n_order: usize,
+    /// More than [`MAX_OUT`] records: the lane-call compare fails (other calls ignore it).
+    order_full: bool,
     step: Option<OwnedRec>,
     bad_resp: bool,
 }
@@ -163,6 +168,9 @@ impl<'s, S, R> Tee<'s, S, R> {
             n_routes: 0,
             takes: [None; MAX_TAKES],
             n_takes: 0,
+            order: [Kind::Packet; MAX_OUT],
+            n_order: 0,
+            order_full: false,
             step: None,
             bad_resp: false,
         }
@@ -170,6 +178,27 @@ impl<'s, S, R> Tee<'s, S, R> {
     fn routes(&self) -> &[RouteRecord] {
         self.routes.get(..self.n_routes).unwrap_or(&[])
     }
+    fn order(&self) -> &[Kind] {
+        self.order.get(..self.n_order).unwrap_or(&[])
+    }
+    /// Notes one output record's kind; more than a lane call can output fails its compare.
+    fn note(&mut self, k: Kind) {
+        match self.order.get_mut(self.n_order) {
+            Some(d) => {
+                *d = k;
+                self.n_order = self.n_order.saturating_add(1);
+            }
+            None => self.order_full = true,
+        }
+    }
+}
+
+/// The kind of a lane call's output record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Packet,
+    Route,
+    Take,
 }
 
 const NO_ROUTE: RouteRecord = RouteRecord {
@@ -185,8 +214,10 @@ impl<S: Sink, R: Responses> Sink for Tee<'_, S, R> {
                 if self.pkts.len() < self.pkts.capacity() {
                     self.pkts.push(*p);
                 }
+                self.note(Kind::Packet);
             }
             Rec::Route(x) => {
+                self.note(Kind::Route);
                 // More than one per op is a lane fault that the compare reports.
                 match self.routes.get_mut(self.n_routes) {
                     Some(d) => {
@@ -216,11 +247,12 @@ impl<S: Sink, R: Responses> Sink for Tee<'_, S, R> {
         // More than one per packet record is a fault that the compare reports.
         match self.takes.get_mut(self.n_takes) {
             Some(d) => {
-                *d = Some((self.pkts.len(), *t));
+                *d = Some(*t);
                 self.n_takes = self.n_takes.saturating_add(1);
             }
             None => self.bad_resp = true,
         }
+        self.note(Kind::Take);
         self.inner.take(t);
     }
 }
@@ -258,6 +290,9 @@ const MAX_ROUTES: usize = 10;
 /// `AcctTake` records one lane call can log: one for its packet record (05 §6.9); the rest of
 /// the call's records are Advance records, which take no token.
 const MAX_TAKES: usize = 2;
+/// Records one lane call can output: its packet, its `MID` records and Advance records, routes
+/// and takes.
+const MAX_OUT: usize = 1 + MAX_MIDS + MAX_ROUTES + MAX_TAKES + 1;
 
 /// The routes of packet `pk`'s classified ops (05 §10 row 7, 07 §3.6): one route record per op
 /// the lane classified `Cross` or `Improve`, forwarded or rejected by the lane itself. Every
@@ -932,16 +967,21 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     let mut gp = tee.pkts.iter();
                     let mut gr = tee.routes().iter();
                     let mut gt = tee.takes.iter().flatten();
-                    let mut seen = 0usize;
+                    let mut kinds = tee.order().iter();
                     let same = n_pk > 0
                         && want.len() == used
+                        && !tee.order_full
+                        && tee.order().len() == used
                         && want.iter().all(|w| match w {
                             OwnedRec::Packet(p) => {
-                                seen = seen.saturating_add(1);
-                                gp.next() == Some(p)
+                                kinds.next() == Some(&Kind::Packet) && gp.next() == Some(p)
                             }
-                            OwnedRec::Route(x) => gr.next() == Some(x),
-                            OwnedRec::Take(t) => gt.next() == Some(&(seen, *t)),
+                            OwnedRec::Route(x) => {
+                                kinds.next() == Some(&Kind::Route) && gr.next() == Some(x)
+                            }
+                            OwnedRec::Take(t) => {
+                                kinds.next() == Some(&Kind::Take) && gt.next() == Some(t)
+                            }
                             OwnedRec::Step(..) => false,
                         });
                     if !same {
