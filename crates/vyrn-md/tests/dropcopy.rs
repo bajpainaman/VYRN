@@ -33,6 +33,7 @@ use vyrn_lane::{Config, Lane, PathTable, RespPkt, Rx, RxIn, SessionSpec};
 use vyrn_log::{Ident, LaneBase, Layout, SeqWriter, TenureStart};
 use vyrn_md::SinkStream;
 use vyrn_md::dropcopy::ring::{RING_CAP, RingError, RingFrame, RingReader, RingTap};
+use vyrn_md::dropcopy::statement::{Section, Statement, StmtTree};
 use vyrn_md::dropcopy::{DcAccount, DcConfig, DcRecord, DcType, DropCopy, EOD_HASH, StreamId};
 use vyrn_replica::{
     BlockInputs, DataJoin, EpochView, OrderCore, ReplayEngine, ReplayError, RustReplay, full_hash,
@@ -309,6 +310,8 @@ impl Sink for Both<'_> {
 struct Run {
     recs: Recs,
     fee_acc: i128,
+    /// The statement sections (10 §10) at epoch end.
+    sections: Vec<Section>,
 }
 
 fn live(script: &[Act]) -> (Journal, Store, Run) {
@@ -365,8 +368,19 @@ fn live(script: &[Act]) -> (Journal, Store, Run) {
     let fee_acc = (0..N).map(|l| e.lane(l).unwrap().book_acc().fee_acc).sum();
     let (_, dc) = m.finish_tap().unwrap();
     assert_eq!(dc.error(), None);
-    let recs = dc.finish(|_| Default::default()).unwrap();
-    (j, store, Run { recs, fee_acc })
+    let mut dc = dc;
+    dc.end_epoch(|_| Default::default()).unwrap();
+    let sections = dc.statement_sections();
+    let recs = dc.into_out().unwrap();
+    (
+        j,
+        store,
+        Run {
+            recs,
+            fee_acc,
+            sections,
+        },
+    )
 }
 
 fn tenure() -> TenureStart {
@@ -482,8 +496,15 @@ fn replay(live_j: &Journal, store: &Store, blocks: &[BlockInputs<N>]) -> Result<
         .sum();
     let (_, dc) = rep.into_sink().finish_tap().unwrap();
     assert_eq!(dc.error(), None);
-    let recs = dc.finish(|_| Default::default()).unwrap();
-    Ok(Run { recs, fee_acc })
+    let mut dc = dc;
+    dc.end_epoch(|_| Default::default()).unwrap();
+    let sections = dc.statement_sections();
+    let recs = dc.into_out().unwrap();
+    Ok(Run {
+        recs,
+        fee_acc,
+        sections,
+    })
 }
 
 /// Every record but `DC_FINAL` / `DC_SETTLED`, per stream, in order.
@@ -627,6 +648,33 @@ fn reconcile(j: &Journal, recs: &Recs) {
     assert!(n_fills >= 8, "the script fills: {n_fills}");
 }
 
+/// 10 §10: each account's own stream's four `DC_EOD` records, as served, are its statement
+/// section; its leaf proves under `ACC_STMT_ROOT`, and a master's aggregate stream is no leaf.
+fn check_statements(run: &Run) -> vyrn_types::Hash {
+    let tree = StmtTree::build(run.sections.iter().copied()).unwrap();
+    let mut n = 0;
+    for (id, recs) in canonical(&run.recs) {
+        let eod: Vec<DcRecord> = recs
+            .iter()
+            .filter(|r| r.kind() == DcType::Eod)
+            .copied()
+            .collect();
+        let eod: [DcRecord; 4] = eod.try_into().unwrap();
+        let p = tree.proof(id.account);
+        if id.master {
+            continue;
+        }
+        let st = Statement {
+            account: id.account,
+            sections: vec![Section::from_eod(BOOK, eod).unwrap()],
+        };
+        assert!(p.unwrap().verify(st.leaf_hash(), tree.root()), "{id:?}");
+        n += 1;
+    }
+    assert_eq!(n, run.sections.len(), "one leaf per account stream");
+    tree.root()
+}
+
 fn fees(recs: &Recs) -> i128 {
     recs.iter()
         .filter(|(s, _, r)| !s.master && r.kind() == DcType::Eod && r.ordinal() == 1)
@@ -661,12 +709,18 @@ fn replay_drop_copy_equals_live_and_the_response_stream() {
     assert_ne!(live.fee_acc, 0);
     let want = canonical(&live.recs);
     assert!(want.keys().any(|s| s.master), "a master stream");
+    let live_root = check_statements(&live);
     for at in std::iter::once(None).chain((0..j.recs.len() - 1).map(Some)) {
         let cuts: Vec<usize> = at.into_iter().collect();
         let bs = blocks(&j, &store, &cuts);
         let rep = replay(&j, &store, &bs).unwrap_or_else(|e| panic!("split {at:?}: {e}"));
         assert_eq!(canonical(&rep.recs), want, "split {at:?}");
         assert_eq!(rep.fee_acc, live.fee_acc);
+        assert_eq!(
+            check_statements(&rep),
+            live_root,
+            "split {at:?}: ACC_STMT_ROOT"
+        );
         check_streams(&rep.recs);
         // Every DC_FINAL names a step the stream had reached; one per block at most.
         let finals = rep

@@ -2003,6 +2003,30 @@ and out, fills (count, base, quote), fees, rebates, message fees, the drop-copy 
 `AccountId` order; its root `ACC_STMT_ROOT` is in the quorum-signed epoch report, and a client
 checks its statement with a Merkle path. The ledger credits fees and in-flight totals from it.
 
+**The drop copy's part of the statement** (`vyrn_md::dropcopy::statement`). The rules below are
+readings of this section and §8.3, ruled or accepted as marked.
+
+1. **Leaf** (accepted). `AccountId` u32 LE, the number of books u16 LE, then per book in ascending
+   `BookId`: the book u16 LE and the account's own stream's four `DC_EOD` records (ordinal 0–3,
+   48 B each, as sent, §8.4 item 6). The leaf hash is
+   BLAKE3(derive_key("vyrn v1 stmt leaf", leaf bytes)), so a client checks its leaf with the
+   `DC_EOD` records it already holds, the last of which is its stream hash (§8.3).
+2. **Tree** (ruled). Domains are separated with `derive_key`, as the SMT's (09 §17.3): a node is
+   BLAKE3(derive_key("vyrn v1 stmt node", left ‖ right)). A level with an odd count carries its
+   last node up unchanged, so no node is duplicated, and the root of no leaves is
+   BLAKE3(derive_key("vyrn v1 stmt node", empty input)). The root is `ACC_STMT_ROOT`, and a path
+   lists each sibling from the leaf up, with its side.
+3. **Masters** (accepted). A master's aggregate stream is not a leaf: its accounts, and its own
+   orders' stream, are.
+4. **Fields not built yet** (current scope). The leaf carries only what the drop copy derives.
+   Allocations, rebates, `MUST_SPLIT`, next tier, class, lane move and router totals wait for
+   open question 14; the leaf that carries them hashes under a new context,
+   `"vyrn v1 stmt leaf v2"`, not a version byte, so a v1 leaf and a v2 leaf never collide and the
+   v1 bytes stay exactly the client's `DC_EOD` records.
+
+Not built yet: the quorum-signed epoch report that carries `ACC_STMT_ROOT`, and delivery of a
+client's path (the observer does not end an epoch yet, §8.4).
+
 **Venue reports per epoch:** volume and trade count per book, the fairness metrics (§9.1), the
 cross-rate profile and peaks (§9.3), `MD_LAG` percentiles from the observers' telemetry, sequencer
 failovers, halts, and every admin control op.
@@ -2117,3 +2141,4 @@ token takes (`AcctTake`, §14.17 item 4). Still open:
 | 11 | Does the account-token CAS stay ~20 ns when one pooled account sends on several sessions at once, and how much does the `PoolRisk` token add to pooled crosses | 05 | 11's pool token-contention test, then B3's pooled `BUSY` curve |
 | 12 | Does `AcctTake` also order `PoolRisk` takes and settlement of pooled fill events, or do those need their own record (Requests to 01, item 9) | 01, 07 | 11's pooled-lane determinism replay with `AcctTake` checks (B4 on a pool log) |
 | 13 | §7.9: a Join dependency that trades on entry (05 §3.7, F4) puts its own taker records in the dependency TX packet, and `SinkStream` leaves it `Unsupported`: is it an `MD_EXEC` taker of its own (a step with two takers), and which `DC_FILL`s, taker and maker, does it give | 10, 05 | a `vyrn-md` replay test with a crossing join dependency, against `RustReplay` |
+| 14 | §10: the statement leaf's sections beyond the drop copy (allocations, rebates, `MUST_SPLIT`, tier, class, lane move, router totals), the epoch report that signs `ACC_STMT_ROOT`, and how a client gets its path | 10, 07, 08 | the epoch-report build; a client proof test against the signed root |

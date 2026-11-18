@@ -2134,6 +2134,7 @@ qty`, where `qty` is the reversed quantity of the original fill.
 | `"vyrn v1 nodecert"`, `"vyrn v1 gov"`, `"vyrn v1 tx"` | Certificates, governance, items |
 | `"vyrn v1 genesis"`, `"vyrn v1 log"`, `"vyrn v1 epochkeys"` | Genesis hash, log hash, key-table hash |
 | `"vyrn v1 smt leaf"`, `"vyrn v1 smt node"` | SMT hashing |
+| `"vyrn v1 stmt leaf"`, `"vyrn v1 stmt node"` | Statement tree, `ACC_STMT_ROOT` (10 §10) |
 | `"vyrn v1 lthash"`, `"vyrn v1 lthash digest"` | LtHash element and digest |
 
 ### 17.4 Invariants
