@@ -274,6 +274,7 @@ home = "LDN"
 observers = ["{ctrl}"]
 delta_ms = 500
 storage = "{}"
+fresh = true
 "#,
                 hex(&seq_key),
                 roster_file.display(),

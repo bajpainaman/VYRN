@@ -22,7 +22,7 @@
 //! | `dev = false` | `true` marks a DEV validator: only then may `[replay] hashlag_us` differ from 1000 |
 //! | `[replay] tick_min, tick_max, win_center, slot_cap, hashlag_us, [[replay.session]] lane, slot, account, k_seq, quote, base` | optional, needs `[data]`: replay of every block that passes item 3 on `vyrn-engine` (`replay.rs`), built from the sequencer's `[engine]` and `[[dev_session]]` (no state snapshot encoding yet). `hashlag_us` (DEV only, default 1000 = the spec's 1 ms, 07 §3.7) is the `REP_E_HASHLAG` bound, for unpinned DEV hosts |
 //! | `[repair] nack, hole_wait_us, retry_us, tries, order_as, order_b_as` | optional: sequencer retransmit (07 §4.10). Holes are Nacked to `nack`, the box's `[consensus] ctrl`, after `hole_wait_us` (5), again every `retry_us` (50), and given up after `tries` (8) or a `NackTooOld`, printing `ORDER_GAP tenure= stream= from= to= path=`. Other timers are DEV only. `order_as`/`order_b_as`: the port the box has for this replica when a relay stands in front of it. Prints `REPAIR nacks= gaps= too_old=` at exit |
-//! | `[consensus] roster, roster_hash, genesis_hash, home, seq_order, observers, delta_ms, storage` | optional: the Simplex voter (`consensus.rs`); committee and peers from the roster file (08 §9.6), checked against `roster_hash`; `membership.seq_keys[0]` must be the roster's primary `seq_key` |
+//! | `[consensus] roster, roster_hash, genesis_hash, home, seq_order, observers, delta_ms, storage, fresh` | optional: the Simplex voter (`consensus.rs`); `storage` (the Simplex journal's directory, kept across restarts) is required for a voter, and an empty journal for the epoch starts only with `fresh = true` or `--fresh` (07 §6.3 Journal, prints `FRESH_JOURNAL epoch= voter=`); committee and peers from the roster file (08 §9.6), checked against `roster_hash`; `membership.seq_keys[0]` must be the roster's primary `seq_key` |
 //!
 //! **Start sequence** (11 §10.1): load and check config → resolve keys → build the order core
 //! (`vyrn_replica::OrderCore`) over the config's `EpochView` → open the NIC queues → start the
@@ -120,6 +120,9 @@ struct Cli {
     config: PathBuf,
     #[arg(long)]
     stop_on_stdin_eof: bool,
+    /// Acknowledge an empty Simplex journal for this epoch (`[consensus] fresh`).
+    #[arg(long)]
+    fresh: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,7 +425,12 @@ fn main() -> ExitCode {
             .with_writer(std::io::stderr)
             .init();
     }
-    let r = Config::load(&cli.config).and_then(|c| start(&c, cli.stop_on_stdin_eof));
+    let r = Config::load(&cli.config).and_then(|mut c| {
+        if let Some(s) = c.consensus.as_mut() {
+            s.fresh |= cli.fresh;
+        }
+        start(&c, cli.stop_on_stdin_eof)
+    });
     match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

@@ -645,6 +645,13 @@ pub struct Outputs {
     pub faults: mpsc::UnboundedReceiver<VoterFault>,
 }
 
+/// The storage partition of voter `index`'s Simplex journal in `epoch`: one per (epoch, voter),
+/// since Commonware requires a unique partition per epoch. A restart that finds it empty has
+/// lost the votes it signed (`vyrn-validator`'s fresh-journal guard).
+pub fn partition(epoch: Epoch, index: u8) -> String {
+    format!("vyrn-consensus-{}-{index}", epoch.0)
+}
+
 /// The Simplex configuration of one voter, with its [`Outputs`].
 #[allow(clippy::type_complexity)]
 pub fn config<E, S, B>(
@@ -725,8 +732,7 @@ where
         reporter,
         track_historical_votes: false,
         strategy: Sequential,
-        // One journal per (epoch, voter): Commonware requires a unique partition per epoch.
-        partition: format!("vyrn-consensus-{}-{index}", cfg.epoch.0),
+        partition: partition(cfg.epoch, index),
         mailbox_size: one.saturating_mul(NonZeroUsize::new(1024).unwrap_or(one)),
         epoch,
         floor: Floor::Genesis(genesis),
