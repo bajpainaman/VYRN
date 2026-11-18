@@ -35,8 +35,9 @@
 //!
 //! **Events on stdout**, one line each: `EVENT bad_mac session=<s> pkt_seq=<q>`, `EVENT
 //! copy_conflict session=<s> pkt_seq=<q>` (the transport to the sequencer's control core is a
-//! follow-up), and at exit `STATS stored=<n> data_frames=<n> heartbeats=<n> duplicate=<n>
-//! fetch_unauth=<n> fetch_limited=<n>`.
+//! follow-up), written by their own thread from a bounded queue so stdout never blocks the poll
+//! loop (a full queue drops and counts the line), and at exit `STATS stored=<n> data_frames=<n>
+//! heartbeats=<n> duplicate=<n> fetch_unauth=<n> fetch_limited=<n> events_unprinted=<n>`.
 //!
 //! **Metrics.** Every [`vyrn_data::Counters`] field as `vyrn_data_<field>_total`, labels `role`,
 //! `home`, `src`. The loop publishes deltas every 100 ms; a std thread serves `GET` on the
@@ -150,6 +151,28 @@ fn serve_metrics(listener: TcpListener, reg: Registry) {
     }
 }
 
+/// Events waiting for the output thread; more are dropped and counted (`events_unprinted`).
+const EVENT_QUEUE: usize = 4096;
+
+fn print_events(rx: &std::sync::mpsc::Receiver<Event>) {
+    while let Ok(e) = rx.recv() {
+        let mut out = std::io::stdout().lock();
+        let _ = match e {
+            Event::BadMac { session, pkt_seq } => {
+                writeln!(out, "EVENT bad_mac session={} pkt_seq={pkt_seq}", session.0)
+            }
+            Event::CopyConflict {
+                session, pkt_seq, ..
+            } => writeln!(
+                out,
+                "EVENT copy_conflict session={} pkt_seq={pkt_seq}",
+                session.0
+            ),
+        };
+        let _ = out.flush();
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let cfg = match Config::load(&cli.config) {
@@ -248,6 +271,14 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
             .map_err(|e| e.to_string())?;
     }
 
+    // Events go to stdout from their own thread through a bounded queue, so a slow or stalled
+    // reader of stdout (or a bad-MAC flood) never blocks ingest.
+    let (events, events_rx) = std::sync::mpsc::sync_channel::<Event>(EVENT_QUEUE);
+    let mut unprinted = 0u64;
+    std::thread::Builder::new()
+        .name("vyrn-data/events".into())
+        .spawn(move || print_events(&events_rx))
+        .map_err(|e| e.to_string())?;
     println!("READY vyrn-data ingest={in_addr} fetch={fetch_addr} metrics={maddr}");
     let _ = std::io::stdout().flush();
     let t0 = Instant::now();
@@ -255,23 +286,12 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
     let now = |t0: Instant| Nanos(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));
     while !stop.load(Ordering::Acquire) {
         let work = node.poll(now(t0));
-        let mut out = std::io::stdout().lock();
+        // Never block the poll loop on stdout: a full queue drops and counts the line.
         for e in node.drain_events() {
-            let _ = match e {
-                Event::BadMac { session, pkt_seq } => {
-                    writeln!(out, "EVENT bad_mac session={} pkt_seq={pkt_seq}", session.0)
-                }
-                Event::CopyConflict {
-                    session, pkt_seq, ..
-                } => writeln!(
-                    out,
-                    "EVENT copy_conflict session={} pkt_seq={pkt_seq}",
-                    session.0
-                ),
-            };
+            if events.try_send(e).is_err() {
+                unprinted = unprinted.wrapping_add(1);
+            }
         }
-        let _ = out.flush();
-        drop(out);
         if published.elapsed() >= Duration::from_millis(100) {
             exported.publish(node.counters());
             published = Instant::now();

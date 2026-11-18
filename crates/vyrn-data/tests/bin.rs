@@ -90,7 +90,9 @@ fn serves_a_replica_exports_metrics_and_stops() {
     // The 5 µs batch timer sends the frame without a flush. An idle destination gets DATA_HB
     // every 100 µs, so heartbeats sent before the packet arrived are skipped.
     let mut buf = [0u8; 2048];
+    let t = Instant::now();
     let d = loop {
+        assert!(t.elapsed() < Duration::from_secs(5), "no DATA frame");
         let got = replica.recv(&mut buf).unwrap();
         if frame::decode(&buf[..got]).unwrap().hdr.kind != Kind::DataHb {
             break frame::decode(&buf[..got]).unwrap();
