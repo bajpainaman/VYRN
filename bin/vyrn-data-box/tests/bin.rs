@@ -176,8 +176,8 @@ fn serves_a_replica_exports_metrics_and_stops() {
     assert_eq!((d.hdr.kind, d.hdr.src, d.hdr.data_seq), (Kind::Data, 1, 1));
     assert_eq!(d.packets().collect::<Vec<_>>(), vec![&out[..n]]);
 
-    // A KEY fetch sealed under the K_fetch the requester derives on its side is served; the
-    // same fetch under another epoch's key is refused (08 §9.6).
+    // A KEY fetch sealed under the K_fetch the requester derives on its side is served, for the
+    // configured epoch and the next (08 §4.6); one under a later epoch's key is refused.
     let fetch_at = field(&ready, "fetch=").to_owned();
     let q = vyrn_data::frame::Fetch::Key {
         session: SessionId(5),
@@ -199,16 +199,31 @@ fn serves_a_replica_exports_metrics_and_stops() {
     client
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
+    let served = |e: u32, buf: &mut [u8]| {
+        client
+            .send_to(&q.seal(&key(e).unwrap()), &fetch_at)
+            .unwrap();
+        let got = client.recv(buf).unwrap();
+        let resp = frame::decode(&buf[..got]).unwrap();
+        assert_eq!(resp.hdr.kind, Kind::FetchResp, "epoch {e}");
+        assert_eq!(resp.packets().collect::<Vec<_>>(), vec![&out[..n]]);
+    };
     client
-        .send_to(&q.seal(&key(EPOCH + 1).unwrap()), &fetch_at)
+        .send_to(&q.seal(&key(EPOCH + 2).unwrap()), &fetch_at)
         .unwrap();
+    served(EPOCH, &mut buf);
+    served(EPOCH + 1, &mut buf);
+
+    // `EPOCH <e>` on stdin moves the keys to e and e + 1: the old epoch's key is refused.
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"EPOCH 10\n").unwrap();
+    let moved = lines.next().unwrap().unwrap();
+    assert_eq!(moved, "FETCH_EPOCHS 10,11");
     client
         .send_to(&q.seal(&key(EPOCH).unwrap()), &fetch_at)
         .unwrap();
-    let got = client.recv(&mut buf).unwrap();
-    let resp = frame::decode(&buf[..got]).unwrap();
-    assert_eq!(resp.hdr.kind, Kind::FetchResp);
-    assert_eq!(resp.packets().collect::<Vec<_>>(), vec![&out[..n]]);
+    served(EPOCH + 2, &mut buf);
+    served(EPOCH + 3, &mut buf);
 
     let t = Instant::now();
     loop {
@@ -225,7 +240,7 @@ fn serves_a_replica_exports_metrics_and_stops() {
         std::thread::yield_now();
     }
 
-    drop(child.stdin.take());
+    drop(stdin);
     let stats = lines
         .map(Result::unwrap)
         .find(|l| l.starts_with("STATS "))
@@ -234,7 +249,7 @@ fn serves_a_replica_exports_metrics_and_stops() {
     assert_eq!(field(&stats, "stored="), "1", "{stats}");
     assert_eq!(field(&stats, "data_frames="), "1", "{stats}");
     assert_eq!(field(&stats, "events_unprinted="), "0", "{stats}");
-    assert_eq!(field(&stats, "fetch_unauth="), "1", "{stats}");
+    assert_eq!(field(&stats, "fetch_unauth="), "2", "{stats}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

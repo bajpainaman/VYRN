@@ -135,5 +135,5 @@ pub mod ring;
 pub mod spread;
 
 pub use ingest::{DataHome, Event, HomeConfig, Ingested, Mode, Packet, Reject};
-pub use node::{Counters, DataNode, NodeConfig};
+pub use node::{Counters, DataNode, FetchKeysErr, NodeConfig};
 pub use spread::Spread;
