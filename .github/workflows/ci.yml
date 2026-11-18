@@ -77,6 +77,19 @@ jobs:
       - name: every Vx workaround marker matches its vx/FRICTION.md entry (11 §5.6)
         run: cargo run --locked --quiet -p vx-friction
 
+  sim-swarm:
+    name: vyrn-sim swarm (11 §6.4)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/llvm # clang and lld with rustc's LLVM major (11 §4.2)
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: 500 fixed seeds (BLD_SIM_SEEDS_PR), tests/seeds.toml, one seed run twice
+        run: cargo run --locked --release --quiet -p sim-swarm -- --start 1 --seeds 500 --jobs 4
+      - name: the SF-24 canary fails INV-DET on every seed that reaches replay
+        run: cargo run --locked --release --quiet -p sim-swarm -- --start 1 --seeds 100 --jobs 4 --canary
+
   actionlint:
     runs-on: ubuntu-24.04
     steps:

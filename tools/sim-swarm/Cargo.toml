@@ -5,9 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish = false
-description = "CI gate tool (spec/11-build.md)."
+description = "Swarm runner over vyrn-sim seeds (spec/11-build.md §6.4)."
 
 [dependencies]
+vyrn-sim = { workspace = true }
+toml = { workspace = true }
 
 [lints]
 workspace = true

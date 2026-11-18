@@ -1,2 +1,27 @@
 # vyrn-sim seeds that once failed; each runs on every commit (spec/11-build.md §6.4).
-seeds = []
+#
+# Format (tools/sim-swarm): each [[seed]] has `seed` (hex), optional `faults` (a schedule in
+# vyrn_sim::cluster::Schedule's text form; absent = the seed's own) and `expect`: "pass" or the
+# check it fails today. `known` lists checks with an open engine bug: a swarm seed that fails one
+# of them is reported as known, not failed. When a fix lands, set the seeds' `expect` to "pass"
+# and remove the check from `known`.
+known = [
+  # vyrn-bbo: endless Rescan steps on a one-tick band, no fills, crossed snapshot. Trigger: one
+  # packet whose orders cross each other at one tick on one session (STP none). No faults needed.
+  "BBO-QUIESCE",
+]
+
+[[seed]]
+seed = "1e"
+faults = ""
+expect = "BBO-QUIESCE"
+
+[[seed]]
+seed = "4"
+# Required: failed ENGINE-FAULT (vyrn-lane settle.rs:177) before ad180b7 (#45); guards that fix.
+faults = "bbo-stall 27099 90261"
+expect = "pass"
+
+[[seed]]
+seed = "3"
+expect = "pass"
