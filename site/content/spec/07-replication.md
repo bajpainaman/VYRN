@@ -371,7 +371,7 @@ poll, and while a burst is full, up to its last frame read, so a timely HashRun 
 counted late; a HashRun is still checked against its own lane at its own receive time. Frames
 held behind a gap whose repair gave up no longer hold the deadlines back, and a held frame keeps
 them back by at most one bound, so a hole that is never filled (no repair) delays
-`REP_E_HASHLAG` but cannot stop it. Each HashRun entry is checked against its own record, as a
+`REP_E_HASHLAG` but cannot stop it. A turn that delivers nothing runs the deadlines at the time of its poll, not later, so a pause after the poll does not pass a frame still in the socket. Each HashRun entry is checked against its own record, as a
 gap fill can leave a lane's records out of receive order. The monotonic/realtime offset is read
 again when the pair of reads took more than 20 µs. Measured on a loaded 2-vCPU host (every
 replica and the harness on one CPU, two CPU hogs; not a latency result), with voters and observer

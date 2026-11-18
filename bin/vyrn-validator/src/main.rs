@@ -1580,7 +1580,9 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         // them): the deadlines `on_frame` would have checked (REP_E_HASHLAG), whatever the data
         // queue is doing.
         if delivered == 0 {
-            let t = now();
+            // The poll's own time, not now: a frame received after it is still in the socket,
+            // and a pause since then must not run the deadlines past it.
+            let t = mono;
             let hm = paths
                 .as_ref()
                 .map_or(u64::MAX, Paths::held_min)
