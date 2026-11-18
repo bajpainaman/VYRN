@@ -162,10 +162,11 @@ fn close_causes_emit_the_vector_records() {
         assert_eq!(row.s("cause"), name);
         let (_bbo, mut w) = setup();
         let mut x = w.rig();
+        // Packets 1..=41 accepted first, so a wrong echo (the last accepted one) shows.
+        for t in 1..42 {
+            assert_eq!(x.send(0, A, t * 1_000, &[Msg::Heartbeat]), Rx::Accepted);
+        }
         if name == "BAD_MAC" {
-            for t in 1..42 {
-                assert_eq!(x.send(0, A, t * 1_000, &[Msg::Heartbeat]), Rx::Accepted);
-            }
             let rx = x.send_keyed(0, A, 50_000, &[Msg::Heartbeat], &[0xEE; 16]);
             assert_eq!(rx, Rx::Closed, "{name}");
         } else {
@@ -173,6 +174,10 @@ fn close_causes_emit_the_vector_records() {
         }
         let last = *x.records(0, A).last().expect("a final record");
         assert_eq!(hex(&last.encode()), row.s("hex"), "{name}");
+        // R-ECHO (04 §7.2): BAD_MAC answers the offending packet 42; a control-path close
+        // answers no request, so it goes in a packet with echo_pkt = 0.
+        let echo = x.resp[0].last().unwrap().echo_pkt;
+        assert_eq!(echo, if name == "BAD_MAC" { 42 } else { 0 }, "{name}");
         // From then on V7 answers out of stream with the cause as detail.
         let rx = x.send(0, A, 60_000, &[Msg::Heartbeat]);
         assert_eq!(rx, Rx::OutOfStream(RejectReason::SessionClosed), "{name}");

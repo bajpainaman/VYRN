@@ -475,7 +475,8 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
     }
     /// Closes a session with a `PROTO_D_*` cause other than `BAD_MAC` (04 §4.3), which V6 sets
     /// itself: emits the final in-stream `Reject SESSION_CLOSED` with detail = `cause` at index
-    /// 0xFF, and from then V7 answers out of stream with the same detail. `false` if the
+    /// 0xFF, in a packet with `echo_pkt` = 0 (R-ECHO: it answers no request), and from then V7
+    /// answers out of stream with the same detail. `false` if the
     /// session is not open or draining on this lane.
     pub fn close_session(&mut self, id: SessionId, cause: u32) -> bool {
         let Some(si) = self.sess.find(id) else {
@@ -487,8 +488,8 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         if !matches!(s.state, SessState::Open | SessState::Draining) {
             return false;
         }
-        let echo = s.expected.saturating_sub(1);
-        self.close(si, cause, RejectReason::SessionClosed, cause, echo);
+        // R-ECHO (04 §7.2): a control-path close answers no request.
+        self.close(si, cause, RejectReason::SessionClosed, cause, 0);
         true
     }
     /// The account and its balance in this lane's book (control path: credits, limits).
