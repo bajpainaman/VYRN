@@ -129,3 +129,38 @@ fn ctl_done_bytes_follow_10_2_4() {
     bad[2] = 25; // reason 25 is reserved, not defined
     assert!(CtlDone::decode(&bad).is_err());
 }
+
+/// V20 of the 04 §11 protocol vectors: the `DataTierStatus` push (04 §4.4) for session A, epoch
+/// 1000, `seq` 1, `data[0]` down. `seq` 0 and a nonzero reserved byte are refused.
+#[test]
+fn v20_data_tier_status_round_trips_and_its_neighbours_are_refused() {
+    use vyrn_admin::codec::DataTierStatus;
+    use vyrn_types::Epoch;
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/golden/vyrn_proto_vectors.out"
+    );
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut rows = text.lines().skip_while(|l| !l.starts_with("V20 "));
+    assert!(rows.next().unwrap().ends_with("(18 B)"));
+    let raw: Vec<u8> = rows
+        .take_while(|l| l.starts_with("  0"))
+        .flat_map(|l| l.trim().split_once(": ").unwrap().1.split(' '))
+        .map(|h| u8::from_str_radix(h, 16).unwrap())
+        .collect();
+    assert_eq!(frame_len(&raw), Some(18));
+    let want = AdminMsg::DataTierStatus(DataTierStatus {
+        epoch: Epoch(1000),
+        seq: 1,
+        down: 0b1,
+    });
+    assert_eq!(decode(&raw).unwrap(), want);
+    assert_eq!(encode(&want).unwrap(), raw);
+    let mut zero_seq = raw.clone();
+    zero_seq[10] = 0;
+    assert!(decode(&zero_seq).is_err());
+    let mut reserved = raw.clone();
+    reserved[17] = 1;
+    assert!(decode(&reserved).is_err());
+    assert!(decode(&raw[..17]).is_err());
+}

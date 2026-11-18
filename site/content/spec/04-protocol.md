@@ -624,7 +624,7 @@ port u16 little-endian. A receiver rejects a frame with a nonzero reserved byte,
 affects when Q replicas mark a data box down or up (07 §5.7). Body, 12 bytes: `epoch` u32 | `seq`
 u32 | `down` u8 | reserved [u8; 3]. `down` bit i set means entry i of the session's
 `KeyBundle.data` list is down, the same positions as `DataRedirect` (§7.6). `seq` counts this
-epoch's statuses for the session from 1, so the **latest** status (D4, D5, DR2) is the one with
+epoch's statuses for the session from 1 (a receiver refuses `seq` 0 as a header error, VR1), so the **latest** status (D4, D5, DR2) is the one with
 the highest `seq` for that `epoch`. A client keeps the latest status of each epoch it holds a
 `KeyBundle` for (the current one and, once pushed, the next), applies the next epoch's at T, and
 ignores a push for any other `epoch` or with `seq` at or below the last it kept for that epoch. With every `KeyBundle` push and every `OpenSessionResp`, `vyrn-admin` also pushes a snapshot of that epoch's current health as its `seq` 1, so a box that stays down across a boundary stays marked down; until the client holds the snapshot for an epoch, it uses that epoch's `data[0]` only if no status of the previous epoch marked the same address down.
