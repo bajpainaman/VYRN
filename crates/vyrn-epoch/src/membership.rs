@@ -118,7 +118,11 @@ impl Membership {
             return Err(HandoffErr::NotForMe);
         }
         accept_cert(cert, domain, self, local)?;
-        if cert.record.next_seq_key != next.seq[0].seq_key {
+        // The bundle must be the epoch the final EpoGo names, not merely one with the same home
+        // and primary key (a skip or a long hold changes the target, §2.5).
+        if local.go().map(|(e, _)| e) != Some(next.epoch)
+            || cert.record.next_seq_key != next.seq[0].seq_key
+        {
             return Err(HandoffErr::SeqKey);
         }
         Ok(Activation {
@@ -176,6 +180,27 @@ mod tests {
         let local = Local::matching(&cert.record);
         assert_eq!(
             old.hand_off(&swapped, &cert, &domain, &local).err(),
+            Some(HandoffErr::SeqKey)
+        );
+    }
+
+    #[test]
+    fn the_next_epoch_must_be_the_one_epogo_names() {
+        let domain = testkit::domain(Mode::Base);
+        let old = testkit::old(Mode::Base);
+        let next = testkit::next(Mode::Base);
+        let later = Membership::new(
+            Epoch(11),
+            HomeCode::Ldn,
+            Mode::Base,
+            testkit::next_voters(Mode::Base),
+            *next.seq(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let cert = testkit::cert(&domain, &[0, 1, 2]);
+        let local = Local::matching(&cert.record);
+        assert_eq!(
+            old.hand_off(&later, &cert, &domain, &local).err(),
             Some(HandoffErr::SeqKey)
         );
     }

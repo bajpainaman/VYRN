@@ -178,6 +178,9 @@ impl Timetable {
                 while self.t >= self.slot(Epoch(self.target.0.saturating_add(1)))? {
                     self.target = self.next_unskipped(self.target)?;
                 }
+                // A retarget across a skipped slot waits for the new target's slot, as a planned
+                // skip does: the old home keeps the book through the skipped slot.
+                self.t = self.t.max(self.slot(self.target)?);
             }
             ScheduleRecord::Activated { epoch } => {
                 if epoch != self.target {
@@ -346,6 +349,25 @@ mod tests {
         let b = tt.boundary();
         assert_eq!(b.t, Nanos(t0.0 + EPOCH_NS));
         assert_eq!((b.to, b.to_home), (Epoch(2), HomeCode::Nyc));
+    }
+
+    #[test]
+    fn a_long_hold_across_a_skip_waits_for_the_next_slot() {
+        let mut tt = Timetable::new(G).unwrap_or_else(|e| panic!("{e}"));
+        let t0 = tt.boundary().t;
+        let skip = ScheduleRecord::Skip { epoch: Epoch(2) };
+        assert_eq!(tt.apply(skip, G), Ok(()));
+        for _ in 0..32 {
+            let t = tt.boundary().t;
+            let hold = ScheduleRecord::Hold {
+                epoch: Epoch(0),
+                t_new: Nanos(t.0 + EPO_HOLD_S * NS_PER_S),
+            };
+            assert_eq!(tt.apply(hold, at_before(t, 10)), Ok(()));
+        }
+        // T reached the end of slot 1; slot 2 is skipped, so the handoff is to 3 at its start.
+        let b = tt.boundary();
+        assert_eq!((b.to, b.t), (Epoch(3), Nanos(t0.0 + 2 * EPOCH_NS)));
     }
 
     #[test]

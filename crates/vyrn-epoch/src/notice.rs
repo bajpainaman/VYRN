@@ -73,14 +73,18 @@ impl Notifier {
     }
 
     /// The schedule changed (hold, skip, override or sequencer change) at a record logged at
-    /// `at`. The next packet gets a revised notice with `flags` | `REVISED`, and offsets the
-    /// revised T has already passed at `at` are not sent again.
+    /// `at`. The next packet gets a revised notice with `flags` | `REVISED`, accumulated over every
+    /// revision since the last notice, and offsets the revised T has already passed at `at` are
+    /// not sent again.
     pub fn revise(&mut self, boundary: &Boundary, seq_index: u8, flags: u16, at: Nanos) {
         self.next = boundary.to;
         self.home = boundary.to_home;
         self.t = boundary.t;
         self.seq_index = seq_index;
-        self.revision = Some(flags | NoticeFlags::REVISED);
+        // Two revisions before the next packet send one notice with both flags (§11.1: a lost
+        // ENDPOINTS bit would leave clients on stale addresses).
+        let pending = self.revision.unwrap_or(0);
+        self.revision = Some(pending | flags | NoticeFlags::REVISED);
         self.offset = self.crossed_from(0, at);
     }
 
@@ -213,6 +217,25 @@ mod tests {
         assert_eq!(
             n.on_packet(Nanos(held.0 - 600 * NS_PER_S)).map(|x| x.secs),
             Some(600)
+        );
+    }
+
+    #[test]
+    fn revisions_before_the_next_packet_keep_every_flag() {
+        let mut n = Notifier::new(&boundary(T), 0);
+        n.revise(&boundary(T), 0, NoticeFlags::ENDPOINTS, before(30, 0));
+        n.revise(&boundary(T), 1, 0, before(29, 0));
+        let r = n.on_packet(before(28, 0));
+        assert_eq!(
+            r.map(|x| (x.seq_index, x.flags)),
+            Some((1, NoticeFlags::ENDPOINTS | NoticeFlags::REVISED))
+        );
+        // The next revision starts clean.
+        n.revise(&boundary(T), 1, NoticeFlags::HOLD, before(27, 0));
+        let r = n.on_packet(before(26, 0));
+        assert_eq!(
+            r.map(|x| x.flags),
+            Some(NoticeFlags::HOLD | NoticeFlags::REVISED)
         );
     }
 }

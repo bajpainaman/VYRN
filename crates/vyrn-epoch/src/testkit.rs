@@ -122,7 +122,7 @@ pub fn ready(member: u8, sent: Nanos, domain: &Domain) -> EpoReady {
 pub struct Local {
     pub book: BookId,
     pub next_home: HomeCode,
-    pub go_seq_key: Option<PubKey>,
+    pub go: Option<(Epoch, PubKey)>,
     pub height: Height,
     pub head: Option<Hash>,
     pub step: StepId,
@@ -134,7 +134,7 @@ impl Local {
         Self {
             book: r.book,
             next_home: r.next_home,
-            go_seq_key: Some(r.next_seq_key),
+            go: Some((Epoch(r.epoch.0 + 1), r.next_seq_key)),
             height: r.last_height,
             head: Some(r.log_hash),
             step: r.last_step,
@@ -150,8 +150,8 @@ impl LocalView for Local {
     fn next_home(&self) -> HomeCode {
         self.next_home
     }
-    fn go_seq_key(&self) -> Option<PubKey> {
-        self.go_seq_key
+    fn go(&self) -> Option<(Epoch, PubKey)> {
+        self.go
     }
     fn final_header_hash(&self, height: Height) -> Option<Hash> {
         (height == self.height).then_some(self.head).flatten()

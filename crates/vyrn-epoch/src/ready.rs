@@ -240,13 +240,14 @@ impl ReadyPool {
         Ok(())
     }
 
-    /// The `EpoGo` this pool supports at `at`: the `Q` lowest fresh voters and both boxes.
+    /// The `EpoGo` this pool supports at `at`: the `Q` lowest fresh voters and both boxes, all
+    /// for `next.epoch()`. Messages for an earlier target never count.
     pub fn go(&self, at: Nanos, next: &Membership) -> Option<EpoGo> {
         let need = next.committee().quorum();
         let ready: Vec<EpoReady> = self
             .latest
             .values()
-            .filter(|r| !r.is_seq() && r.fresh_at(at))
+            .filter(|r| r.epoch == next.epoch() && !r.is_seq() && r.fresh_at(at))
             .take(need)
             .copied()
             .collect();
@@ -257,7 +258,7 @@ impl ReadyPool {
         let fresh_box = |index: u8| {
             self.latest
                 .get(&(SEQ_MEMBER | index))
-                .filter(|r| r.fresh_at(at))
+                .filter(|r| r.epoch == next.epoch() && r.fresh_at(at))
                 .copied()
         };
         Some(EpoGo {
@@ -313,6 +314,26 @@ mod tests {
             Err(GoErr::Stale(0))
         );
         assert_eq!(hold.validate(late, &pool, &next), Ok(()));
+    }
+
+    #[test]
+    fn a_pool_reused_for_a_new_target_ignores_old_readiness() {
+        let s = SEQ_MEMBER;
+        let (pool, _, _) = pool_with(&[0, 1, 2, s | 5, s | 6], AT);
+        let retarget = Membership::new(
+            Epoch(9),
+            vyrn_types::HomeCode::Nyc,
+            Mode::Base,
+            testkit::next_voters(Mode::Base),
+            *testkit::next(Mode::Base).seq(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(pool.go(AT, &retarget), None);
+        let hold = EpoHold {
+            epoch: Epoch(7),
+            t_new: AT,
+        };
+        assert_eq!(hold.validate(AT, &pool, &retarget), Ok(()));
     }
 
     #[test]

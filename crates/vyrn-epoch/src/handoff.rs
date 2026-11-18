@@ -65,7 +65,9 @@ pub enum HandoffErr {
     BadSig(u8),
     #[error("book, epoch or next_home is not this node's boundary")]
     NotForMe,
-    #[error("next_seq_key differs from the EpoGo this node holds, or it holds none")]
+    #[error(
+        "next_seq_key or the next epoch differs from the EpoGo this node holds, or it holds none"
+    )]
     SeqKey,
     #[error("no finalized header at last_height, or its hash differs from log_hash")]
     LogHash,
@@ -226,8 +228,9 @@ pub trait LocalView {
     fn book(&self) -> BookId;
     /// The boundary's target home, from this node's [`crate::Timetable`].
     fn next_home(&self) -> HomeCode;
-    /// `next_seq_key` of the final `EpoGo` in this node's replay of epoch e, if it holds one.
-    fn go_seq_key(&self) -> Option<PubKey>;
+    /// `(next_epoch, next_seq_key)` of the final `EpoGo` in this node's replay of epoch e, if it
+    /// holds one.
+    fn go(&self) -> Option<(Epoch, PubKey)>;
     /// The header hash at `height`, if this node holds that block and its finality certificate.
     fn final_header_hash(&self, height: Height) -> Option<Hash>;
     /// This node's `state_root` after step `s`, if its replay has executed `s`.
@@ -246,7 +249,7 @@ pub fn accept_cert(
     if r.book != local.book() || r.epoch != old.epoch() || r.next_home != local.next_home() {
         return Err(HandoffErr::NotForMe);
     }
-    if local.go_seq_key() != Some(r.next_seq_key) {
+    if local.go().map(|(_, key)| key) != Some(r.next_seq_key) {
         return Err(HandoffErr::SeqKey);
     }
     if local.final_header_hash(r.last_height) != Some(r.log_hash) {
@@ -407,13 +410,7 @@ mod tests {
                 },
                 HandoffErr::NotForMe,
             ),
-            (
-                Local {
-                    go_seq_key: None,
-                    ..ok
-                },
-                HandoffErr::SeqKey,
-            ),
+            (Local { go: None, ..ok }, HandoffErr::SeqKey),
             (Local { head: None, ..ok }, HandoffErr::LogHash),
             (Local { root: None, ..ok }, HandoffErr::NoState),
             (
