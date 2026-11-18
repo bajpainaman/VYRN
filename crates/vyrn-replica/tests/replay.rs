@@ -52,12 +52,11 @@ impl EpochView for View {
     }
 }
 
-/// The engine's conformance script (`vyrn-engine/tests/engine.rs`) without the two cases 07
-/// cannot carry yet (spec gaps, PR body): the `MID` boundary (the 07 codec encodes no `MID`
-/// Advance record) and the `SHED` packet with its resend (live, a `SHED` record has `pkt_hash` 0
-/// and gives its LaneSeqs back; 07 §3.5 hashes it and keeps them). Left: a resting order, a
-/// forwarded improve, a forwarded cross, a forwarded op late at the BBO (a `Shed` step), a
-/// cancel and an idle poll.
+/// The engine's conformance script (`vyrn-engine/tests/engine.rs`), whole: a resting order, a
+/// forwarded improve whose step runs before lane 0's next packet (a `MID` Advance record, 07
+/// §3.6), a forwarded cross, a forwarded op late at the BBO (a `Shed` step), a packet shed at
+/// the lane and its resend (07 §3.5: hashed, joined, its LaneSeqs kept), a cancel and an idle
+/// poll.
 fn script() -> Vec<Act> {
     use Side::{Buy, Sell};
     use Tif::{Day, Ioc};
@@ -72,7 +71,7 @@ fn script() -> Vec<Act> {
         p(0, 1, 1_000, 1_000, vec![new(Sell, Day, 105, 5, 11)]),
         Act::Run,
         p(1, 1, 2_000, 2_000, vec![new(Buy, Day, 105, 2, 1)]),
-        Act::Run,
+        Act::Step(None),
         p(
             0,
             2,
@@ -83,6 +82,10 @@ fn script() -> Vec<Act> {
         Act::Run,
         p(2, 1, 5_000, 5_000, vec![new(Buy, Ioc, 105, 1, 7)]),
         Act::Step(Some(5_000 + u64::from(FWD_DL) + 1)),
+        Act::Run,
+        // 05 §6.8: one New, age 462 at dequeue is late (path 519 + 462 > 980); then its resend.
+        p(0, 3, 10_000, 10_462, vec![new(Sell, Day, 300, 1, 9)]),
+        p(0, 3, 20_000, 20_461, vec![new(Sell, Day, 300, 1, 9)]),
         Act::Run,
         p(
             0,
@@ -173,7 +176,7 @@ fn tenure() -> TenureStart {
 }
 
 /// Frames the live journal with `SeqWriter`, closing a block after each record index in
-/// `cuts` (or after the routes that follow it) and after the last record.
+/// `cuts` (or after the routes and `MID` records that follow it) and after the last record.
 fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
     let ident = Ident {
         book: BOOK,
@@ -219,9 +222,11 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
                 );
             }
         }
-        // A packet's routes stay in its block (07 §3.6), as vyrn-seq frames them: a cut right
-        // after a packet moves past its routes.
-        let route_next = matches!(j.recs.get(i + 1), Some(OwnedRec::Route(_)));
+        // A packet's routes and `MID` records stay in its block (07 §3.6, §7.1), as vyrn-seq
+        // frames them: a cut right after a packet moves past them.
+        let route_next = matches!(j.recs.get(i + 1), Some(OwnedRec::Route(_)))
+            || matches!(j.recs.get(i + 1),
+                Some(OwnedRec::Packet(p)) if p.flags & PacketFlags::MID != 0);
         pending |= cuts.contains(&i);
         if (pending && !route_next) || i + 1 == j.recs.len() {
             pending = false;
@@ -332,7 +337,7 @@ fn one_block_replays_the_live_run_byte_for_byte() {
 }
 
 #[test]
-fn the_script_reaches_cross_improve_and_shed_steps() {
+fn the_script_reaches_every_case() {
     let (j, _) = live07(&script());
     let kinds: Vec<_> = j
         .recs
@@ -346,6 +351,21 @@ fn the_script_reaches_cross_improve_and_shed_steps() {
         assert!(kinds.contains(&k), "{k:?} in {kinds:?}");
     }
     assert!(!j.tx.is_empty(), "a fill");
+    // The cases 07 now carries: a `MID` Advance record, and a lane-shed packet that is hashed
+    // and keeps its LaneSeqs, followed by its resend on the next ones (07 §3.5, §3.6).
+    let pkts = lane_pkts(&j, 0);
+    assert!(
+        pkts.iter().any(|p| p.flags & PacketFlags::MID != 0),
+        "{pkts:?}"
+    );
+    let shed = pkts
+        .iter()
+        .position(|p| p.flags == PacketFlags::SHED)
+        .expect("a shed packet");
+    let (s, r) = (pkts[shed], pkts[shed + 1]);
+    assert_ne!(s.pkt_hash, PktHash(0));
+    assert_eq!((r.session, r.pkt_seq), (s.session, s.pkt_seq), "its resend");
+    assert_eq!(r.first_lane_seq.0, s.first_lane_seq.0 + u64::from(s.count));
 }
 
 #[test]
