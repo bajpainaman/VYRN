@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish = false
-description = "The validator binary: vyrn-replica plus vyrn-chain."
+description = "The validator binary: vyrn-replica, the Simplex voter (vyrn-consensus) and vyrn-chain."
 
 [dependencies]
 vyrn-types = { workspace = true }
@@ -14,6 +14,15 @@ vyrn-nic = { workspace = true }
 vyrn-log = { workspace = true }
 vyrn-replica = { workspace = true }
 vyrn-chain = { workspace = true }
+vyrn-consensus = { workspace = true }
+vyrn-crypto = { workspace = true }
+vyrn-data = { workspace = true }
+vyrn-epoch = { workspace = true }
+commonware-consensus = { workspace = true }
+commonware-runtime = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
@@ -21,5 +30,3 @@ toml = { workspace = true }
 [lints]
 workspace = true
 
-[dev-dependencies]
-vyrn-crypto = { workspace = true }

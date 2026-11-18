@@ -21,6 +21,7 @@ commonware-codec = { workspace = true }
 commonware-utils = { workspace = true }
 commonware-parallel = { workspace = true }
 commonware-actor = { workspace = true }
+commonware-stream = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

@@ -1220,7 +1220,11 @@ digest = BLAKE3("vyrn      v1 proposal" ‖ REP_Proposal bytes)
 ```
 
 The parent rule is that `first_height` equals the parent proposal's `last_height + 1`. Genesis of
-an epoch is the HandoffRecord's `last_height` (08).
+an epoch is the HandoffRecord's `last_height` (08). An epoch with no HandoffRecord before it (epoch 0
+of a fresh deployment) has no certified block to chain to: its genesis is the tenure's height-0
+header (`prev = [0; 32]`), once the voter's order core accepts it, and the first proposal starts
+at height 1. Height 0 is final by definition, at the voters and at the sequencer's listener.
+[Reading, `vyrn-validator`]
 
 **Leader `propose`.** The leader takes every contiguous header after the parent's `last_height`
 that it holds with a valid `seq_sig`, up to 16 of them. It waits for at least one, and for its own

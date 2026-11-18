@@ -97,6 +97,33 @@ impl From<Genesis> for Tip {
     }
 }
 
+/// Headers whose `seq_sig` verified, by `(height, header_hash)`: 07 §6.4 checks each header once
+/// and caches the verdict, so a voter that asks again every poll verifies nothing new. One cache
+/// serves one `seq_key`.
+#[derive(Debug, Default)]
+pub(crate) struct SigCache(std::sync::Mutex<std::collections::BTreeSet<(u64, Hash)>>);
+
+impl SigCache {
+    fn check(&self, h: &BlockHeader, hash: Hash, seq_key: &PubKey) -> bool {
+        let key = (h.height.0, hash);
+        let mut set = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if set.contains(&key) {
+            return true;
+        }
+        let ok = verify_seq_sig(h, seq_key);
+        if ok {
+            set.insert(key);
+        }
+        ok
+    }
+
+    /// Forgets headers below `height` (final, so never checked again).
+    pub(crate) fn prune(&self, height: Height) {
+        let mut set = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *set = set.split_off(&(height.0, Hash([0; 32])));
+    }
+}
+
 /// The longest run (≤ `limit`) of held headers after `tip` that pass item 1 under `seq_key`, in
 /// ascending order. With `limit` = 16 these are the candidate last headers of a proposal.
 pub(crate) fn chain_after<S: BlockSource>(
@@ -105,6 +132,7 @@ pub(crate) fn chain_after<S: BlockSource>(
     seq_key: &PubKey,
     tip: Tip,
     limit: usize,
+    sigs: &SigCache,
 ) -> Vec<BlockHeader> {
     let mut out = Vec::new();
     let (mut prev_hash, mut prev_step, mut height) = (tip.hash, tip.last_step, tip.height);
@@ -117,14 +145,15 @@ pub(crate) fn chain_after<S: BlockSource>(
         };
         // check_anchor: height, prev and last_step ≥ first_step − 1. Within one epoch the steps
         // also continue from the previous header's.
+        let hash = header_hash(&h);
         if check_anchor(prev_hash, height, &h).is_err()
             || h.epoch != epoch
             || prev_step.0.checked_add(1) != Some(h.first_step.0)
-            || !verify_seq_sig(&h, seq_key)
+            || !sigs.check(&h, hash, seq_key)
         {
             break;
         }
-        prev_hash = header_hash(&h);
+        prev_hash = hash;
         prev_step = h.last_step;
         height = next;
         out.push(h);
@@ -329,11 +358,14 @@ mod tests {
             prev = next(&prev);
             src.insert(prev);
         }
-        assert_eq!(chain_after(&src, Epoch(1), &key, tip, 16).len(), 16);
+        assert_eq!(
+            chain_after(&src, Epoch(1), &key, tip, 16, &SigCache::default()).len(),
+            16
+        );
         // A header whose seq_sig is not the sequencer's ends the run before it.
         let bad = sign_header(&src.header(Height(14)).unwrap_or(base), &[0x52; 32]);
         src.insert(bad);
-        let run = chain_after(&src, Epoch(1), &key, tip, 16);
+        let run = chain_after(&src, Epoch(1), &key, tip, 16, &SigCache::default());
         assert_eq!(run.last().map(|h| h.height), Some(Height(13)));
         let p = proposal_for(&src, Epoch(1), tip, &run[2]);
         assert_eq!((p.first_height, p.last_height), (Height(11), Height(13)));
@@ -388,7 +420,7 @@ mod tests {
             hash: header_hash(&genesis),
             last_step: genesis.last_step,
         };
-        let run = chain_after(&src, Epoch(1), &key, tip, 16);
+        let run = chain_after(&src, Epoch(1), &key, tip, 16, &SigCache::default());
         assert_eq!(run.len(), 5);
         assert_eq!(run.last(), Some(&prev));
         assert_eq!(
@@ -413,7 +445,10 @@ mod tests {
             src.check_body(Epoch(1), Height(4), Height(6)),
             Verdict::Valid
         );
-        assert_eq!(chain_after(&src, Epoch(1), &key, tip, 16).len(), 6);
+        assert_eq!(
+            chain_after(&src, Epoch(1), &key, tip, 16, &SigCache::default()).len(),
+            6
+        );
         // A fence that closes after the blocks were stored rejects them on the next check.
         fenced.store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(

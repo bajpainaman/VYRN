@@ -11,7 +11,9 @@
 //! | Who may vote | [`Committee`] (the voters of `REP_Membership`) | 07 §13.1, 01 §14.4 |
 //! | What a certificate proves, checked offline | [`FinalityCert`], [`verify_finality_cert`] | 07 §6.5 |
 //!
-//! [`evidence`] proves a faulty sequencer or voter offline (07 §10).
+//! [`evidence`] proves a faulty sequencer or voter offline (07 §10). [`net`] is a voter's Simplex
+//! network on `commonware-p2p` (07 §3.1); [`ctrl`] is what voters send the sequencer and the
+//! standby on `REP_UDP_CTRL` (07 §6.8).
 //!
 //! The sequencer's side is [`observer`]: its finality listener and the finality gate (07 §6.8).
 //!
@@ -24,8 +26,10 @@
 #![forbid(unsafe_code)]
 
 pub mod cert;
+pub mod ctrl;
 pub mod evidence;
 pub mod membership;
+pub mod net;
 pub mod observer;
 pub mod proposal;
 pub mod silence;
