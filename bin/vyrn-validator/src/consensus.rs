@@ -35,6 +35,9 @@ use vyrn_epoch::{Addr, Domain, EpoConfig};
 use vyrn_log::block::header_hash;
 use vyrn_types::{BlockHeader, Epoch, Hash, Height, HomeCode, Mode, Nanos, PubKey};
 
+/// The context of peer fetch keys (08 §9.6): `K_fetch` with `"peerfetch"` for `"fetch"`.
+pub const PEER_FETCH_CONTEXT: &str = "vyrn      v1 peerfetch";
+
 /// `[consensus]`: the roster and the DEV `EpoConfig` fields (see the module docs).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -312,20 +315,57 @@ impl Plan {
         })
     }
 
-    /// `K_fetch(e, me, d)` (08 §9.6) this voter seals its fetches to data box `d` of its home
-    /// with, from its X25519 `secret`. `None` if the roster has no box `d` or its key is
-    /// unusable.
-    pub fn fetch_key(&self, d: u8, secret: &[u8; 32]) -> Option<[u8; 16]> {
+    /// `K_fetch(e, me, d)` (08 §9.6) under `context` this voter seals its fetches to target `d`
+    /// of its home with (a data box, `SEQ_TARGET + j` or, under [`PEER_FETCH_CONTEXT`],
+    /// `VOTER_TARGET + j`), from its X25519 `secret`. `None` if the roster has no target `d` or
+    /// its key is unusable.
+    pub fn fetch_key(&self, context: &str, d: u8, secret: &[u8; 32]) -> Option<[u8; 16]> {
         let i = u8::try_from(self.me).ok()?;
-        self.roster.requester_fetch_key(
-            vyrn_epoch::FETCH_CONTEXT,
+        self.roster
+            .requester_fetch_key(context, &self.domain, self.epoch, self.home, i, d, secret)
+    }
+
+    /// The keys this voter serves peer fetches under: `K_fetch(e, i, VOTER_TARGET + me)` of
+    /// every requester `i` with a usable key (08 §9.6), by its `repl_addr` IPv4. A keyed server
+    /// with none serves nothing. An `Err` when the roster gives this voter a usable `xchg_key`
+    /// and `secret` is not its private half.
+    pub fn peer_keys(
+        &self,
+        secret: &[u8; 32],
+    ) -> Result<Vec<(std::net::Ipv4Addr, [u8; 16])>, String> {
+        let Some(d) = u8::try_from(self.me)
+            .ok()
+            .and_then(|m| vyrn_epoch::VOTER_TARGET.checked_add(m))
+        else {
+            return Ok(Vec::new());
+        };
+        let keys = self.roster.box_fetch_keys(
+            PEER_FETCH_CONTEXT,
             &self.domain,
             self.epoch,
             self.home,
-            i,
             d,
             secret,
-        )
+        );
+        let Some(keys) = keys else {
+            let usable = self
+                .roster
+                .fetch_target(self.home, d)
+                .is_some_and(|k| k.len() >= 32);
+            return if usable {
+                Err(format!(
+                    "[data] xchg is not the private half of voter {}'s roster xchg_key",
+                    self.me
+                ))
+            } else {
+                Ok(Vec::new())
+            };
+        };
+        Ok(keys
+            .into_iter()
+            .filter(|(i, _, _)| usize::from(*i) != self.me)
+            .filter_map(|(_, a, k)| Some((a.ipv4()?, k)))
+            .collect())
     }
 
     pub fn repl_addr(&self) -> SocketAddr {

@@ -1111,6 +1111,29 @@ any work. Replies are not tagged (next paragraph).
 Every fetched packet is checked like a pushed one. Source 3 is the only source of the bytes the
 sequencer actually matched, so it settles every conflict (§5.6).
 
+**Escalation (reading, semantics).** Each source gets `REP_DATA_WAIT_US` in turn: a record still
+unresolved 300 µs after its ORDER frame is fetched from source 1, and each further 300 µs without
+its payload moves to the next source (2, then 3, then 1 again), skipping any source the replica
+has not configured. Source 2's peer turns round-robin across fetches.
+
+**`PeerDataFetch` bytes (reading, wire; source 2).** The request is the same 32-byte KEY fetch
+as `DataFetch` and `SeqDataReq`, sent to the peer's data port; the answer goes to the request's
+source address. It is `FETCH_RESP` data frames like the sequencer's below, but with `src` = 0xFE,
+carrying every variant the peer holds of the key, split over as many frames as they need; a miss
+is one frame with no packets. A peer holds a key's variants in its join and, after it releases
+them (§5.4), in a FIFO of its last 16,384 released payloads, so a slower peer can still fetch
+them (reading, config). A replica answers at most `REP_SEQ_DATA_MAX_PPS` packets/s (a miss costs
+one, 10 ms of tokens) and refuses RANGE and BLOCK fetches. An answer with fewer tokens on hand
+than variants carries as many as they buy, and that requester's (source address's) next fetch of the key resumes after them, so
+a key holding more variants than a full bucket is still served in full (reading). Its key is
+`K_fetch(e, i, VOTER_TARGET + j)` under the context `"vyrn      v1 peerfetch"` (08 §9.6), for
+requester `i` and serving voter `j`; source 3's is `K_fetch(e, i, SEQ_TARGET + j)` for
+`vyrn-seq` box `j`. A keyed replica serves only fetches that open under a key of a requester at
+the source's IPv4, so one with no usable requester key serves nothing, and a `[data] xchg`
+that is not the private half of its roster key fails startup. An unkeyed one (no `xchg`)
+serves the 32-byte form to its configured peers (DEV). A target whose roster key is unusable
+holds no keys, so it is sent the 32-byte form (reading, DEV).
+
 **`SeqDataReq` bytes (source 3).** The request is the data tier's 32-byte KEY fetch
 (`vyrn-data` frame docs: magic `PF`, kind 1, `session u32, pkt_seq u32`), sent to the
 sequencer's repair port.

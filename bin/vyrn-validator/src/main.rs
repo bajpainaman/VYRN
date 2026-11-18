@@ -18,7 +18,7 @@
 //! | `[cores] order` | REF core of the order core (07 §7.2 core 3); reported, not pinned |
 //! | `[membership] seq_keys = ["<hex>"]` | `REP_Membership`'s `seq_key` per sequencer index (07 §13.1); public keys, so they may sit in the file |
 //! | `[keys] vote, node` | vote key handle; `node` (the p2p identity) defaults to `vote`. Only `env:NAME` (seed hex) resolves, and only with `[consensus]` |
-//! | `[nic] data_port`, `[data] boxes = ["ip:port"], me, max_range, xchg` | optional: the data RX queue (07 §5.4); `boxes[i]` is data box `src = i`, `me` this replica's index in their  destination lists; with `xchg` (needs `[consensus]`) every fetch to `boxes[d]` is sealed under `K_fetch(e, me, d)` (08 §9.6). Without `[data]` vote-rule item 3 is not checked (DEV) |
+//! | `[nic] data_port`, `[data] boxes = ["ip:port"], me, max_range, xchg, seq_repair = "ip:port", seq_box = 0, [[data.peer]] voter, addr` | optional: the data RX queue (07 §5.4); `boxes[i]` is data box `src = i`, `me` this replica's index in their destination lists; with `xchg` (needs `[consensus]`) every fetch to `boxes[d]` is sealed under `K_fetch(e, me, d)` (08 §9.6). `[[data.peer]]` are the other replicas (roster voter index, `[nic] data_port`) and `seq_repair` is `vyrn-seq` box `seq_box`'s `[repair]` port: 07 §5.5 sources 2 and 3 (`fetch.rs`), sealed too with `xchg`. Without `[data]` vote-rule item 3 is not checked (DEV) |
 //! | `dev = false` | `true` marks a DEV validator: only then may `[replay] hashlag_us` differ from 1000 |
 //! | `[replay] tick_min, tick_max, win_center, slot_cap, hashlag_us, [[replay.session]] lane, slot, account, k_seq, quote, base` | optional, needs `[data]`: replay of every block that passes item 3 on `vyrn-engine` (`replay.rs`), built from the sequencer's `[engine]` and `[[dev_session]]` (no state snapshot encoding yet). `hashlag_us` (DEV only, default 1000 = the spec's 1 ms, 07 §3.7) is the `REP_E_HASHLAG` bound, for unpinned DEV hosts |
 //! | `[consensus] roster, roster_hash, genesis_hash, home, seq_order, observers, delta_ms, storage` | optional: the Simplex voter (`consensus.rs`); committee and peers from the roster file (08 §9.6), checked against `roster_hash`; `membership.seq_keys[0]` must be the roster's primary `seq_key` |
@@ -43,7 +43,9 @@
 //! `REPLAY_FAULT height=<h> <why>` and replay stops (so does a `DATA_FAULT`). `voter` (`consensus.rs`): Simplex, `FINAL ...` per certificate.
 //! main: start, readiness, stop, `STATS frames=<n> blocks=<n> faults=<n>` and, with `[data]`,
 //! `DATA_EVICT expired=<n> capped=<n>`: unreferenced payloads the join dropped (07 §5.4; expiry
-//! runs only with `[consensus]`, which reports finality).
+//! runs only with `[consensus]`, which reports finality). The order thread prints, at exit with
+//! `[data]`, `FETCH box=<n> peer=<n> seq=<n> served=<n> missed=<n> limited=<n> bad=<n>`: KEY
+//! fetches it sent to each 07 §5.5 source, and peers' fetches it served (`fetch.rs`).
 //!
 //! **Not wired yet** (PR follow-ups): seals in the voter's source (tail reports, Silence), the chain guardian
 //! (`vyrn_chain::bridge::Guardian` needs a `vyrn_chain::Replica` over finalized `StateCommit`s,
@@ -68,13 +70,14 @@ use vyrn_replica::feed::Gap;
 use vyrn_replica::{BlockInputs, DataErr, DataFeed, DataJoin, Evictions};
 
 mod consensus;
+mod fetch;
 mod replay;
 use vyrn_consensus::Verdict;
 use vyrn_log::Layout;
 use vyrn_nic::frame;
 use vyrn_nic::{BackendKind, KernelUdp, NicBackend, NicConfig, PortConfig, PortId, RxBind};
 use vyrn_replica::{EpochView, FrameErr, OrderCore};
-use vyrn_types::{BookId, Epoch, Height, LaneId, PubKey, SessionId};
+use vyrn_types::{BookId, Epoch, Height, LaneId, PubKey};
 use vyrn_wire::{RX_BURST, RxPkt, RxRing};
 
 #[derive(Parser)]
@@ -117,6 +120,15 @@ struct Config {
 struct Data {
     boxes: Vec<std::net::SocketAddrV4>,
     me: u8,
+    /// Peer replicas: 07 §5.5 source 2 (`fetch.rs`).
+    #[serde(default)]
+    peer: Vec<Peer>,
+    /// `vyrn-seq` box `seq_box`'s `[repair]` port: 07 §5.5 source 3, `SeqDataReq`.
+    #[serde(default)]
+    seq_repair: Option<std::net::SocketAddrV4>,
+    /// The roster index of the box at `seq_repair` among its home's `vyrn-seq` boxes.
+    #[serde(default)]
+    seq_box: u8,
     /// The largest RANGE fetch a data box accepts, in frames.
     #[serde(default = "d_range")]
     max_range: u64,
@@ -126,6 +138,15 @@ struct Data {
     /// (DEV) box serves.
     #[serde(default)]
     xchg: Option<String>,
+}
+
+/// A peer replica: its roster voter index (for its key, `VOTER_TARGET + voter`) and its
+/// `[nic] data_port` address.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Peer {
+    voter: u8,
+    addr: std::net::SocketAddrV4,
 }
 
 fn d_range() -> u64 {
@@ -332,6 +353,10 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                 })
                 .map_err(|e| e.to_string())?;
             let n = u8::try_from(d.boxes.len()).map_err(|_| "config data.boxes: too many")?;
+            let secret = match (&d.xchg, &plan) {
+                (Some(h), Some(_)) => Some(consensus::resolve(h)?),
+                _ => None,
+            };
             let keys = match (&d.xchg, &plan) {
                 (None, _) => Vec::new(),
                 (Some(_), None) => {
@@ -340,17 +365,80 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                             .into(),
                     );
                 }
-                (Some(h), Some(p)) => {
-                    let secret = consensus::resolve(h)?;
+                (Some(_), Some(p)) => {
+                    let secret = secret.unwrap_or_default();
                     (0..n)
                         .map(|b| {
-                            p.fetch_key(b, &secret).ok_or_else(|| {
-                                format!("config data.xchg: no K_fetch for box {b} (08 §9.6)")
-                            })
+                            p.fetch_key(vyrn_epoch::FETCH_CONTEXT, b, &secret)
+                                .ok_or_else(|| {
+                                    format!("config data.xchg: no K_fetch for box {b} (08 §9.6)")
+                                })
                         })
                         .collect::<Result<_, String>>()?
                 }
             };
+            // 07 §5.5 sources 2 and 3, sealed like the box fetches when keyed (08 §9.6).
+            // A peer or box whose roster key is unusable holds no keys either: it serves the
+            // 32-byte form only, so that is what it gets (reading, PR body).
+            let key = |context: &str, t: u8| -> Result<Option<[u8; 16]>, String> {
+                Ok(match (&secret, &plan) {
+                    (Some(s), Some(p)) => {
+                        let k = p.fetch_key(context, t, s);
+                        if k.is_none() {
+                            eprintln!(
+                                "vyrn-validator: fetch target {t:#04x} has no K_fetch; unsealed"
+                            );
+                        }
+                        k
+                    }
+                    _ => None,
+                })
+            };
+            let boxes = d
+                .boxes
+                .iter()
+                .enumerate()
+                .map(|(b, addr)| fetch::Target {
+                    addr: *addr,
+                    key: keys.get(b).copied(),
+                })
+                .collect();
+            let peers = d
+                .peer
+                .iter()
+                .map(|p| {
+                    let t = vyrn_epoch::VOTER_TARGET.saturating_add(p.voter);
+                    Ok(fetch::Target {
+                        addr: p.addr,
+                        key: key(consensus::PEER_FETCH_CONTEXT, t)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let seq = match d.seq_repair {
+                Some(addr) => Some(fetch::Target {
+                    addr,
+                    key: key(
+                        vyrn_epoch::FETCH_CONTEXT,
+                        vyrn_epoch::SEQ_TARGET.saturating_add(d.seq_box),
+                    )?,
+                }),
+                None => None,
+            };
+            let sources = fetch::Sources::new(boxes, peers, seq);
+            let peer_addrs: Vec<SocketAddrV4> = d.peer.iter().map(|p| p.addr).collect();
+            let peer_keys = match (&secret, &plan) {
+                (Some(s), Some(p)) => {
+                    let k = p.peer_keys(s)?;
+                    if k.is_empty() {
+                        eprintln!(
+                            "vyrn-validator: keyed, but no peer has a usable K_fetch; serving no peer fetches"
+                        );
+                    }
+                    Some(k)
+                }
+                _ => None,
+            };
+            let peer = fetch::PeerServer::new(&peer_addrs, peer_keys);
             // A box keys a requester by its repl_addr's IPv4 (08 §9.6), so fetches leave from
             // [nic] ip: the reading is that it is this voter's repl_addr IP.
             let repair = UdpSocket::bind(SocketAddrV4::new(ip, 0)).map_err(|e| e.to_string())?;
@@ -368,7 +456,8 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                 keys,
                 max_range: d.max_range,
                 fetches: VecDeque::new(),
-                missing: None,
+                sources,
+                peer,
             })
         }
         None => None,
@@ -472,8 +561,10 @@ struct DataRx<const N: usize, R> {
     /// Gaps not fully fetched yet, with the box to ask: at most `FETCH_BURST` RANGE fetches go
     /// out per poll and a gap's `from` moves past them. One entry per gap, however long.
     fetches: VecDeque<(u8, Gap)>,
-    /// The payload the front pending block waits for, and when it was last fetched by key.
-    missing: Option<(SessionId, u32, u64)>,
+    /// KEY fetches for the payload the front pending block waits for (07 §5.5).
+    sources: fetch::Sources,
+    /// Peers' KEY fetches, answered from the join (07 §5.5 source 2).
+    peer: fetch::PeerServer,
 }
 
 /// RANGE fetches sent per data poll.
@@ -501,6 +592,19 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             let Ok(f) = frame::parse(self.rx.bytes(p)) else {
                 continue;
             };
+            // A peer's KEY fetch: answered to its source, from the join (07 §5.5 source 2).
+            if f.payload.get(..2) == Some(&vyrn_data::frame::FETCH_MAGIC.to_le_bytes()[..]) {
+                let join = Self::join(&mut self.join, &mut self.replay);
+                let from = f.hdr.src;
+                let to = SocketAddrV4::new(from.ip, from.port);
+                for r in self
+                    .peer
+                    .serve(join, to, f.payload, now, &mut self.sources.counts)
+                {
+                    let _ = self.repair.send_to(&r, to);
+                }
+                continue;
+            }
             if let Ok(fed) =
                 self.feed
                     .on_frame(Self::join(&mut self.join, &mut self.replay), f.payload, now)
@@ -557,23 +661,16 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
 
     /// Item 3 for the pending blocks, in height order: a block whose payloads are all joined
     /// passes or contradicts; a missing payload waits. A payload still missing
-    /// `REP_DATA_WAIT_US` after it was first seen missing, or after its last KEY fetch, is
-    /// fetched by key (07 §5.5 source 1), so a lost RANGE request or reply does not stall the
-    /// queue.
+    /// `REP_DATA_WAIT_US` after it was first seen missing is fetched by key, from each of 07
+    /// §5.5's sources in turn (`fetch.rs`), so a lost RANGE request or reply, or a data box that
+    /// lacks it, does not stall the queue.
     fn check(&mut self, source: &consensus::Source, now: u64) {
         while let Some(b) = self.pending.front() {
             let h = b.header.height;
             match Self::join(&mut self.join, &mut self.replay).check(b) {
                 Err(DataErr::Missing { session, pkt_seq }) => {
-                    match self.missing {
-                        Some((s, q, at)) if (s, q) == (session, pkt_seq) => {
-                            if now.saturating_sub(at) >= REP_DATA_WAIT_NS {
-                                self.fetch_key(session, pkt_seq);
-                                self.missing = Some((session, pkt_seq, now));
-                            }
-                        }
-                        _ => self.missing = Some((session, pkt_seq, now)),
-                    }
+                    let to = self.sources.due(session, pkt_seq, now);
+                    fetch::send_key(&self.repair, session, pkt_seq, &to);
                     return;
                 }
                 Ok(()) => source.valid(h),
@@ -586,6 +683,9 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             let Some(b) = self.pending.pop_front() else {
                 return;
             };
+            // Every path below releases the block's payloads: peers may still ask for them.
+            self.peer
+                .keep(Self::join(&mut self.join, &mut self.replay), &b.lanes);
             match (&mut self.replay, self.replay_dead) {
                 (Some(r), false) => match replay::block(r, &b) {
                     Ok(out) => println!("{} out={}", block_line(&b, Verdict::Valid), hex(&out.0)),
@@ -603,15 +703,6 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 // Without replay nothing else reads these payloads.
                 (None, _) => self.join.release(h, &b.lanes),
             }
-        }
-    }
-
-    /// A KEY fetch to every configured box: the validator has no session-to-data-home map yet
-    /// (DEV reading, PR body), and a box that lacks the packet does not answer.
-    fn fetch_key(&mut self, session: SessionId, pkt_seq: u32) {
-        let q = Fetch::Key { session, pkt_seq };
-        for d in 0..self.boxes.len() {
-            send(&self.repair, &self.boxes, &self.keys, &q, d);
         }
     }
 }
@@ -635,9 +726,6 @@ impl Drop for StopOnDrop<'_> {
         self.0.store(true, Ordering::Release);
     }
 }
-
-/// `REP_DATA_WAIT_US` (07 §5.5): how long a missing payload waits before a KEY fetch.
-const REP_DATA_WAIT_NS: u64 = 300_000;
 
 fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     mut core: OrderCore<N, View>,
@@ -704,6 +792,13 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             // several boxes and their voters share a small host. The socket holds what arrives.
             std::thread::park_timeout(IDLE);
         }
+    }
+    if let Some(d) = data.as_ref() {
+        let c = d.sources.counts;
+        println!(
+            "FETCH box={} peer={} seq={} served={} missed={} limited={} bad={}",
+            c.boxes, c.peer, c.seq, c.served, c.missed, c.limited, c.bad
+        );
     }
     data.as_mut()
         .map(|d| DataRx::<N, D>::join(&mut d.join, &mut d.replay).evictions())
