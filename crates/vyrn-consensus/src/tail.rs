@@ -59,7 +59,7 @@ pub struct Tail {
     pub mark: u64,
     /// `F_i`: every frame `1..=contiguous` of the tenure is held.
     pub contiguous: u64,
-    /// Ranges `[a, b]` held above `F_i`: ascending, disjoint, not adjacent to `F_i`.
+    /// Ranges `[a, b]` held above `F_i`: ascending, disjoint, the first not adjacent to `F_i`.
     pub extra: Vec<(u64, u64)>,
     /// One bit per frame of `(mark, F_i]`, then of each `extra` range in order, LSB first:
     /// 1 = received from a sequencer path, 0 = repaired from a peer.
@@ -70,14 +70,15 @@ impl Tail {
     /// Frames the `direct` bitmap covers, or `None` when the ranges are malformed.
     fn frames(&self) -> Option<u64> {
         let mut total = self.contiguous.checked_sub(self.mark)?;
+        // The first range leaves a gap above `F_i` (frame `F_i + 1` is missing, or `F_i` would
+        // be higher); later ranges only have to be ascending and disjoint, adjacent allowed.
         let mut floor = self.contiguous.checked_add(1)?;
         for &(a, b) in &self.extra {
-            // Above the contiguous run with a gap, ascending and disjoint.
             if a <= floor || b < a {
                 return None;
             }
             total = total.checked_add(b - a + 1)?;
-            floor = b.checked_add(1)?;
+            floor = b;
         }
         (total <= MAX_TAIL_FRAMES).then_some(total)
     }
@@ -184,6 +185,8 @@ pub enum TailErr {
     Direct,
     #[error("reporter {0} is neither a voter nor a seq_order box")]
     Unknown(u8),
+    #[error("reporter {0} is the suspected sequencer; it never reports on its own tenure")]
+    Suspected(u8),
     #[error("signature of reporter {0} is invalid")]
     BadSig(u8),
 }
@@ -285,7 +288,8 @@ impl Silence {
     }
 
     /// Checks the ranges and the signature. Voters sign with their `vote_key`; `seq_order[j]`
-    /// signs as reporter `n + j` with its `seq_key`.
+    /// signs as reporter `n + j` with its `seq_key`, except `j = seq`, the suspected sequencer:
+    /// 07 §9.3's safety argument needs every reporter honest when the sequencer is the fault.
     pub fn verify(&self, committee: &Committee, seq_order: &[PubKey]) -> Result<Reporter, TailErr> {
         for t in &self.report.tails {
             t.check()?;
@@ -298,6 +302,9 @@ impl Silence {
                 let j = usize::from(who)
                     .checked_sub(n)
                     .ok_or(TailErr::Unknown(who))?;
+                if j == usize::from(self.seq) {
+                    return Err(TailErr::Suspected(who));
+                }
                 let k = seq_order.get(j).ok_or(TailErr::Unknown(who))?;
                 (k, Reporter::Standby(u8::try_from(j).unwrap_or(u8::MAX)))
             }
@@ -626,6 +633,11 @@ mod tests {
         assert_eq!(other.verify(&c, &seq), Err(TailErr::BadSig(1)));
         other.report.reporter = 9;
         assert_eq!(other.verify(&c, &seq), Err(TailErr::Unknown(9)));
+        // The suspected sequencer (seq_order[0], reporter n + 0) cannot report on itself, even
+        // correctly signed.
+        let r = report(4, 99, tail(3, &[]), tail(3, &[]));
+        let s = Silence::sign(0, Reason::Silence, r, &seq_seed(0));
+        assert_eq!(s.verify(&c, &seq), Err(TailErr::Suspected(4)));
         // Truncated, trailing and malformed bytes are refused.
         assert_eq!(
             Silence::decode(&bytes[..bytes.len() - 1]),
@@ -642,6 +654,11 @@ mod tests {
     #[test]
     fn malformed_ranges_are_refused() {
         let (c, seq) = committee();
+        // Adjacent ranges after the first gap are well formed: 12..=13 then 14..=15.
+        let r = report(0, 1, tail(10, &[(12, 13), (14, 15)]), tail(1, &[]));
+        let s = Silence::sign(0, Reason::Silence, r, &seed(0));
+        assert_eq!(s.verify(&c, &seq), Ok(Reporter::Voter(0)));
+        assert_eq!(Silence::decode(&s.encode()), Ok(s));
         for extra in [
             &[(11, 12)][..],
             &[(14, 13)],
