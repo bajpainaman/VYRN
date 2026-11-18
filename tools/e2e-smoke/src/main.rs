@@ -4,7 +4,7 @@
 //!
 //! **Invocation.** `e2e-smoke [--bin-dir DIR] [--validators K] [--packets P] [--rate R]
 //! [--seed S] [--wait-s T] [--seq-cpus L] [--validator-cpus L] [--strict-hashlag] [--finality]
-//! [--data] [--dropcopy] [--two-path] [--drop-path-b N]`. `DIR` holds `vyrn-seq`, `vyrn-validator`, (with `--data`) `vyrn-data` and (with
+//! [--data] [--dropcopy] [--two-path] [--drop-path-b N] [--keyed] [--data-shards N] [--data-kill]`. `DIR` holds `vyrn-seq`, `vyrn-validator`, (with `--data`) `vyrn-data` and (with
 //! `--dropcopy`) `vyrn-dropcopy` (default: this binary's directory). Exit 0 when every enabled check passes, 1 when one fails,
 //! 2 when the run could not start. Every wait has a deadline of `T` seconds (default 30): the
 //! harness never blocks on a child, a socket or a pipe without one, and kills every child it
@@ -32,6 +32,7 @@
 //! | `replica-out` | with `--data` every validator replays (`[replay]`) and its `out=<hex>` on each `BLOCK` line equals the tap's output hash of that block; one stopped at `REP_E_HASHLAG` is compared on the blocks it printed (R5); SKIP while no validator replays |
 //! | `finality` | with `--finality` (default 4 validators, a DEV roster as in `bin/vyrn-validator/tests/committee.rs`, `[consensus]` in every validator and the box): while the box still runs, the box's listener (`FINAL height=<h> ... from=<votes\|cert>`) and every validator that did not stop print `FINAL` through the box's last block. A validator's `OUT_OF_ORDER`, `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT` line fails `validators`; `REP_E_HASHLAG` follows R5 and R6. SKIP without it |
 //! | `dropcopy` | with `--dropcopy` (needs `--data` and `--finality`): an observer (`vyrn-validator`, `role = "observer"`, data destination `n + 1`, in the box's order list on both paths (R12) and every validator's `[consensus] observers`) replays every block into its output ring and finalizes from the validators' certificates; `vyrn-dropcopy` serves the ring over Noise, and one client per session logs in to its account's stream. Each stream's served records, without stage markers, equal an in-process `DropCopy` over the tap's `RustReplay` byte for byte, with gapless seqs, and end in a `DC_FINAL`; every record with a `resp_seq` (acks, cancels, outs, taker fills) names a response packet the client received (10 §8.3). It prints a DEV timing of those records after their response packets (R9); SKIP without it |
+//! | `failover` | with `--data-kill` (R13): the home data box is killed mid-run, the validators reach Q `DataDown`s and REDIRECT, the backup admits a sealed one and redirects every session, and every session moves copy 2; SKIP without it |
 //! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed reports no gap or rejected frame, and that join is the one `replay` reads; SKIP without `--data` |
 //!
 //! **Readings** (the spec does not settle these; PR body):
@@ -80,6 +81,21 @@
 //!   datagram: the `dropcopy` check then requires that the observer print `DURABLE_WAIT
 //!   height=h`, replay exactly blocks `0..h`, and that the box went past `h`. Its drop copy is
 //!   not compared then: it holds what the observer could not attest (10 §8.2).
+//! - R13. `--data-kill` (needs `--keyed`): a backup `vyrn-data` box (`src = 1`, roster data
+//!   box 1 with `BOX1_XCHG`, the same destinations) runs beside the home box, and every validator
+//!   lists both (`[data] boxes`) with a DEV `silence_us` of `KILL_SILENCE_US`. The client sends
+//!   each session's first copy 2 to both (07 §5.7 interim reading) and the rest to the home box,
+//!   which the harness kills after 2/5 of the packets. `failover` needs every running validator's
+//!   `DATA_DOWN box=0` at quorum, no `DATA_DOWN box=1` while the backup runs, validator 0's
+//!   sealed `REDIRECT_SENT down=0 to=1` (only it holds a `K_fetch`, R7), the backup's
+//!   `redirects > 0` and `redirect_unknown = 0`, and a verified `DataRedirect` (DR1, under the
+//!   session's `K_seq`) for every session. On its first one per session (DR2) the client moves
+//!   copy 2 to the backup and resends its retained bytes from `resend_from` (DR3). `data` checks
+//!   the backup's `STATS` without `stored` (the killed box's are gone; R11's `fetch_unauth = 0`
+//!   still holds: the unkeyed validators' plain REDIRECTs are malformed to a keyed box, not
+//!   forged), and `replay` still needs every packet in the tap's join, now fed by both boxes'
+//!   frames. The client paces its DR3 resends (20 µs apart): one burst of every retained packet
+//!   overflows the backup's ingest socket on a 2-vCPU host.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -140,6 +156,7 @@ use vyrn_bbo::{Bbo, Phase, Record, TxEntry};
 use vyrn_bench::config::{Config as WlConfig, Mode};
 use vyrn_bench::generator::{GenOptions, Generator, session_keys};
 use vyrn_cut::Hw;
+use vyrn_data::redirect::Redirect;
 use vyrn_engine::{Engine, NoResponses, Rec, Shared, Sink};
 use vyrn_lane::{ArenaConfig, Lane, PathTable, RespPkt, SessionSpec};
 use vyrn_log::Layout;
@@ -159,6 +176,10 @@ const XCHG_SEED: [u8; 32] = [0x5a; 32];
 const BOX_XCHG: [u8; 32] = [0x6b; 32];
 /// `--keyed` (R8): the primary `vyrn-seq` box's X25519 secret.
 const SEQ_XCHG: [u8; 32] = [0x7c; 32];
+/// `--data-kill` (R13): the backup data box's X25519 secret.
+const BOX1_XCHG: [u8; 32] = [0x8d; 32];
+/// `--data-kill` (R13): the validators' DEV `[data] silence_us`, for an unpinned host.
+const KILL_SILENCE_US: u64 = 100_000;
 /// `--keyed` (R7): the relay to validator 0 drops every this-many-th datagram.
 const LOSS_EVERY: u64 = 25;
 const LANES: usize = 2;
@@ -234,6 +255,10 @@ struct Cli {
     /// the validators, which still have path A, finish.
     #[arg(long, value_name = "N")]
     drop_path_b: Option<u64>,
+    /// Add a backup data box and kill the home box mid-run: the validators reach Q DataDowns
+    /// and REDIRECT, and the client moves copy 2 (R13; needs --keyed).
+    #[arg(long)]
+    data_kill: bool,
 }
 
 fn main() -> ExitCode {
@@ -576,6 +601,13 @@ impl Sink for TapSink {
     }
 }
 
+/// A running `vyrn-data` box: its node index and its READY addresses.
+struct DataBoxNode {
+    idx: usize,
+    ingest: SocketAddrV4,
+    fetch: SocketAddrV4,
+}
+
 /// The order frames the tap received, until `stop`.
 fn tap(sock: UdpSocket, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<Vec<Vec<u8>>> {
     std::thread::spawn(move || {
@@ -622,16 +654,30 @@ fn relay(
 }
 
 /// The responses the client received, with their receive times, until `stop`, unchecked.
+/// A `DataRedirect` (04 §7.6) that opens under a session's `K_seq` goes to `redirects` instead
+/// (R13, DR1).
 fn client(
     sock: UdpSocket,
     stop: Arc<AtomicBool>,
+    keys: Vec<[u8; 16]>,
+    redirects: Sender<Redirect>,
 ) -> std::thread::JoinHandle<Vec<(Instant, Vec<u8>)>> {
     std::thread::spawn(move || {
         let mut got = Vec::new();
         let mut buf = [0u8; 4096];
         while !stop.load(Ordering::Acquire) {
             if let Ok(k) = sock.recv(&mut buf) {
-                got.push((Instant::now(), buf.get(..k).unwrap_or_default().to_vec()));
+                let b = buf.get(..k).unwrap_or_default();
+                let r = (k == vyrn_data::redirect::BYTES
+                    && b.get(..2) == Some(&vyrn_data::redirect::MAGIC.to_le_bytes()[..]))
+                .then(|| keys.iter().find_map(|key| Redirect::open(b, key).ok()))
+                .flatten();
+                match r {
+                    Some(r) => {
+                        let _ = redirects.send(r);
+                    }
+                    None => got.push((Instant::now(), b.to_vec())),
+                }
             }
         }
         got
@@ -894,13 +940,14 @@ fn data_ports(n: usize) -> Result<Vec<u16>, String> {
 fn validator_config(
     dir: &Path,
     i: usize,
-    data: Option<(SocketAddrV4, &[u16], u16)>,
+    data: Option<(&[SocketAddrV4], &[u16], u16)>,
     sessions: &[Sess],
     cons: Option<&Cons>,
     hashlag_us: Option<u64>,
     keyed: bool,
     observer: Option<(&Path, SocketAddrV4)>,
     order_b: bool,
+    silence_us: Option<u64>,
 ) -> Result<PathBuf, String> {
     let key = hex(&vyrn_crypto::ed25519::public_key(&SEQ_SEED));
     let data_port = data.and_then(|(_, ps, _)| ps.get(i).copied()).unwrap_or(0);
@@ -917,7 +964,7 @@ fn validator_config(
     };
     // DEV: a larger hashlag bound, or keyed fetches to peers whose roster keys are unusable
     // (R8: only validator 0 has a real xchg_key), which only a DEV validator sends unsealed.
-    let dev = if hashlag_us.is_some() || keyed {
+    let dev = if hashlag_us.is_some() || keyed || silence_us.is_some() {
         "dev = true\n"
     } else {
         ""
@@ -950,6 +997,11 @@ seq_keys = ["{key}"]
         None => s.push_str(&format!("\n[keys]\nvote = \"{vote}\"\n")),
     }
     if let Some((fetch, ports, repair)) = data {
+        let fetch = fetch
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         let peers = ports
             .iter()
             .enumerate()
@@ -957,13 +1009,14 @@ seq_keys = ["{key}"]
             .map(|(j, p)| format!("\n[[data.peer]]\nvoter = {j}\naddr = \"127.0.0.1:{p}\"\n"))
             .collect::<String>();
         s.push_str(&format!(
-            "\n[data]\nboxes = [\"{fetch}\"]\nme = {}\n{}seq_repair = \"127.0.0.1:{repair}\"\n{peers}\n[replay]\ntick_min = {TICK_MIN}\ntick_max = {TICK_MAX}\nwin_center = {WIN_CENTER}\nslot_cap = {SLOT_CAP}\n",
+            "\n[data]\nboxes = [{fetch}]\nme = {}\n{}{}seq_repair = \"127.0.0.1:{repair}\"\n{peers}\n[replay]\ntick_min = {TICK_MIN}\ntick_max = {TICK_MAX}\nwin_center = {WIN_CENTER}\nslot_cap = {SLOT_CAP}\n",
             i + 1,
             if keyed {
                 "xchg = \"env:VYRN_E2E_XCHG\"\n"
             } else {
                 ""
-            }
+            },
+            silence_us.map_or_else(String::new, |us| format!("silence_us = {us}\n"))
         ));
         if let Some(us) = hashlag_us {
             s.push_str(&format!("hashlag_us = {us}\n"));
@@ -1006,6 +1059,7 @@ fn data_config(
     sessions: &[Sess],
     keyed: Option<&Cons>,
     shards: usize,
+    src: u8,
 ) -> Result<PathBuf, String> {
     let dests = dests
         .iter()
@@ -1019,7 +1073,7 @@ role = "data"
 mode = "BASE"
 home = "LDN"
 dev = true
-src = 0
+src = {src}
 books = [{BOOK}]
 dests = [{dests}]
 
@@ -1048,14 +1102,14 @@ n = {shards}
     }
     if let Some(c) = keyed {
         s.push_str(&format!(
-            "\n[roster]\nfile = \"{}\"\nroster_hash = \"{}\"\ngenesis_hash = \"{}\"\nepoch = 0\nbox = 0\nxchg_secret = \"hex:{}\"\n",
+            "\n[roster]\nfile = \"{}\"\nroster_hash = \"{}\"\ngenesis_hash = \"{}\"\nepoch = 0\nbox = {src}\nxchg_secret = \"hex:{}\"\n",
             c.roster.display(),
             c.roster_hash,
             hex(&[0; 32]),
-            hex(&BOX_XCHG)
+            hex(if src == 0 { &BOX_XCHG } else { &BOX1_XCHG })
         ));
     }
-    let p = dir.join("data.toml");
+    let p = dir.join(format!("data-{src}.toml"));
     std::fs::write(&p, s).map_err(|e| e.to_string())?;
     Ok(p)
 }
@@ -1084,6 +1138,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
     }
     if cli.data_shards == 0 || (cli.data_shards > 1 && !cli.data) {
         return Err("--data-shards needs --data and N >= 1".into());
+    }
+    if cli.data_kill && !cli.keyed {
+        return Err("--data-kill needs --keyed: the REDIRECTs it checks are sealed (R13)".into());
     }
     let wait = Duration::from_secs(cli.wait_s);
     let bin_dir = match &cli.bin_dir {
@@ -1137,7 +1194,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let lo = |p: u16| SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, p);
     let obs_ctrl = dc_ports.get(1).map(|p| lo(*p));
     let cons = if cli.finality {
-        let mut c = Cons::new(&dir, &picked, cli.keyed)?;
+        let mut c = Cons::new(&dir, &picked, cli.keyed, if cli.data_kill { 2 } else { 1 })?;
         c.obs = obs_ctrl;
         Some(c)
     } else {
@@ -1170,43 +1227,51 @@ fn run(cli: &Cli) -> Result<bool, String> {
         // The observer is the last destination (its `[data] me`).
         dests.extend(dc_ports.first().map(|p| format!("127.0.0.1:{p}")));
         let keyed = cons.as_ref().filter(|_| cli.keyed);
-        let cfg = data_config(&dir, &dests, &sessions, keyed, cli.data_shards)?;
-        let mut c = command(&bin_dir.join("vyrn-data"), cli.seq_cpus.as_deref());
-        c.arg("--config").arg(cfg).arg("--stop-on-stdin-eof");
-        let i = nodes.spawn("vyrn-data", &mut c, &tx)?;
-        nodes.wait(&rx, Instant::now() + wait, "vyrn-data READY", |ns| {
-            ns.get(i)
-                .is_some_and(|n| line(n, "READY vyrn-data ").is_some())
-        })?;
-        let ingest: SocketAddrV4 = nodes
-            .0
-            .get(i)
-            .and_then(|n| line(n, "READY vyrn-data "))
-            .and_then(|l| field(l, "ingest"))
-            .ok_or("vyrn-data READY has no ingest=")?
-            .parse()
-            .map_err(|e| format!("vyrn-data ingest address: {e}"))?;
-        let fetch: SocketAddrV4 = nodes
-            .0
-            .get(i)
-            .and_then(|n| line(n, "READY vyrn-data "))
-            .and_then(|l| field(l, "fetch"))
-            .ok_or("vyrn-data READY has no fetch=")?
-            .parse()
-            .map_err(|e| format!("vyrn-data fetch address: {e}"))?;
+        // R13: with --data-kill a backup box (`src = 1`) with the same destinations.
+        let mut boxes = Vec::new();
+        for src in 0..if cli.data_kill { 2u8 } else { 1 } {
+            let cfg = data_config(&dir, &dests, &sessions, keyed, cli.data_shards, src)?;
+            let mut c = command(&bin_dir.join("vyrn-data"), cli.seq_cpus.as_deref());
+            c.arg("--config").arg(cfg).arg("--stop-on-stdin-eof");
+            let name = format!("vyrn-data-{src}");
+            let i = nodes.spawn(&name, &mut c, &tx)?;
+            nodes.wait(&rx, Instant::now() + wait, &format!("{name} READY"), |ns| {
+                ns.get(i)
+                    .is_some_and(|n| line(n, "READY vyrn-data ").is_some())
+            })?;
+            let addr = |k: &str| -> Result<SocketAddrV4, String> {
+                nodes
+                    .0
+                    .get(i)
+                    .and_then(|n| line(n, "READY vyrn-data "))
+                    .and_then(|l| field(l, k))
+                    .ok_or(format!("{name} READY has no {k}="))?
+                    .parse()
+                    .map_err(|e| format!("{name} {k} address: {e}"))
+            };
+            boxes.push(DataBoxNode {
+                idx: i,
+                ingest: addr("ingest")?,
+                fetch: addr("fetch")?,
+            });
+        }
         // Read from now on: the node heartbeats every destination while the validators start,
         // and an unread socket would overflow and drop the first DATA frames.
-        Some((i, ingest, fetch, tap(sock, Arc::clone(&stop_tap))))
+        Some((boxes, tap(sock, Arc::clone(&stop_tap))))
     } else {
         None
     };
+    let box_fetch: Vec<SocketAddrV4> = data_node
+        .as_ref()
+        .map_or_else(Vec::new, |(bs, _)| bs.iter().map(|b| b.fetch).collect());
+    let silence_us = cli.data_kill.then_some(KILL_SILENCE_US);
 
     let vals: Vec<usize> = (0..n_val)
         .map(|i| {
             let data = data_node
                 .as_ref()
                 .zip(seq_repair)
-                .map(|((_, _, fetch, _), r)| (*fetch, &val_data[..], r));
+                .map(|(_, r)| (&box_fetch[..], &val_data[..], r));
             let keyed = cli.keyed && i == 0;
             let cfg = validator_config(
                 &dir,
@@ -1218,6 +1283,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 keyed,
                 None,
                 cli.two_path,
+                silence_us,
             )?;
             let mut c = command(
                 &bin_dir.join("vyrn-validator"),
@@ -1233,19 +1299,20 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .collect::<Result<_, String>>()?;
     // --dropcopy: the observer, data destination `n_val + 1`, in the box's order list too.
     let obs = match (&data_node, dc_ports.first(), obs_ctrl) {
-        (Some((_, _, fetch, _)), Some(port), Some(ctrl)) => {
+        (Some(_), Some(port), Some(ctrl)) => {
             // Its data port is `ports[n_val]`; the validators are its `[[data.peer]]`s.
             let ports: Vec<u16> = val_data.iter().copied().chain([*port]).collect();
             let cfg = validator_config(
                 &dir,
                 n_val,
-                Some((*fetch, &ports[..], seq_repair.ok_or("seq_repair")?)),
+                Some((&box_fetch[..], &ports[..], seq_repair.ok_or("seq_repair")?)),
                 &sessions,
                 cons.as_ref(),
                 cli.dev_hashlag_us,
                 false,
                 Some((&ring, ctrl)),
                 true,
+                silence_us,
             )?;
             let mut c = command(
                 &bin_dir.join("vyrn-validator"),
@@ -1344,40 +1411,119 @@ fn run(cli: &Cli) -> Result<bool, String> {
 
     let tap_h = tap(tap_sock, Arc::clone(&stop_tap));
     let stop_cl = Arc::new(AtomicBool::new(false));
-    let cl_h = client(cl_recv, Arc::clone(&stop_cl));
+    let (redir_tx, redir_rx) = channel();
+    let cl_h = client(
+        cl_recv,
+        Arc::clone(&stop_cl),
+        sessions.iter().map(|x| x.k_seq).collect(),
+        redir_tx,
+    );
     let stop_dc = Arc::new(AtomicBool::new(false));
     let dc_clients: Vec<_> = dc_addr.map_or_else(Vec::new, |addr| {
         (0..sessions.len())
             .map(|i| dropcopy::client(addr, i, Arc::clone(&stop_dc), Instant::now() + wait))
             .collect()
     });
-    let (data_idx, data_ingest, data_h) = match data_node {
-        Some((i, ingest, _, h)) => (Some(i), Some(ingest), Some(h)),
-        None => (None, None, None),
+    let (data_boxes, data_h) = match data_node {
+        Some((bs, h)) => (bs, Some(h)),
+        None => (Vec::new(), None),
     };
+    let data_idx = data_boxes.first().map(|b| b.idx);
+    let data_ingest = data_boxes.first().map(|b| b.ingest);
+    let backup = data_boxes.get(1);
 
     // R11, before any packet: validator 0 moves its K_fetch to epoch 1, then the data box and
     // the vyrn-seq box drop epoch 0, so every fetch of the run must be sealed under the
     // re-derived keys.
-    let epoch_step = match (cli.keyed, data_idx, vals.first()) {
-        (true, Some(b), Some(&v)) => Some(rotate_epoch(&mut nodes, &rx, v, &[b, seq], 1, wait)),
+    let epoch_step = match (cli.keyed, data_boxes.is_empty(), vals.first()) {
+        (true, false, Some(&v)) => {
+            let bs: Vec<usize> = data_boxes.iter().map(|b| b.idx).chain([seq]).collect();
+            Some(rotate_epoch(&mut nodes, &rx, v, &bs, 1, wait))
+        }
         _ => None,
     };
 
-    // Send, paced by send_ns.
+    // Send, paced by send_ns. R13 (--data-kill): each session's first copy 2 also goes to the
+    // backup box (07 §5.7 interim reading), the home box is killed after `kill_at` packets, and
+    // a session's first redirect from it (DR2) moves its copy 2 and resends its retained bytes
+    // from `resend_from` (DR3).
+    let kill_at = backup.map(|_| pkts.len() * 2 / 5);
+    let mut killed = None;
+    let mut moved: BTreeMap<SessionId, Redirect> = BTreeMap::new();
+    let mut redirects_heard = 0u64;
+    let mut resent = 0u64;
+    let mut first_sent = std::collections::BTreeSet::new();
+    let mut apply = |sent: &[Pkt], moved: &mut BTreeMap<SessionId, Redirect>| -> u64 {
+        let mut n = 0;
+        while let Ok(r) = redir_rx.try_recv() {
+            redirects_heard += 1;
+            let Some(b) = backup else { continue };
+            if r.down != 0 || r.to != 1 || moved.contains_key(&r.session) {
+                continue;
+            }
+            moved.insert(r.session, r);
+            for p in sent
+                .iter()
+                .filter(|p| p.session == r.session && p.pkt_seq >= r.resend_from)
+            {
+                // Paced: an unpaced burst of every retained packet overflows the backup's
+                // ingest socket on a small host (R13).
+                let _ = cl_sock.send_to(&p.bytes, b.ingest);
+                std::thread::park_timeout(Duration::from_micros(20));
+                n += 1;
+            }
+        }
+        n
+    };
     let t0 = Instant::now();
-    for p in &pkts {
+    for (k, p) in pkts.iter().enumerate() {
         let at = t0 + Duration::from_nanos(p.send_ns);
         while let Some(d) = at.checked_duration_since(Instant::now()) {
             std::thread::park_timeout(d);
         }
+        if kill_at == Some(k) {
+            if let Some(n) = data_idx.and_then(|i| nodes.0.get_mut(i)) {
+                n.child
+                    .kill()
+                    .map_err(|e| format!("kill vyrn-data-0: {e}"))?;
+            }
+            killed = Some(k);
+        }
+        resent += apply(pkts.get(..k).unwrap_or_default(), &mut moved);
         let dst = lane_addrs.get(usize::from(p.lane)).ok_or("lane address")?;
         cl_sock.send_to(&p.bytes, dst).map_err(|e| e.to_string())?;
         // Copy 2 (07 §5.1): the client sends the same bytes to the data node.
-        if let Some(d) = data_ingest {
-            cl_sock.send_to(&p.bytes, d).map_err(|e| e.to_string())?;
+        let home = match (moved.contains_key(&p.session), backup) {
+            (true, Some(b)) => Some(b.ingest),
+            _ => data_ingest,
+        };
+        if let Some(d) = home {
+            // After the kill a send to the dead box may fail; the redirect resends it.
+            let r = cl_sock.send_to(&p.bytes, d);
+            if killed.is_none() {
+                r.map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(b) = backup
+            && first_sent.insert(p.session)
+            && home != Some(b.ingest)
+        {
+            cl_sock
+                .send_to(&p.bytes, b.ingest)
+                .map_err(|e| e.to_string())?;
         }
     }
+    // R13: every session must move; keep applying redirects until it has (or the deadline).
+    let moved_wait = if backup.is_some() {
+        let until = Instant::now() + wait;
+        while moved.len() < sessions.len() && Instant::now() < until {
+            resent += apply(&pkts, &mut moved);
+            std::thread::park_timeout(Duration::from_millis(5));
+        }
+        Some(moved.len())
+    } else {
+        None
+    };
     // Let the box take the last packets before it stops; its stop closes the last block.
     let settle = Instant::now() + Duration::from_millis(300);
     while let Some(d) = settle.checked_duration_since(Instant::now()) {
@@ -1423,8 +1569,17 @@ fn run(cli: &Cli) -> Result<bool, String> {
             )
         });
     let seq_ok = nodes.stop(seq, &rx, Instant::now() + wait)?;
-    // The data node flushes its open frames on stop.
-    let data_ok = data_idx.map(|i| nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
+    // The data node flushes its open frames on stop. R13: the home box was killed, so the
+    // backup is the one checked.
+    let data_check_idx = backup.map(|b| b.idx).or(data_idx);
+    // R13: what each validator printed while the backup still ran (it is marked down after).
+    nodes.drain(&rx);
+    let before_backup_stop: Vec<usize> = vals
+        .iter()
+        .map(|&i| nodes.0.get(i).map_or(0, |n| n.lines.len()))
+        .collect();
+    let data_ok =
+        data_check_idx.map(|i| nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
     let seq_node = nodes.0.get(seq).ok_or("seq")?;
     let seq_blocks: Vec<(u64, u64, u64)> = blocks(seq_node).into_iter().map(|b| b.0).collect();
     let stats = line(seq_node, "STATS ").unwrap_or("").to_owned();
@@ -1538,7 +1693,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let mut fed_stored = 0u64;
     match &data_frames {
         Some(fs) => {
-            let mut feed = DataFeed::new(BookId(BOOK), 1, 0);
+            let n_boxes = u8::try_from(data_boxes.len()).map_err(|e| e.to_string())?;
+            let mut feed = DataFeed::new(BookId(BOOK), n_boxes, 0);
             for f in fs {
                 match feed.on_frame(&mut join, f, 0) {
                     Ok(fed) => {
@@ -1948,7 +2104,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
         }),
         _ => Report::skip("dropcopy", "off (enable with --dropcopy)"),
     }
-    match (data_idx, data_ok) {
+    match (data_check_idx, data_ok) {
         (Some(i), Some(ok)) => rep.check("data", {
             let n = nodes.0.get(i).ok_or("data node")?;
             let st = line(n, "STATS ").unwrap_or("").to_owned();
@@ -1958,7 +2114,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
             if !ok {
                 errs.push(format!("vyrn-data did not stop cleanly: {st}"));
             }
-            if stored != Some(pkts.len() as u64) {
+            // R13: the backup stores only what reached it; `replay` checks the join holds every
+            // packet.
+            if backup.is_none() && stored != Some(pkts.len() as u64) {
                 errs.push(format!("stored {stored:?} != {} packets sent", pkts.len()));
             }
             // #120: EVENT lines + events_unprinted + events_dropped = bad_mac + copy conflicts.
@@ -2014,6 +2172,77 @@ fn run(cli: &Cli) -> Result<bool, String> {
         ),
     }
 
+    // R13: the home box died; Q DataDowns, a sealed REDIRECT admitted by the backup, and every
+    // session's copy 2 moved (`replay` and `data` then pass on the backup's frames).
+    match (moved_wait, backup) {
+        (Some(n_moved), Some(b)) => rep.check("failover", {
+            let mut errs = Vec::new();
+            let mut votes = Vec::new();
+            for (&i, &upto) in vals.iter().zip(&before_backup_stop) {
+                let Some(n) = nodes.0.get(i) else { continue };
+                let live = n.lines.get(..upto).unwrap_or_default();
+                if live.iter().any(|l| l.starts_with("DATA_DOWN box=1 ")) {
+                    errs.push(format!("{}: marked the live backup down", n.name));
+                }
+                if stopped(n).is_some() {
+                    continue;
+                }
+                let dd = line(n, "DATA_DOWN box=0 ");
+                let g = |k| dd.and_then(|l| field(l, k)).and_then(|v| v.parse::<u64>().ok());
+                match (g("votes"), g("quorum")) {
+                    (Some(v), Some(q)) if v >= q => votes.push(format!("{}={v}/{q}", n.name)),
+                    _ => errs.push(format!("{}: no DATA_DOWN box=0 at quorum", n.name)),
+                }
+            }
+            // Only validator 0 holds a K_fetch (R7), so its REDIRECTs are the sealed ones.
+            let v0 = vals.first().and_then(|&i| nodes.0.get(i));
+            let v0_fo = v0.and_then(|n| line(n, "FAILOVER ")).unwrap_or("").to_owned();
+            let v0_redirects = field(&v0_fo, "redirects").and_then(|v| v.parse::<u64>().ok());
+            if !v0.is_some_and(|n| n.lines.iter().any(|l| l.starts_with("REDIRECT_SENT down=0 to=1 "))) {
+                errs.push("validator-0 sent no REDIRECT down=0 to=1".into());
+            }
+            if v0_redirects.unwrap_or(0) == 0 {
+                errs.push(format!("validator-0 FAILOVER {v0_fo}"));
+            }
+            let st = nodes
+                .0
+                .get(b.idx)
+                .and_then(|n| line(n, "STATS "))
+                .unwrap_or("")
+                .to_owned();
+            let admitted = field(&st, "redirects").and_then(|v| v.parse::<u64>().ok());
+            if admitted.unwrap_or(0) == 0 || field(&st, "redirect_unknown") != Some("0") {
+                errs.push(format!(
+                    "backup redirects={admitted:?} redirect_unknown={:?}: it must admit a sealed REDIRECT and know every session's source",
+                    field(&st, "redirect_unknown")
+                ));
+            }
+            if killed.is_none() {
+                errs.push("the home box was not killed".into());
+            }
+            if n_moved != sessions.len() {
+                errs.push(format!("{n_moved} of {} sessions moved copy 2", sessions.len()));
+            }
+            let from: Vec<String> = moved
+                .values()
+                .map(|r| format!("{:#x}@{}", r.session.0, r.resend_from))
+                .collect();
+            if errs.is_empty() {
+                Ok(format!(
+                    "home box killed after {} packets; DATA_DOWN {}; validator-0 sent {} sealed REDIRECTs, the backup admitted and sent {}; the client heard {redirects_heard}, moved {n_moved} sessions (resend_from {}) and resent {resent} packets",
+                    killed.unwrap_or(0),
+                    votes.join(" "),
+                    v0_redirects.unwrap_or(0),
+                    admitted.unwrap_or(0),
+                    from.join(" ")
+                ))
+            } else {
+                Err(errs.join("; "))
+            }
+        }),
+        _ => Report::skip("failover", "off (enable with --data-kill, R13)"),
+    }
+
     let _ = std::io::stdout().flush();
     let _ = std::fs::remove_dir_all(&dir);
     Ok(rep.0)
@@ -2057,7 +2286,8 @@ struct Cons {
 impl Cons {
     /// `ports`: `n` TCP repl ports, then the box's CTRL port (`data_ports`).
     /// `keyed` (R7): validator 0 and data box 0 get real X25519 keys, every other entry none.
-    fn new(dir: &Path, ports: &[u16], keyed: bool) -> Result<Self, String> {
+    /// `boxes` (R13): the data boxes of the home, each with its own key.
+    fn new(dir: &Path, ports: &[u16], keyed: bool, boxes: usize) -> Result<Self, String> {
         let (repl, ctrl) = ports.split_at(ports.len().saturating_sub(1));
         let n = repl.len();
         use vyrn_epoch::{Addr, DataBox, Domain, Home, Roster, SeqEntry, Voter};
@@ -2110,11 +2340,16 @@ impl Cons {
             seq,
             recovery: 0,
             data: if keyed {
-                vec![DataBox {
-                    facility: 1,
-                    addr: addr(0),
-                    xchg_key: vyrn_crypto::x25519::public_key(&BOX_XCHG).to_vec(),
-                }]
+                [BOX_XCHG, BOX1_XCHG]
+                    .iter()
+                    .take(boxes)
+                    .zip(1u8..)
+                    .map(|(x, f)| DataBox {
+                        facility: f,
+                        addr: addr(0),
+                        xchg_key: vyrn_crypto::x25519::public_key(x).to_vec(),
+                    })
+                    .collect()
             } else {
                 Vec::new()
             },

@@ -104,6 +104,11 @@ impl Sources {
         }
     }
 
+    /// The peer targets, with the keys this replica seals to them under.
+    pub fn peers(&self) -> &[Target] {
+        &self.peers
+    }
+
     /// A new epoch's keys (`EPOCH <e>`), by the same index as the targets they seal for.
     pub fn set_keys(
         &mut self,
