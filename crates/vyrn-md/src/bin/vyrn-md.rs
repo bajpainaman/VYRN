@@ -121,7 +121,7 @@ fn op(w: &[&str]) -> Result<BookOp, String> {
             side: side(2)?,
             tick: Tick(u(3)?),
             qty: Qty(u(4)?),
-            prio_ts: Nanos(u64::from(u(5)?)),
+            prio_ts: Nanos(num(w.get(5).ok_or("short line")?)?),
             via_bbo: u(6)? == 1,
             auction: u(7)? == 1,
         },
@@ -250,12 +250,18 @@ fn run(args: &Args) -> Result<(), String> {
     if let Some(addr) = args.retx {
         let l = TcpListener::bind(addr).map_err(|e| e.to_string())?;
         tracing::info!(%addr, "retransmit service");
-        for conn in l.incoming() {
-            let Ok(mut c) = conn else { continue };
-            if let Err(err) = publisher.retx.serve(&mut c) {
-                tracing::warn!(%err, "retransmit connection");
+        // One thread per connection, so a client that keeps its connection open blocks no one.
+        let store = &publisher.retx;
+        std::thread::scope(|s| {
+            for conn in l.incoming() {
+                let Ok(mut c) = conn else { continue };
+                s.spawn(move || {
+                    if let Err(err) = store.serve(&mut c) {
+                        tracing::warn!(%err, "retransmit connection");
+                    }
+                });
             }
-        }
+        });
     }
     Ok(())
 }

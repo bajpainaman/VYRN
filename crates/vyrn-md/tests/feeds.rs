@@ -147,8 +147,10 @@ fn cases() -> Vec<Case> {
                 c.param = Some(num(w[2]));
             }
             "sorder" => {
-                let now = Nanos(c.param.unwrap());
-                c.snap.as_mut().unwrap().orders.push((
+                // A reader ranks snapshot orders by wire position.
+                let orders = &mut c.snap.as_mut().unwrap().orders;
+                let now = Nanos(orders.len() as u64);
+                orders.push((
                     u32_(w[1]),
                     Order {
                         side: side(w[2]),
@@ -178,7 +180,7 @@ fn hexes(p: &[Vec<u8>]) -> Vec<String> {
 #[test]
 fn feeds_match_the_published_vectors() {
     let all = cases();
-    assert_eq!(all.len(), 18);
+    assert_eq!(all.len(), 19);
     for c in &all {
         let mut got: Vec<Vec<u8>> = vec![];
         let mut s = c.ev.iter().copied();
@@ -234,6 +236,7 @@ fn feeds_match_the_published_vectors() {
                 let mut out = vec![];
                 mbo_c_encode(&c.input, &mut out).unwrap();
                 assert_eq!(vec![hex(&out)], c.pkt, "{name}");
+                assert!(out.len() <= c.input.len(), "{name}: MBO-C longer than MBO");
                 let back = mbo_c_decode(&out).unwrap();
                 let orig = Packet::decode(&c.input).unwrap();
                 assert_eq!(back.records, orig.records, "{name}");
@@ -295,5 +298,54 @@ fn snapshot_reader_rejects_a_bad_hash() {
     assert_eq!(
         SnapReader::new(Feed::Mbo, BOOK, EPOCH).on_packet(&got[0]),
         Err(vyrn_md::SnapError::Hash)
+    );
+}
+
+/// A and B deliver the same SNAP packets interleaved: duplicates must not reset assembly.
+#[test]
+fn snapshot_reader_skips_a_b_duplicates() {
+    let snap = Snapshot {
+        as_of: StepId(5),
+        orders: (0..200u32)
+            .map(|i| {
+                (
+                    0x0100_0000 | i,
+                    Order {
+                        side: Side::Buy,
+                        tick: Tick(100),
+                        qty: Qty(1),
+                        prio_ts: Nanos(u64::from(i)),
+                    },
+                )
+            })
+            .collect(),
+        resume: vec![],
+    };
+    let mut got: Vec<Vec<u8>> = vec![];
+    SnapEncoder::new(Feed::Mbo, BOOK, EPOCH).publish(&snap, Nanos(1), &mut got);
+    assert!(got.len() >= 3);
+    let mut r = SnapReader::new(Feed::Mbo, BOOK, EPOCH);
+    let mut read = None;
+    for p in &got {
+        for _ in 0..2 {
+            read = r.on_packet(p).unwrap().or(read);
+        }
+    }
+    assert_eq!(read, Some(snap));
+}
+
+#[test]
+fn mbo_c_rejects_an_overflowing_delta() {
+    let mut b = unhex("000207000300010000000000000000000000000000000000000000000000000000");
+    b.truncate(32);
+    b[2] = 1; // count 1
+    // MD_REDUCE, flags 0, then zz(oid delta) = u64::MAX (10-byte varint).
+    b.extend_from_slice(&[0x03, 0x00]);
+    b.extend_from_slice(&[0xFF; 9]);
+    b.push(0x01);
+    b.extend_from_slice(&[0, 0]);
+    assert_eq!(
+        mbo_c_decode(&b).map(|_| ()),
+        Err(vyrn_md::MboCError::Overflow)
     );
 }

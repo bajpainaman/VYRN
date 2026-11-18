@@ -11,8 +11,11 @@
 //!   last `MD_SNAP_RESUME`, inclusive.
 //! - Packets: header `step_base` = `as_of`, `ts_base` = the publish time; each snapshot closes
 //!   its last packet, so the next starts a new one.
-//! - A reader gives every order `prio_ts = ts_base` of its packet: the level-FIFO order is the
-//!   priority, not the timestamps.
+//! - A reader gives the `i`-th order of the snapshot `prio_ts = i`: the level-FIFO order is the
+//!   priority, and this rank keeps it through a rebuilt book and the next snapshot. Every
+//!   snapshot order then ranks ahead of any later add (whose `prio_ts` is a real time); 10 §7.6
+//!   puts no timestamps on the wire, so a later step residual with an older priority cannot be
+//!   placed among them.
 
 use vyrn_types::{BookId, Epoch, Nanos};
 
@@ -142,8 +145,12 @@ impl SnapReader {
         if h.channel != self.channel || h.book != self.book || h.epoch16 != self.epoch16 {
             return Err(SnapError::WrongChannel);
         }
-        if self.next_seq.is_some_and(|s| s != h.seq) {
-            self.cur = None;
+        match self.next_seq {
+            // A duplicate (the other of A and B): already taken.
+            Some(next) if h.seq < next => return Ok(None),
+            // A gap: the snapshot in progress lost a packet.
+            Some(next) if h.seq > next => self.cur = None,
+            _ => {}
         }
         self.next_seq = Some(h.seq + 1);
         let mut done = None;
@@ -184,7 +191,7 @@ impl SnapReader {
                     Some(c),
                 ) if c.snap.resume.is_empty() => {
                     c.body.extend_from_slice(&r.encode());
-                    let prio_ts = h.ts_base;
+                    let prio_ts = Nanos(c.snap.orders.len() as u64);
                     c.snap.orders.push((
                         oid,
                         Order {

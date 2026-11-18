@@ -9,8 +9,11 @@
 //! not sent yet, are left out; the reader sees which seqs came from their headers. The server
 //! answers every request on a connection until the client closes it.
 //!
-//! Age is order-stream time: a packet is dropped once the newest stored `ts_base` of its
-//! channel is `MD_RETX_SECS` past its own, so A and B hold the same packets.
+//! Age is order-stream time, so A and B hold the same packets. A packet is stamped with the
+//! highest `ts_base` stored so far (any channel), not its own: a packet's `ts_base` can be an old
+//! priority time (a residual or an `MBO-W` synthetic add), but it was published no earlier than
+//! every packet before it. A packet is held while the newest stamp is at most `retain_ns` past
+//! its own.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -73,7 +76,9 @@ type Key = (u16, u16, u16);
 /// encoders emit.
 pub struct RetxStore {
     retain_ns: u64,
-    /// By (channel code, book, epoch16): (seq, ts_base, bytes), seq ascending.
+    /// The highest `ts_base` stored.
+    now: u64,
+    /// By (channel code, book, epoch16): (seq, stamp, bytes), seq ascending.
     chans: BTreeMap<Key, VecDeque<(u64, u64, Vec<u8>)>>,
 }
 
@@ -81,6 +86,7 @@ impl RetxStore {
     pub fn new(retain_ns: u64) -> Self {
         RetxStore {
             retain_ns,
+            now: 0,
             chans: BTreeMap::new(),
         }
     }
@@ -99,7 +105,8 @@ impl RetxStore {
         if q.back().is_some_and(|b| b.0 >= h.seq) {
             return;
         }
-        let now = h.ts_base.0;
+        self.now = self.now.max(h.ts_base.0);
+        let now = self.now;
         q.push_back((h.seq, now, bytes.to_vec()));
         while q
             .front()
@@ -115,7 +122,9 @@ impl RetxStore {
             .get(&(r.channel.code(), r.book.0, r.epoch16))
             .into_iter()
             .flatten()
-            .filter(move |p| p.0 >= r.from_seq && p.0 <= r.to_seq)
+            .filter(move |p| {
+                p.0 >= r.from_seq && p.0 <= r.to_seq && self.now - p.1 <= self.retain_ns
+            })
             .map(|p| p.2.as_slice())
     }
 

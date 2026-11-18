@@ -454,6 +454,7 @@ def mboc(pkt):
     for i in range(count):
         r = pkt[32 + 16 * i: 48 + 16 * i]
         t = r[0]
+        start = len(out)
         out += r[:2]
         if t in (0x01, 0x02, 0x03, 0x11):
             x16, oid, tick, qty = struct.unpack("<HIII", r[2:])
@@ -474,6 +475,9 @@ def mboc(pkt):
             out += var(low) + var(step)
         else:
             raise ValueError(t)
+        if len(out) - start > 16:  # escape: the raw record, type | 0x80
+            del out[start:]
+            out += bytes([0x80 | t]) + r[1:]
     return bytes(out)
 
 
@@ -489,6 +493,9 @@ def mboc_inputs(mbo_vectors):
         struct.pack("<BBHIII", 0x01, 5, 65535, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF),
     ]
     pkts.append(header(1, 4, len(recs), 9, 5000, 3) + b"".join(recs))
+    worst = [struct.pack("<BBHIII", 0x01, i & 1, 65535, 0xFFFFFFFF * (i & 1), 0xFFFFFFFF * (i & 1),
+                         0xFFFFFFFF) for i in range(88)]
+    pkts.append(header(1, 0, len(worst), 4, 7000, 2) + b"".join(worst))
     lane = [struct.pack("<B7xQ", 0x0E, 300), struct.pack("<BBHIII", 0x02, 9, 0, 0x01000007, 50, 4)]
     pkts.append(header(1, 3, len(lane), 2, 6000, 299) + b"".join(lane))
     return pkts

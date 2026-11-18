@@ -22,6 +22,11 @@
 //! | `MD_STATUS` | `epoch`, `step` |
 //! | `MD_ATTEST` | `height low`, `last step` |
 //!
+//! **Escape.** A record whose varint form is longer than 16 bytes is sent raw instead: type byte
+//! `0x80 | type`, then bytes 1–15 of its 16-byte form. A raw keyed record still sets `prev_oid`
+//! and `prev_tick`. So no `MBO-C` record is longer than its `MBO` record, and an `MBO-C` packet
+//! fits wherever its `MBO` packet does (the two share packet boundaries). \[Guessing\]
+//!
 //! 10 §7.5 says `tick − touch`. A packet cannot carry the touch (lane channels are read in merge
 //! order, so a reader does not know it when it decodes), so `prev_tick` stands in for it.
 //! \[Guessing\] The flag byte is not in 10 §7.5's list but no record decodes without it.
@@ -162,7 +167,13 @@ pub fn mbo_c_encode(mbo: &[u8], out: &mut Vec<u8>) -> Result<(), MboCError> {
     let mut prev = (0, 0);
     for (i, b) in body.as_chunks::<REC_BYTES>().0.iter().enumerate() {
         let r = Record::decode(b).map_err(|e| MboCError::Packet(PacketError::Record(i, e)))?;
+        let start = out.len();
         encode_record(b, &r, &mut prev, out)?;
+        if out.len() - start > REC_BYTES {
+            out.truncate(start);
+            out.push(0x80 | b[0]);
+            out.extend_from_slice(&b[1..]);
+        }
     }
     Ok(())
 }
@@ -174,6 +185,15 @@ struct Reader<'a> {
 impl Reader<'_> {
     fn byte(&mut self) -> Result<u8, MboCError> {
         let (&x, rest) = self.b.split_first().ok_or(MboCError::Truncated)?;
+        self.b = rest;
+        Ok(x)
+    }
+
+    fn take(&mut self, n: usize) -> Result<&[u8], MboCError> {
+        if self.b.len() < n {
+            return Err(MboCError::Truncated);
+        }
+        let (x, rest) = self.b.split_at(n);
         self.b = rest;
         Ok(x)
     }
@@ -201,7 +221,10 @@ impl Reader<'_> {
     /// `zz(x − base)` back to `x`.
     fn keyed(&mut self, base: u32) -> Result<u32, MboCError> {
         let d = unzz(self.var()?);
-        u32::try_from(i64::from(base) + d).map_err(|_| MboCError::Overflow)
+        i64::from(base)
+            .checked_add(d)
+            .and_then(|x| u32::try_from(x).ok())
+            .ok_or(MboCError::Overflow)
     }
 }
 
@@ -225,6 +248,27 @@ pub fn mbo_c_decode(bytes: &[u8]) -> Result<Packet, MboCError> {
     for n in 0..count {
         let mut b = [0u8; REC_BYTES];
         b[0] = r.byte()?;
+        if b[0] & 0x80 != 0 {
+            b[0] &= 0x7F;
+            b[1..].copy_from_slice(r.take(REC_BYTES - 1)?);
+            let rec = Record::decode(&b).map_err(|_| MboCError::Record(n))?;
+            match rec {
+                Record::Add { oid, tick, .. }
+                | Record::Delete { oid, tick, .. }
+                | Record::Reduce { oid, tick, .. }
+                | Record::Exec {
+                    maker: oid, tick, ..
+                } => prev = (oid, tick.0),
+                Record::Sync { .. }
+                | Record::Step { .. }
+                | Record::Bust { .. }
+                | Record::Status { .. }
+                | Record::Attest { .. } => {}
+                _ => return Err(MboCError::NotMbo),
+            }
+            records.push(rec);
+            continue;
+        }
         b[1] = r.byte()?;
         let put = |b: &mut [u8; REC_BYTES], at: usize, v: &[u8]| {
             b[at..at + v.len()].copy_from_slice(v);

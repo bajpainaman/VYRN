@@ -622,7 +622,7 @@ fn retransmit_serves_a_range_over_tcp() {
     };
     // The store holds the packets whose ts_base is within 30 µs of the newest one.
     let ts = |p: &[u8]| u64::from_le_bytes(p[16..24].try_into().unwrap());
-    let newest = ts(lane0[lane0.len() - 1]);
+    let newest = out.iter().map(|p| ts(p)).max().unwrap();
     let held: Vec<&Vec<u8>> = lane0
         .iter()
         .copied()
@@ -635,4 +635,45 @@ fn retransmit_serves_a_range_over_tcp() {
     assert_eq!(retx_fetch(&mut c, &req(n, n)).unwrap().len(), 1);
     drop(c);
     server.join().unwrap();
+}
+
+/// A packet whose ts_base is an old priority time was still just published: it is held.
+#[test]
+fn retransmit_ages_by_publication_not_ts_base() {
+    use vyrn_md::{Channel, Feed, Header, RetxRequest, RetxStore};
+    let pkt = |seq, ts| {
+        Packet {
+            header: Header {
+                channel: Channel {
+                    feed: Feed::MboW,
+                    index: 0,
+                },
+                count: 0,
+                book: BOOK,
+                epoch16: EPOCH.low16(),
+                seq,
+                ts_base: Nanos(ts),
+                step_base: 0,
+            },
+            records: vec![],
+        }
+        .encode()
+    };
+    let mut store = RetxStore::new(30_000);
+    store.store(&pkt(1, 100_000));
+    store.store(&pkt(2, 10)); // a synthetic add with a 100 µs old priority
+    store.store(&pkt(3, 100_001));
+    let req = RetxRequest {
+        channel: Channel {
+            feed: Feed::MboW,
+            index: 0,
+        },
+        book: BOOK,
+        epoch16: EPOCH.low16(),
+        from_seq: 1,
+        to_seq: 3,
+    };
+    assert_eq!(store.range(&req).count(), 3);
+    store.store(&pkt(4, 140_000));
+    assert_eq!(store.range(&req).count(), 0);
 }
