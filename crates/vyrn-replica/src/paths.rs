@@ -132,8 +132,9 @@ fn due(
 #[derive(Debug)]
 struct Sub {
     next: u64,
-    /// Each held frame's bytes and receive time.
-    hold: BTreeMap<u64, (Vec<u8>, u64)>,
+    /// Each held frame's bytes, receive time, and whether that time is in `Paths::held_at`
+    /// (not once its gap's repair gave up).
+    hold: BTreeMap<u64, (Vec<u8>, u64, bool)>,
     both: u64,
     /// Paths each frame above `both` arrived on (bit A = 1, B = 2), and the bytes of its first
     /// copy, which is the one handed on: another copy counts for its path only if it is the
@@ -189,6 +190,16 @@ pub struct Paths {
     /// Copies whose bytes (`flags` aside) differ from the first copy of their frame, per path.
     /// They count for no path, so a block that needs them stays held.
     pub mismatched: [u64; 2],
+}
+
+/// Takes one frame received at `t` out of `held_at`.
+fn uncount(held_at: &mut BTreeMap<u64, u32>, t: u64) {
+    if let Some(c) = held_at.get_mut(&t) {
+        *c = c.saturating_sub(1);
+        if *c == 0 {
+            held_at.remove(&t);
+        }
+    }
 }
 
 /// Whether two copies are the same frame: equal bytes except `flags`.
@@ -284,21 +295,21 @@ impl Paths {
             }
         } else if q > s.next {
             if s.hold.len() < HOLD_MAX {
-                s.hold.insert(q, (frame.to_vec(), at));
-                let c = self.held_at.entry(at).or_default();
-                *c = c.saturating_add(1);
+                let counted = !s.gap.is_some_and(|g| g.done);
+                s.hold.insert(q, (frame.to_vec(), at, counted));
+                if counted {
+                    let c = self.held_at.entry(at).or_default();
+                    *c = c.saturating_add(1);
+                }
             }
         } else {
             s.next = s.next.saturating_add(1);
             let mut run = Vec::new();
-            while let Some(f) = s.hold.remove(&s.next) {
-                if let Some(c) = self.held_at.get_mut(&f.1) {
-                    *c = c.saturating_sub(1);
-                    if *c == 0 {
-                        self.held_at.remove(&f.1);
-                    }
+            while let Some((f, t, counted)) = s.hold.remove(&s.next) {
+                if counted {
+                    uncount(&mut self.held_at, t);
                 }
-                run.push(f);
+                run.push((f, t));
                 s.next = s.next.saturating_add(1);
             }
             // Each frame's time is the earliest of its own and those after it in the run.
@@ -342,12 +353,20 @@ impl Paths {
                 (s.next, to)
             });
             match due(&mut s.gap, want, now, r) {
-                Some((from, to, true)) => out.push(Ask::Gap {
-                    path: None,
-                    key,
-                    from,
-                    to,
-                }),
+                Some((from, to, true)) => {
+                    // Repair gave up: the held frames no longer hold back the deadlines
+                    // (`held_min`), or a record on another substream could wait forever.
+                    for h in s.hold.values_mut().filter(|h| h.2) {
+                        h.2 = false;
+                        uncount(&mut self.held_at, h.1);
+                    }
+                    out.push(Ask::Gap {
+                        path: None,
+                        key,
+                        from,
+                        to,
+                    });
+                }
                 Some((from, to, false)) => {
                     for &path in paths {
                         out.push(Ask::Nack {
@@ -630,7 +649,17 @@ mod tests {
             from: 2,
             to: 3,
         };
+        assert_eq!(
+            p.held_min(),
+            0,
+            "4 holds the deadlines back while repair runs"
+        );
         assert_eq!(asks(&mut p, 210, false), vec![gap]);
+        // Codex #213: a given-up gap no longer holds the deadlines back, nor does a frame
+        // held behind it later.
+        assert_eq!(p.held_min(), u64::MAX);
+        p.rx(Path::A, &frame(0, 5), &mut d);
+        assert_eq!(p.held_min(), u64::MAX);
         assert!(asks(&mut p, 999, false).is_empty(), "reported once");
         // A one-path box asks on A only, and a filled hole asks for nothing.
         let mut q = Paths::new(BookId(1), 0, 1).one_path();

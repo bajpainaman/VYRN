@@ -1513,7 +1513,9 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             let hm = paths.as_ref().map_or(u64::MAX, Paths::held_min);
             let mut on = |payload: &[u8], at: u64| {
                 delivered += 1;
-                let r = core.on_frame_at(payload, at, at.min(hm));
+                // A frame past `cap` that the full carry let through still keeps the deadlines at
+                // `cap`, as its path's unread frames may hold a timely HashRun.
+                let r = core.on_frame_at(payload, at, at.min(hm).min(cap));
                 if track
                     && !matches!(r, Err(FrameErr::OutOfOrder))
                     && let Some((key, q)) = vyrn_replica::paths::frame_key(payload)
@@ -1564,7 +1566,10 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         // queue is doing.
         if delivered == 0 {
             let hm = paths.as_ref().map_or(u64::MAX, Paths::held_min);
-            let r = core.tick(now().min(hm).min(carry.first().map_or(u64::MAX, |c| c.0)));
+            // A full burst's unread frames came no later than its last one read (`cap`), even
+            // when the frames read were all duplicates and nothing was delivered.
+            let carried = carry.first().map_or(u64::MAX, |c| c.0);
+            let r = core.tick(now().min(hm).min(carried).min(cap));
             report(
                 &mut core,
                 r,

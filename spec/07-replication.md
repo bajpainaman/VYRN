@@ -368,8 +368,9 @@ received after its last frame read wait for the next poll (each keeps its own ti
 path's unread frames came before them. A frame that fills a gap (§4.9) counts as received no
 later than the earliest frame held behind it, and each held frame keeps its own time. The
 deadlines run at most up to the oldest frame still held behind a gap or waiting for the next
-poll, so a timely HashRun among them is not counted late; a HashRun is still checked against its
-own lane at its own receive time. The observer's 200 ms stays until
+poll, and while a burst is full, up to its last frame read, so a timely HashRun among them is not
+counted late; a HashRun is still checked against its own lane at its own receive time. Frames
+held behind a gap whose repair gave up no longer hold the deadlines back. The observer's 200 ms stays until
 loaded DEV runs show it within the voters' bound. A stuck HashRun still fails the observer.
 \[DEV only\]
 
