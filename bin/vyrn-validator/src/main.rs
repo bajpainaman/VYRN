@@ -1531,9 +1531,12 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                         let join = data
                             .as_mut()
                             .map(|d| &*DataRx::<N, D>::join(&mut d.join, &mut d.replay));
+                        // A fault means the decoder took bytes the order core rejected: they are
+                        // no candidate (Codex r4618629082).
                         let s = core
-                            .tail()
-                            .ok_or_else(|| "no ready block".to_string())
+                            .fault()
+                            .map_or(Ok(()), |x| Err(format!("fault at height {}", x.height.0)))
+                            .and_then(|()| core.tail().ok_or_else(|| "no ready block".to_string()))
                             .and_then(|t| depose::seal(&t, &p, next, 0, star, join));
                         match s {
                             Ok(s) => {
@@ -1563,20 +1566,6 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                     d.finals();
                 }
                 std::thread::park_timeout(IDLE);
-                continue;
-            }
-            if let Some((m, real)) = last_frame
-                && now().saturating_sub(m) >= f.silence_ns
-                && let Some(t) = core.tail()
-            {
-                println!(
-                    "SUSPECT height={} f_a={} f_b={}",
-                    t.height.0,
-                    t.subs.first().map_or(0, |s| s.last),
-                    t.subs.get(1).map_or(0, |s| s.last)
-                );
-                f.shared.freeze(depose::report(&t, f.epoch, 0, f.me, real));
-                f.reported = true;
                 continue;
             }
         }
@@ -1704,6 +1693,24 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         }
         if delivered > 0 {
             last_frame = Some((now(), realtime_ns()));
+        }
+        // 07 §9.1, judged only after a poll that found the ORDER queues empty: a thread that
+        // was descheduled first reads what arrived meanwhile (Codex r4618629093).
+        if let Some(f) = fo.as_mut()
+            && k == 0
+            && carry.is_empty()
+            && let Some((m, real)) = last_frame
+            && now().saturating_sub(m) >= f.silence_ns
+            && let Some(t) = core.tail()
+        {
+            println!(
+                "SUSPECT height={} f_a={} f_b={}",
+                t.height.0,
+                t.subs.first().map_or(0, |s| s.last),
+                t.subs.get(1).map_or(0, |s| s.last)
+            );
+            f.shared.freeze(depose::report(&t, f.epoch, 0, f.me, real));
+            f.reported = true;
         }
         // The final height first: payloads polled below are stamped with it on arrival, and a
         // stale one would expire them early (07 §5.4 retention).

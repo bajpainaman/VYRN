@@ -198,6 +198,10 @@ impl BlockSource for Source {
     /// and item 4's unavailable list is its own. Any other seal is no candidate here.
     fn check_seal(&self, _: Epoch, seal: &Seal) -> Verdict {
         match self.held() {
+            // Heights this voter already rejected stay rejected (Codex r4618629082).
+            Some(h) if h.invalid_from.is_some_and(|f| seal.header.height.0 >= f) => {
+                Verdict::Invalid
+            }
             Some(h) if h.seal.as_ref() == Some(seal) => Verdict::Valid,
             _ => Verdict::Pending,
         }
@@ -659,4 +663,45 @@ pub fn run(
         engine.abort();
         Ok::<(), String>(())
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod seal_tests {
+    use super::*;
+    use vyrn_consensus::SealExt;
+    use vyrn_types::{BookId, StepId};
+
+    /// Codex r4618629082: once the order core rejected a height, this voter's own seal
+    /// candidate covering it is no longer valid, though it equals the held candidate.
+    #[test]
+    fn a_seal_over_a_rejected_height_is_invalid() {
+        let header = BlockHeader {
+            height: Height(6),
+            epoch: Epoch(0),
+            book: BookId(7),
+            first_step: StepId(8),
+            last_step: StepId(9),
+            prev: Hash([1; 32]),
+            order_root: Hash([2; 32]),
+            data_root: Hash([3; 32]),
+            seq_sig: [0; 64],
+        };
+        let seal = Seal {
+            header,
+            ext: SealExt {
+                end_frame_seq: [12, 0],
+                next_seq: 0xFF,
+                next_tenure: 1,
+                unavail: Vec::new(),
+            },
+        };
+        let s = Source::new();
+        s.set_seal(seal.clone());
+        assert_eq!(s.check_seal(Epoch(0), &seal), Verdict::Valid);
+        s.invalid_from(Height(7));
+        assert_eq!(s.check_seal(Epoch(0), &seal), Verdict::Valid);
+        s.invalid_from(Height(6));
+        assert_eq!(s.check_seal(Epoch(0), &seal), Verdict::Invalid);
+    }
 }
