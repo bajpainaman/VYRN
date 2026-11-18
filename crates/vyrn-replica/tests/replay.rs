@@ -271,7 +271,12 @@ fn lane_pkts(j: &Journal, l: u8) -> Vec<vyrn_types::PacketRecord> {
 /// The live run, framed and decoded by the order core into blocks (a block closes after each
 /// record index in `cuts`).
 fn blocks(cuts: &[usize]) -> (Journal, Store, Vec<BlockInputs<N>>) {
-    let (live_j, store) = live07(&script());
+    blocks_of(&script(), cuts)
+}
+
+/// [`blocks`] of any script.
+fn blocks_of(script: &[Act], cuts: &[usize]) -> (Journal, Store, Vec<BlockInputs<N>>) {
+    let (live_j, store) = live07(script);
     let key = vyrn_crypto::ed25519::public_key(&SEED);
     let layout = Layout::new(N as u8, 1, 0).unwrap();
     let mut core = OrderCore::<N, _>::new(layout, View(key)).unwrap();
@@ -719,6 +724,70 @@ fn the_vx_client_matches_rust_replay_split_anywhere() {
     let (j, _) = live07(&script());
     for at in 0..j.recs.len() - 1 {
         let (live_j, store, blocks) = blocks(&[at]);
+        let (_, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
+        let vx =
+            vx_replay(&store, &blocks, &lib).unwrap_or_else(|e| panic!("split after {at}: {e}"));
+        let h: Vec<Hash> = vx.iter().map(|x| x.2).collect();
+        assert_eq!(h, rust_hashes, "split after {at}");
+    }
+}
+
+/// A script where the price band binds on a stale bound (11 §5.3 band reference): a buy
+/// empties the last ask at 105, and before any later step observes the bounds a buy at 300 is
+/// checked against the published ask. Rust's `Bbo::finish` keeps the conservative bound (ask
+/// 105, edge 210), so that buy is a `BAD_TICK` reject on both engines.
+fn band_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let p = |l, a, rx_ts, now, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts,
+        now,
+        msgs,
+    };
+    vec![
+        p(0, 1, 1_000, 1_000, vec![new(Sell, Day, 105, 1, 1)]),
+        Act::Run,
+        p(1, 1, 2_000, 2_000, vec![new(Buy, Day, 105, 1, 2)]),
+        Act::Step(None),
+        // The buyer applies its fill (an Advance at step 3), then sends a buy far above 105.
+        Act::Poll,
+        p(1, 2, 3_000, 3_000, vec![new(Buy, Day, 300, 1, 3)]),
+        Act::Run,
+    ]
+}
+
+#[test]
+fn the_vx_client_matches_rust_replay_when_the_band_binds() {
+    let (live_j, store, blocks) = blocks_of(&band_script(), &[]);
+    let (rep, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    // The case is reached: a BAD_TICK reject against the stale ask.
+    let bad_tick = live_j.resp.iter().any(|(_, p)| {
+        p.records().iter().any(|r| {
+            matches!(
+                r,
+                vyrn_bbo::Record::Reject {
+                    reason: vyrn_types::RejectReason::BadTick,
+                    ..
+                }
+            )
+        })
+    });
+    assert!(bad_tick, "{:#?}", live_j.resp);
+    let Some(lib) = vx_lib() else { return };
+    let vx = vx_replay(&store, &blocks, &lib).unwrap();
+    let (lanes, tx) = live_bytes(&live_j);
+    for l in 0..N {
+        assert_eq!(vx[0].0[l], lanes[l], "lane {l} responses");
+    }
+    assert_eq!(vx[0].1, tx, "fill TX packets");
+    assert_eq!(vec![vx[0].2], rust_hashes);
+    // The same at every block boundary.
+    let (j, _) = live07(&band_script());
+    for at in 0..j.recs.len() - 1 {
+        let (live_j, store, blocks) = blocks_of(&band_script(), &[at]);
         let (_, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
         let vx =
             vx_replay(&store, &blocks, &lib).unwrap_or_else(|e| panic!("split after {at}: {e}"));

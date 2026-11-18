@@ -989,13 +989,20 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   dependencies, Rescan, Control, Seal, Uncross, step payloads, snapshot and state bytes) stops
   with `PBV_E_UNSUPPORTED` rather than guess, so a v1 Vx validator halts on it instead of
   diverging silently.
-- *Band reference.* A lane call checks the price band against the best bid and ask after the
-  latest step its records' `fills_applied` name (the step history the BBO replayer publishes).
-  **Known divergence (open):** Rust's `Bbo::finish` publishes the conservative bounds that
-  `band_env` and `touch` keep, not the exact best prices, so once a band binds (for example
-  after a fill empties the last ask) the Vx client can accept an order `RustReplay` rejects. The
-  M3 script never reaches that case; v1 is not safe on a workload where the band can bind
-  until the client keeps the same bounds.
+- *Band reference.* A lane call checks the price band against the snapshot published after
+  the latest step its records' `fills_applied` name. The snapshot is Rust's `Bbo` bounds, not
+  the exact book: before each step `band_env` widens (B, A) to the envelope of the snapshot
+  versions the cut's ops may hold, `touch`, a resting taker and an Idle/Depletion observation
+  move them, and `finish` publishes them as a new version when they change. The client keeps
+  the same bounds, version history and per-lane lowest versions (the BBO reads each lane's
+  applied seq and snapshot version once the lane has replayed every call due before the step,
+  as Rust's cut cores publish them), so a stale bound after a fill empties the last ask rejects
+  as in `RustReplay` (`tests/replay.rs`, band test).
+  **Open (05/07):** replay classifies a call against the snapshot after its `fills_applied`
+  step, but a live lane can read a newer snapshot without taking a boundary, and
+  `PacketRecord` does not log which. With a binding band, `RustReplay` then diverges from the
+  live run (both engines agree with each other). Logging the snapshot version, or reading the
+  snapshot only at boundaries, needs a 05/07 ruling.
 - *Threads.* `VxReplay` creates the `n + 1` threads (W-04) but does not pin them yet: pinning
   comes with the core map (§10.1), and tests run unpinned. W-03 calls libc `sched_yield`, not
   `vyrn_vx_spin`, because vxc cannot declare a host symbol (W-18 in `vx/FRICTION.md`).
