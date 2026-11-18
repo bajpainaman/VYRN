@@ -39,14 +39,14 @@
 //! **Errors.** Every encoder error is returned and poisons the writer (the encoder fails
 //! closed, [`StreamEncoder::encode`]); the sequencer fail-stops on it.
 
-use vyrn_types::{AcctTake, RouteRecord, SessionId, StepId, StepKind};
+use vyrn_types::{AcctTake, Nanos, RouteRecord, SessionId, StepId, StepKind};
 use vyrn_types::{BlockHeader, Hash, LaneId, LaneSeq, PacketFlags, PacketRecord, PktHash};
 
 use crate::block::sign_header;
 use crate::frame::FRAME_HEADER_BYTES;
 use crate::{
-    BlockAssembler, BlockMark, Body, Home, Ident, LaneRec, Layout, RepErr, Section, SessionBind,
-    StepHalf, StreamEncoder, TenureStart,
+    BlockAssembler, BlockMark, Body, Heartbeat, Home, Ident, LaneRec, Layout, RepErr, Section,
+    SessionBind, StepHalf, StreamEncoder, TenureStart,
 };
 
 /// The longest canonical LEB128 of a u64.
@@ -399,6 +399,27 @@ impl SeqWriter {
         let h = sign_header(&h, &self.seed);
         out.push(self.encode(&Body::Header(h))?);
         Ok((out, h))
+    }
+
+    /// One HEARTBEAT frame (07 §9.1: a voter suspects the sequencer after `FAILOVER_SILENCE_MS`
+    /// with no frame of the tenure). It takes the next `frame_seq` and leaves pending records
+    /// unframed. `None` before frame 1, which must open with the `TenureStart`.
+    pub fn heartbeat(&mut self, ptp_now: Nanos) -> Result<Option<Vec<u8>>, RepErr> {
+        if self.tenure.is_some() {
+            return Ok(None);
+        }
+        let hb = Heartbeat {
+            last_step: self.framed_step,
+            last_height: vyrn_types::Height(self.enc.state().next_height().0.saturating_sub(1)),
+            ptp_now,
+        };
+        self.encode(&Body::Heartbeat(hb)).map(Some)
+    }
+
+    /// The open block's ORDER section bytes framed so far (07 §9.4: a seal's `order_root` is over
+    /// them after the last `BlockMark`).
+    pub fn open_order_bytes(&self) -> &[u8] {
+        self.enc.state().open_bytes()
     }
 
     /// The height the next [`close_block`](Self::close_block) closes.

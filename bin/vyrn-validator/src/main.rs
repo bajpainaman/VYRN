@@ -23,6 +23,7 @@
 //! | `[replay] tick_min, tick_max, win_center, slot_cap, hashlag_us, [[replay.session]] lane, slot, account, k_seq, quote, base` | optional, needs `[data]`: replay of every block that passes item 3 on `vyrn-engine` (`replay.rs`), built from the sequencer's `[engine]` and `[[dev_session]]` (no state snapshot encoding yet). `hashlag_us` (DEV only, default 1000 = the spec's 1 ms, 07 §3.7) is the `REP_E_HASHLAG` bound, for unpinned DEV hosts |
 //! | `[repair] nack, hole_wait_us, retry_us, tries, order_as, order_b_as` | optional: sequencer retransmit (07 §4.10). Holes are Nacked to `nack`, the box's `[consensus] ctrl`, after `hole_wait_us` (5), again every `retry_us` (50), and given up after `tries` (8) or a `NackTooOld`, printing `ORDER_GAP tenure= stream= from= to= path=`. Other timers are DEV only. `order_as`/`order_b_as`: the port the box has for this replica when a relay stands in front of it. Prints `REPAIR nacks= gaps= too_old=` at exit |
 //! | `[consensus] roster, roster_hash, genesis_hash, home, seq_order, observers, delta_ms, storage` | optional: the Simplex voter (`consensus.rs`); `storage` (the Simplex journal's directory, kept across restarts) is required for a voter, and an empty journal for the epoch starts only with `--fresh`, a flag and not a config key (07 §6.3 Journal, prints `FRESH_JOURNAL epoch= voter=`); committee and peers from the roster file (08 §9.6), checked against `roster_hash`; `membership.seq_keys[0]` must be the roster's primary `seq_key` |
+//! | `[failover] silence_us = 2000, abort_us = 5000` | optional, a voter with `[consensus]`: the voter's side of sequencer failover (07 §9.1–9.4, `depose.rs`), with no standby promotion yet; other values are DEV only. Prints `SUSPECT`, `SILENCE_SENT`, `DEPOSED`, `PREFIX`, `SEAL` or `NO_SEAL`, `UNFROZEN`, and `DEPOSED_DROPS frames=` at exit |
 //!
 //! **Start sequence** (11 §10.1): load and check config → resolve keys → build the order core
 //! (`vyrn_replica::OrderCore`) over the config's `EpochView` → open the NIC queues → start the
@@ -101,6 +102,7 @@ use vyrn_replica::{
 };
 
 mod consensus;
+mod depose;
 mod failover;
 mod fetch;
 mod replay;
@@ -154,6 +156,9 @@ struct Config {
     replay: Option<replay::Section>,
     #[serde(default)]
     repair: Option<RepairCfg>,
+    /// Sequencer failover, the voter's side (07 §9.1–9.4, `depose.rs`).
+    #[serde(default)]
+    failover: Option<depose::Section>,
 }
 
 /// `[repair]` (module docs): sequencer retransmit (07 §4.10).
@@ -363,6 +368,20 @@ impl Config {
                 return bad(
                     "repair.hole_wait_us/retry_us",
                     "other than 5 and 50 (07 §4.9) are DEV only: set dev = true",
+                );
+            }
+        }
+        if let Some(f) = &c.failover {
+            if c.observer() || c.consensus.is_none() {
+                return bad("failover", "needs a voter with [consensus]");
+            }
+            if f.silence_us == 0 || f.abort_us == 0 {
+                return bad("failover", "silence_us and abort_us must be at least 1");
+            }
+            if !c.dev && (f.silence_us != depose::d_silence() || f.abort_us != depose::d_abort()) {
+                return bad(
+                    "failover.silence_us/abort_us",
+                    "other than 2000 and 5000 (07 §9.1) are DEV only: set dev = true",
                 );
             }
         }
@@ -657,6 +676,21 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
     };
     let stats = Arc::new(Stats::default());
     let stop = Arc::new(AtomicBool::new(false));
+    let fo_shared = depose::Shared::default();
+    let fo_order = match (&cfg.failover, &plan) {
+        (Some(f), Some(p)) => Some(depose::OrderSide {
+            shared: fo_shared.clone(),
+            silence_ns: f.silence_us.saturating_mul(1000),
+            epoch: view_epoch,
+            me: u8::try_from(p.me).unwrap_or(u8::MAX),
+            was_frozen: false,
+            reported: false,
+            sealed: false,
+            dropped: 0,
+        }),
+        _ => None,
+    };
+    let fo_voter = cfg.failover.map(|f| (f, fo_shared.clone()));
     let order = {
         let (stats, stop, source) = (Arc::clone(&stats), Arc::clone(&stop), source.clone());
         let gate = cfg.observer();
@@ -692,6 +726,7 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                     &source,
                     &stop,
                     &stats,
+                    fo_order,
                 )
             })
             .map_err(|e| e.to_string())?
@@ -725,7 +760,7 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                         // However the voter ends, an error or a panic included, the order
                         // thread stops too, so main joins both and reports the failure.
                         let _stop = StopOnDrop(&stop);
-                        consensus::run(plan, source, &stop)
+                        consensus::run(plan, source, &stop, fo_voter)
                     })
                     .map_err(|e| e.to_string())?,
             )
@@ -1430,8 +1465,11 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     source: &consensus::Source,
     stop: &AtomicBool,
     stats: &Stats,
+    mut fo: Option<depose::OrderSide>,
 ) -> Option<Evictions> {
     let mut last_final = 0;
+    // Monotonic and real time of the newest frame the core took (07 §9.1 silence clock).
+    let mut last_frame: Option<(u64, u64)> = None;
     let t0 = Instant::now();
     let now = || u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let mut bursts = [[RxPkt::empty(); RX_BURST]; 2];
@@ -1456,6 +1494,81 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     let mut frontier: std::collections::BTreeMap<vyrn_replica::paths::Key, u64> =
         std::collections::BTreeMap::new();
     while !stop.load(Ordering::Acquire) {
+        // 07 §9.1–9.4 (`depose.rs`): frozen, nothing is polled; deposed, the ORDER queues are
+        // drained unread (INV-REP-5). The data path runs either way.
+        if let Some(f) = fo.as_mut() {
+            let phase = f.shared.phase();
+            if phase == depose::Phase::Live && f.was_frozen {
+                f.was_frozen = false;
+                f.reported = false;
+                last_frame = Some((now(), realtime_ns()));
+                println!("UNFROZEN");
+            }
+            if phase != depose::Phase::Live {
+                f.was_frozen = true;
+                if phase == depose::Phase::Deposed {
+                    // Deposed by the others before this voter suspected: its tail as of now.
+                    if !f.reported {
+                        f.reported = true;
+                        let real = last_frame.map_or(0, |x| x.1);
+                        f.shared.publish(
+                            core.tail()
+                                .map(|t| depose::report(&t, f.epoch, 0, f.me, real)),
+                        );
+                    }
+                    for (rx, b) in rxs.iter_mut().zip(bursts.iter_mut()) {
+                        if let Some(rx) = rx {
+                            let n = rx.poll(b);
+                            rx.release(n);
+                            f.dropped = f.dropped.saturating_add(n as u64);
+                        }
+                    }
+                    if !f.sealed
+                        && let Some((p, next)) = f.shared.take_decision()
+                    {
+                        f.sealed = true;
+                        let star = vyrn_consensus::BlockSource::header(source, p.height);
+                        let join = data
+                            .as_mut()
+                            .map(|d| &*DataRx::<N, D>::join(&mut d.join, &mut d.replay));
+                        // A fault means the decoder took bytes the order core rejected: they are
+                        // no candidate (Codex r4618629082).
+                        let s = core
+                            .fault()
+                            .map_or(Ok(()), |x| Err(format!("fault at height {}", x.height.0)))
+                            .and_then(|()| core.tail().ok_or_else(|| "no ready block".to_string()))
+                            .and_then(|t| depose::seal(&t, &p, next, 0, star, join));
+                        match s {
+                            Ok(s) => {
+                                println!(
+                                    "SEAL height={} end_a={} end_b={} last_step={} next_seq={} unavail={}",
+                                    s.header.height.0,
+                                    s.ext.end_frame_seq[0],
+                                    s.ext.end_frame_seq[1],
+                                    s.header.last_step.0,
+                                    s.ext.next_seq,
+                                    s.ext.unavail.len()
+                                );
+                                source.set_seal(s);
+                            }
+                            Err(e) => println!("NO_SEAL {e}"),
+                        }
+                    }
+                }
+                if let Some(d) = data.as_mut() {
+                    let fh = source.final_height();
+                    if fh > last_final {
+                        last_final = fh;
+                        DataRx::<N, D>::join(&mut d.join, &mut d.replay).finalized(Height(fh));
+                    }
+                    d.poll(now());
+                    d.check(source, now(), paths.as_ref().filter(|_| gate));
+                    d.finals();
+                }
+                std::thread::park_timeout(IDLE);
+                continue;
+            }
+        }
         let mut k = 0;
         let mut delivered = 0usize;
         // `REP_E_HASHLAG` runs from each frame's receive time (07 §3.7): its `rx_ts`
@@ -1522,6 +1635,14 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             let Ok(f) = frame::parse(bytes) else {
                 continue;
             };
+            // 07 §9.1: a frame of the tenure that *arrived* restarts the silence clock, even
+            // one `Paths` then holds behind a gap (Vercel r4618491843).
+            if fo.is_some()
+                && let Ok((h, _)) = vyrn_log::frame::FrameHeader::parse(f.payload)
+                && (h.book, h.epoch16, h.tenure, h.sender) == (ctx.0, ctx.1, 0, 0)
+            {
+                last_frame = Some((now(), realtime_ns()));
+            }
             // The sequencer's answer to a Nack for frames its ring no longer holds.
             if let (Some(t), Some(ps)) = (NackTooOld::decode(f.payload), paths.as_mut()) {
                 rep_stats[2] = rep_stats[2].saturating_add(1);
@@ -1569,6 +1690,27 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             if let Some(rx) = rx {
                 rx.release(n);
             }
+        }
+        if delivered > 0 {
+            last_frame = Some((now(), realtime_ns()));
+        }
+        // 07 §9.1, judged only after a poll that found the ORDER queues empty: a thread that
+        // was descheduled first reads what arrived meanwhile (Codex r4618629093).
+        if let Some(f) = fo.as_mut()
+            && k == 0
+            && carry.is_empty()
+            && let Some((m, real)) = last_frame
+            && now().saturating_sub(m) >= f.silence_ns
+            && let Some(t) = core.tail()
+        {
+            println!(
+                "SUSPECT height={} f_a={} f_b={}",
+                t.height.0,
+                t.subs.first().map_or(0, |s| s.last),
+                t.subs.get(1).map_or(0, |s| s.last)
+            );
+            f.shared.freeze(depose::report(&t, f.epoch, 0, f.me, real));
+            f.reported = true;
         }
         // The final height first: payloads polled below are stamped with it on arrival, and a
         // stale one would expire them early (07 §5.4 retention).
@@ -1662,6 +1804,9 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     }
     if let Some(d) = data.as_mut() {
         d.finals();
+    }
+    if let Some(f) = fo.as_ref() {
+        println!("DEPOSED_DROPS frames={}", f.dropped);
     }
     if repair.is_some() {
         println!(

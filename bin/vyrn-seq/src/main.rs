@@ -16,7 +16,7 @@
 //! | `[engine] dedicated, pooled = 0, tick_min, tick_max, win_center, slot_cap` | lanes and book window |
 //! | `[nic] backend, ip, port_base` | `kernel_udp` or `sim`; lane `l` listens on `port_base + l` (0: ephemeral) |
 //! | `[cores] pin = false, engine, stream, seal` | `pin = true` pins the engine and stream threads to `engine` and `stream` (both required); a failed pin fail-stops before `READY`; `seal` is `abort`, `count` or `off` |
-//! | `[replication] order = ["ip:port", ...], order_b = [...], block_ms` | where ORDER, HASH and HEADER frames go on path A and, flagged `PATH_B`, on path B (optional; 07 §3.1; opt-in cost: one header copy and one send per frame per path-B replica on the stream thread, +30–40% per frame in DEV with 5 replicas, not a latency result); block period. `rtx_ring_bytes` (default 64 MiB, `REP_RTX_RING_BYTES`): path A frames kept for a replica's `Nack` on `[consensus] ctrl`, served only to configured replicas, at their configured address (07 §4.10, `rtx.rs`); prints `RTX nacks= sent= too_old= refused= limited=` at exit |
+//! | `[replication] order = ["ip:port", ...], order_b = [...], block_ms, heartbeat_us` | where ORDER, HASH and HEADER frames go on path A and, flagged `PATH_B`, on path B (optional; 07 §3.1; opt-in cost: one header copy and one send per frame per path-B replica on the stream thread, +30–40% per frame in DEV with 5 replicas, not a latency result); block period. `rtx_ring_bytes` (default 64 MiB, `REP_RTX_RING_BYTES`): path A frames kept for a replica's `Nack` on `[consensus] ctrl`, served only to configured replicas, at their configured address (07 §4.10, `rtx.rs`); prints `RTX nacks= sent= too_old= refused= limited=` at exit. `heartbeat_us` (optional; 07 §9.1 sets 50): a HEARTBEAT frame after that long with no frame sent; unset sends none |
 //! | `[keys] seq` | the `seq_key` handle (Ed25519 seed) |
 //! | `[epoch_boundary] next, t_ns, to_home, seq_index` | optional: per-lane `EpochNotice` triggers (08 §2.4) |
 //! | `[[dev_session]] lane, slot, account, k_seq, k_out, quote, base` | DEV only: sessions opened at start |
@@ -343,6 +343,7 @@ where
         .map(|s| Ok((dev_sid(s)?, config::hex::<16>(&s.k_out)?)))
         .collect::<Result<_, String>>()?;
     let block = Duration::from_millis(cfg.replication.block_ms);
+    let heartbeat = cfg.replication.heartbeat_us.map(Duration::from_micros);
     let mut plan = EnginePlan::from(cfg)?;
     // Nacks from the finality listener to the stream core (`rtx.rs`).
     let (nack_tx, nack_rx) = std::sync::mpsc::sync_channel::<rtx::Req>(rtx::NACK_QUEUE);
@@ -416,6 +417,9 @@ where
                         rtx: rtx::Ring::new(epoch16, 0, ring_bytes),
                         nacks: nack_rx,
                         rtx_out: Vec::new(),
+                        heartbeat,
+                        last_ship: Instant::now(),
+                        heartbeats: 0,
                         t0: Instant::now(),
                         src: ip,
                         k_out,
@@ -1158,6 +1162,10 @@ fn ingest(
     r.map(|_| ())
 }
 
+/// Heartbeats an idle stream sends before it closes an empty block (*reading*, 07 §9.1, §9.3):
+/// 0.8 s at 07's 50 µs, far below a TailReport's 2^20-frame cap.
+const IDLE_BLOCK_HEARTBEATS: u32 = 16_384;
+
 /// The stream core: frames, blocks, and the responses those frames release.
 struct StreamCore<T: TxRing> {
     writer: SeqWriter,
@@ -1175,6 +1183,11 @@ struct StreamCore<T: TxRing> {
     rtx: rtx::Ring,
     nacks: std::sync::mpsc::Receiver<rtx::Req>,
     rtx_out: Vec<(SocketAddrV4, Vec<u8>)>,
+    /// `[replication] heartbeat_us`, and when a frame last left.
+    heartbeat: Option<Duration>,
+    last_ship: Instant,
+    /// Heartbeats since the last block closed (Codex r4618501052).
+    heartbeats: u32,
     t0: Instant,
     src: Ipv4Addr,
     k_out: Vec<(SessionId, [u8; 16])>,
@@ -1228,6 +1241,32 @@ impl<T: TxRing> StreamCore<T> {
             }
             self.drain()?;
             self.retransmit()?;
+            // Only while idle: a stream that ships frames needs no heartbeat (07 §9.1).
+            if let Some(hb) = self.heartbeat
+                && self.last_ship.elapsed() >= hb
+            {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+                match self
+                    .writer
+                    .heartbeat(Nanos(now))
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(f) => {
+                        self.ship(&[f])?;
+                        self.heartbeats = self.heartbeats.saturating_add(1);
+                        // A TailReport covers the frames after the last BlockMark, at most
+                        // MAX_TAIL_FRAMES (2^20) of them: an idle stream closes an empty
+                        // block every IDLE_BLOCK_HEARTBEATS, so heartbeats never outgrow it.
+                        if !open && self.heartbeats >= IDLE_BLOCK_HEARTBEATS {
+                            self.close_block()?;
+                        }
+                    }
+                    // Frame 1 (the TenureStart) has not left yet.
+                    None => self.last_ship = Instant::now(),
+                }
+            }
             let end = done && got == 0;
             if open && (end || (!group && opened.elapsed() >= block)) {
                 self.close_block()?;
@@ -1248,6 +1287,7 @@ impl<T: TxRing> StreamCore<T> {
     }
 
     fn close_block(&mut self) -> Result<(), String> {
+        self.heartbeats = 0;
         let (frames, h) = self.writer.close_block().map_err(|e| e.to_string())?;
         self.ship(&frames)?;
         self.stats.blocks.fetch_add(1, Ordering::Relaxed);
@@ -1366,6 +1406,9 @@ impl<T: TxRing> StreamCore<T> {
     /// Sends each frame on path A, then its `PATH_B` copy on path B (07 §3.1, D4): both before
     /// the responses they release.
     fn ship(&mut self, frames: &[Vec<u8>]) -> Result<(), String> {
+        if !frames.is_empty() {
+            self.last_ship = Instant::now();
+        }
         let dst = |r: &SocketAddrV4| Endpoint {
             mac: [0; 6],
             ip: *r.ip(),

@@ -5,6 +5,7 @@
 //! |---|---|---|
 //! | Who a voter connects to | [`Peer`]: `vote_key`, `node_key`, `repl_addr` of each voter | 07 §3.1, §13.1 |
 //! | What `Engine::start` takes | [`VoterNet`]: three channels and a blocker, keyed by vote key | 07 §6.3 |
+//! | Where `Silence` and its TailReport go | [`VoterNet::tail`], a fourth channel | 07 §3.1, §9.1 |
 //!
 //! **Two keys.** A connection authenticates the peer's `node_key` (its p2p identity, as in the
 //! roster). Simplex names participants by `vote_key`. [`VoterNet`]'s senders, receivers and
@@ -45,6 +46,10 @@ use vyrn_types::PubKey;
 const CH_VOTE: u64 = 0;
 const CH_CERT: u64 = 1;
 const CH_RESOLVER: u64 = 2;
+/// `Silence` and its TailReport (07 §3.1: "TailReports use commonware-p2p"). *Reading*
+/// (transport): a channel of its own on the voters' network, next to Simplex's three; the
+/// standby joins it in a later change.
+const CH_TAIL: u64 = 3;
 /// Messages per second one peer may send on one channel: three votes a view at ~1 kHz views,
 /// with headroom for catch-up. Commonware sizes each channel's mailbox as peers × this burst, so
 /// it also bounds memory (100 000 cost ~0.5 GB per voter).
@@ -195,11 +200,33 @@ type Channel = (
     VoteReceiver<lookup::Receiver<ed25519::PublicKey>>,
 );
 
+/// The tail channel: encoded `Silence` messages among the voters (07 §3.1, §9.1).
+pub struct TailChannel(Channel);
+
+impl TailChannel {
+    /// Sends `bytes` to every other voter. Reliable while a connection is up; a voter that was
+    /// disconnected misses it, so the caller repeats its own `Silence`.
+    pub fn broadcast(&mut self, bytes: Vec<u8>) {
+        use commonware_p2p::Sender as _;
+        let _ = self.0.0.send(Recipients::All, bytes, true);
+    }
+
+    /// The next message and the vote key of the voter whose connection carried it; `None` once
+    /// the network stopped.
+    pub async fn recv(&mut self) -> Option<(PubKey, Vec<u8>)> {
+        let (from, msg) = self.0.1.recv().await.ok()?;
+        let key: &[u8] = from.as_ref();
+        Some((PubKey::try_from(key).ok()?, msg.as_ref().to_vec()))
+    }
+}
+
 /// What `simplex::Engine::start` takes, and the blocker for `voter::config`.
 pub struct VoterNet {
     pub vote: Channel,
     pub cert: Channel,
     pub resolver: Channel,
+    /// `Silence` messages, encoded ([`crate::tail::Silence::encode`]).
+    pub tail: TailChannel,
     pub blocker: VoteBlocker<lookup::Oracle<ed25519::PublicKey>>,
 }
 
@@ -241,7 +268,10 @@ pub fn start(
         NAMESPACE,
         listen,
         n,
-        commonware_p2p::max_message_size(&[max_payload_size::<Scheme, Digest>(max)]),
+        commonware_p2p::max_message_size(&[
+            max_payload_size::<Scheme, Digest>(max),
+            crate::tail::SILENCE_MAX_BYTES,
+        ]),
         NonZeroUsize::new(1024).unwrap_or(NonZeroUsize::MIN),
     );
     cfg.allow_private_ips = true;
@@ -265,11 +295,13 @@ pub fn start(
         )
     };
     let (vote, cert, resolver) = (channel(CH_VOTE), channel(CH_CERT), channel(CH_RESOLVER));
+    let tail = TailChannel(channel(CH_TAIL));
     network.start();
     Ok(VoterNet {
         vote,
         cert,
         resolver,
+        tail,
         blocker: VoteBlocker {
             inner: oracle,
             keys,

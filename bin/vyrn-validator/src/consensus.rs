@@ -30,7 +30,7 @@ use commonware_consensus::simplex::Engine;
 use commonware_runtime::{Runner as _, Supervisor as _};
 use serde::Deserialize;
 use vyrn_consensus::voter::{Timeouts, VoterConfig};
-use vyrn_consensus::{BlockSource, Committee, Genesis, Verdict, ctrl, net};
+use vyrn_consensus::{BlockSource, Committee, Genesis, Seal, Verdict, ctrl, net};
 use vyrn_epoch::{Addr, Domain, EpoConfig};
 use vyrn_log::block::header_hash;
 use vyrn_types::{BlockHeader, Epoch, Hash, Height, HomeCode, Mode, Nanos, PubKey};
@@ -85,6 +85,10 @@ struct Held {
     valid: BTreeSet<u64>,
     /// The lowest height a fault, fence or data contradiction covers.
     invalid_from: Option<u64>,
+    /// The tenure is deposed here (07 §9.2), and this voter's seal candidate (07 §9.4,
+    /// `depose.rs`) once it holds one.
+    deposed: bool,
+    seal: Option<Seal>,
 }
 
 /// The voter's [`BlockSource`]. The order thread writes it; Simplex reads it. `default()` is
@@ -134,6 +138,20 @@ impl Source {
         }
     }
 
+    /// The tenure is deposed at this voter (07 §9.2): from now on it proposes only a seal.
+    pub fn set_deposed(&self) {
+        if let Some(mut h) = self.held() {
+            h.deposed = true;
+        }
+    }
+
+    /// This voter's seal candidate (07 §9.4).
+    pub fn set_seal(&self, seal: Seal) {
+        if let Some(mut h) = self.held() {
+            h.seal = Some(seal);
+        }
+    }
+
     /// Nothing at or above `height` may be voted for (a fault, or a data root that differs).
     pub fn invalid_from(&self, height: Height) {
         if let Some(mut h) = self.held() {
@@ -165,6 +183,36 @@ impl BlockSource for Source {
     fn excl_root(&self, _: Epoch, _: Height, _: Height) -> Hash {
         Hash([0; 32])
     }
+
+    fn seal(&self, _: Epoch) -> Option<Seal> {
+        self.held()?.seal.clone()
+    }
+
+    fn deposed(&self, _: Epoch) -> bool {
+        self.held().is_some_and(|h| h.deposed)
+    }
+
+    /// 07 §9.3 items 3–4 on the tail. The voter asks only about its own candidate
+    /// ([`BlockSource::seal`]), which this voter built from the frames and payloads it holds
+    /// (`depose::seal`): its bytes are the frames it holds, so item 3 has nothing to compare,
+    /// and item 4's unavailable list is its own. Any other seal is no candidate here.
+    fn check_seal(&self, _: Epoch, seal: &Seal) -> Verdict {
+        match self.held() {
+            // Heights this voter already rejected stay rejected (Codex r4618629082).
+            Some(h) if h.invalid_from.is_some_and(|f| seal.header.height.0 >= f) => {
+                Verdict::Invalid
+            }
+            Some(h) if h.seal.as_ref() == Some(seal) => Verdict::Valid,
+            _ => Verdict::Pending,
+        }
+    }
+}
+
+/// `CLOCK_REALTIME` in ns: the clock of a TailReport's `t_last_rx` (07 §9.3, PTP in production).
+pub fn realtime_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
 /// No blob in the journal's partition holds a byte (or the partition does not exist).
@@ -183,6 +231,8 @@ pub struct Plan {
     pub vote_seed: [u8; 32],
     pub node_seed: [u8; 32],
     pub seq_key: PubKey,
+    /// `seq_order`'s `seq_key`s, primary first (07 §9.5): who may report a tail.
+    pub seq_order: Vec<PubKey>,
     pub epoch: Epoch,
     pub observers: Vec<SocketAddr>,
     pub timeouts: Timeouts,
@@ -415,6 +465,7 @@ impl Plan {
             vote_seed,
             node_seed,
             seq_key: membership.seq()[0].seq_key,
+            seq_order: membership.seq().iter().map(|b| b.seq_key).collect(),
             epoch,
             observers: s.observers.clone(),
             timeouts,
@@ -487,7 +538,12 @@ pub fn observe(
 /// Runs the voter until `stop`: waits for the genesis header, then Simplex. Prints
 /// `FINAL height=<last> view=<v> first=<h> kind=<0|1> sigs=<k>` per certificate and
 /// `VOTER_FAULT kind=<k> voter=<i>` per piece of evidence.
-pub fn run(plan: Plan, source: Source, stop: &AtomicBool) -> Result<(), String> {
+pub fn run(
+    plan: Plan,
+    source: Source,
+    stop: &AtomicBool,
+    fo: Option<(crate::depose::Section, crate::depose::Shared)>,
+) -> Result<(), String> {
     let genesis = loop {
         if stop.load(Ordering::Acquire) {
             return Ok(());
@@ -516,7 +572,7 @@ pub fn run(plan: Plan, source: Source, stop: &AtomicBool) -> Result<(), String> 
             ctx.child("voter"),
             n.blocker,
             VoterConfig {
-                committee: plan.committee,
+                committee: plan.committee.clone(),
                 vote_seed: plan.vote_seed,
                 seq_key: plan.seq_key,
                 epoch: plan.epoch,
@@ -527,15 +583,64 @@ pub fn run(plan: Plan, source: Source, stop: &AtomicBool) -> Result<(), String> 
         )
         .map_err(|e| e.to_string())?;
         let engine = Engine::new(ctx.child("engine"), vcfg).start(n.vote, n.cert, n.resolver);
+        // 07 §9.1–9.3 (`depose.rs`): this voter's own `Silence`, peers' from the tail channel.
+        let mut tail = n.tail;
+        let me = u8::try_from(plan.me).unwrap_or(u8::MAX);
+        let mut tally = fo.as_ref().map(|(s, _)| {
+            crate::depose::Tally::new(
+                plan.committee.clone(),
+                plan.seq_order.clone(),
+                plan.epoch,
+                // Reading: this release runs tenure 0 only (promotion is a later change).
+                0,
+                me,
+                s.abort_us,
+            )
+        });
+        let mut own: Option<Vec<u8>> = None;
+        let mut resent = std::time::Instant::now();
         let send = |b: &[u8]| {
             for a in &plan.observers {
                 // UDP: a lost datagram is a lost vote, which the certificate later covers.
                 let _ = ctrl.send_to(b, a);
             }
         };
-        let mut tick = tokio::time::interval(Duration::from_millis(5));
+        // 1 ms with `[failover]`: the abort window is 5 ms and the tail wait 4.05 ms (07 §9.1–9.2).
+        let period = if fo.is_some() { 1 } else { 5 };
+        let mut tick = tokio::time::interval(Duration::from_millis(period));
         while !stop.load(Ordering::Acquire) {
+            if let (Some(t), Some((_, shared))) = (tally.as_mut(), fo.as_ref()) {
+                if let Some(b) = t.own(shared, &plan.vote_seed) {
+                    println!("SILENCE_SENT epoch={} voter={me}", plan.epoch.0);
+                    tail.broadcast(b.clone());
+                    own = Some(b);
+                    resent = std::time::Instant::now();
+                }
+                // A peer that was disconnected missed it: again every 2 ms until live.
+                if shared.phase() == crate::depose::Phase::Live {
+                    own = None;
+                } else if let Some(b) = own
+                    .as_ref()
+                    .filter(|_| resent.elapsed() >= Duration::from_millis(2))
+                {
+                    tail.broadcast(b.clone());
+                    resent = std::time::Instant::now();
+                }
+                if let Some(line) = t.poll(shared, realtime_ns()) {
+                    if line.starts_with("DEPOSED") {
+                        source.set_deposed();
+                    }
+                    println!("{line}");
+                }
+            }
             tokio::select! {
+                Some((_, b)) = tail.recv(), if tally.is_some() => {
+                    if let Some(t) = tally.as_mut()
+                        && let Err(e) = t.on_silence(&b)
+                    {
+                        println!("SILENCE_REFUSED {e}");
+                    }
+                }
                 Some(c) = out.certs.recv() => {
                     send(&ctrl::encode_cert(&c));
                     source.finalized(c.proposal.last_height);
@@ -558,4 +663,45 @@ pub fn run(plan: Plan, source: Source, stop: &AtomicBool) -> Result<(), String> 
         engine.abort();
         Ok::<(), String>(())
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod seal_tests {
+    use super::*;
+    use vyrn_consensus::SealExt;
+    use vyrn_types::{BookId, StepId};
+
+    /// Codex r4618629082: once the order core rejected a height, this voter's own seal
+    /// candidate covering it is no longer valid, though it equals the held candidate.
+    #[test]
+    fn a_seal_over_a_rejected_height_is_invalid() {
+        let header = BlockHeader {
+            height: Height(6),
+            epoch: Epoch(0),
+            book: BookId(7),
+            first_step: StepId(8),
+            last_step: StepId(9),
+            prev: Hash([1; 32]),
+            order_root: Hash([2; 32]),
+            data_root: Hash([3; 32]),
+            seq_sig: [0; 64],
+        };
+        let seal = Seal {
+            header,
+            ext: SealExt {
+                end_frame_seq: [12, 0],
+                next_seq: 0xFF,
+                next_tenure: 1,
+                unavail: Vec::new(),
+            },
+        };
+        let s = Source::new();
+        s.set_seal(seal.clone());
+        assert_eq!(s.check_seal(Epoch(0), &seal), Verdict::Valid);
+        s.invalid_from(Height(7));
+        assert_eq!(s.check_seal(Epoch(0), &seal), Verdict::Valid);
+        s.invalid_from(Height(6));
+        assert_eq!(s.check_seal(Epoch(0), &seal), Verdict::Invalid);
+    }
 }

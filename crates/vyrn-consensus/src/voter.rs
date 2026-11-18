@@ -431,8 +431,10 @@ where
                         clock.sleep(POLL).await;
                         continue;
                     }
-                    if app.source.seal(app.epoch).is_some() {
-                        return; // Deposed, and the seal does not extend this parent.
+                    if app.source.deposed(app.epoch) {
+                        // Deposed: the seal does not extend this parent, or this voter holds
+                        // none (07 §9.4). Never a kind-0 range.
+                        return;
                     }
                     let run =
                         chain_after(&app.source, app.epoch, &app.seq_key, parent, max, &app.sigs);
@@ -1146,6 +1148,17 @@ mod tests {
             assert!(app.verify(ctx(4, 3, p12), on12).await.await.unwrap());
             // Nothing extends the seal: a leader whose parent is the seal declines.
             assert!(app.propose(ctx(5, 1, want)).await.await.is_err());
+        });
+    }
+
+    /// 07 §9.4 with no tail fetch: a deposed leader that holds no seal candidate (it lacks a
+    /// frame of the prefix) proposes nothing, though signed headers above its parent would
+    /// make a kind-0 range; the view then nullifies.
+    #[test]
+    fn a_deposed_leader_without_a_seal_proposes_nothing() {
+        with_app(5, |mut app, src, g| async move {
+            src.2.store(true, std::sync::atomic::Ordering::Release);
+            assert!(app.propose(ctx(1, 0, g)).await.await.is_err());
         });
     }
 
