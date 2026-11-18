@@ -26,6 +26,7 @@
 //! | The bridge signer table (rotation number → keys) | [`BridgeSignerTable`], [`BridgeSigners`] | governance (`SetParam`, 09 §6.7) | `vyrn-chain` (`Epochs::bridge_signers`), guardians, relayers | a set activates at the first boundary after approval; every activated set stays readable | [`BridgeErr`] | 09 §6.7, 08 §9.5 |
 //! | The opening auction: window answers, reference and band, uncross rule, fills | [`window_answer`], [`reference`], [`Band`], [`uncross`], [`marginal`], [`UncrossRecord`], [`auction_fill`] | the lanes (answers, fills) and the BBO core (`UncrossRecord`) | sessions, every lane, replicas, oracles | after cert(e, S) and Apply; U = (e+1, 1) is the first step of e+1 | `Reject` reasons per §7.2 (IOC per 04 §6.9: spec gap) | 08 §7.2–7.7, 05 §8.8 |
 //! | The role state machines, force seal, halt and reassignment | [`OldSeq`], [`OldReplica`], [`NewReplica`], [`NewSeq`], [`EpoForceSeal`], [`ForceSealPool`], [`EpoReassign`] | each role; voters of `R_e` (force seal); Q operators (reassign) | the role itself; 09 (slashing evidence); the target home | events in log order; timing predicates over logged PTP times | [`RoleErr`], [`SealErr`] | 08 §4.2–4.5, §10.1, §10.3 |
+//! | The log tail over the WAN | [`TailFollow`], [`EpoTailReq`], [`TailPull`] | 2 relays and every voter of `R_e`, the old data tier; the requester | the new and third homes | state is final only to the last finalized block; a pull goes to the old and third homes at once, the first answer wins | [`TailErr`] | 08 §5.5, §10.6 |
 //! | The membership hand-off | [`Membership`], [`Activation`], [`Membership::hand_off`] | `EpoConfig(e+1)` (roster) | `vyrn-consensus` (the next [`vyrn_consensus::Committee`]), `vyrn-replica`, `vyrn-chain` | only with a verified cert(e, S) | [`MembershipErr`], [`HandoffErr`] | 08 §9, 07 §13.1 |
 //!
 //! # Domain separation
@@ -44,7 +45,7 @@
 //!
 //! # Not in this crate yet
 //!
-//! The tail stream (§5.5) is a follow-up. The opening auction's
+//! The opening auction's
 //! distributed marginal search and histograms are the engine's (05 §8.8); [`marginal`] is their
 //! sequential reference. The spec gaps this crate had to fill are marked "Spec gap" at the point of use.
 #![forbid(unsafe_code)]
@@ -58,6 +59,7 @@ mod notice;
 mod ready;
 mod roles;
 mod schedule;
+mod tail;
 
 pub use auction::{
     AtUncross, AuctionOrder, Band, Clearing, EPO_ACK_QUEUED, EPO_HIST_HALF, EPO_HIST_TICKS,
@@ -84,6 +86,9 @@ pub use roles::{
 };
 pub use schedule::{
     Boundary, EpoConfig, ScheduleErr, ScheduleRecord, Timetable, default_home, slot_start,
+};
+pub use tail::{
+    EPO_TAIL_REQ_MAX, EpoTailReq, RespVerdict, TailErr, TailFollow, TailPull, TailSource, TailWant,
 };
 pub use vyrn_types::HandoffRecord;
 
