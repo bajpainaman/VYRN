@@ -1803,8 +1803,13 @@ Login (client → server, 128 B)
      nonce would wrap ends the connection.
    - **Deadline.** The handshake counts against `DC_LOGIN_TIMEOUT_MS`, which runs from the TCP
      accept, so an unauthenticated client still holds nothing past it.
-   - **Post-quantum.** 01 §14.20 G's hybrid key agreement does not name the drop copy; when it
-     does, the handshake gains an ML-KEM-768 encapsulation as the admin stream's does. Not built.
+   - **Stays Noise.** Noise is the drop copy's transport for good, not a stand-in for TLS: it is
+     small, has no `unsafe`, and its crates are on the allowlist. The rustls provider that PQ-12
+     adds is for the TLS streams; the drop copy does not move to it. (Owner ruling, 2026-11-18.)
+   - **Post-quantum.** From `E_pq` the handshake is hybrid X25519 + ML-KEM-768, as 01 §14.20 G
+     requires of every key agreement that protects a live secret: the Noise HFS pattern
+     `NKhfs`, `-> e, es, e1` and `<- e, ee, ekem1`, with the KEM secret mixed into the chaining
+     key the way `ee` is, so the transport keys hold if either part does. Not built.
 
    `tests/dc_noise_vectors.txt`, written by an independent script, fixes both handshake
    messages, the handshake hash and the transport messages byte for byte.
