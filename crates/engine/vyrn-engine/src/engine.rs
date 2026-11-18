@@ -4,20 +4,20 @@
 
 use vyrn_bbo::admit::{Clock, NeverLate};
 use vyrn_bbo::{
-    Bbo, ControlCons, ControlRing, Cut, CutDelta, Diverge, ENG_CONTROL_RING, FillProd, FwdCons,
-    MAX_LANES, Poll, Record, StepEntry, StepLogProd, TxEntry, TxProd, decode_records,
+    Bbo, ControlCmd, ControlCons, ControlRing, Cut, CutDelta, Diverge, ENG_CONTROL_RING, FillProd,
+    FwdCons, MAX_LANES, Poll, Record, StepEntry, StepLogProd, TxEntry, TxProd, decode_records,
 };
 use vyrn_cut::{
     BboFloor, Consumer, Counter, CounterLine, CutEntry, CutWriter, ENG_STEP_LOG, ENG_TX_RING,
     FillRing, Floor, FwdRing, HalfCut, HalfCutVal, LANES_PER_HALF, LaneCut, LaneCutEntry, Line64,
-    Producer, STEP_LOG_READERS, Snapshot, SnapshotLine, StepLog, TxRing, Visibility,
+    PoolTok, Producer, STEP_LOG_READERS, Snapshot, SnapshotLine, StepLog, TxRing, Visibility,
 };
 use vyrn_lane::{
     Arena, ArenaConfig, ArenaView, ArenaWriter, Config as LaneConfig, Lane, LaneBook, LogRec, Mid,
     Ports, RespPkt, Rx, RxIn,
 };
 use vyrn_risk::Route;
-use vyrn_types::{LaneId, LaneSeq, PacketRecord, StepId};
+use vyrn_types::{AccountId, AcctTake, LaneId, LaneSeq, PacketRecord, SessionId, StepId};
 
 /// Steps whose cut replay keeps for `MID` boundaries (`ENG_STEP_LOG`).
 pub(crate) const STEP_HIST: usize = ENG_STEP_LOG;
@@ -44,6 +44,9 @@ pub trait Sink {
     fn lane_resp(&mut self, _lane: LaneId, _p: &RespPkt) {}
     /// A fill TX packet (05 §8.10 rules 1 and 2), after its step's [`Rec::Step`].
     fn tx(&mut self, _h: &TxEntry, _recs: &[Record]) {}
+    /// A pooled lane's token take (01 §14.17.4, 05 §6.9): an order-stream element, called
+    /// right before the [`Rec::Packet`] it covers.
+    fn take(&mut self, _t: &AcctTake) {}
 }
 
 /// A fault (05 §14.3): the caller fail-stops the sequencer (live) or the replica (replay).
@@ -59,6 +62,8 @@ pub enum Fault {
     NoLane,
     /// A ring did not hold the lines its header announced.
     Ring,
+    /// A pooled account's token was held, or its `ver` ran out (`INV-WRITER`, 05 §6.9).
+    Pool(LaneId),
 }
 
 /// Every line and ring of one box (05 §4.1), owned in one place so the split handles can borrow
@@ -146,6 +151,8 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     /// A step the BBO core published whose lines the stream role has not seen yet (a delayed
     /// `Visibility`, such as `Sim`): read before the BBO core is polled again.
     unread: Option<StepId>,
+    /// Per lane: `(session, account, token)` of each pooled session ([`Engine::pool_session`]).
+    pool: Vec<Vec<(SessionId, AccountId, &'a PoolTok)>>,
 }
 
 impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
@@ -244,6 +251,7 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             recs: Vec::with_capacity(TX_RECS),
             scratch: Vec::with_capacity(32),
             unread: None,
+            pool: (0..n).map(|_| Vec::new()).collect(),
         })
     }
 
@@ -264,6 +272,37 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
     /// The control ring's producer end (control role, core 0: auction and `Control` steps).
     pub fn control(&mut self) -> &mut Producer<'a, Line64, ENG_CONTROL_RING, 1, V> {
         &mut self.ctl_p
+    }
+    /// The control role queues `c` for the BBO core, which executes it as the next step
+    /// (`Control`, `Uncross` or `Seal`, 05 §8.8). `false` if the control ring is full.
+    ///
+    /// Replay: the order stream does not carry the command (05 §10 rows 4–5 take only the
+    /// step's kind), so a replayer queues the same commands, in order, before
+    /// [`Engine::replay`]; the BBO core holds each until the step that names it.
+    pub fn command(&mut self, c: &ControlCmd) -> bool {
+        self.ctl_p.push(self.vis, c.encode()).is_ok()
+    }
+    /// Lane `l` is pooled and `session` on it belongs to pooled `account`, whose token is
+    /// `tok` (one `PoolTok` per account, shared by every pool lane). From then on each record
+    /// of that session takes the token, logs [`AcctTake`] through [`Sink::take`] and releases
+    /// it (05 §6.9). Pair with `Lane::set_pool_index` and `vyrn_bbo::Config::pool`, which make
+    /// STP and kills compare the account across the pool. Configuration, before `seal()`.
+    /// `false` if `l` is not a lane.
+    pub fn pool_session(
+        &mut self,
+        l: usize,
+        session: SessionId,
+        account: AccountId,
+        tok: &'a PoolTok,
+    ) -> bool {
+        match self.pool.get_mut(l) {
+            Some(p) => {
+                p.retain(|(s, _, _)| *s != session);
+                p.push((session, account, tok));
+                true
+            }
+            None => false,
+        }
     }
     /// The BBO core's newest snapshot.
     pub fn snapshot(&self) -> Option<Snapshot> {
@@ -411,12 +450,26 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
         for p in lane.drain_responses() {
             sink.lane_resp(id, &p);
         }
+        let pool = self.pool.get(l).map_or(&[][..], Vec::as_slice);
         for r in lane.drain_log() {
             // A `RouteRecord` (G9) is not in this crate's journal yet; replay wiring is the
             // engine's follow-up (`routes_of`).
-            if let LogRec::Packet(p) = r {
-                sink.record(&Rec::Packet(p));
+            let LogRec::Packet(p) = r else { continue };
+            if let Some((_, account, tok)) = pool.iter().find(|(s, _, _)| *s == p.session) {
+                // Spec gap (PR body): the engine plays every pool core on one thread, so the
+                // lane's work for this record is already done and no other core can have
+                // written the account meanwhile. The take is logged before the record it
+                // covers, which is the order 05 §6.9 requires.
+                let ver = tok.try_take(id).map_err(|_| Fault::Pool(id))?;
+                sink.take(&AcctTake {
+                    lane: id,
+                    account: *account,
+                    ver,
+                    lane_seq: p.first_lane_seq,
+                });
+                tok.release(id).map_err(|_| Fault::Pool(id))?;
             }
+            sink.record(&Rec::Packet(p));
         }
         if lane.fault() {
             return Err(Fault::Lane(id));

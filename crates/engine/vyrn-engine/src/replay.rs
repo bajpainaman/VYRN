@@ -115,6 +115,9 @@ impl<S: Sink> Sink for Tee<'_, S> {
     fn tx(&mut self, h: &vyrn_bbo::TxEntry, recs: &[vyrn_bbo::Record]) {
         self.inner.tx(h, recs);
     }
+    fn take(&mut self, t: &vyrn_types::AcctTake) {
+        self.inner.take(t);
+    }
 }
 
 /// Equal as steps: every field but `pub_a`/`pub_b`, the half-cut publication ids. Those count
