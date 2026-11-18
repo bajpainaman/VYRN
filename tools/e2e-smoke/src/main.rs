@@ -27,7 +27,7 @@
 //! |---|---|
 //! | `seq` | the box exits 0, `records` equals the packets sent, `seal_violations=0`, at least 2 blocks |
 //! | `validators` | each validator reports heights `0..=H` contiguous with the box's `first_step`/`last_step`, every verdict `Valid`, no `FAULT` |
-//! | `replay` | the tap's `OrderCore` readies the same blocks, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box |
+//! | `replay` | the tap's `OrderCore` readies the same blocks, holding every packet sent exactly once, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box |
 //! | `replica-out` | each validator that prints `out=<hex>` on its `BLOCK` lines matches the tap's output hash per block; SKIP while no validator replays |
 //! | `finality` | with `--finality`: each validator prints `FINAL height=<h>` up to `H`; SKIP without it |
 //! | `data` | with `--data`: payloads reach validators through `vyrn-data`; refused until that path is wired |
@@ -76,7 +76,9 @@ use vyrn_lane::{ArenaConfig, Lane, PathTable, RespPkt, SessionSpec};
 use vyrn_log::Layout;
 use vyrn_replica::{BlockInputs, DataJoin, EpochView, OrderCore, ReplayEngine, RustReplay};
 use vyrn_risk::{AcctRisk, AcctSlot, BookSpec, SessionBuckets};
-use vyrn_types::{AccountId, BookId, Epoch, Hash, Height, LaneId, PubKey, SessionId, Tick};
+use vyrn_types::{
+    AccountId, BookId, Epoch, Hash, Height, LaneId, PacketFlags, PubKey, SessionId, Tick,
+};
 use vyrn_wire::{ReqHeader, Request, Response, encode_request};
 
 const WORKLOAD: &str = include_str!("../wl-smoke.toml");
@@ -846,6 +848,28 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     "tap readied {} blocks, the box closed {}",
                     ids.len(),
                     seq_blocks.len()
+                ));
+            }
+            // Every packet sent is sequenced exactly once: Advance records do not count, so a
+            // lost client packet cannot hide behind them.
+            let mut seen: Vec<(u32, u32)> = ready
+                .iter()
+                .flat_map(|b| &b.lanes)
+                .filter_map(|r| match r {
+                    vyrn_log::LaneRec::Pkt(p) if p.flags & PacketFlags::ADVANCE == 0 => {
+                        Some((p.session.0, p.pkt_seq))
+                    }
+                    _ => None,
+                })
+                .collect();
+            seen.sort_unstable();
+            let mut sent: Vec<(u32, u32)> = pkts.iter().map(|p| (p.session.0, p.pkt_seq)).collect();
+            sent.sort_unstable();
+            if seen != sent {
+                return Err(format!(
+                    "blocks hold {} packet records, {} packets were sent",
+                    seen.len(),
+                    sent.len()
                 ));
             }
             let (hashes, mut replayed) = replay_all(&sessions, &pkts, &ready)?;
