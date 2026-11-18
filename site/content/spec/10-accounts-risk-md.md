@@ -1698,7 +1698,9 @@ carries its label.
 1. **Source.** The drop copy is a `Tap` of `SinkStream`, not a second adapter, and takes its
    release order (§7.9 item 7). \[Likely\]
 2. **Lane ops.** An `Ack` of a `New` is `DC_ACK`, a `CancelAck` (of a `Cancel` or a `Reduce`)
-   `DC_CANCEL` with `qty` = canceled, a lane `Out` `DC_OUT`. `step` is the op's LaneSeq,
+   `DC_CANCEL` with `qty` = canceled, a lane `Out` `DC_OUT`. A `New` the lane takes out at once
+   with no `Ack` (`Out(STP)` under CancelNewest, 05 §2.4) never rested: its `DC_OUT` carries the
+   `New`'s side and limit tick and changes no order state. `step` is the op's LaneSeq,
    `ordinal` its message index, `resp_seq` the lane response packet's. A `Reject` changes no
    order state and has no record; the client's trading session has it. A step's dependencies
    (§7.9 item 10) come to the tap as lane ops, in index order, after the step's interval and

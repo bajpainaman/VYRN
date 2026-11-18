@@ -834,7 +834,7 @@ impl<O: DcOut> DropCopy<O> {
                 )
             }
             (
-                _,
+                msg,
                 Resp::Out {
                     index,
                     handle,
@@ -842,11 +842,24 @@ impl<O: DcOut> DropCopy<O> {
                     client_tag,
                     ..
                 },
-            ) => {
-                let o = *self.orders.get(&key(handle)).ok_or(DcError::Order)?;
-                self.set_order(key(handle), None);
-                base(DcType::Out, o.side, handle, o.tick, qty, client_tag, index)
-            }
+            ) => match (self.orders.get(&key(handle)).copied(), msg) {
+                (Some(o), _) => {
+                    self.set_order(key(handle), None);
+                    base(DcType::Out, o.side, handle, o.tick, qty, client_tag, index)
+                }
+                // A New the lane takes out at once (STP CancelNewest, 05 §2.4) never rested:
+                // its own side and limit tick, and no order state (10 §8.4 item 2).
+                (None, Some(Msg::New { flags, tick, .. })) => base(
+                    DcType::Out,
+                    side_of(flags.side),
+                    handle,
+                    tick,
+                    qty,
+                    client_tag,
+                    index,
+                ),
+                (None, _) => return Err(DcError::Order),
+            },
             (_, Resp::Reject { .. }) => return Ok(()),
             _ => return Err(DcError::Unsupported("lane record")),
         };

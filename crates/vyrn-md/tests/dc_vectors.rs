@@ -349,7 +349,7 @@ fn blocks(kind: &str) -> Vec<Vec<&'static str>> {
 #[test]
 fn streams_match_the_vectors() {
     let cases = blocks("case ");
-    assert_eq!(cases.len(), 6);
+    assert_eq!(cases.len(), 7);
     for c in &cases {
         run_case(&c[1..]);
     }

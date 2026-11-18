@@ -227,8 +227,14 @@ class Model:
             out = (CANCEL, o["side"], idx, h, o["tick"], c, tag)
         elif r[0] == "out":
             _, idx, _cause, h, q, tag = r
-            o = self.orders.pop((lane, h))
-            out = (OUT, o["side"], idx, h, o["tick"], q, tag)
+            if (lane, h) in self.orders:
+                o = self.orders.pop((lane, h))
+                out = (OUT, o["side"], idx, h, o["tick"], q, tag)
+            else:
+                # A New the lane took out at once (STP CancelNewest) never rested: its own side
+                # and limit tick.
+                assert msg[0] == "new"
+                out = (OUT, msg[1], idx, h, msg[2], q, tag)
         else:
             return
         if acct is not None:
@@ -586,6 +592,17 @@ RESCAN_CASE = [
     ("step", 4, "idle", 0, None, []),
     ("final", 2, 4),
 ]
+# A lane New that would trade with its own account's resting order is taken out at once
+# (STP CancelNewest, 05 §2.4) with no Ack: a DC_OUT at its side and limit tick, after the
+# packet's other message, a Cancel the lane rejects. The resting order stays.
+LANE_STP_CASE = [
+    ("op", 1, 1, S11, 1, ("new", 1, 101, 2, 31), ("ack", 0, h(1), 101, 31)),
+    ("op", 1, 2, S11, 2, ("cancel", h(8), 32), ("rej", 0, 3)),
+    ("op", 1, 3, S11, 2, ("new", 0, 101, 1, 33), ("out", 1, OUT_STP, h(2), 1, 33)),
+    ("op", 1, 4, S11, 3, ("cancel", h(1), 34), ("cxl", 0, h(1), 2, 31)),
+    ("step", 1, "idle", 0, None, []),
+    ("final", 1, 1),
+]
 BAL = {101: (1000, 20, 7, 0), 102: (5, 0, 3, 1), 201: (77, 0, 0, 0)}
 
 
@@ -699,6 +716,7 @@ def main(out_dir):
     run_case(lines, "revert_settle", 100, REVERT_CASE, BAL, post_settled=[(9, 2)])
     run_case(lines, "stp_alloc", 100, STP_ALLOC_CASE, BAL, post_settled=[(3, 4)])
     run_case(lines, "rescan", 100, RESCAN_CASE, BAL)
+    run_case(lines, "lane_stp", 100, LANE_STP_CASE, BAL)
     # Sessions over a store of epoch 5 (case cross, ended) and epoch 6 (case quiet, open).
     E0, E1 = 5, 6
     seeds = {101: bytes([1]) * 32, 102: bytes([2]) * 32, 900: bytes([9]) * 32,
