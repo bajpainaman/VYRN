@@ -48,7 +48,7 @@
 use std::collections::VecDeque;
 
 use std::io::Read as _;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -59,11 +59,8 @@ use clap::Parser;
 use serde::Deserialize;
 use vyrn_chain as _;
 use vyrn_data::frame::Fetch;
-use vyrn_nic::TxClass;
-use vyrn_nic::frame::{Endpoint, FrameHdr};
 use vyrn_replica::feed::Gap;
 use vyrn_replica::{BlockInputs, DataErr, DataFeed, DataJoin};
-use vyrn_wire::TxRing;
 
 mod consensus;
 use vyrn_consensus::Verdict;
@@ -300,23 +297,16 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                     udp_port: cfg.nic.data_port,
                 })
                 .map_err(|e| e.to_string())?;
-            let tx = nic
-                .tx_ring(PortId(0), TxClass::Control)
-                .map_err(|e| e.to_string())?;
             let n = u8::try_from(d.boxes.len()).map_err(|_| "config data.boxes: too many")?;
-            let me = drx.local_addr();
-            println!("DATA rx={me}");
+            let repair = UdpSocket::bind(SocketAddrV4::new(ip, 0)).map_err(|e| e.to_string())?;
+            repair.set_nonblocking(true).map_err(|e| e.to_string())?;
+            println!("DATA rx={}", drx.local_addr());
             Some(DataRx {
                 feed: DataFeed::new(BookId(cfg.book), n, d.me),
                 join: DataJoin::default(),
                 pending: VecDeque::new(),
                 rx: drx,
-                tx,
-                me: Endpoint {
-                    mac: [0; 6],
-                    ip: *me.ip(),
-                    port: me.port(),
-                },
+                repair,
                 boxes: d.boxes.clone(),
                 max_range: d.max_range,
                 fetches: VecDeque::new(),
@@ -387,19 +377,21 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
 const IDLE: std::time::Duration = std::time::Duration::from_micros(50);
 
 /// The data RX queue and the join it fills (07 §5.4).
-struct DataRx<const N: usize, R, T> {
+struct DataRx<const N: usize, R> {
     feed: DataFeed,
     join: DataJoin,
     /// Ready blocks whose ORDER part passed, waiting for their payloads (item 3).
     pending: VecDeque<BlockInputs<N>>,
     rx: R,
-    tx: T,
-    me: Endpoint,
+    /// Fetches go out on this socket and their answers come back to it: a data box answers a
+    /// KEY fetch to the fetch's source address (07 §5.5), and a `kernel_udp` TX ring sends from
+    /// an ephemeral socket nothing polls. RANGE answers come to `rx` as data frames.
+    repair: UdpSocket,
     boxes: Vec<std::net::SocketAddrV4>,
     max_range: u64,
     /// Gaps not fully fetched yet, with the box to ask: at most `FETCH_BURST` RANGE fetches go
     /// out per poll and a gap's `from` moves past them. One entry per gap, however long.
-    fetches: VecDeque<(FrameHdr, Gap)>,
+    fetches: VecDeque<(SocketAddrV4, Gap)>,
     /// The payload the front pending block waits for, and when it was last fetched by key.
     missing: Option<(SessionId, u32, u64)>,
 }
@@ -407,7 +399,7 @@ struct DataRx<const N: usize, R, T> {
 /// RANGE fetches sent per data poll.
 const FETCH_BURST: usize = 16;
 
-impl<const N: usize, R: RxRing, T: TxRing> DataRx<N, R, T> {
+impl<const N: usize, R: RxRing> DataRx<N, R> {
     /// Polls the queue once; sends a RANGE fetch for every gap. Returns the frames taken.
     fn poll(&mut self, now: u64) -> usize {
         let mut burst = [RxPkt::empty(); RX_BURST];
@@ -424,24 +416,25 @@ impl<const N: usize, R: RxRing, T: TxRing> DataRx<N, R, T> {
             }
         }
         self.rx.release(k);
-        let mut wire = [0u8; frame::MAX_FRAME_BYTES];
+        // Answers to KEY fetches, on the repair socket.
+        let mut buf = [0u8; frame::MAX_FRAME_BYTES];
+        while let Ok(n) = self.repair.recv(&mut buf) {
+            if let Ok(fed) = self
+                .feed
+                .on_frame(&mut self.join, buf.get(..n).unwrap_or(&[]), now)
+                && let Some(g) = fed.gap
+            {
+                gaps.push(g);
+            }
+        }
         for g in gaps {
-            let Some(to) = self.boxes.get(usize::from(g.src)) else {
-                continue;
-            };
-            let hdr = FrameHdr {
-                src: self.me,
-                dst: Endpoint {
-                    mac: [0; 6],
-                    ip: *to.ip(),
-                    port: to.port(),
-                },
-            };
-            self.fetches.push_back((hdr, g));
+            if let Some(to) = self.boxes.get(usize::from(g.src)) {
+                self.fetches.push_back((*to, g));
+            }
         }
         let mut budget = FETCH_BURST;
         while budget > 0
-            && let Some((hdr, g)) = self.fetches.front_mut()
+            && let Some((to, g)) = self.fetches.front_mut()
         {
             let mut done = g.from > g.to;
             for q in g.fetches(self.max_range).take(budget).collect::<Vec<_>>() {
@@ -452,9 +445,8 @@ impl<const N: usize, R: RxRing, T: TxRing> DataRx<N, R, T> {
                         _ => done = true,
                     }
                 }
-                if let Ok(n) = frame::build(hdr, &Fetch::encode(&q), &mut wire) {
-                    let _ = self.tx.send(wire.get(..n).unwrap_or(&[]));
-                }
+                // UDP: a lost fetch is retried by key while its payload stays missing.
+                let _ = self.repair.send_to(&Fetch::encode(&q), *to);
             }
             if done {
                 self.fetches.pop_front();
@@ -500,20 +492,9 @@ impl<const N: usize, R: RxRing, T: TxRing> DataRx<N, R, T> {
     /// A KEY fetch to every configured box: the validator has no session-to-data-home map yet
     /// (DEV reading, PR body), and a box that lacks the packet does not answer.
     fn fetch_key(&mut self, session: SessionId, pkt_seq: u32) {
-        let mut wire = [0u8; frame::MAX_FRAME_BYTES];
         let q = Fetch::encode(&Fetch::Key { session, pkt_seq });
         for to in &self.boxes {
-            let hdr = FrameHdr {
-                src: self.me,
-                dst: Endpoint {
-                    mac: [0; 6],
-                    ip: *to.ip(),
-                    port: to.port(),
-                },
-            };
-            if let Ok(n) = frame::build(&hdr, &q, &mut wire) {
-                let _ = self.tx.send(wire.get(..n).unwrap_or(&[]));
-            }
+            let _ = self.repair.send_to(&q, to);
         }
     }
 }
@@ -530,10 +511,10 @@ impl Drop for StopOnDrop<'_> {
 /// `REP_DATA_WAIT_US` (07 §5.5): how long a missing payload waits before a KEY fetch.
 const REP_DATA_WAIT_NS: u64 = 300_000;
 
-fn order_thread<const N: usize, R: RxRing, D: RxRing, T: TxRing>(
+fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     mut core: OrderCore<N, View>,
     mut rx: R,
-    mut data: Option<DataRx<N, D, T>>,
+    mut data: Option<DataRx<N, D>>,
     source: &consensus::Source,
     stop: &AtomicBool,
     stats: &Stats,
@@ -584,14 +565,14 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing, T: TxRing>(
     }
 }
 
-fn report<const N: usize, D: RxRing, T: TxRing>(
+fn report<const N: usize, D: RxRing>(
     core: &mut OrderCore<N, View>,
     r: Result<(), FrameErr>,
     faulted: &mut bool,
     stalled: &mut bool,
     stats: &Stats,
     source: &consensus::Source,
-    mut data: Option<&mut DataRx<N, D, T>>,
+    mut data: Option<&mut DataRx<N, D>>,
 ) {
     while let Some(b) = core.take_ready() {
         let h = b.header.height;
