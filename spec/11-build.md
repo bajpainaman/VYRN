@@ -991,8 +991,11 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   diverging silently.
 - *Band reference.* A lane call checks the price band against the best bid and ask after the
   latest step its records' `fills_applied` name (the step history the BBO replayer publishes).
-  The M3 script's band (10 000 bps) never binds, so this reading is not yet checked against
-  `RustReplay`; a narrow-band workload is the next test.
+  **Known divergence (open):** Rust's `Bbo::finish` publishes the conservative bounds that
+  `band_env` and `touch` keep, not the exact best prices, so once a band binds (for example
+  after a fill empties the last ask) the Vx client can accept an order `RustReplay` rejects. The
+  M3 script never reaches that case; v1 is not safe on a workload where the band can bind
+  until the client keeps the same bounds.
 - *Threads.* `VxReplay` creates the `n + 1` threads (W-04) but does not pin them yet: pinning
   comes with the core map (§10.1), and tests run unpinned. W-03 calls libc `sched_yield`, not
   `vyrn_vx_spin`, because vxc cannot declare a host symbol (W-18 in `vx/FRICTION.md`).

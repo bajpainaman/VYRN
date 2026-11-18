@@ -396,21 +396,32 @@ impl<P: Payloads, const N: usize> ReplayEngine<N> for VxReplay<P> {
                 LaneRec::Route(_) => None,
             })
             .collect::<Result<_, _>>()?;
-        for (j, (i, p)) in pkts.iter().enumerate() {
-            let later = |x: &&RouteRecord| {
-                !pkts[j + 1..].iter().any(|(_, q)| {
-                    q.lane == x.lane
-                        && q.flags & PacketFlags::ADVANCE == 0
-                        && q.first_lane_seq.0 <= x.lane_seq.0
-                        && x.lane_seq.0 < q.first_lane_seq.0 + u64::from(q.count)
-                })
-            };
-            let own: Vec<RouteRecord> = routes.iter().filter(later).copied().collect();
+        // The last packet whose range holds each (lane, LaneSeq), in one pass; then each
+        // packet's routes in one more.
+        let mut owner = std::collections::BTreeMap::new();
+        for (j, (_, p)) in pkts.iter().enumerate() {
+            if p.flags & PacketFlags::ADVANCE == 0 {
+                let lo = p.first_lane_seq.0;
+                for q in lo..lo.saturating_add(u64::from(p.count)) {
+                    owner.insert((p.lane.0, q), j);
+                }
+            }
+        }
+        let mut owned: Vec<Vec<RouteRecord>> = vec![Vec::new(); pkts.len()];
+        for x in &routes {
+            if let Some(o) = owner
+                .get(&(x.lane.0, x.lane_seq.0))
+                .and_then(|&j| owned.get_mut(j))
+            {
+                o.push(*x);
+            }
+        }
+        for ((i, p), own) in pkts.iter().zip(&owned) {
             let l = usize::from(p.lane.0);
             if l >= N {
                 return Err(ReplayError(format!("record {i}: lane {l}")));
             }
-            lanes[l].push(self.slot(*i, p, &own)?);
+            lanes[l].push(self.slot(*i, p, own)?);
         }
         let mut steps = Vec::new();
         for s in &blk.steps {
