@@ -45,6 +45,18 @@ pub const MAX_EXTRA_RANGES: usize = 64;
 /// Decode cap on the frames one [`Tail`] may describe (its `direct` bitmap). Not in 07; it bounds
 /// what a malformed report can make a decoder allocate (128 KiB of bitmap).
 pub const MAX_TAIL_FRAMES: u64 = 1 << 20;
+/// The longest encoded [`Silence`]: both substreams with [`MAX_EXTRA_RANGES`] ranges and a full
+/// `direct` bitmap. It sizes the tail channel's messages ([`crate::net`]).
+pub const SILENCE_MAX_BYTES: usize = 2
+    + 4
+    + 1
+    + 1
+    + 8
+    + 2 * (8 + 8 + 1 + MAX_EXTRA_RANGES * 16 + (MAX_TAIL_FRAMES as usize).div_ceil(8))
+    + 8
+    + 4
+    + 1
+    + 64;
 /// `REP_TAIL_WAIT_MS` = 4.05 ms (07 §9.2), in nanoseconds.
 pub const TAIL_WAIT_NS: u64 = 4_050_000;
 /// `REP_PROMOTE_LAG_US`: the `replay_lag_us` bound of a promotable box (07 §9.5).

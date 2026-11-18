@@ -161,6 +161,10 @@ pub struct Replication {
     pub order_b: Vec<SocketAddrV4>,
     /// A block closes this often while steps are pending.
     pub block_ms: u64,
+    /// A HEARTBEAT frame after this long with no frame sent (07 §9.1: 50 µs). *Reading* (DEV):
+    /// unset sends none, as before; a voter with `[failover]` then suspects an idle sequencer.
+    #[serde(default)]
+    pub heartbeat_us: Option<u64>,
     /// The stream core's retransmit ring (07 §4.10, `REP_RTX_RING_BYTES`): path A frames kept
     /// for a replica's `Nack`, which reaches it through `[consensus] ctrl`.
     #[serde(default = "d_rtx_ring")]

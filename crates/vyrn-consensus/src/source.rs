@@ -55,6 +55,14 @@ pub trait BlockSource: Clone + Send + Sync + 'static {
         None
     }
 
+    /// The tenure is deposed at this voter (07 §9.2), with or without a seal it holds. A deposed
+    /// leader proposes only the seal (07 §9.4); one that holds none (it lacks a frame of the
+    /// prefix and has no tail fetch yet) proposes nothing, and the view nullifies. Default: as
+    /// [`seal`](Self::seal).
+    fn deposed(&self, epoch: Epoch) -> bool {
+        self.seal(epoch).is_some()
+    }
+
     /// 07 §9.4's checks on the tail of `seal`: §6.4 items 3 and 4 for the seal header and §9.3
     /// items 3 and 4 (consistency, data). The signed headers below it get [`check_body`]
     /// (BlockSource::check_body) as any range does.
@@ -263,11 +271,13 @@ pub(crate) mod mem {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
-    /// Headers by height, and the seal candidate once a test deposes the tenure.
+    /// Headers by height, the seal candidate once a test deposes the tenure, and whether it
+    /// was deposed with no candidate (the voter lacks a frame of the prefix).
     #[derive(Clone, Default)]
     pub struct MemSource(
         pub Arc<Mutex<BTreeMap<Height, BlockHeader>>>,
         pub Arc<Mutex<Option<Seal>>>,
+        pub Arc<std::sync::atomic::AtomicBool>,
     );
 
     impl MemSource {
@@ -297,6 +307,9 @@ pub(crate) mod mem {
         }
         fn seal(&self, _: Epoch) -> Option<Seal> {
             self.1.lock().ok()?.clone()
+        }
+        fn deposed(&self, e: Epoch) -> bool {
+            self.2.load(std::sync::atomic::Ordering::Acquire) || self.seal(e).is_some()
         }
         fn check_seal(&self, _: Epoch, s: &Seal) -> Verdict {
             if self.seal(Epoch(0)).as_ref() == Some(s) {

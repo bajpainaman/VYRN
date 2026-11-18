@@ -21,8 +21,8 @@ use vyrn_consensus::ctrl::{self, Ctrl};
 use vyrn_consensus::{Committee, Listener, verify_finality_cert};
 use vyrn_log::{Ident, LaneBase, Layout, SeqWriter, TenureStart};
 use vyrn_types::{
-    BookId, Epoch, Hash, Height, LaneId, LaneSeq, Mode, Nanos, PacketRecord, SessionId, StepId,
-    StepKind,
+    BlockHeader, BookId, Epoch, Hash, Height, LaneId, LaneSeq, Mode, Nanos, PacketRecord,
+    SessionId, StepId, StepKind,
 };
 
 const SEQ_SEED: [u8; 32] = [0x42; 32];
@@ -139,6 +139,19 @@ impl Box_ {
         Self { child, lines }
     }
 
+    /// The first line starting with any of `prefixes`, within `secs`.
+    fn wait_any(&self, prefixes: &[&str], secs: u64) -> String {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(l) if prefixes.iter().any(|p| l.starts_with(p)) => return l,
+                Ok(_) => {}
+                Err(_) => panic!("no {prefixes:?} line within {secs} s"),
+            }
+        }
+    }
+
     /// The first line starting with `prefix`, within `secs`.
     fn wait(&self, prefix: &str, secs: u64) -> String {
         let deadline = Instant::now() + Duration::from_secs(secs);
@@ -158,8 +171,8 @@ impl Box_ {
     }
 }
 
-/// The frames of blocks `0..n`, one New and its Improve step each, signed with `SEQ_SEED`.
-fn blocks(n: u32) -> Vec<Vec<Vec<u8>>> {
+/// The tenure-0 writer of the test's sequencer, signing with `SEQ_SEED`.
+fn writer() -> SeqWriter {
     let ts = TenureStart {
         epoch: Epoch(0),
         tenure: 0,
@@ -183,54 +196,82 @@ fn blocks(n: u32) -> Vec<Vec<Vec<u8>>> {
         tenure: 0,
         sender: 0,
     };
-    let mut w = SeqWriter::new(Layout::new(2, 1, 0).unwrap(), ident, ts, SEQ_SEED, 1472).unwrap();
-    (1..=n)
-        .map(|i| {
-            let body = format!("request packet {i}");
-            let p = PacketRecord {
-                lane: LaneId(0),
-                count: 1,
-                flags: 0,
-                session: SessionId(0x0010_0001),
-                pkt_seq: i,
-                rx_ts: Nanos(u64::from(i) * 1_000),
-                pkt_hash: vyrn_crypto::pkt_hash(body.as_bytes()),
-                first_lane_seq: LaneSeq(u64::from(i)),
-                fills_applied: StepId(0),
-                snap_lag: 0,
-            };
-            let mut f = w
-                .packet(p, Some(vyrn_crypto::hash::hash(body.as_bytes())))
-                .unwrap();
-            let cut = [LaneSeq(u64::from(i)), LaneSeq(0)];
-            f.extend(
-                w.step(
-                    StepId(u64::from(i)),
-                    StepKind::Improve,
-                    Some((LaneId(0), LaneSeq(u64::from(i)))),
-                    0,
-                    Vec::new(),
-                    &cut,
-                    0,
-                )
-                .unwrap(),
-            );
-            f.extend(w.close_block().unwrap().0);
-            f
-        })
-        .collect()
+    SeqWriter::new(Layout::new(2, 1, 0).unwrap(), ident, ts, SEQ_SEED, 1472).unwrap()
 }
 
-#[test]
-fn four_validators_finalize_and_the_listener_learns_it() {
-    let dir = std::env::temp_dir().join(format!("vyrn-committee-{}", std::process::id()));
+const SESSION: SessionId = SessionId(0x0010_0001);
+
+/// Packet `i` and its Improve step, framed (`flush`) but in no closed block.
+fn records(w: &mut SeqWriter, i: u32) -> Vec<Vec<u8>> {
+    let body = format!("request packet {i}");
+    let p = PacketRecord {
+        lane: LaneId(0),
+        count: 1,
+        flags: 0,
+        session: SESSION,
+        pkt_seq: i,
+        rx_ts: Nanos(u64::from(i) * 1_000),
+        pkt_hash: vyrn_crypto::pkt_hash(body.as_bytes()),
+        first_lane_seq: LaneSeq(u64::from(i)),
+        fills_applied: StepId(0),
+        snap_lag: 0,
+    };
+    let mut f = w
+        .packet(p, Some(vyrn_crypto::hash::hash(body.as_bytes())))
+        .unwrap();
+    let cut = [LaneSeq(u64::from(i)), LaneSeq(0)];
+    f.extend(
+        w.step(
+            StepId(u64::from(i)),
+            StepKind::Improve,
+            Some((LaneId(0), LaneSeq(u64::from(i)))),
+            0,
+            Vec::new(),
+            &cut,
+            0,
+        )
+        .unwrap(),
+    );
+    f.extend(w.flush().unwrap());
+    f
+}
+
+/// Blocks `0..n` (block `i` holds packet `i + 1` and its step), and the last header.
+fn blocks_with(w: &mut SeqWriter, n: u32) -> (Vec<Vec<u8>>, Option<BlockHeader>) {
+    let mut out = Vec::new();
+    let mut last = None;
+    for i in 1..=n {
+        out.extend(records(w, i));
+        let (f, h) = w.close_block().unwrap();
+        out.extend(f);
+        last = Some(h);
+    }
+    (out, last)
+}
+
+/// The frames of blocks `0..n`, one New and its Improve step each, signed with `SEQ_SEED`.
+fn blocks(n: u32) -> Vec<Vec<u8>> {
+    blocks_with(&mut writer(), n).0
+}
+
+/// Four validators of a roster committee on localhost, their CTRL listener socket and ORDER
+/// ports. `extra` is appended to every config (`[failover]`), `dev` sets `dev = true`.
+struct Committee4 {
+    dir: std::path::PathBuf,
+    committee: Committee,
+    ctrl: UdpSocket,
+    vals: Vec<Box_>,
+    orders: Vec<SocketAddrV4>,
+}
+
+fn committee4(tag: &str, dev: bool, extra: &str) -> Committee4 {
+    let dir = std::env::temp_dir().join(format!("vyrn-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let seq_key = vyrn_crypto::ed25519::public_key(&SEQ_SEED);
     let keys: Vec<_> = (0..4)
         .map(|i| vyrn_crypto::ed25519::public_key(&vote_seed(i)))
         .collect();
     let repl: Vec<u16> = (0..4).map(|_| free_tcp()).collect();
-
     // The sequencer's CTRL port: this test runs the finality listener itself (07 §6.8).
     let ctrl_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     ctrl_sock
@@ -238,8 +279,6 @@ fn four_validators_finalize_and_the_listener_learns_it() {
         .unwrap();
     let ctrl = ctrl_sock.local_addr().unwrap();
     let committee = Committee::new(Mode::Base, keys.clone(), &[seq_key]).unwrap();
-    let mut listener = Listener::new(committee.clone(), Epoch(0), Height(0));
-
     let (roster_hex, roster_hash) = roster(&keys, &repl, [seq_key, [0x77; 32]]);
     let roster_file = dir.join("roster.hex");
     std::fs::write(&roster_file, roster_hex).unwrap();
@@ -256,6 +295,7 @@ role = "validator"
 mode = "BASE"
 book = 7
 lanes = 2
+dev = {dev}
 
 [nic]
 backend = "kernel_udp"
@@ -276,7 +316,7 @@ home = "LDN"
 observers = ["{ctrl}"]
 delta_ms = 500
 storage = "{}"
-"#,
+{extra}"#,
                 hex(&seq_key),
                 roster_file.display(),
                 hex(&[0; 32]),
@@ -297,12 +337,31 @@ storage = "{}"
         orders.push(a.rsplit('=').next().unwrap().parse().unwrap());
         vals.push(v);
     }
+    Committee4 {
+        dir,
+        committee,
+        ctrl: ctrl_sock,
+        vals,
+        orders,
+    }
+}
+
+#[test]
+fn four_validators_finalize_and_the_listener_learns_it() {
+    let Committee4 {
+        dir,
+        committee,
+        ctrl: ctrl_sock,
+        vals,
+        orders,
+    } = committee4("committee", false, "");
+    let mut listener = Listener::new(committee.clone(), Epoch(0), Height(0));
 
     // 40 blocks to every validator in one burst, so each HASH frame is queued right behind its
     // packet: on a loaded 2-vCPU host a gap between them can pass REP_HASHLAG_MAX (1 ms).
     let s = UdpSocket::bind("127.0.0.1:0").unwrap();
     for a in &orders {
-        for f in blocks(40).iter().flatten() {
+        for f in &blocks(40) {
             s.send_to(f, a).unwrap();
         }
     }
@@ -339,6 +398,124 @@ storage = "{}"
     }
     for v in vals {
         assert!(v.stop());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every line `v` prints until it exits, after its stdin closes; and whether it exited 0.
+fn stop_and_drain(mut v: Box_) -> (bool, Vec<String>) {
+    drop(v.child.stdin.take());
+    let ok = v.child.wait().unwrap().success();
+    let mut out = Vec::new();
+    while let Ok(l) = v.lines.recv_timeout(Duration::from_secs(2)) {
+        out.push(l);
+    }
+    (ok, out)
+}
+
+/// 07 §9.1–9.5, no promotable box: the test's sequencer frames 40 blocks and one more packet and
+/// step, then goes silent (no heartbeat, no standby). The four voters suspect, exchange
+/// `Silence` on the p2p tail channel, depose at Q, and finalize the seal of the prefix with
+/// `next_seq = 0xFF`. The seal is checked against one this test computes from the frames it
+/// sent (`H*` = block 39, `F*` = its last frame, `order_root` over the tail's ORDER bytes,
+/// the tail packet unavailable without `[data]`), so a prefix one frame short or a root over
+/// the wrong frames fails, though every voter would agree on it. After `DEPOSED` the sequencer
+/// sends block 40's mark and header: no voter applies it (INV-REP-5).
+#[test]
+fn a_silent_sequencer_is_deposed_and_its_prefix_sealed() {
+    use vyrn_consensus::{ProposalKind, SealExt};
+    // DEV timers on loopback: 300 ms of silence, a 2 s abort window.
+    let Committee4 {
+        dir,
+        committee,
+        ctrl,
+        vals,
+        orders,
+    } = committee4(
+        "depose",
+        true,
+        "\n[failover]\nsilence_us = 300000\nabort_us = 2000000\n",
+    );
+    let mut w = writer();
+    let (mut frames, star) = blocks_with(&mut w, 40);
+    let star = star.unwrap();
+    frames.extend(records(&mut w, 41));
+    let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for a in &orders {
+        for f in &frames {
+            s.send_to(f, a).unwrap();
+        }
+    }
+    // What the seal must be, from the sender's side.
+    let f_star = u64::try_from(frames.len()).unwrap();
+    let want = vyrn_consensus::tail::seal_header(
+        &star,
+        StepId(41),
+        vyrn_log::block::order_root(w.open_order_bytes(), &[]),
+        vyrn_log::block::data_root(&[Hash([0; 32])], &[]),
+    );
+    let want_ext = SealExt {
+        end_frame_seq: [f_star, 0],
+        next_seq: 0xFF,
+        next_tenure: 1,
+        unavail: vec![(SESSION, 41)],
+    };
+    for v in &vals {
+        v.wait("DEPOSED", 60);
+    }
+    // INV-REP-5: block 40's mark and header, after deposition.
+    let (late, _) = w.close_block().unwrap();
+    for a in &orders {
+        for f in &late {
+            s.send_to(f, a).unwrap();
+        }
+    }
+    // A voter deposed by the others' Silence before its own order thread decoded the whole
+    // tail holds no candidate (no tail fetch yet, `NO_SEAL`); Q of 4 must hold this one.
+    let mut sealed = 0;
+    for v in &vals {
+        let l = v.wait_any(&["SEAL ", "NO_SEAL "], 30);
+        if l.starts_with("SEAL ") {
+            assert!(l.contains(&format!("end_a={f_star} ")), "{l}");
+            assert!(l.contains("next_seq=255"), "{l}");
+            sealed += 1;
+        }
+    }
+    assert!(
+        sealed >= committee.quorum(),
+        "{sealed} voters hold the seal"
+    );
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut buf = [0u8; 9216];
+    let cert = loop {
+        assert!(Instant::now() < deadline, "no seal certificate");
+        let Ok(n) = ctrl.recv(&mut buf) else { continue };
+        if let Ctrl::Cert(c) = ctrl::decode(&buf[..n]).unwrap()
+            && c.proposal.kind == ProposalKind::Seal
+        {
+            break c;
+        }
+    };
+    assert_eq!(verify_finality_cert(&cert, &committee), Ok(()));
+    assert_eq!(cert.proposal.last_height, Height(40));
+    assert_eq!(
+        cert.proposal.last_hash,
+        vyrn_log::block::header_hash(&want),
+        "the seal header differs from the sender's prefix"
+    );
+    assert_eq!(cert.seal, Some(want_ext));
+    for v in vals {
+        let (ok, lines) = stop_and_drain(v);
+        assert!(ok);
+        assert!(
+            !lines.iter().any(|l| l.starts_with("BLOCK height=40")),
+            "a voter applied a frame of the deposed tenure"
+        );
+        let drops = lines
+            .iter()
+            .find_map(|l| l.strip_prefix("DEPOSED_DROPS frames="))
+            .and_then(|n| n.parse::<u64>().ok());
+        assert!(drops.is_some_and(|d| d >= 1), "{drops:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

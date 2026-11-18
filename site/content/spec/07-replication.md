@@ -2188,6 +2188,20 @@ than Q voters have sent `Silence` within `REP_SUSPECT_ABORT_MS` = 5 ms, it unfre
 buffered frames and repairs the rest. A single isolated voter therefore cannot depose a live
 sequencer. The standby sends a TailReport too, but its Silence never counts toward Q.
 
+*Readings* (`vyrn-validator` `depose.rs`, `vyrn-seq`):
+- **Heartbeats** (**semantics**, DEV): `vyrn-seq` sends a HEARTBEAT frame only after
+  `[replication] heartbeat_us` with no frame sent, so a busy stream sends none. Unset, it sends
+  none at all, and a voter with `[failover]` then suspects an idle sequencer.
+- **Freeze** (**semantics**): a frozen voter stops polling its ORDER queues, so the socket
+  buffers what still arrives, and it runs no `REP_E_HASHLAG` deadline. An abort resumes both.
+  Frames buffered past the bound then trip `REP_E_HASHLAG`, as the 5 ms abort window against a
+  1 ms bound implies anyway.
+- **Timers** (DEV): `[failover] silence_us` and `abort_us` differ from `FAILOVER_SILENCE_MS` and
+  `REP_SUSPECT_ABORT_MS` only with `dev = true`.
+- **Transport**: `Silence` and its TailReport travel on their own `commonware-p2p` channel among
+  the voters (§3.1), not on `REP_UDP_CTRL`. A voter repeats its own every 2 ms until it is live
+  again, because a send reaches only peers connected at that moment.
+
 ### 9.2 Deposition
 
 When a voter holds Silence messages from Q distinct voters, the tenure is **deposed** at that
@@ -2271,6 +2285,18 @@ the static ACL, and every frame at or below `H*` is covered by `seq_sig`. **Prop
 that any reporter holds is in the prefix, unless a lower frame is held by no reporter, or the
 sequencer equivocated.
 
+*Readings* (`vyrn-validator`; each a **semantics** reading of what this release reports):
+- `H_i` is the last block the order core made ready (header, ORDER frames and HashRuns), and
+  `F_i` the last frame it decoded. It decodes in `frame_seq` order, so it holds `1..F_i`. A
+  report carries no `extra` ranges, since frames held behind a gap are not reported, and every
+  `direct` bit is 1, since the source of a repaired frame is not tracked.
+- **No tail fetch yet** (item 2, a known gap): a voter whose `H_i` is below `H*`, or whose `F_i`
+  is below `F*` on a substream, holds no seal candidate. As leader it proposes nothing and the
+  view nullifies. It never seals a shorter prefix. A voter deposed by the others' `Silence`
+  before it decoded the whole tail is such a voter.
+- Item 4 at seal time fetches nothing: a tail packet the voter's data join cannot resolve, or
+  every one without a data tier, is unavailable.
+
 ### 9.4 Seal proposal and seal block
 
 The seal is one Simplex proposal of kind 1:
@@ -2321,6 +2347,11 @@ seal header  { height: Hs, epoch, book, first_step: last_step(H*) + 1,
 - **A deposed leader proposes only the seal.** From deposition on (§9.2), a leader never
   proposes a kind-0 range. When the seal does not extend the view's parent, for example when the
   parent is already the seal, it proposes nothing and the view nullifies (INV-REP-5).
+- *Reading* (`vyrn-validator`, **semantics**): a voter's seal check (§9.3 items 3–4) accepts
+  exactly its own candidate. That candidate is built from the frames and payloads the voter
+  holds, so item 3 has no other bytes to compare, and item 4's unavailable list is its own. The
+  candidate's `order_root` is over the ORDER section bytes after `BlockMark(H*)` through `F*`,
+  `Pad` excluded, as §6.1 does for a block.
 - After the seal is final, `next_seq` emits frame 1 of tenure `next_tenure` with `TenureStart{
   first_step: last_step(Hs) + 1, first_height: Hs + 1, prev_header_hash: header_hash(Hs), lane
   bases, prev_cut = lane_bounds }`.

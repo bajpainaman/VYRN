@@ -129,6 +129,9 @@ struct Sub {
     tenure: u8,
     /// The height of the block the next lane record belongs to.
     open: u64,
+    /// `frame_seq` of the frame that carried each `BlockMark` not yet ready, and of the last
+    /// ready block's: the TailReport's `mark` (07 §9.3).
+    marks: BTreeMap<u64, u64>,
     parts: BTreeMap<u64, Part>,
 }
 
@@ -139,6 +142,28 @@ struct Anchor {
     first_step: StepId,
     first_height: Height,
     prev_header_hash: Hash,
+}
+
+/// One substream's share of [`OrderCore::tail`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubTail {
+    /// `frame_seq` of `BlockMark(H_i)` on this substream.
+    pub mark: u64,
+    /// `F_i`: every frame `1..=last` of the tenure was decoded.
+    pub last: u64,
+    /// The ORDER section bytes after `BlockMark(H_i)`, through `F_i`.
+    pub order_bytes: Vec<u8>,
+    /// The lane records after `BlockMark(H_i)`, in O-order; a packet whose HashRun has not
+    /// arrived has `pkt_hash` 0 (unhashed, 07 §9.3 item 4).
+    pub recs: Vec<LaneRec>,
+}
+
+/// [`OrderCore::tail`]: `H_i`, the last step of the prefix, and each substream's tail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TailState {
+    pub height: Height,
+    pub last_step: StepId,
+    pub subs: Vec<SubTail>,
 }
 
 /// The order core of one tenure. `N` is the box's lane count.
@@ -179,6 +204,7 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
                 started: false,
                 tenure: 0,
                 open: 0,
+                marks: BTreeMap::new(),
                 parts: BTreeMap::new(),
             });
         }
@@ -234,6 +260,45 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
         } else {
             Verdict::Pending
         }
+    }
+
+    /// What this core holds above its last ready block, `H_i` (07 §9.3–9.4): per substream the
+    /// `frame_seq` of `BlockMark(H_i)` and of the last frame decoded (`F_i`: the decoder takes
+    /// frames in order with no gap), and every ORDER section byte and lane record after that
+    /// mark. `last_step` is the last step both halves of which were decoded (a cut-only record
+    /// whose home record is missing ends the prefix before it, 07 §9.4). `None` before the
+    /// tenure's first block is ready.
+    pub fn tail(&self) -> Option<TailState> {
+        let (_, first_step) = self.tip?;
+        let h = self.next_height.checked_sub(1)?;
+        let last_step = self
+            .merged
+            .back()
+            .map_or(StepId(first_step.0.saturating_sub(1)), |s| s.rec.step);
+        let mut subs = Vec::new();
+        for sub in &self.subs {
+            let mark = *sub.marks.get(&h)?;
+            let mut order_bytes = Vec::new();
+            let mut recs = Vec::new();
+            for (_, p) in sub.parts.range(h.saturating_add(1)..) {
+                if let Some(hb) = &p.half {
+                    order_bytes.extend_from_slice(&hb.order_bytes);
+                }
+                recs.extend(p.recs.iter().cloned());
+            }
+            order_bytes.extend_from_slice(sub.dec.state().open_bytes());
+            subs.push(SubTail {
+                mark,
+                last: sub.dec.next_frame_seq().saturating_sub(1),
+                order_bytes,
+                recs,
+            });
+        }
+        Some(TailState {
+            height: Height(h),
+            last_step,
+            subs,
+        })
     }
 
     /// Sets the `REP_E_HASHLAG` bound to `ns`. DEV only (07 §3.7): the spec's bound is
@@ -465,6 +530,7 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
                     return Err(FaultKind::Decode(RepErr::Mark));
                 }
                 sub.parts.entry(sub.open).or_default();
+                sub.marks.insert(sub.open, id.frame_seq);
                 sub.open = sub.open.saturating_add(1);
             }
             Section::SessionBind(_) | Section::HashRun { .. } | Section::Pad(_) => {}
@@ -604,6 +670,8 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
                 if let Some(p) = sub.parts.remove(&h) {
                     lanes.extend(p.recs);
                 }
+                // The ready block's mark stays: it is `mark` while this block is `H_i`.
+                sub.marks = sub.marks.split_off(&h);
                 if i == 0 {
                     split = lanes.len();
                 }

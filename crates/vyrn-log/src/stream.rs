@@ -470,6 +470,12 @@ impl SubstreamState {
             .collect()
     }
 
+    /// The open block's ORDER section bytes so far: every section after the last `BlockMark`
+    /// (07 §9.4, the seal's tail).
+    pub fn open_bytes(&self) -> &[u8] {
+        &self.block_bytes
+    }
+
     /// This half's current cut, absolute.
     pub fn half_cut(&self) -> Vec<LaneSeq> {
         self.prev_cut.iter().map(|&c| LaneSeq(c)).collect()
