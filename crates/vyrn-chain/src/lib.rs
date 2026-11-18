@@ -20,6 +20,10 @@
 //! | [`lthash`] | 28-byte order element, 1024 × u16 LtHash, digest | 09 §9.4 | lanes (diffs), the commit box (sum) | `StateCommit`, syncing nodes |
 //! | [`commit`] | `StateCommit` (226 + 10·books B), `CommitVote`, `CommitCert` (item 0x24) | 09 §9.5 | validator boxes (VK) | light clients, L1 posts, `DoubleCommit` evidence |
 //! | [`signer`] | `Ed25519Signer` (VK), `BridgeSigner` (BK) traits; software signers | 09 §2.2 | HSM / key-file adapters | [`commit`], bridge posts |
+//! | [`tx`] | `TxEnvelope`, `SignerRef`; Ed25519 over `derive_key("vyrn v1 tx", …)` | 09 §4.4 | wallets, sessions, nodes | every validator |
+//! | [`forced`] | `ForcedPacket` (item 0x10), cheap checks before the signature | 09 §7 | clients the sequencer ignores | committee members, the lane |
+//! | [`l1attest`] | `L1Attest`, `Deposited`; 3-of-5 identical, nonce-ordered credit | 09 §6.3 | each operator's L1 nodes | the state machine |
+//! | [`evidence`] | `SeqEquivocation`, `DoubleVote` (`VoteMsg` 57 B), `DoubleCommit`, `BadPost`; §8.4 amounts | 09 §8 | anyone | the state machine |
 //! | [`keccak256`] | Keccak-256 (Ethereum padding), RustCrypto `sha3` (11 §2.2) | 01 §14.11 | — | [`eip712`], [`wdtree`] |
 //!
 //! **Ordering.** Post `k` names post `k − 1` by its EIP-712 struct hash in `prev_post`; post 1 has
@@ -50,8 +54,9 @@
 //!
 //! # Not implemented yet
 //!
-//! The wallet signature of the `TxEnvelope` (§4.4) and `AnchorFault` (§5.4), slashing evidence (§8), forced inclusion (§7),
-//! L1 deposit attestation (§6.3), and the `AllocLeaf`/`SessionLeaf`/`OperatorLeaf` layouts.
+//! secp256k1 `TxEnvelope` signatures, `AnchorFault` (§5.4), the evidence kinds that need records
+//! 09 does not encode yet (`FenceViolation`, `HandoffWithheld`, `CrossHomeVote`, `Censorship`,
+//! `WrongExclusion`), the incremental SMT, and the `AllocLeaf`/`SessionLeaf`/`OperatorLeaf` layouts.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -59,12 +64,16 @@ pub mod bridge;
 mod codec;
 pub mod commit;
 pub mod eip712;
+pub mod evidence;
+pub mod forced;
+pub mod l1attest;
 pub mod loghash;
 pub mod lthash;
 pub mod session;
 pub mod signer;
 pub mod smt;
 pub mod tesla;
+pub mod tx;
 pub mod wdtree;
 
 use vyrn_types::Hash;
@@ -72,12 +81,16 @@ use vyrn_types::Hash;
 pub use bridge::{Checkpoint, Guardian, Verdict, VetoReason, build_post};
 pub use commit::{CommitCert, CommitVote, StateCommit};
 pub use eip712::{Address, Domain, Post, SigError, SignerSet, Unpause};
+pub use evidence::{Evidence, EvidenceLedger, EvidenceState, Fault};
+pub use forced::{ForcedReject, ForcedState};
+pub use l1attest::{DepositTally, Deposited, L1Attest};
 pub use loghash::{LogChain, Roots};
 pub use lthash::{LtHash, OrderElem};
 pub use session::{OpenReject, SessionOpen, SessionState};
 pub use signer::{BridgeSigner, Ed25519Signer, SignerError};
 pub use smt::{AccountLeaf, BalanceLeaf, Proof, Smt};
 pub use tesla::{ClientKeys, KcomWindow, KeyDisclosure, Traversal};
+pub use tx::{SignerRef, TxEnvelope};
 pub use wdtree::Withdrawal;
 
 /// Keccak-256 as Ethereum uses it (pad `0x01 … 0x80`, not SHA3's `0x06`). 01 §14.11 allows it only

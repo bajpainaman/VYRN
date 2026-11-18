@@ -13,6 +13,9 @@ description = "Chain mode: wallet session open, key registration, TESLA disclosu
 vyrn-types = { workspace = true }
 vyrn-crypto = { workspace = true }
 vyrn-epoch = { workspace = true }
+# Header hash and seq_sig for SeqEquivocation (09 §8.2); request-packet parsing for ForcedPacket (§7.2).
+vyrn-log = { workspace = true }
+vyrn-wire = { workspace = true }
 k256 = { workspace = true }
 sha3 = { workspace = true }
 thiserror = { workspace = true }
