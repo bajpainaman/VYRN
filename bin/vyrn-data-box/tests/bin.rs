@@ -249,6 +249,17 @@ fn serves(shards: Option<String>) {
     served(EPOCH + 2, &mut buf);
     served(EPOCH + 3, &mut buf);
 
+    // 07 §5.7 step 3: `REDIRECT` sends session 5's DataRedirect, sealed under its K_seq, to the
+    // client address its copy came from; session 77 was never heard from and is only counted.
+    stdin.write_all(b"REDIRECT 0 1 5:2,77:1\n").unwrap();
+    assert_eq!(lines.next().unwrap().unwrap(), "REDIRECT_QUEUED 2");
+    let got = client.recv(&mut buf).unwrap();
+    let r = vyrn_data::redirect::Redirect::open(&buf[..got], &K).unwrap();
+    assert_eq!(
+        (r.down, r.to, r.session, r.resend_from),
+        (0, 1, SessionId(5), 2)
+    );
+
     let t = Instant::now();
     loop {
         let m = scrape(&metrics);
@@ -275,6 +286,8 @@ fn serves(shards: Option<String>) {
     assert_eq!(field(&stats, "events_unprinted="), "0", "{stats}");
     assert_eq!(field(&stats, "fetch_unauth="), "2", "{stats}");
     assert_eq!(field(&stats, "fetch_ring_hit="), "4", "{stats}");
+    assert_eq!(field(&stats, "redirects="), "1", "{stats}");
+    assert_eq!(field(&stats, "redirect_unknown="), "1", "{stats}");
     let n = if shards.is_some() { "2" } else { "1" };
     assert_eq!(field(&stats, "shards="), n, "{stats}");
     let _ = std::fs::remove_dir_all(&dir);

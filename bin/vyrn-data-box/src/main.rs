@@ -42,7 +42,8 @@
 //! loop (a full queue drops and counts the line), and at exit `STATS stored=<n> data_frames=<n>
 //! heartbeats=<n> duplicate=<n> fetch_unauth=<n> fetch_limited=<n> bad_mac=<n> events_dropped=<n>
 //! events_unprinted=<n> fetch_ring_hit=<n> fetch_log_hit=<n> fetch_miss=<n> fetch_resent=<n>
-//! hop_full=<n> shards=<n>`, every counter summed over the cores.
+//! hop_full=<n> redirects=<n> redirect_unknown=<n> shards=<n>`, every counter summed over the
+//! cores.
 //! A stop waits up to 1 s for queued events to print and counts the rest
 //! in `events_unprinted`, so `EVENT` lines + `events_unprinted` + `events_dropped` = `bad_mac` +
 //! `conflicts`.
@@ -57,7 +58,11 @@
 //! under either (08 §4.6), dropping older epochs' keys, then prints `FETCH_EPOCHS <e>,<e+1>`. At
 //! start the box holds `[roster] epoch` and the next one, so requesters that move to the next
 //! epoch are served without a restart. A refused or unknown line prints `CONTROL_ERR <why>` on
-//! stderr and changes nothing. Lines reach the RX core through a queue of `CONTROL_QUEUE`; while
+//! stderr and changes nothing. `REDIRECT <down> <to> <session>:<resend_from>[,…]` sends each
+//! session's `DataRedirect{down → to, resend_from}` (07 §5.7 step 3) from the shard that owns it
+//! and prints `REDIRECT_QUEUED <n>`; *reading:* 07 §5.7 has the replicas send `resend_from` to
+//! the boxes but names no message, so the operator channel carries it until one exists. Lines
+//! reach the RX core through a queue of `CONTROL_QUEUE`; while
 //! it is full the stdin reader waits, never a core.
 //!
 //! **Stop.** With `--stop-on-stdin-eof`, closing stdin stops the RX core; each shard drains its
@@ -79,14 +84,14 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::registry::Registry;
 use vyrn_cut::Hw;
 use vyrn_data::config::{Config, hex};
-use vyrn_data::shards::{self, RxCore, SenderRing, ShardRing};
+use vyrn_data::shards::{self, RxCore, SenderRing, ShardRing, ShardTx};
 use vyrn_data::{Counters, Event, NodeConfig};
 use vyrn_log::{BlockStore, FileStore, MemStore};
 use vyrn_nic::frame::Endpoint;
 use vyrn_nic::{
     BackendKind, KernelUdp, NicBackend, NicConfig, PortConfig, PortId, RxBind, TxClass,
 };
-use vyrn_types::{LaneId, Nanos};
+use vyrn_types::{LaneId, Nanos, SessionId};
 use vyrn_wire::RxRing;
 
 #[derive(Parser)]
@@ -358,29 +363,58 @@ impl KeySource {
 }
 
 /// One control line (cold path). `EPOCH <e>` installs `K_fetch` of e and e + 1 and prints
-/// `FETCH_EPOCHS <a>,<b>`; a refused or unknown line prints `CONTROL_ERR <why>` on stderr.
+/// `FETCH_EPOCHS <a>,<b>`. `REDIRECT <down> <to> <session>:<resend_from>[,…]` hands each
+/// session's `DataRedirect` (07 §5.7 step 3) to its shard and prints `REDIRECT_QUEUED <n>`. A
+/// refused or unknown line prints `CONTROL_ERR <why>` on stderr.
 fn control<R: RxRing, F: RxRing>(
     line: &str,
     keys: Option<&KeySource>,
     node: &mut RxCore<R, F>,
+    shards: &mut [ShardTx<'_>],
     acks: &std::sync::mpsc::SyncSender<Result<String, String>>,
 ) {
-    let mut w = line.split_whitespace();
-    let r = match (w.next(), w.next().map(str::parse::<u32>), w.next()) {
-        (None, ..) => return,
-        (Some("EPOCH"), Some(Ok(e)), None) => match keys {
-            Some(k) => k.install(node, e),
-            None => Err("an open-mode box has no fetch keys".into()),
+    let w: Vec<&str> = line.split_whitespace().collect();
+    let r = match w.as_slice() {
+        [] => return,
+        ["EPOCH", e] => match (e.parse::<u32>(), keys) {
+            (Ok(e), Some(k)) => k.install(node, e).map(|()| {
+                let ep: Vec<String> = node.fetch_epochs().map(|e| e.to_string()).collect();
+                format!("FETCH_EPOCHS {}", ep.join(","))
+            }),
+            (Ok(_), None) => Err("an open-mode box has no fetch keys".into()),
+            (Err(_), _) => Err(format!("unknown control line {:?}", line.trim())),
         },
+        ["REDIRECT", down, to, list] => redirects(down, to, list).map(|(d, t, sessions)| {
+            let n = node.redirect(d, t, &sessions, shards);
+            format!("REDIRECT_QUEUED {n}")
+        }),
         _ => Err(format!("unknown control line {:?}", line.trim())),
     };
     // Printed by their own thread: a stalled stdout or stderr never blocks the poll loop, and
-    // a full queue drops the line (the keys are installed either way).
-    let ack = r.map(|()| {
-        let ep: Vec<String> = node.fetch_epochs().map(|e| e.to_string()).collect();
-        format!("FETCH_EPOCHS {}", ep.join(","))
-    });
-    let _ = acks.try_send(ack.map_err(|e| format!("CONTROL_ERR {e}")));
+    // a full queue drops the line (the change is made either way).
+    let _ = acks.try_send(r.map_err(|e| format!("CONTROL_ERR {e}")));
+}
+
+/// The arguments of `REDIRECT`: `down`, `to` and `session:resend_from` pairs, comma-separated.
+#[allow(clippy::type_complexity)]
+fn redirects(down: &str, to: &str, list: &str) -> Result<(u8, u8, Vec<(SessionId, u32)>), String> {
+    let bad =
+        || format!("REDIRECT {down} {to} {list}: expected <down> <to> <session>:<resend_from>[,…]");
+    let (d, t) = (
+        down.parse().map_err(|_| bad())?,
+        to.parse().map_err(|_| bad())?,
+    );
+    let sessions = list
+        .split(',')
+        .map(|p| {
+            let (s, q) = p.split_once(':').ok_or_else(bad)?;
+            Ok((
+                SessionId(s.parse().map_err(|_| bad())?),
+                q.parse().map_err(|_| bad())?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((d, t, sessions))
 }
 
 /// The roster file: raw bytes, or the same bytes as hex text (whitespace ignored).
@@ -637,7 +671,7 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
                     while !shared.stop.load(Ordering::Acquire) && !shared.aborted() {
                         let work = rx.poll(shared.now(), &mut to_shard, &mut rx_out);
                         while let Ok(l) = ctl.try_recv() {
-                            control(&l, keys, &mut rx, acks);
+                            control(&l, keys, &mut rx, &mut to_shard, acks);
                         }
                         if published.elapsed() >= PUBLISH {
                             ex.publish(rx.counters());
@@ -771,7 +805,7 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
     // A closed stdout (the supervisor went away) is not a reason to fail the stop.
     let _ = writeln!(
         std::io::stdout(),
-        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} bad_mac={} events_dropped={} events_unprinted={unprinted} fetch_ring_hit={} fetch_log_hit={} fetch_miss={} fetch_resent={} hop_full={} shards={n}",
+        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} bad_mac={} events_dropped={} events_unprinted={unprinted} fetch_ring_hit={} fetch_log_hit={} fetch_miss={} fetch_resent={} hop_full={} redirects={} redirect_unknown={} shards={n}",
         c.stored,
         c.data_frames,
         c.heartbeats,
@@ -784,7 +818,9 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
         c.fetch_log_hit,
         c.fetch_miss,
         c.fetch_resent,
-        c.hop_full
+        c.hop_full,
+        c.redirects,
+        c.redirect_unknown
     );
     Ok(())
 }
