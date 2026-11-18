@@ -2250,7 +2250,10 @@ fn post(side: Side, tick: u32, qty: u32, tag: u32) -> vyrn_wire::Msg {
 /// record held by the lane, its Ack held until a CONT Rescan ends the sweep (rule B). `rep`
 /// makes lane 2's sell at 104 a local new-priority Replace of a resting sell at 110 (gap item
 /// 3b): the batch taker is then the Replace's version, as `JKind::NewPrio` is in `Bbo::rescan`.
-fn batch_script(post_only: bool, rep: bool) -> Vec<Act> {
+/// `stp` sends that sell from lane 1's account 1 with cancel-newest STP (gap item 4): the batch
+/// taker meets its own buy at 105 and ends `Out STP`, then a CancelAll of the session cancels
+/// its two resting buys, which needs the ended taker gone from the book.
+fn batch_script(post_only: bool, rep: bool, stp: bool) -> Vec<Act> {
     use Side::{Buy, Sell};
     use Tif::{Day, Ioc};
     let p = |l, a, t: u64, m| Act::Pkt {
@@ -2297,19 +2300,40 @@ fn batch_script(post_only: bool, rep: bool) -> Vec<Act> {
                     9_000,
                     replace(Handle::new(2, 1).unwrap(), Sell, Day, 104, 3),
                 )
+            } else if stp {
+                p(
+                    1,
+                    1,
+                    9_000,
+                    stp_new(Sell, Day, 104, 3, 9, vyrn_bbo::Stp::CancelNewest),
+                )
             } else {
                 p(2, 2, 9_000, new(Sell, Day, 104, 3, 9))
             },
         ]
     };
     s.extend([Act::Run, Act::Poll, Act::Run]);
+    if stp {
+        s.push(p(
+            1,
+            1,
+            10_000,
+            vyrn_wire::Msg::CancelAll { client_tag: 11 },
+        ));
+        s.extend([Act::Run, Act::Poll, Act::Run]);
+    }
     s
 }
 
 #[test]
 fn the_vx_client_replays_rescan_batch_takers_that_trade() {
-    for (post_only, by_replace) in [(false, false), (true, false), (false, true)] {
-        let script = batch_script(post_only, by_replace);
+    for (post_only, by_replace, stp) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let script = batch_script(post_only, by_replace, stp);
         let (live_j, store, blocks) = blocks_of(&script, &[]);
         let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
         check_same(&live_j, &rep);
@@ -2326,7 +2350,7 @@ fn the_vx_client_replays_rescan_batch_takers_that_trade() {
         let traded = j.recs.iter().any(|r| {
             matches!(r, OwnedRec::Step(e, _) if e.kind == StepKind::Rescan.code() && e.n_fills > 0)
         });
-        assert!(post_only || traded, "a batch taker trades");
+        assert!(post_only || stp || traded, "a batch taker trades");
         assert_vx_matches(&script, 0..j.recs.len() - 1);
     }
 }
@@ -3051,5 +3075,140 @@ fn the_vx_client_accepts_a_replace_of_an_order_that_left_auction_only() {
     check_same(&live_j, &rep);
     let (j, _) = live07(&script);
     assert_eq!(fills_at(&j, 0, 112), 1, "{:?}", lane_recs(&j, 0));
+    assert_vx_matches(&script, 0..j.recs.len() - 1);
+}
+
+/// A New with STP mode `stp` (04 §6.8).
+fn stp_new(
+    side: Side,
+    tif: Tif,
+    tick: u32,
+    qty: u32,
+    tag: u32,
+    stp: vyrn_bbo::Stp,
+) -> vyrn_wire::Msg {
+    vyrn_wire::Msg::New {
+        flags: vyrn_wire::OrderFlags::from_byte(vyrn_bbo::OrderFlags::new(side, tif, false, stp).0)
+            .unwrap(),
+        tick: vyrn_types::Tick(tick),
+        qty: vyrn_types::Qty(qty),
+        client_tag: tag,
+    }
+}
+
+/// STP that triggers (05 §2.4, 04 §6.8, gap item 4). Lane 0's account 1 rests a sell of 2 at
+/// 105, account 2 a sell at 106. Account 1 then crosses its own sell: cancel-newest is
+/// `Reject STP` with the resting handle and the maker stays; a FOK cancel-both finds nothing
+/// fillable before its own maker (`FOK_UNFILLABLE`); a FOK cancel-oldest skips it in the dry
+/// run, then the sweep ends it (`Out STP`) and fills the sell at 106. Lane 1 and lane 0's
+/// account 1 rest sells at 104; account 1's cancel-both buy of 3 fills lane 1's, then ends its
+/// own maker and goes `Out STP` for its open 2, since it has filled. A CancelAll of that session
+/// then finds nothing open: the makers STP ended have left the book.
+fn stp_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::{Day, Fok};
+    use vyrn_bbo::Stp;
+    let p = |l, a, t: u64, m| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs: vec![m],
+    };
+    let settle = [Act::Run, Act::Poll, Act::Run];
+    let mut s = vec![
+        p(0, 1, 1_000, new(Sell, Day, 105, 2, 1)),
+        p(0, 2, 1_100, new(Sell, Day, 106, 1, 2)),
+    ];
+    for (t, m) in [
+        (2_000, stp_new(Buy, Day, 106, 1, 3, Stp::CancelNewest)),
+        (2_500, stp_new(Buy, Fok, 106, 1, 4, Stp::CancelBoth)),
+        (3_000, stp_new(Buy, Fok, 106, 1, 5, Stp::CancelOldest)),
+    ] {
+        s.extend(settle.clone());
+        s.push(p(0, 1, t, m));
+    }
+    s.extend(settle.clone());
+    s.push(p(1, 1, 4_000, new(Sell, Day, 104, 1, 6)));
+    s.push(p(0, 1, 4_100, new(Sell, Day, 104, 1, 7)));
+    s.extend(settle.clone());
+    s.push(p(
+        0,
+        1,
+        5_000,
+        stp_new(Buy, Day, 104, 3, 8, Stp::CancelBoth),
+    ));
+    s.extend(settle.clone());
+    // The order `Reject STP` ended is ended by the exchange: TOO_LATE with detail OUT.
+    s.push(p(0, 1, 6_000, cancel(Handle::new(3, 1).unwrap(), 9)));
+    s.extend(settle.clone());
+    // A CancelAll of the session whose makers STP ended: nothing left to cancel.
+    s.push(p(0, 1, 7_000, vyrn_wire::Msg::CancelAll { client_tag: 10 }));
+    s.extend(settle);
+    s
+}
+
+#[test]
+fn the_vx_client_replays_stp_that_triggers() {
+    use vyrn_bbo::Record as R;
+    use vyrn_types::RejectReason as RR;
+    let script = stp_script();
+    let (live_j, store, blocks) = blocks_of(&script, &[]);
+    let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let all: Vec<_> = live_j
+        .resp
+        .iter()
+        .flat_map(|(_, p)| p.records().iter().copied())
+        .chain(live_j.tx.iter().flat_map(|(_, r)| r.iter().copied()))
+        .collect();
+    let h1 = Handle::new(1, 1).unwrap();
+    let has = |f: &dyn Fn(&R) -> bool| all.iter().any(f);
+    assert!(
+        has(
+            &|r| matches!(r, R::Reject { reason: RR::Stp, client_tag: 3, detail, .. } if *detail == h1.0)
+        ),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(
+            r,
+            R::Reject {
+                reason: RR::FokUnfillable,
+                client_tag: 4,
+                ..
+            }
+        )),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(r, R::Out { cause: 2, handle, qty, .. } if *handle == h1 && qty.0 == 2)),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(r, R::Fill { tick, qty, .. } if tick.0 == 106 && qty.0 == 1)),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(r, R::Out { cause: 2, client_tag: 8, qty, .. } if qty.0 == 2)),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(
+            r,
+            R::Reject {
+                reason: RR::TooLate,
+                client_tag: 9,
+                detail: 3,
+                ..
+            }
+        )),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(r, R::CancelAck { client_tag: 10, canceled, .. } if canceled.0 == 0)),
+        "{all:?}"
+    );
+    let (j, _) = live07(&script);
     assert_vx_matches(&script, 0..j.recs.len() - 1);
 }
