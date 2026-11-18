@@ -623,8 +623,10 @@ epoch's statuses for the session from 1, so the **latest** status (D4, D5, DR2) 
 the highest `seq` for the current `epoch`; a client ignores a push with another `epoch` or with
 `seq` at or below the last it applied. A new `KeyBundle` starts a new epoch with every entry up.
 On a push that marks its current data node down, the client moves copy 2 to the first entry not
-marked down (D4) and sends it every retained transmission from its lowest unacknowledged
-`pkt_seq`, unchanged (DR3). In CHAIN mode the same fields come from chain state (09). Vector: V20
+marked down (D4) and sends it **every** transmission it still retains (DR4), unchanged (DR3):
+an acknowledged packet may still be unresolved at the replicas, and a status carries no
+`resend_from`. A `DataRedirect` for the same failure that arrives later names a node the client
+has left, so DR2 drops it. In CHAIN mode the same fields come from chain state (09). Vector: V20
 (§11).
 
 `OpenSessionReq` body (20 + 2 × `n_books` bytes):
