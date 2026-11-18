@@ -125,12 +125,10 @@ fn heartbeats_keep_their_cadence_under_a_fetch_flood() {
     );
     assert!(miss > 10_000, "the box served the flood: {stats}");
     // Without the fix (#184's cascade) the RX and shard threads take the sender's turns: on a
-    // 2-vCPU host about two thirds of the cadence is lost and p99 is a scheduler slice (~5 ms).
-    // With it, ~20% is lost and p99 is a few hundred µs. p99.9 and the maximum are left
-    // unchecked: a few host-level slices reach them either way.
+    // 2-vCPU host p99 is a scheduler slice (~5 ms) and two thirds of the cadence is lost. With
+    // it, p99 is a few hundred µs. Gaps are what a replica's silence check sees, so only they
+    // are asserted: the frame count also depends on how often a debug sender checks its timers
+    // on the host (an arm runner sent one per ~200 µs with tight gaps), and p99.9 and the
+    // maximum catch occasional host-level slices either way.
     assert!(p99 < Duration::from_millis(2), "p99 heartbeat gap {p99:?}");
-    assert!(
-        frames as u128 * 2 >= want,
-        "{frames} frames for a {want}-heartbeat cadence"
-    );
 }
