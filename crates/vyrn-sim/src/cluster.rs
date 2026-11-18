@@ -493,6 +493,21 @@ fn first_diff<T: PartialEq + std::fmt::Debug>(
     )
 }
 
+/// The earliest end of a lane stall that covers `t`, if any lane is stalled at `t`. The engine
+/// polls all lanes in one call (`Engine::poll_lanes`, `Engine::run`), so while any lane is
+/// stalled no lane is polled: a stall pauses every lane's boundaries (spec gap, PR follow-up).
+fn lane_stall_end(faults: &[Fault], t: u64) -> Option<u64> {
+    faults
+        .iter()
+        .filter_map(|f| match *f {
+            Fault::LaneStall { at, ns, .. } if t >= at && t < at.saturating_add(ns) => {
+                Some(at.saturating_add(ns))
+            }
+            _ => None,
+        })
+        .min()
+}
+
 fn stalled(faults: &[Fault], lane: Option<u8>, t: u64) -> u64 {
     let mut t = t;
     // Stalls may overlap; repeat until `t` is outside every one.
@@ -747,14 +762,41 @@ pub fn run(seed: u64, schedule: &Schedule) -> Report {
             Ev::Bbo => {
                 bbo_pending = false;
                 bbo_free = t.saturating_add(BBO_COST);
-                match e.run(&FixedClock(t), &mut out, QUIESCE_ROUNDS) {
-                    Ok(true) => None,
-                    Ok(false) => Some((
-                        "BBO-QUIESCE",
-                        format!("no quiescence in {QUIESCE_ROUNDS} step and poll rounds"),
-                    )),
-                    Err(f) => Some(("ENGINE-FAULT", format!("BBO fault {f:?}"))),
+                match lane_stall_end(faults, t) {
+                    // SF-11: a stalled lane core runs no boundary, so no lane polls. The BBO
+                    // core steps alone; fills wait in the rings (back-pressure, SF-14), and a
+                    // full run follows when the stall ends.
+                    Some(end) => {
+                        let mut r = Ok(());
+                        for _ in 0..QUIESCE_ROUNDS {
+                            match e.step(&FixedClock(t), &mut out) {
+                                Ok(Some(_)) => {}
+                                Ok(None) => break,
+                                Err(f) => {
+                                    r = Err(f);
+                                    break;
+                                }
+                            }
+                        }
+                        bbo_pending = true;
+                        q.push(stalled(faults, None, end.max(bbo_free)), Ev::Bbo);
+                        r.err()
+                            .map(|f| ("ENGINE-FAULT", format!("BBO fault {f:?}")))
+                    }
+                    None => match e.run(&FixedClock(t), &mut out, QUIESCE_ROUNDS) {
+                        Ok(true) => None,
+                        Ok(false) => Some((
+                            "BBO-QUIESCE",
+                            format!("no quiescence in {QUIESCE_ROUNDS} step and poll rounds"),
+                        )),
+                        Err(f) => Some(("ENGINE-FAULT", format!("BBO fault {f:?}"))),
+                    },
                 }
+            }
+            Ev::Poll if lane_stall_end(faults, t).is_some() => {
+                // SF-11: skip every lane's idle poll while one is stalled (follow-up: per lane).
+                q.push(t.saturating_add(POLL_NS), Ev::Poll);
+                None
             }
             Ev::Poll => {
                 let r = e.poll_lanes(&mut out);

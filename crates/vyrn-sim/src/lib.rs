@@ -34,7 +34,9 @@
 //!   the virtual time of processing, so a lane stall (SF-11) sheds late packets (SF-27). After
 //!   each packet the BBO core runs to quiescence at `max(now, bbo free)`; a BBO stall (SF-12)
 //!   makes forwarded ops late, which yields `Shed` steps.
-//! - Every lane also takes an idle poll every [`cluster::POLL_NS`].
+//! - Every lane also takes an idle poll every [`cluster::POLL_NS`]. While any lane is stalled
+//!   (SF-11), no lane is polled and the BBO core steps without lane polls, so fills and
+//!   settlements wait in the rings until the stall ends.
 //! - Replicas receive the order stream and the payload store and replay them with
 //!   `vyrn_engine::Engine::replay`. SF-24 (only when the schedule names it) flips one field of
 //!   one record in one replica's copy, which `INV-DET` must catch.
