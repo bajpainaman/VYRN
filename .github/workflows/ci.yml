@@ -83,7 +83,7 @@ jobs:
     timeout-minutes: 40
     # vxc_blake3.x86_64-linux (vx/TOOLCHAIN) was pinned on Debian 13 with HOME=/home/user: vxc
     # embeds its source and target dirs and links the distro's LLVM/MLIR 22 statically, so the job
-    # builds it there. vxc reads its checkout (stdlib) and two .so files of its build dir at run
+    # builds it there. VX-WORKAROUND W-10 (issue to file): vxc reads its checkout (stdlib) and two .so files of its build dir at run
     # time (FRICTION.md W-10), so the cache holds those with the binary; vx/build.sh checks the hash.
     container:
       image: debian:trixie
