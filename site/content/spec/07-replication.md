@@ -1293,7 +1293,10 @@ with `down` its first home and `to` the current one, since it has followed no mo
 keep sent packets for `REP_CLIENT_RETAIN_MS` = 100 ms (04 DR4), so with about 2 ms of detection a
 home box with more than about 1 200 sessions can have clients drop packets sent when it failed
 before their redirect arrives. Lifting it needs a decision this reading does not make: a
-multi-session REDIRECT, a REDIRECT budget separate from the fetch bucket, or a longer DR4 window. `REP_DATA_SILENCE_MS`
+multi-session REDIRECT, a REDIRECT budget separate from the fetch bucket, or a longer DR4 window. The
+bound is pinned by `bin/vyrn-validator` `failover.rs` (`first_round_outlasts_dr4_above_the_bound`),
+and e2e R13 runs a client that discards each packet after 100 ms and fails if a packet it sent to
+the dead home expired before its redirect. `REP_DATA_SILENCE_MS`
 is 1 ms. A DEV validator may raise it (`[data] silence_us`) for an unpinned host.
 
 **Backup addresses (interim reading).** Step 3 needs every live box to know the affected

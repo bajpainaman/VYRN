@@ -570,6 +570,34 @@ mod tests {
         assert!(sent.iter().all(|r| (r.1, r.2, r.3) == (4, 0, 2)));
     }
 
+    /// The bound 07 §5.7 records (open; the batched REDIRECT lifts it): 2 000 sessions of one
+    /// home queued at once, 2 ms after the failure. Clients keep sent packets for 100 ms (04
+    /// DR4), so a session's first REDIRECT must leave by 98 ms; at [`REDIRECT_BATCH`] per
+    /// [`GOSSIP_EVERY_NS`] only 10 batches do. The batch PR flips the last assertion.
+    #[test]
+    fn first_round_outlasts_dr4_above_the_bound() {
+        const RETAIN_NS: u64 = 100_000_000;
+        const DETECT_NS: u64 = 2_000_000;
+        let mut f = Failover::new(2, 0, 1, 0, 1);
+        let list: Vec<(SessionId, u32)> = (0..2000).map(|i| (SessionId(i), 1)).collect();
+        f.queue(0, 1, &list);
+        let mut in_time = 0usize;
+        let mut t = 0;
+        while t + DETECT_NS <= RETAIN_NS {
+            in_time += f.batch(t).len();
+            t += GOSSIP_EVERY_NS;
+        }
+        assert_eq!(
+            in_time,
+            10 * REDIRECT_BATCH,
+            "about 1 200 sessions fit DR4's window"
+        );
+        assert!(
+            in_time < list.len(),
+            "2 000 sessions do not (07 §5.7 limit)"
+        );
+    }
+
     /// Session 5 is final through 9, so past it; 6 has a released block not final yet below
     /// its unresolved record, which wins; 7 only an unresolved one; 8 only a final block.
     #[test]
