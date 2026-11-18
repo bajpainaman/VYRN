@@ -30,3 +30,12 @@ seed = "a"
 # with a logged snap_lag (05 §6.5).
 faults = "delay 73 15166; dup 65; delay 2 44940"
 expect = "pass"
+
+[[seed]]
+seed = "6f"
+# Required: replay's lowver (05 §8.6, 07 §3.8 LOWVER) changes its output. With replay ignoring
+# the logged mask, or taking envelope(0) for every advanced lane, its band reset publishes other
+# bounds and snapshot versions than live, and record 392 names a version replay never published
+# (INV-DET: NoSnapshot). Guards that LOWVER is an input to replay, not only a check.
+faults = "drop 31"
+expect = "pass"
