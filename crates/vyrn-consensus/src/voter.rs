@@ -5,7 +5,7 @@
 //! |---|---|
 //! | `Automaton::propose` | [`App`]: longest valid header run after the parent (≤ 16), once its body is valid (07 §6.3) |
 //! | `Automaton::verify` | [`App`]: INV-REP-4 (07 §6.4); pending until `REP_VERIFY_WAIT_MS`, then false |
-//! | certify | true exactly when this voter's `verify` (or its own proposal) accepted the payload |
+//! | certify | true when this voter's `verify`, its own proposal or its own journaled notarize or finalize accepted the payload; false only when its own `verify` rejected it; otherwise pending until one of those lands or a finalization covers the view (07 §6.3 reading) |
 //! | `Relay` | no-op: headers reach voters through frames (07 §6.3) |
 //! | `Reporter` | [`Finalized`]: every finalization as a [`FinalityCert`], this voter's own finalize votes as [`FinalizeVote`]s for the sequencer's listener (07 §6.8), and conflicting votes as [`VoterFault`] evidence (07 §10.2) |
 //! | Elector | [`VoterOrder`]: round-robin in `REP_Membership.voters` order ([`Committee::leader`]) |
@@ -153,8 +153,18 @@ impl SealCand {
 #[derive(Default)]
 struct Known {
     tips: BTreeMap<Digest, Entry>,
-    /// `(view, payload)` this voter verified or proposed in that view: what `certify` answers.
+    /// `(view, payload)` this voter verified or proposed in that view, or signed a notarize or
+    /// finalize for (its journal replays those on restart): `certify` answers true.
     accepted: BTreeSet<(u64, Digest)>,
+    /// `(view, payload)` this voter's own `verify` rejected: `certify` answers false.
+    rejected: BTreeSet<(u64, Digest)>,
+    /// `certify` calls for a `(view, payload)` this voter has not judged yet: answered when it
+    /// does, and dropped (no answer, never false) once a finalization covers the view, as
+    /// Commonware aborts its own outstanding certifications. Not on nullification: a notarized
+    /// view that is also nullified can still be a child's parent, and Commonware keeps waiting.
+    waiting: BTreeMap<(u64, Digest), Vec<oneshot::Sender<bool>>>,
+    /// The highest view a finalization covered: nothing at or below it needs a verdict.
+    final_view: u64,
 }
 
 impl Known {
@@ -163,6 +173,26 @@ impl Known {
     fn prune(&mut self, view: u64, height: Height) {
         self.tips.retain(|_, e| e.tip.height >= height);
         self.accepted.retain(|(v, _)| *v >= view);
+        self.rejected.retain(|(v, _)| *v >= view);
+        self.waiting.retain(|(v, _), _| *v > view);
+        self.final_view = self.final_view.max(view);
+    }
+
+    /// Records this voter's verdict on `(view, digest)` and answers every `certify` waiting on
+    /// it. The first verdict stands.
+    fn judge(&mut self, view: u64, digest: Digest, ok: bool) {
+        let key = (view, digest);
+        if !self.accepted.contains(&key) && !self.rejected.contains(&key) {
+            if ok {
+                self.accepted.insert(key);
+            } else {
+                self.rejected.insert(key);
+            }
+        }
+        let ok = self.accepted.contains(&key);
+        for tx in self.waiting.remove(&key).unwrap_or_default() {
+            tx.send_lossy(ok);
+        }
     }
 }
 
@@ -207,7 +237,7 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
     fn accept(&self, view: u64, digest: Digest, entry: Entry) {
         let mut k = lock(&self.known);
         k.tips.insert(digest, entry);
-        k.accepted.insert((view, digest));
+        k.judge(view, digest, true);
     }
 
     /// The seal on top of `parent`, when the source holds one whose header sits on `parent` or on
@@ -436,8 +466,13 @@ where
         let view = context.round.view().get();
         self.context.child("verify").spawn(move |clock| async move {
             let deadline = clock.current() + VERIFY_WAIT;
+            let mut tx = Some(tx);
+            // The vote's answer is due at the deadline; the verdict, which certify reports, is
+            // not. Missing data at the deadline is no rejection: the vote gets false and this
+            // keeps judging until a verdict lands or a finalization covers the view (07 §6.3
+            // reading), so a late header still certifies.
             let verdict = loop {
-                if tx.is_closed() {
+                if lock(&app.known).final_view >= view {
                     return;
                 }
                 let parent = app.resolve(&context.parent.1).map(|e| e.tip);
@@ -468,12 +503,19 @@ where
                         Verdict::Pending => {}
                     }
                 }
-                if clock.current() >= deadline {
-                    break false;
+                if clock.current() >= deadline
+                    && let Some(t) = tx.take()
+                {
+                    t.send_lossy(false);
                 }
                 clock.sleep(POLL).await;
             };
-            tx.send_lossy(verdict);
+            if !verdict {
+                lock(&app.known).judge(view, payload, false);
+            }
+            if let Some(t) = tx {
+                t.send_lossy(verdict);
+            }
         });
         rx
     }
@@ -485,13 +527,25 @@ where
     S: BlockSource,
 {
     /// 07 §6.3: certify returns the result of `verify` for the same payload, and adds nothing.
-    /// Keyed by `(round, payload)`, as Commonware requires.
+    /// Keyed by `(round, payload)`, as Commonware requires. *Reading* (07 §6.3): it never
+    /// answers false for a payload this voter has not judged, since Commonware journals a false
+    /// certification as a permanent local rejection: this voter then never leaves the view on
+    /// that notarization, only by a nullification or finalization the others make. It answers true once this
+    /// voter's verify or proposal accepted the payload or it signed a notarize or finalize for it
+    /// (replayed from its journal on restart), false once its own verify rejected it, and
+    /// otherwise waits; a finalization at or above the view drops the wait unanswered, where
+    /// Commonware's `add_finalization` aborts its own outstanding certifications.
     async fn certify(&mut self, round: Round, payload: Digest) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
-        let ok = lock(&self.known)
-            .accepted
-            .contains(&(round.view().get(), payload));
-        tx.send_lossy(ok);
+        let key = (round.view().get(), payload);
+        let mut k = lock(&self.known);
+        if k.accepted.contains(&key) {
+            tx.send_lossy(true);
+        } else if k.rejected.contains(&key) {
+            tx.send_lossy(false);
+        } else {
+            k.waiting.entry(key).or_default().push(tx);
+        }
         rx
     }
 }
@@ -597,7 +651,20 @@ impl<E: Clock + Spawner, S: BlockSource> Reporter for Finalized<E, S> {
     fn report(&mut self, activity: Self::Activity) -> Feedback {
         let closed = match activity {
             Activity::Finalization(f) => self.cert(&f).is_some_and(|c| self.out.send(c).is_err()),
+            // This voter's own notarize (live, or replayed from its journal on restart): it signed
+            // only what it accepted, so certify may answer true (07 §6.3 reading).
+            Activity::Notarize(n) => {
+                if n.attestation.signer == self.me {
+                    let view = n.proposal.round.view().get();
+                    lock(&self.app.known).judge(view, n.proposal.payload, true);
+                }
+                false
+            }
             Activity::Finalize(f) => {
+                if f.attestation.signer == self.me {
+                    let view = f.proposal.round.view().get();
+                    lock(&self.app.known).judge(view, f.proposal.payload, true);
+                }
                 // Optional output: a dropped receiver discards votes, never stops the reporter.
                 if let Some(v) = self.own_vote(&f) {
                     let _ = self.votes.send(v);
@@ -772,6 +839,7 @@ where
 mod tests {
     use super::*;
     use crate::source::mem::MemSource;
+    use commonware_consensus::simplex::types::{Notarize, Proposal as CwProposal};
     use commonware_consensus::types::View;
     use commonware_runtime::{Runner, Supervisor, deterministic};
     use vyrn_log::block::{header_hash, sign_header};
@@ -874,9 +942,141 @@ mod tests {
             assert!(app.verify(ctx(2, 1, p12), p3).await.await.unwrap());
             // Heights 1–2 again, now as a child of a proposal ending at 3: the parent rule fails.
             assert!(!app.verify(ctx(3, 2, p3), p12).await.await.unwrap());
-            // certify answers per round: view 3 never verified it.
+            // certify answers per round: view 1 accepted it. View 3 never matched it, which is no
+            // rejection (it may be a seal not held yet), so certify waits rather than say false.
             assert!(app.certify(ctx(1, 0, g).round, p12).await.await.unwrap());
-            assert!(!app.certify(ctx(3, 2, p3).round, p12).await.await.unwrap());
+            let mut v3 = app.certify(ctx(3, 2, p3).round, p12).await;
+            assert!(matches!(
+                v3.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        });
+    }
+
+    #[test]
+    fn certify_waits_for_a_verify_still_running() {
+        with_app(3, |mut app, src, g| async move {
+            // Header 2 has not arrived: verify of 1..=2 is still pending when certify comes.
+            let h2 = src.header(Height(2)).unwrap();
+            let p12 = digest(&src, 1, 2);
+            src.0.lock().unwrap().retain(|h, _| h.0 != 2);
+            let verdict = app.verify(ctx(1, 0, g), p12).await;
+            let mut cert = app.certify(ctx(1, 0, g).round, p12).await;
+            assert!(
+                cert.try_recv().is_err(),
+                "certify answered before verify judged"
+            );
+            src.insert(h2);
+            assert!(verdict.await.unwrap());
+            assert!(
+                cert.await.unwrap(),
+                "certify must follow verify's acceptance"
+            );
+        });
+    }
+
+    #[test]
+    fn a_verify_that_times_out_on_missing_data_still_certifies_later() {
+        with_app(3, |mut app, src, g| async move {
+            let h2 = src.header(Height(2)).unwrap();
+            let p12 = digest(&src, 1, 2);
+            src.0.lock().unwrap().retain(|h, _| h.0 != 2);
+            // The vote's answer at the deadline is false: header 2 has not arrived.
+            assert!(!app.verify(ctx(1, 0, g), p12).await.await.unwrap());
+            // That is no rejection: certify waits rather than answering false.
+            let mut cert = app.certify(ctx(1, 0, g).round, p12).await;
+            assert!(matches!(
+                cert.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            app.context.sleep(VERIFY_WAIT * 3).await;
+            assert!(matches!(
+                cert.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            src.insert(h2);
+            assert!(cert.await.unwrap(), "the late header certifies");
+        });
+    }
+
+    #[test]
+    fn certify_never_answers_false_for_an_unjudged_payload() {
+        with_app(3, |mut app, src, g| async move {
+            let p12 = digest(&src, 1, 2);
+            let mut cert = app.certify(ctx(2, 0, g).round, p12).await;
+            assert!(matches!(
+                cert.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            // A finalization of an earlier view keeps it waiting (a nullified, notarized view
+            // can still be a parent); one covering its view drops it: no answer, not false.
+            lock(&app.known).prune(1, Height(1));
+            assert!(matches!(
+                cert.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            lock(&app.known).prune(2, Height(2));
+            assert!(matches!(
+                cert.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ));
+        });
+    }
+
+    #[test]
+    fn a_restarted_voter_certifies_its_own_journaled_votes() {
+        with_app(3, |mut app, src, g| async move {
+            let seed = |i: u8| [i + 1; 32];
+            let voters = (0..4u8)
+                .map(|i| vyrn_crypto::ed25519::public_key(&seed(i)))
+                .collect();
+            let committee = Committee::new(vyrn_types::Mode::Base, voters, &[]).unwrap();
+            let signer = |i: u8| {
+                let key = ed25519::PrivateKey::decode(seed(i).to_vec()).unwrap();
+                Scheme::signer(NAMESPACE, committee.participants().clone(), key).unwrap()
+            };
+            let mine = signer(0);
+            let own = vyrn_crypto::ed25519::public_key(&seed(0));
+            let me = committee
+                .participants()
+                .iter()
+                .position(|k| {
+                    let b: &[u8] = k.as_ref();
+                    b == own.as_slice()
+                })
+                .map(Participant::from_usize)
+                .unwrap();
+            let (out, _certs) = mpsc::unbounded_channel();
+            let (votes, _votes) = mpsc::unbounded_channel();
+            let (faults, _faults) = mpsc::unbounded_channel();
+            let mut reporter = Finalized {
+                app: app.clone(),
+                committee: committee.clone(),
+                epoch: EPOCH,
+                out,
+                me,
+                votes,
+                faults,
+            };
+            let p12 = digest(&src, 1, 2);
+            let p3 = digest(&src, 3, 3);
+            let round = |v: u64| Round::new(CwEpoch::new(u64::from(EPOCH.0)), View::new(v));
+            let prop = |v: u64, d| CwProposal::new(round(v), View::new(v - 1), d);
+            // What replay reports after a restart: this voter's notarize of view 1, and another
+            // voter's notarize of view 2, which proves nothing about this voter's verify.
+            reporter.report(Activity::Notarize(
+                Notarize::sign(&mine, prop(1, p12)).unwrap(),
+            ));
+            reporter.report(Activity::Notarize(
+                Notarize::sign(&signer(1), prop(2, p3)).unwrap(),
+            ));
+            assert!(app.certify(round(1), p12).await.await.unwrap());
+            let mut other = app.certify(round(2), p3).await;
+            assert!(
+                matches!(other.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                "a peer's vote must not certify"
+            );
+            let _ = g;
         });
     }
 
