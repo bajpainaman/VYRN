@@ -164,7 +164,7 @@ vxc_build() {
     sysroot="$(rustup run "$pin" rustc --print sysroot)"
     commit="$(rustup run "$pin" rustc -vV | sed -n 's/^commit-hash: //p')"
     RUSTUP_TOOLCHAIN="$pin" CARGO_TARGET_DIR="$VX_SRC/target" \
-      RUSTFLAGS="--remap-path-prefix=$CARGO_HOME/registry/src=/cargo/registry/src --remap-path-prefix=$sysroot=/rustc/sysroot --remap-path-prefix=$sysroot/lib/rustlib/src/rust=/rustc/$commit" \
+      RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}/registry/src=/cargo/registry/src --remap-path-prefix=$sysroot=/rustc/sysroot --remap-path-prefix=$sysroot/lib/rustlib/src/rust=/rustc/$commit" \
       cargo build --release --locked --quiet
   )
   ln -sfn "$VX_SRC/target/release/vxc" "$LOCAL_BIN/vxc"
