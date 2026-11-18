@@ -153,7 +153,7 @@ PBV_STATIC_ASSERT(offsetof(pbo_event, msg) == 40, pbo_event_msg_offset);
 /* ===================================================================================== */
 
 /* Bumped on any change to a layout, a ring, an error code or the supported subset. */
-#define PBV_ABI_VERSION 4u
+#define PBV_ABI_VERSION 5u
 
 typedef struct pbv_ctx pbv_ctx;
 
@@ -202,6 +202,8 @@ typedef struct pbv_ctx pbv_ctx;
                                 13 n x record[16]: exactly the bytes H(lane l) hashes */
 #define PBV_STEP_BYTES  576u /* 0 step u64, 8 kind u8, 9 has_src u8, 10 src_lane u8, 11 cross u8
                                 (StepFlags::CROSS), 12 plen u8 (<= 32), 16 src_lane_seq u64,
+                                24 lowver u64 (07 §3.8 LOWVER: bit l, lane l takes the version
+                                its op at cut[l] was applied under; PBV_ABI_VERSION 5),
                                 32 cut (u64 per lane), 544 payload (07 §3.8: Rescan band,
                                 Control code and argument, Uncross p* and Q) */
 #define PBV_TX_BYTES    288u /* 0 step u64, 8 session u32, 12 resp_seq u32, 16 pkt_seq u32,

@@ -36,7 +36,7 @@ extern "C" {
 // ---- constants ---------------------------------------------------------------------------
 // VX-WORKAROUND W-12 (issue to file): no hex integer literals, so every constant is decimal.
 
-const ABI_VERSION : u64 = 4;
+const ABI_VERSION : u64 = 5;
 const U32_MAX : u64 = 4294967295;
 const U64_MAX : u64 = 18446744073709551615;
 const NS_PER_S : u64 = 1000000000;
@@ -257,6 +257,8 @@ struct LOp {
   seq : u64, kind : u64, root : u64, vslot : u64, side : u64, tick : u64, total : u64,
   flags : u64, ts : u64, sess_id : u64, acct : u64, tag : u64, ix : u64, cross : u64,
   resp_seq : u64, pkt_seq : u64, snap_ver : u64,
+  // The version the lane held when it applied this op (Lane::applied_ver, 07 §3.8 LOWVER).
+  aver : u64,
 }
 
 struct Ev { step : u64, kind : u64, liq : u64, cause : u64, vslot : u64, handle : u64, tick : u64, qty : u64 }
@@ -295,11 +297,9 @@ struct Bbo {
   ords : *mut BOrd, book_l : *mut i64, book_r : *mut i64, n_book : i64,
   tx : *mut i8, n_tx : i64, n_fills : u64,
   // Rust's Bbo bounds and snapshot history (05 §8.6): (B, A), the version, the last published
-  // pair, per-version (id, B, A), each lane's lowest snapshot version, and each lane's
-  // (applied, snapshot version) as its counter line reads before this step.
+  // pair, per-version (id, B, A) and each lane's lowest snapshot version.
   bb : u64, ba : u64, ver : u64, lp_b : u64, lp_a : u64,
   vh_ver : *mut u64, vh_b : *mut u64, vh_a : *mut u64, lowver : *mut u64,
-  rapp : *mut u64, rver : *mut u64,
   // The book phase (05 §8.8), the last published one, and each version's "not Continuous"
   // flag (an envelope over a flagged version is suspect, as in Bbo::envelope).
   phase : u64, lp_ph : u64, vh_f : *mut u64,
@@ -411,8 +411,6 @@ const Y_EV_HEAD : i64 = 0;
 const Y_FWD_TAIL : i64 = 1;
 const Y_CUT : i64 = 2;
 const Y_WAIT : i64 = 3;
-// Lane line 2l word 4: the version of the snapshot it last read (word 3 is fills_applied).
-const Y_SNAP_VER : i64 = 4;
 // BBO line 2n word 1: the newest snapshot version (replay's `snap_now`).
 const Y_SNAP_NOW : i64 = 1;
 // Lane line 2l word 5: the take this lane waits for, (pred ver << 32) | (pred lane << 24) |
@@ -1226,7 +1224,6 @@ fn lane_pkt(c : *mut Ctx, l : i64, r : *mut i8, mids : u64) -> void {
     (*ln).pkt_bid = vb;
     (*ln).pkt_ask = va;
     (*ln).snap_ver = v;
-    sst(c, 2i64 * l, Y_SNAP_VER, v);
     if rd64(r, 32i64) != (*ln).seq + 1u64 { fail_lane(ln, E_MISMATCH); return; }
     (*ln).n_ops = 0i64;
     (*ln).cur_sess = si;
@@ -1540,6 +1537,7 @@ fn pass2_through(c : *mut Ctx, l : i64, upto : u64) -> void {
       maybe_mid(c, l, 2u64, (*op).seq);
       if (*ln).err != 0u64 { return; }
       if (*op).explicit == 0u64 { pass2_apply(c, l, op); }
+      (*lop(c, l, (*op).seq)).aver = (*ln).snap_ver;
       (*op).applied = 1u64;
       (*ln).applied = (*op).seq;
       publish_applied(c, l);
@@ -1827,7 +1825,6 @@ fn lane_call(c : *mut Ctx, l : i64, k : u64) -> void {
       // Outside a packet the lane also takes the boundary's snapshot if newer (vyrn-lane).
       if (*ln).snap_base > (*ln).snap_ver {
         (*ln).snap_ver = (*ln).snap_base;
-        sst(c, 2i64 * l, Y_SNAP_VER, (*ln).snap_ver);
       }
       if flags != F_ADVANCE || rd64(r, 32i64) != (*ln).seq + 1u64 || rd64(r, 16i64) != (*ln).last_prio
          || rd32(r, 4i64) != 0u64 || rd8(r, 1i64) != 0u64 {
@@ -2274,8 +2271,6 @@ fn await_ready(c : *mut Ctx, s : u64) -> bool {
         spin();
       }
       sst(c, 2i64 * l + 1i64, Y_WAIT, 0u64);
-      *offset_mut((*b).rapp, l) = sld(c, 2i64 * l, Y_APPLIED);
-      *offset_mut((*b).rver, l) = sld(c, 2i64 * l, Y_SNAP_VER);
     }
     return true;
   }
@@ -2296,6 +2291,9 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
     let src_q = rd64(sp, 16i64);
     let plen = rd8(sp, STEP_PLEN);
     let pay : *mut i8 = offset_mut(sp, STEP_PAYLOAD);
+    // StepRecord.lowver (07 §3.8 LOWVER): a bit past the box's lanes is a bad cut (Bbo).
+    let lowm = rd64(sp, 24i64);
+    if n < 64i64 && (lowm >> (n as u64)) != 0u64 { fail_bbo(c, E_CUT); return; }
     // 07 §3.8: only Rescan, Control, Seal and Uncross steps carry a payload.
     if plen > 32u64 || (plen != 0u64 && kind != K_RESCAN && kind != K_CONTROL && kind != K_SEAL
                          && kind != K_UNCROSS) {
@@ -2319,6 +2317,13 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
         if stopped(c) { return; }
         spin();
       }
+    }
+    // A LOWVER lane must name an op replay applied (Engine::step_call: BadRecord).
+    for l in 0i64..n {
+      if ((lowm >> (l as u64)) & 1u64) != 0u64 && rd64(sp, 32i64 + 8i64 * l) == 0u64 {
+        fail_bbo(c, E_BAD_RECORD);
+        return;
+      } else { }
     }
     for l in 0i64..n {
       let cl = rd64(sp, 32i64 + 8i64 * l);
@@ -2408,10 +2413,11 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
     // finish: the lowest snapshot version each lane's ops in the cut may hold, then (B, A) as
     // a new version when they changed.
     if !await_ready(c, s) { return; }
+    // 07 §3.8 LOWVER: each logged lane takes the version its op at cut[l] was applied under.
     for l in 0i64..n {
-      if *offset_mut((*b).cut, l) == *offset_mut((*b).rapp, l) {
-        *offset_mut((*b).lowver, l) = *offset_mut((*b).rver, l);
-      }
+      if ((lowm >> (l as u64)) & 1u64) != 0u64 {
+        *offset_mut((*b).lowver, l) = (*lop(c, l, *offset_mut((*b).cut, l))).aver;
+      } else { }
     }
     if has_src {
       *offset_mut((*b).lowver, src_l as i64) = (*lop(c, src_l as i64, src_q)).snap_ver;
@@ -3099,10 +3105,8 @@ pub fn pbv_new(cfg : *const i8, accts : *const i8, n_accts : u32, sp : *const i8
     (*b).vh_f = zalloc(8i64 * (HIST as i64));
     (*b).fz = zalloc(8i64 * n);
     (*b).lowver = zalloc(8i64 * n);
-    (*b).rapp = zalloc(8i64 * n);
-    (*b).rver = zalloc(8i64 * n);
     if is_null_mut((*b).vh_ver) || is_null_mut((*b).vh_b) || is_null_mut((*b).vh_a) || is_null_mut((*b).vh_f) || is_null_mut((*b).fz)
-       || is_null_mut((*b).lowver) || is_null_mut((*b).rapp) || is_null_mut((*b).rver)
+       || is_null_mut((*b).lowver)
        || is_null_mut((*c).hist_ver) || is_null_mut((*c).sv_id) || is_null_mut((*c).sv_bid)
        || is_null_mut((*c).sv_ask) {
       return nul;
@@ -3188,8 +3192,6 @@ pub fn pbv_free(c : *mut Ctx) -> void {
     let v6 : *mut i8 = (*b).vh_f; free(v6);
     let v7 : *mut i8 = (*b).fz; free(v7);
     let v3 : *mut i8 = (*b).lowver; free(v3);
-    let v4 : *mut i8 = (*b).rapp; free(v4);
-    let v5 : *mut i8 = (*b).rver; free(v5);
     let r0 : *mut i8 = (*c).bbo; free(r0);
     let r1 : *mut i8 = (*c).lanes; free(r1);
     let r2 : *mut i8 = (*c).sync; free(r2);

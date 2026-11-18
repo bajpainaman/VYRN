@@ -1911,3 +1911,65 @@ fn the_vx_client_reproduces_each_take_in_pool_order() {
         );
     }
 }
+
+/// A lane that only joins takes its `lowver` from the step's logged `LOWVER` bit (07 §3.8,
+/// §7.1): lane 2's join at 104 lands on its half-cut entry after a cancel moved the best bid,
+/// and its later sell is band-checked over the version that op was applied under.
+fn lowver_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let p = |l, t: u64, m| Act::Pkt {
+        l,
+        a: 1,
+        rx_ts: t,
+        now: t,
+        msgs: vec![m],
+    };
+    let mut s = vec![
+        p(1, 1_000, new(Buy, Day, 105, 1, 1)),
+        p(0, 2_000, new(Buy, Day, 110, 1, 2)),
+        p(0, 3_000, cancel(Handle::new(1, 1).unwrap(), 3)),
+        p(2, 4_000, new(Buy, Day, 104, 1, 4)),
+        p(2, 5_000, new(Sell, Day, 108, 1, 5)),
+        p(1, 6_000, new(Buy, Day, 107, 1, 6)),
+    ];
+    // Each packet in its own steps, so the lanes' cuts land on their half-cut entries.
+    let mut out = Vec::new();
+    for a in s.drain(..) {
+        out.extend([a, Act::Run, Act::Poll, Act::Run]);
+    }
+    out
+}
+
+#[test]
+fn the_vx_client_takes_each_logged_lowver() {
+    let (live_j, store, mut blocks) = blocks_of(&lowver_script(), &[]);
+    let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let low = |b: &BlockInputs<N>| b.steps.iter().filter(|m| m.rec.lowver != 0).count();
+    assert!(low(&blocks[0]) >= 2, "the script logs LOWVER steps");
+    let (j, _) = live07(&lowver_script());
+    assert_vx_matches(&lowver_script(), 0..j.recs.len() - 1);
+    let Some(lib) = vx_lib() else { return };
+    // A LOWVER bit on a lane whose cut names no op: both engines refuse the step (BadRecord).
+    let m = blocks[0]
+        .steps
+        .iter_mut()
+        .find(|m| m.rec.cut[2].0 == 0)
+        .unwrap();
+    m.rec.lowver |= 1 << 2;
+    let mut data = DataJoin::default();
+    for ((_, s, q, _), b) in &store.0 {
+        data.put(*s, *q, b.clone());
+    }
+    let (bbo, mut sh) = new_box();
+    let mut rust = RustReplay::new(
+        engine(bbo, &mut sh),
+        data,
+        vyrn_engine::NoResponses,
+        Journal::default(),
+    );
+    assert!(rust.replay_block(&blocks[0]).is_err());
+    let e = vx_replay(&store, &blocks, &lib).unwrap_err();
+    assert!(e.to_string().contains("bad record"), "{e}");
+}

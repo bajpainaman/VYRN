@@ -1036,9 +1036,8 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   3. Replace (keep and new priority) and CancelAll.
   4. STP that triggers (currently `PBV_E_UNSUPPORTED` in the sweep and the FOK dry run).
   5. In-packet dependencies (05 §3.7: Join and Cancel dependencies, Reduce barriers).
-  6. The per-step lowver mask (07 `StepRecord`, the engine thread's change), once it is on main.
-  7. `engine.client` wiring in `vyrn-validator` (nothing constructs `VxReplay` today).
-  8. Then a write-up of what a Vx default (`engine.client = vx`) needs; the default stays `rust`.
+  6. `engine.client` wiring in `vyrn-validator` (nothing constructs `VxReplay` today).
+  7. Then a write-up of what a Vx default (`engine.client = vx`) needs; the default stays `rust`.
 - *Pooled lanes (`AcctTake`, 05 §6.9, 07 §7.1).* `pbv_config` byte 48 is the pool mask,
   `pbv_account` byte 6 flags a pool-wide index at byte 44 (`Lane::set_pool_index`), and
   `pbv_session` byte 10 flags a pooled account at byte 12 (`Engine::pool_session`;
@@ -1069,9 +1068,21 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   Rust's `Bbo` bounds, not the exact book: before each step `band_env` widens (B, A) to the
   envelope of the snapshot versions the cut's ops may hold, `touch`, a resting taker and an
   Idle/Depletion observation move them, and `finish` publishes them as a new version when
-  they change. The client keeps the same bounds, version history and per-lane lowest versions
-  (the BBO reads each lane's applied seq and snapshot version once the lane has replayed every
-  call due before the step, as Rust's cut cores publish them). `tests/replay.rs` checks this
+  they change. The client keeps the same bounds, version history and per-lane lowest versions.
+- *`LOWVER` (07 §3.8, #190; `PBV_ABI_VERSION` 5).* Step slot byte 24 carries the step's
+  `lowver` bitmap. For each set bit the BBO takes, at the step's finish, the version lane `l`
+  held when it applied its op at `cut[l]`: each op-log entry records the lane's snapshot version
+  when pass 2 applies it, which is `Lane::applied_ver` and so `CounterLine.snap_ver` as #190
+  publishes it. A source lane then takes its forwarded op's version, as before. A bit past the
+  box's lanes is `PBV_E_CUT`, and a bit on a lane whose cut is 0 is `PBV_E_BAD_RECORD`
+  (`Engine::step_call`). The client no longer reads lane counters for `lowver`. **[Reading]**
+  "The version of the packet holding `cut[l]`" is the version of the lane call that applied the
+  op, as `Engine::low_hist` records it, not the op's own packet's when pass 2 runs in a later
+  call. In replay, `lowver` reaches the outputs only through `band_env`. Since a wider envelope
+  only starts searches further out, no script found so far shows different bytes for any
+  `lowver`, including 0 on every lane. So `tests/replay.rs` checks LOWVER steps byte for byte at
+  every split and the `BadRecord` case against `RustReplay`, but no test can isolate the value
+  itself. `tests/replay.rs` checks this
   against `RustReplay` byte for byte: the band and `snap_lag` scripts at every block boundary,
   a lane's catch-up past the 4095-version window, and an evicted version.
 - *Capacity.* The op log (`OPLOG_CAP`) and the forwarded queue (`FWDQ_CAP` = 1024 per lane) are

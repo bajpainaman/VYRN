@@ -527,6 +527,7 @@ impl<P: Payloads, const N: usize> ReplayEngine<N> for VxReplay<P> {
                 ],
             );
             put(&mut b, 16, &s.rec.src_lane_seq.0.to_le_bytes());
+            put(&mut b, 24, &s.rec.lowver.to_le_bytes());
             for (l, c) in s.rec.cut.iter().enumerate() {
                 put(&mut b, 32 + 8 * l, &c.0.to_le_bytes());
             }
