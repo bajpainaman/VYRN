@@ -719,7 +719,7 @@ delay bound of the model (01 §14.0 fact 3):
 | Hops 2–4: proposal, notarize, finalize → `Q_CHAIN` at every voter and at the sequencer | 2.45 | |
 | Vote signature checks | 0.10 | 0.15 under scheme 1 (hybrid, 01 §14.20): the ML-DSA parts run in parallel with the batched Ed25519 parts |
 | **No fault** | **5.31** | was 4.85 with F1 data homes; 6.11 under scheme 1 (+0.05 vote checks, +0.75 because the leader signs its proposal after its `verify`, since the proposal carries `excl_root`; 07 §6.5a) |
-| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault; under scheme 1, 8.91 (margin 0.09 ms to the 9.00 ms gate of `FIN_GATE_BLOCKS` = 8; open question PQ-9, 01 §14.20) |
+| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault; under scheme 1, 8.91 (margin 0.09 ms to the 9.00 ms gate of `FIN_GATE_BLOCKS` = 8, accepted by PQ-9, 01 §14.20; PQ-10 and PQ-11 are open) |
 | or a data box redirect (07 §5.7, 3 ms in place of 0.71) | **7.60** | |
 | or the sequencer is the fault | 07 failover; its seal must be final ≤ 9 ms after the last frame | |
 
