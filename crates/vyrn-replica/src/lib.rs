@@ -96,7 +96,7 @@ pub mod vx;
 pub use check::{StepErr, check_step};
 pub use data::{DataErr, DataJoin, full_hash};
 pub use epoch::{ActiveEpoch, EpochJournal, JournalErr, ReplicaLocal};
-pub use feed::{DataFeed, Fed, FeedErr, REP_DATA_SILENCE_NS};
+pub use feed::{DataFeed, Fed, FeedErr, Gap, REP_DATA_SILENCE_NS};
 pub use hashlag::{REP_HASHLAG_MAX_NS, check_hashlag};
 pub use lane::{LaneErr, LaneState};
 pub use order::{Fault, FaultKind, FrameErr, HeaderErr, OrderCore};

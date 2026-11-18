@@ -13,8 +13,10 @@
 //! **Per data box** (indexed by the frame's `src`). `DATA` frames to one destination carry
 //! `data_seq` 1, 2, … with no gap, and a `DATA_HB` carries the last `DATA` sent (`vyrn-data` crate
 //! docs). The feed keeps the highest `data_seq` seen and returns a missing run as
-//! [`Fed::gap`]: the box's `src` and the `DataFetch{from, to}` (a RANGE fetch) to send it, whose
-//! `dst` is this replica's index in the box's destination list, given at [`DataFeed::new`]. A `DATA` frame at
+//! [`Fed::gap`], once. [`Gap::fetches`] splits it into the `DataFetch{from, to}` RANGE requests
+//! the box accepts (each at most its `max_range` frames), whose `dst` is this replica's index in
+//! the box's destination list, given at [`DataFeed::new`]. The feed does not ask again: a run the
+//! box no longer holds is fetched by key (07 §5.5) when its records stay unresolved. A `DATA` frame at
 //! or below the highest is a resend that a RANGE fetch asked for: its packets are stored and the
 //! position stays. `FETCH_RESP` frames carry no stream position. [`DataFeed::silent`] lists the
 //! boxes heard from once and silent for `REP_DATA_SILENCE_MS` (07 §5.3), for `DataDown{d}`.
@@ -50,9 +52,36 @@ pub struct Fed {
     pub stored: u32,
     /// Packets that did not parse or named another book.
     pub dropped: u32,
-    /// `(src, fetch)`: `DATA` frames of data box `src` were never received; `fetch` is the
-    /// `Fetch::Range` that asks it for them.
-    pub gap: Option<(u8, Fetch)>,
+    /// `DATA` frames of one data box that were never received.
+    pub gap: Option<Gap>,
+}
+
+/// `DATA` frames `from..=to` that data box `src` sent to destination `dst` and this replica lacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gap {
+    pub src: u8,
+    pub dst: u8,
+    pub from: u64,
+    pub to: u64,
+}
+
+impl Gap {
+    /// The RANGE fetches that ask box `src` for the gap, each for at most `max_range` (≥ 1)
+    /// frames, oldest first. Lazy: a caller bounds a long run with `take`.
+    pub fn fetches(&self, max_range: u64) -> impl Iterator<Item = Fetch> + '_ {
+        let step = max_range.max(1);
+        let mut next = Some(self.from);
+        core::iter::from_fn(move || {
+            let from = next.filter(|&f| f <= self.to)?;
+            let to = from.saturating_add(step.saturating_sub(1)).min(self.to);
+            next = to.checked_add(1);
+            Some(Fetch::Range {
+                dst: self.dst,
+                from,
+                to,
+            })
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -109,8 +138,12 @@ impl DataFeed {
                 _ => seq,
             };
             if last_missing > s.high {
-                let (from, to) = (s.high.saturating_add(1), last_missing);
-                fed.gap = Some((src, Fetch::Range { dst: me, from, to }));
+                fed.gap = Some(Gap {
+                    src,
+                    dst: me,
+                    from: s.high.saturating_add(1),
+                    to: last_missing,
+                });
             }
             s.high = s.high.max(seq);
         }

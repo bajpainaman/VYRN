@@ -340,7 +340,14 @@ fn data_feed_tracks_each_box_and_refuses_what_is_not_its_own() {
     };
     let (good, other_book, seq0) = (req(5, 1, 1), req(5, 2, 2), req(5, 0, 1));
     let mut feed = DataFeed::new(BookId(1), 2, 3);
-    let range = |from, to| Some((1, Fetch::Range { dst: 3, from, to }));
+    let range = |from, to| {
+        Some(vyrn_replica::Gap {
+            src: 1,
+            dst: 3,
+            from,
+            to,
+        })
+    };
     let mut j = DataJoin::default();
     let f = frame(Kind::Data, 1, 1, 1, &[&good, &other_book, &seq0, b"short"]);
     assert_eq!(
@@ -391,6 +398,21 @@ fn data_feed_tracks_each_box_and_refuses_what_is_not_its_own() {
     ));
     let f7 = frame(Kind::Data, 1, 7, 1, &[&good]);
     assert_eq!(feed.on_frame(&mut j, &f7, 60).unwrap().gap, range(6, 6));
+    // A gap longer than a box's max_range splits into fetches it accepts, oldest first.
+    let g = range(6, 6 + 600).unwrap();
+    let qs: Vec<Fetch> = g.fetches(256).collect();
+    let r3 = |from, to| Fetch::Range { dst: 3, from, to };
+    assert_eq!(qs, vec![r3(6, 261), r3(262, 517), r3(518, 606)]);
+    assert_eq!(g.fetches(0).count(), 601, "max_range 0 is taken as 1");
+    let top = vyrn_replica::Gap {
+        from: u64::MAX - 1,
+        to: u64::MAX,
+        ..g
+    };
+    assert_eq!(
+        top.fetches(1).collect::<Vec<_>>(),
+        vec![r3(u64::MAX - 1, u64::MAX - 1), r3(u64::MAX, u64::MAX)]
+    );
     let r = packet(5, 1, &good, 0);
     assert_eq!(j.resolve(&r).map(|x| x.0), Ok(good.as_slice()));
 }

@@ -377,7 +377,6 @@ fn a_changed_step_diverges() {
 #[test]
 fn payloads_from_a_data_box_replay_the_live_run() {
     use core::net::{Ipv4Addr, SocketAddrV4};
-    use vyrn_data::frame::Fetch;
     use vyrn_data::{DataNode, HomeConfig, Mode, NodeConfig};
     use vyrn_nic::frame::{Endpoint, FrameHdr, build, parse};
     use vyrn_nic::{
@@ -480,16 +479,13 @@ fn payloads_from_a_data_box_replay_the_live_run() {
         assert_eq!((fed.stored, fed.dropped), (1, 0));
         gaps.extend(fed.gap);
     }
-    let range = Fetch::Range {
+    let gap = vyrn_replica::Gap {
+        src: 0,
         dst: 1,
         from: 2,
         to: 2,
     };
-    assert_eq!(
-        gaps,
-        vec![(0, range)],
-        "DATA 3 reveals that DATA 2 is missing"
-    );
+    assert_eq!(gaps, vec![gap], "DATA 3 reveals that DATA 2 is missing");
     assert!(
         matches!(
             join.check(&blocks[0]),
@@ -497,7 +493,9 @@ fn payloads_from_a_data_box_replay_the_live_run() {
         ),
         "no vote while a payload is missing"
     );
-    inject(fetch_ep, &gaps[0].1.encode());
+    for q in gaps[0].fetches(256) {
+        inject(fetch_ep, &q.encode());
+    }
     node.poll(Nanos(0));
     for f in drain(&mut rx) {
         let fed = feed.on_frame(&mut join, &f, 0).unwrap();

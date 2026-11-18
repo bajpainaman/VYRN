@@ -995,6 +995,23 @@ clients, and the state roots would agree on a wrong state.
 Advance records have no payload and are never joined. Until the HashRun arrives, the
 record is matched on `(session, pkt_seq)` only and stays **unhashed**.
 
+**Data RX.** The replica reads `DATA`, `DATA_HB` and `FETCH_RESP` frames from every data box:
+- A data box numbers `data_seq` once per destination, across every book it serves. A frame of any
+  book therefore moves that box's position and liveness, but only packets of the served book are
+  stored.
+- `DATA n` above the highest `data_seq` seen, `h`, means frames `h+1 ..= n−1` were lost. A
+  `DATA_HB n` (its `data_seq` is the last `DATA` sent) means frames `h+1 ..= n` were lost.
+- Each gap is fetched once, by `DataFetch{from, to}` RANGE requests no longer than the box
+  accepts. A run the box no longer holds is fetched by key under §5.5.
+- A `DATA` frame at or below `h` is a resend, and only stores its packets. `FETCH_RESP` carries
+  no position.
+- Every data box lists its destinations in the same order (the voters, then the warm standby,
+  §5.1), so a replica's `dst` index is the same for every box.
+- A stored packet has passed 01 §6.1 V1, the header half of V9, the served book and
+  `pkt_seq ≥ 1`. The replica checks no tag and does not filter on `epoch16` (04 D3): the record's
+  `pkt_hash` picks the variant, against the replica's own hash.
+- The `REP_DATA_SILENCE_MS` clock of a box starts at its first frame.
+
 ### 5.5 Fetching a missing packet
 
 A record that stays unresolved for `REP_DATA_WAIT_US` = 300 µs after its ORDER frame triggers a
