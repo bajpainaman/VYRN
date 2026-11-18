@@ -108,21 +108,30 @@ fn an_uncross_with_auction_only_remainders_does_not_allocate() {
         hi: Tick(0),
     }));
     e.run(&NeverLate, &mut sink, 64).unwrap();
-    let pkts: Vec<(usize, u64, Vec<u8>)> = [
-        (0, 1, new(Side::Sell, Tif::Day, 104, 2, 1)),
-        (1, 1, new(Side::Buy, Tif::Day, 106, 2, 2)),
-        (2, 1, new(Side::Buy, Tif::AuctionOnly, 100, 3, 3)),
-        (2, 2, new(Side::Buy, Tif::AuctionOnly, 99, 4, 4)),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(i, (l, a, m))| {
-        let hdr = ReqHeader::new(sid(l, a as u32), 1, Epoch(0).low16(), BOOK, false);
-        let mut buf = [0u8; MAX_REQ_PAYLOAD];
-        let n = encode_request(&mut buf, hdr, &[m], &kseq(l, a as u32), None).unwrap();
-        (l, 1_000 * (i as u64 + 1), buf[..n].to_vec())
-    })
-    .collect();
+    // 70 auction-only buys below p* on lane 2, more than the 64 held events the lane's queue
+    // started with, so the uncross ends 70 remainders in one boundary.
+    let mut ms = vec![
+        (0, 1, 1, new(Side::Sell, Tif::Day, 104, 2, 1)),
+        (1, 1, 1, new(Side::Buy, Tif::Day, 106, 2, 2)),
+    ];
+    for k in 0..70u32 {
+        ms.push((
+            2,
+            1,
+            k + 1,
+            new(Side::Buy, Tif::AuctionOnly, 100, 1, 10 + k),
+        ));
+    }
+    let pkts: Vec<(usize, u64, Vec<u8>)> = ms
+        .into_iter()
+        .enumerate()
+        .map(|(i, (l, a, seq, m))| {
+            let hdr = ReqHeader::new(sid(l, a as u32), seq, Epoch(0).low16(), BOOK, false);
+            let mut buf = [0u8; MAX_REQ_PAYLOAD];
+            let n = encode_request(&mut buf, hdr, &[m], &kseq(l, a as u32), None).unwrap();
+            (l, 1_000 * (i as u64 + 1), buf[..n].to_vec())
+        })
+        .collect();
     for (l, rx_ts, bytes) in &pkts {
         let rx = RxIn {
             bytes,

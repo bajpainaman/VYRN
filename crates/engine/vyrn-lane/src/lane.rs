@@ -440,7 +440,9 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             acct_ix: (0..u32::try_from(NA).unwrap_or(0)).collect(),
             b3: Vec::with_capacity(4096),
             dep_cancels: Vec::with_capacity(64),
-            emitq: Vec::with_capacity(64),
+            // One `Out AUCTION` per order slot on top of the held events: an uncross can end
+            // every order of the lane in one boundary (05 §8.8 item 6) on the sealed thread.
+            emitq: Vec::with_capacity(64usize.saturating_add(n)),
         }
     }
 
