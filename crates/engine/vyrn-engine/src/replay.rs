@@ -788,7 +788,9 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 }
                 // Due once its step's fills are in, and once the replayed BBO has published the
                 // snapshot it was classified against (its `snap_lag`, 07 §7.1).
-                if c.f >= s || self.snap_due(l, &c.rec).is_none() {
+                // A version the ring already evicted is not waited for: `lane_call` rejects it
+                // with `Why::NoSnapshot`.
+                if c.f >= s || self.snap_want(l, &c.rec).is_some_and(|v| v > self.snap_now) {
                     break;
                 }
                 let at = |why| WireDiverged {
@@ -837,19 +839,14 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         Ok(())
     }
 
-    /// The snapshot packet record `rec` of lane `l` names, `snap_base + snap_lag`, once the
-    /// replayed BBO has published it; always `Some` for an Advance or `SHED` record, which
-    /// classify nothing.
-    fn snap_due(&self, l: usize, rec: &PacketRecord) -> Option<vyrn_cut::Snapshot> {
+    /// The snapshot version packet record `rec` of lane `l` names, `snap_base + snap_lag`;
+    /// `None` for an Advance or `SHED` record, which classifies nothing.
+    fn snap_want(&self, l: usize, rec: &PacketRecord) -> Option<u64> {
         let lane = self.lanes.get(l)?;
         if is_advance(rec) || rec.flags & PacketFlags::SHED != 0 {
-            return Some(vyrn_cut::Snapshot::default());
-        }
-        let v = lane.snap_base().saturating_add(u64::from(rec.snap_lag));
-        if v > self.snap_now {
             return None;
         }
-        self.snap_of(v)
+        Some(lane.snap_base().saturating_add(u64::from(rec.snap_lag)))
     }
 
     /// The arena's tick range: a `Rescan` with no band covers all of it (05 §10).
@@ -920,9 +917,11 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             };
         }
         // The snapshot the live lane classified this packet against (05 §6.5, 07 §7.1).
-        let snap = self.snap_due(l, rec).ok_or(Why::NoSnapshot)?;
-        if let Some(x) = self.lanes.get_mut(l) {
-            x.restore_snapshot(snap);
+        if let Some(v) = self.snap_want(l, rec) {
+            let snap = self.snap_of(v).ok_or(Why::NoSnapshot)?;
+            if let Some(x) = self.lanes.get_mut(l) {
+                x.restore_snapshot(snap);
+            }
         }
         let mut routes = [(LaneSeq(0), Route::Join); MAX_ROUTES];
         let n_route = routes_of(routes_in, rec, &mut routes);
