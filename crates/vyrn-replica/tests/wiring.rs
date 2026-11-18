@@ -211,6 +211,41 @@ fn data_join_checks_data_root_per_half() {
 }
 
 #[test]
+fn release_keeps_what_a_shed_retry_still_needs() {
+    use vyrn_replica::data::REP_SHED_KEEP_BLOCKS;
+    let p = bytes(0xC0);
+    let shed = packet(7, 1, &p, PacketFlags::SHED);
+    // The retry has the same signed bytes, so the same hash and variant.
+    let retry = packet(7, 1, &p, 0);
+    let other = bytes(0xD0);
+    let variant = packet(7, 1, &other, 0);
+    let mut j = DataJoin::default();
+    j.put(SessionId(7), 1, p.clone());
+    j.put(SessionId(7), 1, other.clone());
+    j.release(Height(10), &[LaneRec::Pkt(shed)]);
+    assert!(
+        j.resolve(&retry).is_ok(),
+        "the shed block's release keeps the retry's payload"
+    );
+    j.release(Height(11), &[LaneRec::Pkt(variant)]);
+    assert!(
+        j.resolve(&retry).is_ok(),
+        "releasing one variant keeps the others"
+    );
+    assert!(j.resolve(&variant).is_err());
+    // A retry that never comes: the payload goes REP_SHED_KEEP_BLOCKS after the shed block.
+    j.release(Height(10 + REP_SHED_KEEP_BLOCKS - 1), &[]);
+    assert!(j.resolve(&retry).is_ok());
+    j.release(Height(10 + REP_SHED_KEEP_BLOCKS), &[]);
+    assert!(j.resolve(&retry).is_err());
+    // A retry released in a later block frees it at once.
+    j.put(SessionId(7), 1, p);
+    j.release(Height(200), &[LaneRec::Pkt(shed)]);
+    j.release(Height(201), &[LaneRec::Pkt(retry)]);
+    assert!(j.resolve(&retry).is_err());
+}
+
+#[test]
 fn count_follows_the_lane_numbering() {
     // Two messages: a New (0x01) and a Heartbeat (0x10).
     let mut p = vec![0u8; 16 + 32 + 16];
