@@ -112,6 +112,8 @@ jobs:
         run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 50000 --strict-hashlag --keyed --data-shards 2 --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: 4 validators with finality, keyed home and backup data boxes, the home killed mid-run, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R12)
         run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 50000 --strict-hashlag --keyed --data-kill --workload tools/e2e-smoke/wl-smoke-nocross.toml
+      - name: 4 validators with finality, keyed home and backup data boxes, the home killed mid-run, 2 000 sessions, WL-SMOKE-MANY seed 1 (tools/e2e-smoke R13, R15)
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 50000 --strict-hashlag --keyed --data-kill --packets 8000 --workload tools/e2e-smoke/wl-smoke-many.toml
       - name: 4 validators with finality, an observer and vyrn-dropcopy, WL-SMOKE seed 1 (tools/e2e-smoke)
         run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --dev-hashlag-us 50000 --strict-hashlag
       - name: 4 validators and an observer on two replication paths, vyrn-dropcopy, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R12)

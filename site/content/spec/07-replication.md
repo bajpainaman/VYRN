@@ -1328,7 +1328,8 @@ message's sessions are strictly ascending. `resend_from` is the session's lowest
 `pkt_seq` in any block the replica holds that is not final yet, resolved there or not, because a
 payload one replica repaired before finality may be held by no other; if it holds none, it is one
 past the highest `pkt_seq` in a final block. Shed records count toward neither. A session the replica first
-releases after the home moved gets its own rounds then, from its lowest `pkt_seq` in that block,
+holds after the home moved (a checked block enters its pending queue, payloads possibly still
+missing) gets its own rounds then, from its lowest `pkt_seq` in that block,
 with `down` its first home and `to` the current one, since it has followed no move.
 *Former limit (lifted by REDIRECT_BATCH):* with one session per message at 128 per 10 ms, a
 home box with more than about 1 200 sessions could have clients drop packets sent when it failed
@@ -1338,7 +1339,10 @@ round in the first 10 ms period. `bin/vyrn-validator` `failover.rs`
 discards each packet after 100 ms and fails if a packet it sent to the dead home expired before
 its redirect. Packets sent before the kill reached the home box; the client may discard them, and
 the data check, which needs every payload resolved on the backup, guards them. `REP_DATA_SILENCE_MS`
-is 1 ms. A DEV validator may raise it (`[data] silence_us`) for an unpinned host.
+is 1 ms. A DEV validator may raise it (`[data] silence_us`) for an unpinned host; e2e R13 uses
+50 ms (ruled, DEV only): on an unpinned 2-vCPU host a live backup's sender core was measured
+going 51.9 ms without a turn, so 20 ms marked it down. e2e R15 runs the failover with 2 000
+sessions.
 
 **Backup addresses (interim reading).** Step 3 needs every live box to know the affected
 sessions' addresses, but only the home box receives copy 2. Until this is settled, a client sends
