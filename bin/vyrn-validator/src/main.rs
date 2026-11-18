@@ -1064,11 +1064,23 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             && let Ok(n) = self.repair.recv(&mut buf)
         {
             answers += 1;
-            if let Ok(fed) = self.feed.on_frame(
-                Self::join(&mut self.join, &mut self.replay),
-                buf.get(..n).unwrap_or(&[]),
-                now,
-            ) && let Some(g) = fed.gap
+            let b = buf.get(..n).unwrap_or(&[]);
+            // A box's empty answer to a KEY fetch: it never stored the key (reading (j)).
+            if let Ok(f) = vyrn_data::frame::decode(b)
+                && f.hdr.kind == vyrn_data::frame::Kind::FetchResp
+                && f.n_pkts == 0
+                && usize::from(f.hdr.src) < self.boxes.len()
+            {
+                let q = f.hdr.data_seq;
+                self.sources.box_missed(
+                    vyrn_types::SessionId(u32::try_from(q >> 32).unwrap_or(u32::MAX)),
+                    u32::try_from(q & u64::from(u32::MAX)).unwrap_or(u32::MAX),
+                );
+            }
+            if let Ok(fed) =
+                self.feed
+                    .on_frame(Self::join(&mut self.join, &mut self.replay), b, now)
+                && let Some(g) = fed.gap
             {
                 gaps.push(g);
             }
@@ -1224,7 +1236,7 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                         // Lost at its box: so may the packets after it be. Every key the pending
                         // blocks miss escalates at once (07 §5.5, `fetch.rs` reading (j)), so a
                         // burst reaches source 3 while the sequencer still retains it.
-                        if self.sources.stuck(session, pkt_seq, now) {
+                        if self.sources.stuck(session, pkt_seq) {
                             let join = Self::join(&mut self.join, &mut self.replay);
                             let total: usize =
                                 self.pending.iter().map(|(b, _)| b.lanes.len()).sum();
@@ -1269,6 +1281,11 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             let Some((b, _)) = self.pending.pop_front() else {
                 return;
             };
+            self.sources
+                .released(b.lanes.iter().filter_map(|r| match r {
+                    LaneRec::Pkt(p) => Some((p.session, p.pkt_seq)),
+                    _ => None,
+                }));
             if let Some(fo) = self.failover.as_mut() {
                 fo.released(
                     h.0,

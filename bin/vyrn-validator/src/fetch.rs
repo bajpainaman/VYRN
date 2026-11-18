@@ -6,8 +6,8 @@
 //! without it moves to the next source: 2, one peer replica in round-robin order
 //! (`PeerDataFetch`), then 3, the sequencer's repair port (`SeqDataReq`), then back to 1. A
 //! source that is not configured is skipped. Every missing key has its own escalation. The
-//! front block's first missing key escalates alone until it is [`Sources::stuck`] (its boxes
-//! and a peer missed it: it was lost at its box); then every key the pending blocks miss
+//! front block's first missing key escalates alone until it is [`Sources::stuck`] (a data
+//! box answered its KEY fetch with a miss: it was lost at its box); then every key the pending blocks miss
 //! escalates at once, so a burst of lost packets reaches source 3 within one escalation, not
 //! one after another: the sequencer retains a packet only `REP_SEQ_PKT_RETAIN_MS` = 50 ms
 //! (07 §5.5, reading (j)). A replica catching up, whose data is still arriving by RANGE, keeps
@@ -109,13 +109,13 @@ struct Esc {
     /// The stage asked last (`None`: not asked yet), and since when.
     last: Option<Stage>,
     at: u64,
-    /// When it was first seen missing.
-    since: u64,
     /// The scan cycle that last named it.
     round: u64,
     /// Its own peer cursor, so each key turns through every peer whatever the other keys do
     /// (Vercel r4617946666).
     peer: usize,
+    /// A data box answered its KEY fetch with a miss (an empty `FETCH_RESP`).
+    box_missed: bool,
 }
 
 /// The fetch sources and the escalation of each missing key the pending blocks wait for.
@@ -194,14 +194,22 @@ impl Sources {
         true
     }
 
-    /// Whether `(session, pkt_seq)` has been missing so long that its data boxes and a peer
-    /// were asked and missed (2 × `REP_DATA_WAIT_US`): then it was lost at its box, and so may
-    /// the packets after it be, so every missing key is escalated at once (reading (j)). A
-    /// replica catching up, whose data is in flight, does not get there.
-    pub fn stuck(&self, session: SessionId, pkt_seq: u32, now: u64) -> bool {
+    /// A data box answered `(session, pkt_seq)`'s KEY fetch with a miss: it never stored it.
+    pub fn box_missed(&mut self, session: SessionId, pkt_seq: u32) {
+        if let Some(x) = self.missing.get_mut(&(session, pkt_seq)) {
+            x.box_missed = true;
+        }
+    }
+
+    /// Whether a data box said it lacks `(session, pkt_seq)`: then it was lost at its box, and
+    /// so may the packets after it be, so every missing key is escalated at once (reading (j)).
+    /// A replica catching up, whose data is in flight, never gets a box's miss, so it keeps
+    /// asking for one key: a timer here (2 × `REP_DATA_WAIT_US`) fired for a restarted voter
+    /// catching up and stopped it at `REP_E_HASHLAG` in 8 of 40 loaded runs.
+    pub fn stuck(&self, session: SessionId, pkt_seq: u32) -> bool {
         self.missing
             .get(&(session, pkt_seq))
-            .is_some_and(|x| now.saturating_sub(x.since) >= REP_DATA_WAIT_NS.saturating_mul(2))
+            .is_some_and(|x| x.box_missed)
     }
 
     /// Where this round's scan starts among `total` pending records: where the last one
@@ -231,6 +239,14 @@ impl Sources {
         }
     }
 
+    /// A block was released: its keys need no more fetching, so their escalations go, whether
+    /// or not a scan ever ran (Codex r4618328951). The map holds only pending blocks' keys.
+    pub fn released(&mut self, keys: impl IntoIterator<Item = (SessionId, u32)>) {
+        for k in keys {
+            self.missing.remove(&k);
+        }
+    }
+
     /// A pending block misses `(session, pkt_seq)` at `now`: the targets to KEY-fetch it from
     /// now, empty while the current source still has time.
     pub fn due(&mut self, session: SessionId, pkt_seq: u32, now: u64) -> Vec<Target> {
@@ -245,9 +261,9 @@ impl Sources {
                 Esc {
                     last: None,
                     at: now,
-                    since: now,
                     round,
                     peer,
+                    box_missed: false,
                 },
             );
             return Vec::new();
@@ -579,15 +595,28 @@ mod tests {
         for g in &got {
             assert!(g.contains(&t(11)) && g.contains(&t(12)), "{g:?}");
         }
-        // A key is stuck once its boxes and a peer had their wait.
+        // A key is stuck once a box said it lacks it, however long it has waited.
         let mut s = Sources::new(vec![t(1)], vec![t(11)], Some(t(21)));
         assert!(s.begin_round(5 * w));
         assert!(s.due(k, 9, 5 * w).is_empty());
-        assert!(!s.stuck(k, 9, 7 * w - 1));
-        assert!(s.stuck(k, 9, 7 * w));
+        assert_eq!(s.due(k, 9, 6 * w), vec![t(1)]);
+        assert_eq!(s.due(k, 9, 7 * w), vec![t(11)]);
+        assert!(!s.stuck(k, 9));
+        s.box_missed(k, 8);
+        assert!(!s.stuck(k, 9));
+        s.box_missed(k, 9);
+        assert!(s.stuck(k, 9));
         // Rounds are at least ROUND_NS apart.
         assert!(!s.begin_round(5 * w + ROUND_NS - 1));
         assert!(s.begin_round(5 * w + ROUND_NS));
+        // Single-key rounds never end a cycle: releasing the block forgets its keys, and only
+        // its keys (Codex r4618328951).
+        for q in 10..1000u32 {
+            let _ = s.due(k, q, 8 * w);
+            s.scanned(0, 0);
+        }
+        s.released((10..1000u32).map(|q| (k, q)));
+        assert_eq!(s.missing.keys().copied().collect::<Vec<_>>(), vec![(k, 9)]);
     }
 
     /// The scan goes on where the last round stopped and wraps, so a key past one round's budget

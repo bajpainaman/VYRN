@@ -1221,13 +1221,14 @@ sequencer actually matched, so it settles every conflict (§5.6).
 unresolved 300 µs after its ORDER frame is fetched from source 1, and each further 300 µs without
 its payload moves to the next source (2, then 3, then 1 again), skipping any source the replica
 has not configured. Source 2's peer turns round-robin across fetches. **Every unresolved record
-escalates on its own (reading, `vyrn-validator`):** once the first one has missed at its data
-boxes and a peer (2 × `REP_DATA_WAIT_US`, so it was lost at its box), a replica asks for all of
-them at once, not for one key after another: a round at most every 100 µs examines at most
-256 pending records and asks at most 32 keys, starting where the last round stopped, so every
-missing key gets its turn however long the backlog, and keeps its timer until two full passes of
-the scan go by without it. A replica catching up, whose data is still in flight,
-keeps asking for one. Source 3 holds a packet only
+escalates on its own (reading, `vyrn-validator`):** once a data box answers the first one's KEY
+fetch with a miss (a `FETCH_RESP` with no packets: it was lost at its box), a replica asks for all
+of them at once, not for one key after another: a round at most every 100 µs examines at most 256
+pending records and asks at most 32 keys, starting where the last round stopped, so every missing
+key gets its turn however long the backlog, and keeps its timer until two full passes of the scan go
+by without it. A replica catching up, whose data is still in flight, never gets a box's miss and
+keeps asking for one (a 600 µs timer in its place stopped a restarted voter at `REP_E_HASHLAG` in 8
+of 40 loaded runs). Source 3 holds a packet only
 `REP_SEQ_PKT_RETAIN_MS` after the newest one it took, so a burst lost at the data box (a socket
 overflow) that is walked one key at a time, at up to 3 × 300 µs a key, outlives that window: 89
 lost packets stalled every replica on `Missing` for good.

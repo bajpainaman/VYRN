@@ -234,8 +234,9 @@
 //!   for good: the box had stored 1403 of 1500 packets, and the validators, which escalated one
 //!   key at a time, reached source 3 after it had dropped the rest (`REPAIR_STATS served=0
 //!   missed=67240`). Validators now escalate every missing key at once (`fetch.rs` reading (j)).
-//!   The tap, which replays like a replica, KEY-fetches from the unkeyed sequencer each packet the
-//!   client sent that its join still lacks 2 ms on (`TAP_SEQ_WAIT`), again every 2 ms; under
+//!   The tap, which replays like a replica, KEY-fetches from the unkeyed boxes and sequencer each
+//!   packet the client sent that its join still lacks 2 ms on (`TAP_SEQ_WAIT`), again every 2 ms
+//!   (the box: a run lost a packet the box had since repaired, past the sequencer's 50 ms); under
 //!   `--keyed` (R8) the box would refuse its plain fetch, so it does not ask, and `--copy2-gap`
 //!   is refused. *Ruled-style, as R1, for the box's count only:* `data` lets the box store fewer
 //!   than it was sent by at most its ingest socket's kernel drop count (`/proc/net/udp`, read
@@ -884,7 +885,7 @@ struct DataTap {
     stored: u64,
     /// Frames the tap asked for again by RANGE fetch and got.
     repaired: u64,
-    /// R19: KEY fetches the tap sent the sequencer's retention.
+    /// R19: KEY fetch rounds the tap sent its boxes and the sequencer's retention.
     seq_asked: u64,
     /// Rejected frames, dropped packets and the gaps never repaired.
     errs: Vec<String>,
@@ -969,7 +970,8 @@ fn data_tap(
                 }
             }
             // R19: a packet still missing TAP_SEQ_WAIT after it was sent (or last asked) is
-            // KEY-fetched from the sequencer's retention, as a replica's source 3 (07 §5.5).
+            // KEY-fetched from its boxes (source 1), which may have repaired it, and from the
+            // sequencer's retention (source 3), at once (07 §5.5).
             if let Some((to, rx)) = &seq {
                 sent.extend(rx.try_iter().map(|(s, q, t)| ((s, q), t)));
                 sent.retain(|&(s, q), at| {
@@ -981,7 +983,10 @@ fn data_tap(
                             session: s,
                             pkt_seq: q,
                         };
-                        let _ = sock.send_to(&f.encode(), to);
+                        let f = f.encode();
+                        for a in fetch.iter().chain([to]) {
+                            let _ = sock.send_to(&f, a);
+                        }
                         t.seq_asked += 1;
                         *at = now;
                     }
