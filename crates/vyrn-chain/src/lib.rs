@@ -16,6 +16,10 @@
 //! | [`bridge`] | [`bridge::Checkpoint`] → `Post`; the guardian's veto decision | 09 §6.4, §6.5 | validators (build), guardians (review) | relayers, L1 |
 //! | [`session`] | `SessionOpen` (item 0x01), checks 2–4 | 09 §5.2 | wallets | every validator |
 //! | [`tesla`] | `K_seq`, `K_out`, `K_com` chain and anchor; `KeyDisclosure` (45 B) | 09 §5.3, §5.4, §5.10 | clients, sequencer node, committee members | validators' `tag_com` check, third-party auditors |
+//! | [`loghash`] | `log_hash(H)` over each chain block's three roots | 09 §9.2 | validator boxes | voters (check 7), sync, `HandoffRecord` |
+//! | [`lthash`] | 28-byte order element, 1024 × u16 LtHash, digest | 09 §9.4 | lanes (diffs), the commit box (sum) | `StateCommit`, syncing nodes |
+//! | [`commit`] | `StateCommit` (226 + 10·books B), `CommitVote`, `CommitCert` (item 0x24) | 09 §9.5 | validator boxes (VK) | light clients, L1 posts, `DoubleCommit` evidence |
+//! | [`signer`] | `Ed25519Signer` (VK), `BridgeSigner` (BK) traits; software signers | 09 §2.2 | HSM / key-file adapters | [`commit`], bridge posts |
 //! | [`keccak256`] | Keccak-256 (Ethereum padding), RustCrypto `sha3` (11 §2.2) | 01 §14.11 | — | [`eip712`], [`wdtree`] |
 //!
 //! **Ordering.** Post `k` names post `k − 1` by its EIP-712 struct hash in `prev_post`; post 1 has
@@ -46,16 +50,19 @@
 //!
 //! # Not implemented yet
 //!
-//! The wallet signature of the `TxEnvelope` (§4.4) and `AnchorFault` (§5.4), the order LtHash (§9.4), `StateCommit` encoding and `CommitCert`
-//! verification (§9.5), the log hash chain (§9.2), slashing evidence (§8), forced inclusion (§7),
+//! The wallet signature of the `TxEnvelope` (§4.4) and `AnchorFault` (§5.4), slashing evidence (§8), forced inclusion (§7),
 //! L1 deposit attestation (§6.3), and the `AllocLeaf`/`SessionLeaf`/`OperatorLeaf` layouts.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod bridge;
 mod codec;
+pub mod commit;
 pub mod eip712;
+pub mod loghash;
+pub mod lthash;
 pub mod session;
+pub mod signer;
 pub mod smt;
 pub mod tesla;
 pub mod wdtree;
@@ -63,8 +70,12 @@ pub mod wdtree;
 use vyrn_types::Hash;
 
 pub use bridge::{Checkpoint, Guardian, Verdict, VetoReason, build_post};
+pub use commit::{CommitCert, CommitVote, StateCommit};
 pub use eip712::{Address, Domain, Post, SigError, SignerSet, Unpause};
+pub use loghash::{LogChain, Roots};
+pub use lthash::{LtHash, OrderElem};
 pub use session::{OpenReject, SessionOpen, SessionState};
+pub use signer::{BridgeSigner, Ed25519Signer, SignerError};
 pub use smt::{AccountLeaf, BalanceLeaf, Proof, Smt};
 pub use tesla::{ClientKeys, KcomWindow, KeyDisclosure, Traversal};
 pub use wdtree::Withdrawal;
