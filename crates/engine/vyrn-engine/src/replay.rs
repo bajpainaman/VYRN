@@ -359,6 +359,32 @@ pub fn control_payload(c: &ControlCmd) -> Option<[u8; CONTROL_PAYLOAD_LEN]> {
     Some([code, phase, l0, l1, l2, l3, h0, h1, h2, h3])
 }
 
+/// Bytes of the payload of the `Uncross` step that opens an auction (07 §3.8 "uncross data"):
+/// `price` u32 LE (p*), then `qty` u64 LE (Q). Later chunk steps of the same uncross carry an
+/// empty payload. Replay queues the uncross this names and checks it against the book: a frozen
+/// book that cannot fill `qty` on both sides at `price` is `Why::Mismatch` at the step.
+pub const UNCROSS_PAYLOAD_LEN: usize = 12;
+
+/// The payload of the `Uncross` step that `ControlCmd::Uncross` opens.
+pub fn uncross_payload(price: Tick, qty: u64) -> [u8; UNCROSS_PAYLOAD_LEN] {
+    let mut b = [0u8; UNCROSS_PAYLOAD_LEN];
+    let (p, q) = b.split_at_mut(4);
+    p.copy_from_slice(&price.0.to_le_bytes());
+    q.copy_from_slice(&qty.to_le_bytes());
+    b
+}
+
+/// The `ControlCmd::Uncross` an opening `Uncross` step's payload names ([`uncross_payload`]'s
+/// inverse).
+pub fn uncross_of_payload(b: &[u8]) -> Option<ControlCmd> {
+    let b: &[u8; UNCROSS_PAYLOAD_LEN] = b.try_into().ok()?;
+    let [p0, p1, p2, p3, q0, q1, q2, q3, q4, q5, q6, q7] = *b;
+    Some(ControlCmd::Uncross {
+        price: Tick(u32::from_le_bytes([p0, p1, p2, p3])),
+        qty: u64::from_le_bytes([q0, q1, q2, q3, q4, q5, q6, q7]),
+    })
+}
+
 /// The command a `Control` step's payload names ([`control_payload`]'s inverse).
 pub fn control_of_payload(b: &[u8]) -> Option<ControlCmd> {
     let b: &[u8; CONTROL_PAYLOAD_LEN] = b.try_into().ok()?;
@@ -687,6 +713,23 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     return Err(at(Why::BadStep));
                 }
             }
+            // The step that opens an uncross names its p* and Q (07 §3.8); its chunk steps and
+            // a Seal carry nothing. Replay queues the command, as the control role did live.
+            let opens = w.kind == StepKind::Uncross && !self.bbo.uncrossing();
+            let queued = if opens {
+                Some(uncross_of_payload(w.payload).ok_or(at(Why::BadStep))?)
+            } else if w.kind == StepKind::Seal {
+                Some(ControlCmd::Seal)
+            } else {
+                None
+            };
+            if let Some(c) = queued {
+                if (w.kind == StepKind::Seal && !w.payload.is_empty()) || !self.command(&c) {
+                    return Err(at(Why::BadStep));
+                }
+            } else if w.kind == StepKind::Uncross && !w.payload.is_empty() {
+                return Err(at(Why::BadStep));
+            }
             let mut cut: Cut = [LaneSeq(0); MAX_LANES];
             for (d, c) in cut.iter_mut().zip(w.cut) {
                 *d = *c;
@@ -713,7 +756,12 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 cut,
             };
             let mut tee = Tee::new(sink, log, buf);
-            self.step_call(&rs, &mut tee).map_err(at)?;
+            // An uncross the frozen book cannot fill (the BBO's "histograms disagree" fault) is
+            // a payload that does not match the replayed book.
+            self.step_call(&rs, &mut tee).map_err(|why| match why {
+                Why::Fault(_) if w.kind == StepKind::Uncross => at(Why::Mismatch),
+                why => at(why),
+            })?;
             if tee.bad_resp {
                 return Err(at(Why::Response));
             }

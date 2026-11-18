@@ -1196,9 +1196,14 @@ impl<T: TxRing> StreamCore<T> {
                 }
                 let kind = StepKind::from_code(e.kind).ok_or("unknown step kind")?;
                 let src = has_src(kind).then_some((e.src_lane, e.src_lane_seq));
-                // Spec gap: the engine's StepEntry carries no payload for Rescan, Seal and
-                // Uncross (07 §3.8), so those steps are framed with an empty one. A Control
-                // step takes the payload of the command the engine queued for it.
+                // Spec gap: the engine's StepEntry carries no payload for Rescan (07 §3.8), so it
+                // is framed with an empty one; a Seal's payload is empty. A Control step takes
+                // the payload of the command the engine queued for it. An opening Uncross step
+                // must carry p* and Q, but this release queues only the gate's Phase commands,
+                // so an Uncross step here has no command to frame and stops the stream.
+                if kind == StepKind::Uncross {
+                    return Err("Uncross step without a queued command".into());
+                }
                 let payload = if kind == StepKind::Control {
                     let p = self
                         .control
