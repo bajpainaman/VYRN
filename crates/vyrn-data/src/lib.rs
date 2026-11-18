@@ -108,6 +108,13 @@
 //!
 //! A malformed or out-of-range fetch is dropped and counted (`fetch_bad`).
 //!
+//! ## Two-epoch boundary (08 §4.6) — *reading*, recorded there
+//!
+//! One key table checks every `epoch16`. From T, [`DataHome::add_epoch`] adds e + 1's keys and
+//! `epoch16` picks the table; a copy of neither epoch is [`Reject::Epoch`] (counted in `epoch`),
+//! before the MAC, so it raises no event. [`DataHome::retire_epoch`] drops e at activation (new
+//! home) or after `EPO_REDIRECT_HOLD_S` (old home).
+//!
 //! # Hot path
 //!
 //! The ring slots, its index, the dedupe windows (one per keyed session, made at construction),

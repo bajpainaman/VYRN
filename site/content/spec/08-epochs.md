@@ -413,6 +413,18 @@ The new home's data tier must accept e+1 copies from T. Reason: replicas vote on
 only when they hold every payload it references (07), and window blocks are final within
 `FINALITY_MAX_MS` of each packet (§7.1). The opening block then waits for no transfer either.
 
+**Keys across the boundary (reading, `vyrn-data`).** A data home holds one key table per epoch it
+serves. With one table it checks no `epoch16`, as replicas filter none (07 §5.4). From T the new
+home also holds the next epoch's keys (`K_seq(e+1, ·)` or `K_com(e+1, ·)`), and the owner names both
+epochs rather than assuming consecutive numbers; `epoch16` then picks the
+table, and a copy whose `epoch16` is neither e nor e + 1 is dropped and counted before its MAC is
+checked, so it raises no `DataBadMac` (F5, P8). Dedupe windows and the ring span both epochs,
+because sessions and `pkt_seq` carry over (04 H8): a resend under e + 1 of a packet first sent
+under e is a D3 variant. The new home retires e at activation, the old home at
+`EPO_REDIRECT_HOLD_S` after the seal; copies already stored age out of the ring. A `DataRedirect`
+during the boundary is tagged under e + 1's key (04 H2). The destination set does not split:
+both of the new home's roles fan out to `R_{e+1}` and the standby.
+
 ### 4.7 Third home
 
 The third home follows e from the old home until it holds cert(e, S), verified as in §5.4, then
