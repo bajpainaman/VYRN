@@ -114,9 +114,11 @@ fn spawn_with(
         tag,
         extra,
         "engine = 2\nstream = 4",
+        false,
     )
 }
 
+/// `spawn_with` with this `[cores]` body; `pipe_err` pipes stderr for the test to read.
 fn spawn_cores(
     replica: &UdpSocket,
     seal: &str,
@@ -124,6 +126,7 @@ fn spawn_cores(
     tag: &str,
     extra: &str,
     cores: &str,
+    pipe_err: bool,
 ) -> (Child, PathBuf) {
     let dir = std::env::temp_dir().join(format!("vyrn-seq-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -183,6 +186,11 @@ base = 1000000000
         .env("VYRN_SMOKE_SEQ_SEED", hex(&SEED))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(if pipe_err {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
         .spawn()
         .unwrap();
     (child, dir)
@@ -253,8 +261,9 @@ fn orders(
 }
 
 /// Closes stdin, reads stdout to EOF and returns the `STATS` line and whether the box exited 0.
-/// `[cores] pin = true`: pinned to a CPU this test may use, the box starts and stops cleanly;
-/// pinned past `CPU_SETSIZE`, it fail-stops before `READY` with the reason on stderr. Linux
+/// `[cores] pin`: pinned to a CPU this test may use, the box starts, reports the CPU in
+/// `LAYOUT` and stops cleanly; unpinned, `LAYOUT` says `unpinned` though cores are set. Either
+/// thread pinned past `CPU_SETSIZE` fail-stops it before `READY`, naming that thread. Linux
 /// only: `pin_current_thread` is `Unsupported` elsewhere, so a pinned box never starts there.
 #[cfg(target_os = "linux")]
 #[test]
@@ -266,34 +275,65 @@ fn pinned_cores_start_and_a_bad_pin_fail_stops() {
         .and_then(|l| l.trim().split([',', '-']).next().map(str::to_owned))
         .unwrap_or_else(|| "0".into());
     let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let ok = format!("pin = true\nengine = {cpu}\nstream = {cpu}");
-    let (mut child, dir) = spawn_cores(&replica, "count", 2, "pin-ok", "", &ok);
-    let mut out = BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    loop {
-        line.clear();
-        assert!(out.read_line(&mut line).unwrap() > 0, "exited before READY");
-        if line.starts_with("READY vyrn-seq ") {
-            break;
+    for (pin, layout) in [
+        (
+            true,
+            format!("LAYOUT engine={cpu} stream={cpu} control=main"),
+        ),
+        (
+            false,
+            "LAYOUT engine=unpinned stream=unpinned control=main".to_owned(),
+        ),
+    ] {
+        let cores = format!("pin = {pin}\nengine = {cpu}\nstream = {cpu}");
+        let tag = format!("pin-ok-{pin}");
+        let (mut child, dir) = spawn_cores(&replica, "count", 2, &tag, "", &cores, false);
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        let mut seen = Vec::new();
+        loop {
+            let mut line = String::new();
+            assert!(
+                out.read_line(&mut line).unwrap() > 0,
+                "exited before READY: {seen:?}"
+            );
+            if line.starts_with("READY vyrn-seq ") {
+                break;
+            }
+            seen.push(line.trim().to_owned());
         }
+        assert!(seen.contains(&layout), "{seen:?}");
+        let (_, clean) = stop(&mut child, out);
+        assert!(clean);
+        let _ = std::fs::remove_dir_all(&dir);
     }
-    let (_, clean) = stop(&mut child, out);
-    assert!(clean);
-    let _ = std::fs::remove_dir_all(&dir);
 
-    let bad = "pin = true\nengine = 65535\nstream = 65535";
-    let (mut child, dir) = spawn_cores(&replica, "count", 2, "pin-bad", "", bad);
-    drop(child.stdin.take());
-    let mut text = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut text)
-        .unwrap();
-    assert!(!exits(&mut child).success());
-    assert!(!text.contains("READY"), "{text}");
-    let _ = std::fs::remove_dir_all(&dir);
+    for (engine, stream, who) in [
+        ("65535", cpu.as_str(), "engine"),
+        (cpu.as_str(), "65535", "stream"),
+    ] {
+        let bad = format!("pin = true\nengine = {engine}\nstream = {stream}");
+        let tag = format!("pin-bad-{who}");
+        let (mut child, dir) = spawn_cores(&replica, "count", 2, &tag, "", &bad, true);
+        drop(child.stdin.take());
+        let (mut text, mut err) = (String::new(), String::new());
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        assert!(!exits(&mut child).success());
+        assert!(!text.contains("READY"), "{text}");
+        let want = format!("cores.pin: {who} to cpu 65535");
+        assert!(err.contains(&want), "{who}: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn stop(child: &mut Child, out: BufReader<ChildStdout>) -> (String, bool) {
