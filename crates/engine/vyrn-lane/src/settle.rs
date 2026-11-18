@@ -74,7 +74,15 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
         // B1.
         let mut step = StepId(0);
         let mut taker: Option<u32> = None;
-        while let Some(ev) = self.evbuf.front().copied() {
+        loop {
+            // Refill as B1 consumes: the ring may hold more events of steps ≤ `at.step` than
+            // the buffer took at once (rule G makes them all visible).
+            if self.evbuf.is_empty() {
+                self.buffer_events(vis);
+            }
+            let Some(ev) = self.evbuf.front().copied() else {
+                break;
+            };
             if ev.step > at.step {
                 break;
             }
@@ -221,6 +229,8 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
             }
         };
         if kind == RiskFill::Taker {
+            // An explicit Replace took effect at this step even if it never rests or goes out.
+            self.end_replaced(sp.leg);
             if taker.is_some_and(|t| t != sp.leg) {
                 self.taker_end(taker.take());
             }
@@ -239,10 +249,8 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
             .root(sp.root)
             .map_or(0, |r| r.filled)
             .saturating_add(ev.qty);
-        let cur_total = self
-            .root(sp.root)
-            .and_then(|r| self.slot(r.cur))
-            .map_or(0, |c| c.total);
+        // Completion against the version that traded, not a pending later one (`root.cur`).
+        let cur_total = sp.total;
         if let Some(r) = self.root_mut(sp.root) {
             r.filled = filled;
             if filled >= cur_total {
@@ -315,20 +323,53 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
         let Some(sp) = self.slot(w).copied() else {
             return;
         };
-        if sp.kind != SKind::NewPrio {
+        if sp.kind != SKind::NewPrio || !sp.pred_pending || sp.pred == 0 {
             return;
         }
-        let prev = self.root(sp.root).map_or(0, |r| r.prev);
-        if prev == 0 {
-            return;
-        }
-        if let Some(r) = self.root_mut(sp.root) {
-            r.prev = 0;
+        let prev = sp.pred;
+        if let Some(s) = self.slot_mut(w) {
+            s.pred_pending = false;
         }
         self.tombstone(prev, sp.ins_seq, sp.ts);
         self.end_position(prev);
         let old_leg = self.slot(prev).map_or(0, |s| s.leg);
         self.release(old_leg);
+        self.true_up(w);
+    }
+
+    /// The new version of a `Replace` reserved its whole total, but the predecessor's fills,
+    /// now final, are part of it: release them from the new leg (10 §4.4).
+    pub(crate) fn true_up(&mut self, w: u32) {
+        let Some(s) = self.slot(w).copied() else {
+            return;
+        };
+        if s.kind != SKind::NewPrio || s.trued {
+            return;
+        }
+        if let Some(x) = self.slot_mut(w) {
+            x.trued = true;
+        }
+        let Some(o) = s.risk.filter(|o| !o.closed) else {
+            return;
+        };
+        let filled = self.root(s.root).map_or(0, |r| r.filled);
+        let filled_old = filled.saturating_sub(o.settled.0);
+        if filled_old == 0 {
+            return;
+        }
+        let rem = o.qty.0.saturating_sub(o.settled.0);
+        if filled_old < rem {
+            self.settle_with(w, |st, o| st.reduce(o, Qty(filled_old)));
+        } else {
+            self.release(w);
+        }
+    }
+
+    /// The predecessor of pending `NewPrio` version `w`, or 0.
+    fn pending_pred(&self, w: u32) -> u32 {
+        self.slot(w)
+            .filter(|s| s.kind == SKind::NewPrio && s.pred_pending)
+            .map_or(0, |s| s.pred)
     }
 
     /// The version before a refused explicit `Replace` is current again.
@@ -336,14 +377,30 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
         let Some(sp) = self.slot(w).copied() else {
             return;
         };
-        if sp.kind != SKind::NewPrio {
+        if sp.kind != SKind::NewPrio || !sp.pred_pending {
             return;
         }
-        if let Some(r) = self.root_mut(sp.root)
-            && r.prev != 0
-        {
-            r.cur = r.prev;
-            r.prev = 0;
+        if let Some(s) = self.slot_mut(w) {
+            s.pred_pending = false;
+        }
+        // Unlink `w` from the chain: its successor (or the root) points at its predecessor.
+        let cur = self.root(sp.root).map_or(0, |r| r.cur);
+        if cur == w {
+            if let Some(r) = self.root_mut(sp.root) {
+                r.cur = sp.pred;
+            }
+            return;
+        }
+        let mut x = cur;
+        while x != 0 {
+            let leg = self.slot(x).map_or(0, |s| s.leg);
+            if self.slot(leg).is_some_and(|h| h.pred == w) {
+                if let Some(h) = self.slot_mut(leg) {
+                    h.pred = sp.pred;
+                }
+                return;
+            }
+            x = self.pending_pred(leg);
         }
     }
 
@@ -390,7 +447,7 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
             }
         } else {
             if kind == FillKind::Out && ev.cause == OUT_FINISHED {
-                let prev = self.root(sp.root).map_or(0, |r| r.prev);
+                let prev = self.pending_pred(v);
                 let old_leg = self.slot(prev).map_or(0, |s| s.leg);
                 self.release(old_leg);
             }
@@ -442,7 +499,7 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
                     self.end_replaced(v);
                 }
                 DEP_ENDED => {
-                    let prev = self.root(sp.root).map_or(0, |r| r.prev);
+                    let prev = self.pending_pred(v);
                     let old_leg = self.slot(prev).map_or(0, |s| s.leg);
                     self.release(old_leg);
                     self.release(sp.leg);
@@ -737,6 +794,7 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
             );
             return;
         }
+        self.true_up(p.w);
         if !new.taker_end && new.taker_filled < new.total.saturating_sub(filled_old) && !new.dead {
             self.stage(
                 p,

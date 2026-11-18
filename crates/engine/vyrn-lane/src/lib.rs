@@ -36,8 +36,11 @@
 //!   is in flight; settles after it keep `LaneSeq` order behind it. Later ops of the lane are
 //!   kept out by the BBO's cut, which stops before the first op keyed after the taker (vyrn-bbo
 //!   `febe805`); the lane adds no hold of its own for them.
-//! - **R (cancel of a replace).** A cancel that pass 2 applies tombstones both the current
-//!   version and a pending explicit `Replace`'s previous version.
+//! - **R (cancel of a replace).** Each `NewPrio` version records its own predecessor and whether
+//!   that replace is still at the BBO core. A cancel that pass 2 applies tombstones the current
+//!   version and every pending predecessor in the chain, with one journal entry. When a replace
+//!   takes effect (its first taker event, `Rested`, or a Join dependency resting) the
+//!   predecessor ends there and the new leg's reservation drops by the predecessor's fills.
 //!
 //! The arena's ordering protocol is checked by Miri on `arena_tests` and by the lane–BBO
 //! conformance tests, not by a loom model: `loom` is a dev-dependency of `vyrn-cut` only (11 §2.2,

@@ -626,3 +626,178 @@ fn lane_book_reads_like_mem_book() {
         );
     }
 }
+
+fn base_resv(x: &mut Rig<'_>, l: usize, a: u32) -> u64 {
+    x.lanes[l]
+        .account_mut(vyrn_risk::AcctSlot(a))
+        .unwrap()
+        .1
+        .base_resv
+}
+
+/// Active positions of lane 0's level, as slots.
+fn active(x: &Rig<'_>, side: Side, tick: u32) -> Vec<u32> {
+    let lb = vyrn_lane::LaneBook::new(&x.views);
+    level(&lb, side, tick)
+        .into_iter()
+        .filter(|p| p.3)
+        .map(|p| p.0)
+        .collect()
+}
+
+fn replace(h: Handle, side: Side, tick: u32, qty: u32) -> Msg {
+    Msg::Replace {
+        flags: wire_flags(day(side)),
+        handle: h,
+        tick: Tick(tick),
+        qty: Qty(qty),
+    }
+}
+
+#[test]
+fn a_chain_of_two_pending_replaces_ends_each_predecessor() {
+    // Codex P1: sell 3 @ 110 (local, under ask 105), then one packet replaces it to 104 and
+    // to 103 (both improve on ask 105, forwarded). 05 §2.3: each replace ends the version
+    // before it, so only the order @ 103 is live and only its 3 lots are reserved.
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    ask_105(&mut x, &mut bbo);
+    x.send(0, 2, 2_000, &[new(day(Side::Sell), 110, 3, 12)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 2);
+    x.send(
+        0,
+        2,
+        3_000,
+        &[
+            replace(h, Side::Sell, 104, 3),
+            replace(h, Side::Sell, 103, 3),
+        ],
+    );
+    x.settle(&mut bbo);
+    assert!(active(&x, Side::Sell, 110).is_empty(), "v0 ended");
+    assert!(active(&x, Side::Sell, 104).is_empty(), "v1 ended");
+    assert_eq!(active(&x, Side::Sell, 103).len(), 1);
+    assert_eq!(base_resv(&mut x, 0, 2), 3);
+}
+
+#[test]
+fn a_replace_that_fills_completely_releases_its_predecessor() {
+    // Vercel: lane 1 bids 3 @ 100; lane 0 rests sell 3 @ 110, then replaces it to sell 3 @ 100
+    // (a Cross, forwarded). It fills 3 and never rests or goes out; the old version still ends
+    // at the replace (05 §2.3), so nothing stays reserved or visible.
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    x.send(1, 1, 500, &[new(day(Side::Buy), 100, 3, 1)]);
+    x.settle(&mut bbo);
+    x.send(0, 2, 2_000, &[new(day(Side::Sell), 110, 3, 12)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 2);
+    x.send(0, 2, 3_000, &[replace(h, Side::Sell, 100, 3)]);
+    x.settle(&mut bbo);
+    assert!(
+        x.records(0, 2)
+            .iter()
+            .any(|r| matches!(r, Record::Fill { qty: Qty(3), .. }))
+    );
+    assert!(active(&x, Side::Sell, 110).is_empty());
+    assert_eq!(base_resv(&mut x, 0, 2), 0);
+}
+
+#[test]
+fn a_replace_after_partial_fills_reserves_only_what_can_still_trade() {
+    // Codex P1: sell 10 @ 106 (improve), lane 1 buys 4. A local Replace to 10 @ 107 leaves
+    // 10 − 4 = 6 open (05 §2.3: qty' counts the fills). Lane 1 buys 6 @ 107: the order is
+    // filled, so nothing stays reserved (10 §4.4).
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    x.send(0, 2, 1_000, &[new(day(Side::Sell), 106, 10, 12)]);
+    x.settle(&mut bbo);
+    x.send(1, 1, 2_000, &[new(day(Side::Buy), 106, 4, 1)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 2);
+    x.send(0, 2, 3_000, &[replace(h, Side::Sell, 107, 10)]);
+    x.settle(&mut bbo);
+    assert_eq!(base_resv(&mut x, 0, 2), 6);
+    x.send(1, 2, 4_000, &[new(day(Side::Buy), 107, 6, 2)]);
+    x.settle(&mut bbo);
+    assert_eq!(base_resv(&mut x, 0, 2), 0);
+}
+
+#[test]
+fn fills_before_a_pending_reduce_are_counted_against_the_version_that_traded() {
+    // Codex P1: sell 10 @ 106; lane 1 buys 6 (step runs); lane 0 then reduces by 4 before it
+    // has applied that step (no boundary inside the packet). Sequentially the 6 fills come
+    // first, so the reduce by 4 = the open 4 ends the order: CancelAck 4 (04 §6.4), and
+    // nothing stays reserved.
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    x.send(0, 1, 1_000, &[new(day(Side::Sell), 106, 10, 11)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 1);
+    x.send(1, 1, 2_000, &[new(day(Side::Buy), 106, 6, 1)]);
+    x.bbo_step(&mut bbo).unwrap();
+    let at = x.lane_cut(0);
+    let none = [Mid {
+        pass: 1,
+        next: LaneSeq(99),
+        at,
+    }];
+    let m = [Msg::Reduce {
+        handle: h,
+        by: Qty(4),
+        client_tag: 44,
+    }];
+    assert_eq!(x.send_at(0, 1, 3_000, 3_000, &m, &none), Rx::Accepted);
+    x.settle(&mut bbo);
+    assert_eq!(
+        x.records(0, 1).last(),
+        Some(&Record::CancelAck {
+            index: 0,
+            handle: h,
+            canceled: Qty(4),
+            client_tag: 44
+        })
+    );
+    assert_eq!(base_resv(&mut x, 0, 1), 0);
+}
+
+#[test]
+fn a_second_cancel_all_keeps_the_first_kill_as_tombstones() {
+    // Codex P1, 05 §4.7: one session per account, so CancelAll #1 (LaneSeq 2) is an AcctKill.
+    // Before CancelAll #2 (LaneSeq 3) overwrites it, every order the first one covered gets
+    // its tombstone at LaneSeq 2, also the ones B2 already ended.
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    ask_105(&mut x, &mut bbo);
+    x.send(0, 1, 2_000, &[Msg::CancelAll { client_tag: 1 }]);
+    x.settle(&mut bbo);
+    x.send(0, 1, 3_000, &[Msg::CancelAll { client_tag: 2 }]);
+    let lb = vyrn_lane::LaneBook::new(&x.views);
+    assert_eq!(lb.slot(lid(0), 1).unwrap().tomb_seq, LaneSeq(2));
+    assert_eq!(lb.acct_kill(lid(0), 1).kill_seq, LaneSeq(3));
+}
+
+#[test]
+fn canceling_a_pending_replace_writes_one_journal_entry() {
+    // Vercel, 05 §4.9 (one entry per independent op). Seqs: 1 ask_105 (forwarded), 2 local
+    // join @ 110, 3 Replace to 104 (forwarded), 4 its Cancel (local), 5 local join @ 120. The
+    // journal holds 2, 4, 5, and a reader sees all three.
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    ask_105(&mut x, &mut bbo);
+    x.send(0, 2, 2_000, &[new(day(Side::Sell), 110, 3, 12)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 2);
+    x.send(
+        0,
+        2,
+        3_000,
+        &[replace(h, Side::Sell, 104, 3), cancel(h, 13)],
+    );
+    x.send(0, 3, 3_100, &[new(day(Side::Sell), 120, 1, 14)]);
+    let lb = vyrn_lane::LaneBook::new(&x.views);
+    let mut seqs = Vec::new();
+    lb.journal(lid(0), LaneSeq(0), LaneSeq(5), |j| seqs.push(j.seq.0));
+    assert_eq!(seqs, vec![2, 4, 5]);
+}

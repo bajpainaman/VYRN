@@ -140,6 +140,13 @@ pub(crate) struct SlotP {
     pub taker_filled: u32,
     /// A batch taker's terminal `Out`/`Reject` (its record is the lane's, 05 §8.10 rule 4).
     pub taker_end: bool,
+    /// `NewPrio` versions: the version this one replaces, and whether the replace is still at
+    /// the BBO core (explicit, not yet in effect). Per version, so a chain `v0 → v1 → v2` of
+    /// pending replaces keeps every link (contract rule R).
+    pub pred: u32,
+    pub pred_pending: bool,
+    /// `NewPrio` versions: the reservation was trued up for the predecessor's fills.
+    pub trued: bool,
     /// A `Rescan` batch taker whose latest status event is `RESTED_IN_FLIGHT` (rule B).
     pub in_flight: bool,
     /// Index, session and `pkt_seq` of the op that created it (for lane-emitted records).
@@ -157,8 +164,6 @@ pub(crate) struct RootP {
     pub tag: u32,
     /// Current version as pass 1 knows it (includes pending ops).
     pub cur: u32,
-    /// The version before a pending explicit new-priority `Replace` (0 = none pending).
-    pub prev: u32,
     pub filled: u32,
     /// The lane knows the order ended (`TOO_LATE` from now on), and how (04 §6.3).
     pub ended: bool,
@@ -527,10 +532,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         let (kind, ins_ts) = match p.kind {
             SKind::KeepPrio => (SlotKind::KeepPrio, p.ts.0),
             SKind::NewPrio => {
-                let pred = self
-                    .root(root)
-                    .and_then(|r| self.slot(if r.prev != 0 { r.prev } else { r.cur }))
-                    .map_or(0, |v| v.total);
+                let pred = self.slot(p.pred).map_or(0, |v| v.total);
                 (SlotKind::NewPrio, u64::from(pred))
             }
             _ => (SlotKind::Original, 0),
@@ -1063,7 +1065,8 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                     return Err(rej(RejectReason::SideMismatch, 0));
                 }
                 if tick == vp.tick && f == vp.flags && qty.0 < vp.total && qty.0 > 0 {
-                    // A same-tick reduction is a Reduce (01 §6.2, 04 §6.5).
+                    // A same-tick reduction is a Reduce (01 §6.2, 04 §6.5), with its buckets.
+                    self.check_cancel(si, CancelKind::Reduce, ts)?;
                     let by = vp.total.saturating_sub(qty.0);
                     return self.reduce_op(base, r, by, rp.tag, ts);
                 }
@@ -1098,19 +1101,15 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                         ix,
                         sess: si,
                         pkt: cur_pkt,
+                        pred: v,
+                        pred_pending: route.is_some(),
                         ..SlotP::default()
                     };
                 }
                 if let Some(x) = self.root_mut(r) {
-                    x.prev = v;
                     x.cur = w;
                 }
                 self.write_slot_line(w, r, rp.acct);
-                if route.is_none()
-                    && let Some(x) = self.root_mut(r)
-                {
-                    x.prev = 0; // a local Replace cannot be shed: the new version is current
-                }
                 let mut op = Op {
                     k: OpK::Replace,
                     root: r,
@@ -1388,11 +1387,8 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                 let w = if o.k == OpK::Join { o.v } else { o.w };
                 if let Some(p) = self.slot_mut(w) {
                     p.explicit = true;
-                }
-                if o.k == OpK::Replace
-                    && let Some(x) = self.root_mut(o.root)
-                {
-                    x.prev = o.v; // now explicit: it can be shed
+                    // A Replace dependency is explicit: it can be shed or refused.
+                    p.pred_pending = o.k == OpK::Replace;
                 }
             } else {
                 if let Some(x) = self.root_mut(o.root) {
@@ -1489,21 +1485,25 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                 self.pend_push(op, PendK::ReplaceAck);
             }
             OpK::Cancel => {
-                // Robust to an earlier explicit Replace still at the BBO core: end both
-                // candidates; the settle uses whichever is current (contract rule R).
-                let prev = self.root(op.root).map_or(0, |r| r.prev);
-                for v in [op.v, prev] {
-                    if v != 0 {
-                        self.tombstone(v, op.seq, ts);
-                        self.end_position(v);
-                        self.journal(JEnt {
-                            seq: op.seq,
-                            tick: op.tick,
-                            slot: v,
-                            kind: JKind::Tomb,
-                        });
-                    }
+                // Robust to earlier explicit Replaces still at the BBO core: end the current
+                // version and every pending predecessor; the settle uses whichever is current
+                // (contract rule R). One journal entry per op (05 §4.9).
+                let mut v = op.v;
+                while v != 0 {
+                    self.tombstone(v, op.seq, ts);
+                    self.end_position(v);
+                    let leg = self.slot(v).map_or(0, |p| p.leg);
+                    v = self
+                        .slot(leg)
+                        .filter(|h| h.kind == SKind::NewPrio && h.pred_pending)
+                        .map_or(0, |h| h.pred);
                 }
+                self.journal(JEnt {
+                    seq: op.seq,
+                    tick: op.tick,
+                    slot: op.v,
+                    kind: JKind::Tomb,
+                });
                 self.pend_push(op, PendK::CancelAck);
             }
             OpK::Reduce => {
@@ -1572,7 +1572,9 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                 break;
             };
             let cur = self.slot(rp.cur).copied().unwrap_or_default();
-            if rp.live && !rp.ended && cur.ins_seq < upto && !cur.tomb {
+            // Single session: materialize the previous kill for every root it covered, ended
+            // ones included (B2 already released them), before `AcctKill` is overwritten.
+            if rp.live && (single || !rp.ended) && cur.ins_seq < upto && !cur.tomb {
                 self.tombstone(rp.cur, tseq, tts);
                 if !single {
                     self.end_position(rp.cur);
