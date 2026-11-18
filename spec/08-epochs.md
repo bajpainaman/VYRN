@@ -1287,10 +1287,10 @@ order addresses, the recovery address) are in the endpoint table (§11.1), not h
 | R2 | `version` = 1; `sig_scheme` ∈ {0, 1} and equals `EpoConfig(e).sig_scheme`; no trailing byte |
 | R3 | `epoch_from` ≤ e |
 | R4 | Per home: `client` ∈ {0, 1}, every `facility` ≥ 1, and neither client holds Q voters (`CLIENT_SPLIT`) |
-| R5 | Per home: no key repeats among the `vote_key`s and `seq_key`s (07 §13.1) |
+| R5 | Per home: no key repeats among the `vote_key`s and `seq_key`s (07 §13.1). CHAIN: an operator's two boxes (2k, 2k + 1) carry the same `seq_key` and `xchg_key`, from its one `NodeCert`, and different `facility` values; that `seq_key` counts once |
 | R6 | Per home: `recovery` names a Rust voter; `n_seq` as above |
 | R7 | CHAIN: no bridge or guardian key is zero or repeats within its list, and the set equals the bridge signer table's set of `rotation_no`, activated or scheduled to activate at or before e (§9.5), so `R_{e+1}` is checked before its boundary |
-| R8 | `EpoConfig(e).seq_order` names two distinct boxes of `home(e)`: BASE the primary in F1 and the standby in F2; CHAIN an F1 box (even position) as primary and another operator's F2 box (odd position) as standby |
+| R8 | `EpoConfig(e).seq_order` names two distinct boxes of `home(e)`: BASE the primary in F1 and the standby in F2; CHAIN an F1 box (even position) as primary and another operator's F2 box (odd position) as standby, in different facilities |
 
 **The schedule's `seq_order`.** BASE: the first box in F1 and the first in F2. CHAIN: the F1 box
 of `seq_op(e)` and the F2 box of `next_seq(e, seq_op(e))` (09 §3.1–3.2), roster indices

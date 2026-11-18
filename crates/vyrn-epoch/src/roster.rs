@@ -139,6 +139,8 @@ pub enum RosterErr {
     DuplicateKey(u8),
     #[error("home {0}: recovery is not a Rust voter")]
     Recovery(u8),
+    #[error("home {0}: an operator's two vyrn-seq boxes differ in SK or XK, or share a facility")]
+    OperatorBoxes(u8),
     #[error("home {0}: wrong number of vyrn-seq boxes")]
     SeqCount(u8),
     #[error("the bridge section is malformed or missing")]
@@ -307,11 +309,24 @@ impl Roster {
                     return Err(RosterErr::ClientSplit(code));
                 }
             }
+            // CHAIN: an operator's F1 and F2 boxes come from one NodeCert, so they share SK and
+            // XK and sit in different facilities (09 §1, §2.3); SK is counted once per operator.
+            if mode == Mode::Chain
+                && home.seq.chunks(2).any(|p| {
+                    p.len() == 2
+                        && (p[0].seq_key != p[1].seq_key
+                            || p[0].xchg_key != p[1].xchg_key
+                            || p[0].facility == p[1].facility)
+                })
+            {
+                return Err(RosterErr::OperatorBoxes(code));
+            }
+            let step = if mode == Mode::Chain { 2 } else { 1 };
             let keys: Vec<&[u8]> = home
                 .voters
                 .iter()
                 .map(|v| v.vote_key.as_slice())
-                .chain(home.seq.iter().map(|s| s.seq_key.as_slice()))
+                .chain(home.seq.iter().step_by(step).map(|s| s.seq_key.as_slice()))
                 .collect();
             if keys.iter().enumerate().any(|(i, k)| keys[..i].contains(k)) {
                 return Err(RosterErr::DuplicateKey(code));
@@ -418,7 +433,12 @@ impl Membership {
         let allowed = match domain.mode {
             Mode::Base => primary.facility == 1 && standby.facility == 2,
             // An F1 box and another operator's F2 box (09 §1, §3.2).
-            Mode::Chain => pos_p % 2 == 0 && pos_s % 2 == 1 && pos_p / 2 != pos_s / 2,
+            Mode::Chain => {
+                pos_p % 2 == 0
+                    && pos_s % 2 == 1
+                    && pos_p / 2 != pos_s / 2
+                    && primary.facility != standby.facility
+            }
         };
         if p == s || !allowed {
             return Err(RosterErr::SeqOrder(cfg.seq_order));
@@ -605,5 +625,39 @@ mod tests {
                 Some(RosterErr::SeqOrder(bad))
             );
         }
+    }
+
+    #[test]
+    fn chain_operator_boxes_share_sk_and_split_facilities() {
+        let domain = testkit::domain(Mode::Chain);
+        let roster = testkit::roster(Mode::Chain, 0);
+        let ldn = roster.home(HomeCode::Ldn);
+        assert_eq!(ldn.seq[0].seq_key, ldn.seq[1].seq_key);
+        assert!(Roster::decode(Mode::Chain, &roster.encode()).is_ok());
+        // Different SK within one operator's pair.
+        let mut r = roster.clone();
+        r.homes[1].seq[1].seq_key = r.homes[1].seq[2].seq_key.clone();
+        assert_eq!(
+            Roster::decode(Mode::Chain, &r.encode()),
+            Err(RosterErr::OperatorBoxes(2))
+        );
+        // Both boxes of operator 1 in F1: decode refuses, so no same-facility standby is chosen.
+        let mut r = roster.clone();
+        r.homes[1].seq[3].facility = 1;
+        assert_eq!(
+            Roster::decode(Mode::Chain, &r.encode()),
+            Err(RosterErr::OperatorBoxes(2))
+        );
+        // A primary and a standby in one facility (positions valid) are refused by R8.
+        let mut r = roster.clone();
+        r.homes[1].seq[0].facility = 2;
+        r.homes[1].seq[1].facility = 1;
+        let mut cfg = testkit::config(&domain, &r);
+        cfg.roster_hash = r.hash(&domain);
+        let table = testkit::bridge_table(&r);
+        assert_eq!(
+            Membership::from_roster(&cfg, &r.encode(), &domain, table.as_ref()).err(),
+            Some(RosterErr::SeqOrder(cfg.seq_order))
+        );
     }
 }

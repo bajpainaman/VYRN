@@ -216,6 +216,7 @@ fn roster_verdict(r: Result<(), crate::RosterErr>) -> String {
             E::ClientSplit(_) => "client_split",
             E::DuplicateKey(_) => "duplicate_key",
             E::Recovery(_) => "recovery",
+            E::OperatorBoxes(_) => "operator_boxes",
             E::SeqCount(_) => "seq_count",
             E::Bridge => "bridge",
             E::SeqOrder(_) => "seq_order",

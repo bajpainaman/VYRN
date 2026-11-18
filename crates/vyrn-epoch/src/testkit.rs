@@ -206,6 +206,7 @@ pub fn roster(mode: Mode, scheme: u8) -> crate::Roster {
     let home = |h: u8, voter_seed: fn(u8) -> [u8; 32], seq_base: u8| {
         let n = n(mode);
         let n_seq = n_seq(mode);
+        let op = |j: u8| if mode == Mode::Chain { j / 2 } else { j };
         Home {
             voters: (0..n)
                 .map(|i| Voter {
@@ -224,8 +225,9 @@ pub fn roster(mode: Mode, scheme: u8) -> crate::Roster {
                     // CHAIN: box 2k is operator k's F1 box, 2k + 1 its F2 box.
                     facility: j % 2 + 1,
                     node_key: key(seq_node_seed(h, j), j),
-                    seq_key: key([seq_base + j; 32], j),
-                    xchg_key: kex([seq_base + 8 + j; 32], j),
+                    // CHAIN: both boxes of operator j / 2 carry its one NodeCert SK and XK.
+                    seq_key: key([seq_base + op(j); 32], op(j)),
+                    xchg_key: kex([seq_base + 8 + op(j); 32], op(j)),
                     client_addr: addr(h, 0x40 + j, 9_000),
                     repl_addr: addr(h, 0x40 + j, 9_001),
                 })
