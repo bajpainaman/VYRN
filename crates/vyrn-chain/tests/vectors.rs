@@ -171,7 +171,12 @@ fn post_of(m: &J) -> Post {
         deposit_nonce: m.get("depositNonce").u64(),
         wd_root: m.get("wdRoot").b32(),
         wd_count: m.get("wdCount").u64() as u32,
-        wd_totals: m.get("wdTotals").arr().iter().map(J::u128).collect(),
+        wd_totals: m
+            .get("wdTotals")
+            .arr()
+            .iter()
+            .map(|t| eip712::word(t.u128()))
+            .collect(),
     }
 }
 
@@ -355,9 +360,41 @@ fn wdtree_matches_openzeppelin() {
         assert!(!wdtree::verify(&root, &bad.leaf_hash(), &want));
     }
     let assets = [ws[0].token, ws[1].token];
-    let totals: Vec<u128> = v.get("totals").arr().iter().map(J::u128).collect();
+    let totals: Vec<[u8; 32]> = v
+        .get("totals")
+        .arr()
+        .iter()
+        .map(|t| eip712::word(t.u128()))
+        .collect();
     assert_eq!(wdtree::totals(&ws, &assets).unwrap(), totals);
     assert_eq!(wdtree::totals(&ws, &assets[..1]), None);
+    // A total over many accounts exceeds u128 and is still postable: three of u128::MAX sum to
+    // 3·2^128 − 3 = 0x02 ‖ ff…fd (low 16 bytes) in the uint256 word.
+    let big: Vec<Withdrawal> = (0..3)
+        .map(|i| Withdrawal {
+            wd_id: 100 + i,
+            amount: u128::MAX,
+            ..ws[0]
+        })
+        .collect();
+    let mut want = [0u8; 32];
+    want[15] = 0x02;
+    want[16..].copy_from_slice(&(u128::MAX - 2).to_be_bytes());
+    assert_eq!(wdtree::totals(&big, &assets).unwrap()[0], want);
+    // Carry across a byte boundary: 0xff + 0x01 = 0x0100.
+    let carry: Vec<Withdrawal> = [0xff, 0x01]
+        .iter()
+        .enumerate()
+        .map(|(i, &a)| Withdrawal {
+            wd_id: 200 + i as u64,
+            amount: a,
+            ..ws[0]
+        })
+        .collect();
+    assert_eq!(
+        wdtree::totals(&carry, &assets).unwrap()[0],
+        eip712::word(0x100)
+    );
     assert_eq!(wdtree::root(&[]), [0u8; 32]);
 }
 
@@ -533,75 +570,93 @@ fn post1_rebuilds_from_its_checkpoint_and_guardian_accepts() {
     let post2 = build_post(7, 2, post.struct_hash(), &cp2, &assets).unwrap();
     assert_eq!(post2, post_of(m2));
 
+    let canonical = BTreeMap::from([(1, post.struct_hash()), (2, post2.struct_hash())]);
     let replica = FakeReplica {
-        checkpoints: vec![cp.clone(), cp2],
-        posts: BTreeMap::new(),
+        checkpoints: vec![cp.clone(), cp2.clone()],
+        posts: canonical.clone(),
     };
     let epochs = FakeEpochs(SignerSet {
         rotation_no: 0,
         bridge_keys: keys5(e.get("bridgeKeys")),
         guardian_keys: keys5(e.get("guardianKeys")),
     });
-    let g = Guardian {
-        replica: &replica,
+    let guardian = |replica| Guardian {
+        replica,
         epochs: &epochs,
         domain: domain(&e),
         chain_id: 7,
         assets: &assets,
     };
+    let g = guardian(&replica);
+    let secrets: Vec<[u8; 32]> = e.get("bridgeKeyPrivate").arr().iter().map(J::b32).collect();
+    // Signatures by BK_0..BK_3 over `p`: four stolen keys.
+    let four = |p: &Post| -> Vec<[u8; 65]> {
+        let digest = domain(&e).digest(&p.struct_hash());
+        secrets[..4]
+            .iter()
+            .map(|s| eip712::sign(&digest, s).unwrap())
+            .collect()
+    };
+    let veto = |reason| Verdict::Veto {
+        reason,
+        signers: 0b1111,
+    };
+
     let sigs: Vec<Vec<u8>> = vec.get("signatures").arr().iter().map(J::bytes).collect();
     assert_eq!(g.review(0, &post, &sigs), Verdict::Accept);
+    assert_eq!(g.review(0, &post2, &four(&post2)), Verdict::Accept);
     assert_eq!(g.review(1, &post, &sigs), Verdict::UnknownSignerSet);
     assert_eq!(
         g.review(0, &post, &sigs[..3]),
         Verdict::Ignore(SigError::NotEnoughSignatures)
     );
 
-    // Four keys sign a post that moves one withdrawal to another recipient: veto, with evidence.
+    // A post that moves one withdrawal to another recipient.
     let mut forged_cp = cp.clone();
     forged_cp.withdrawals[0].recipient = [0xee; 20];
     let forged = build_post(7, 1, [0; 32], &forged_cp, &assets).unwrap();
-    let digest = domain(&e).digest(&forged.struct_hash());
-    let secrets: Vec<[u8; 32]> = e.get("bridgeKeyPrivate").arr().iter().map(J::b32).collect();
-    let fsigs: Vec<[u8; 65]> = secrets[..4]
-        .iter()
-        .map(|s| eip712::sign(&digest, s).unwrap())
-        .collect();
     assert_eq!(
-        g.review(0, &forged, &fsigs),
-        Verdict::Veto {
-            reason: VetoReason::Differs,
-            signers: 0b1111
-        }
+        g.review(0, &forged, &four(&forged)),
+        veto(VetoReason::NotCanonical)
     );
-    // A post naming a commit this replica never computed.
-    let mut unknown = post.clone();
-    unknown.commit = [0xab; 32];
-    let digest = domain(&e).digest(&unknown.struct_hash());
-    let usigs: Vec<[u8; 65]> = secrets
-        .iter()
-        .map(|s| eip712::sign(&digest, s).unwrap())
-        .collect();
+    // An older finalized checkpoint reposted under the next number: well formed and chained to
+    // post 1, and still not the chain's post 2.
+    let replay = build_post(7, 2, post.struct_hash(), &cp, &assets).unwrap();
     assert_eq!(
-        g.review(0, &unknown, &usigs),
-        Verdict::Veto {
-            reason: VetoReason::UnknownCommit,
-            signers: 0b1_1111
-        }
+        g.review(0, &replay, &four(&replay)),
+        veto(VetoReason::NotCanonical)
     );
-    // Post 2 with no post 1 recorded here.
-    let mut second = post.clone();
-    second.post_no = 2;
-    let digest = domain(&e).digest(&second.struct_hash());
-    let ssigs: Vec<[u8; 65]> = secrets
-        .iter()
-        .map(|s| eip712::sign(&digest, s).unwrap())
-        .collect();
+    // A number the chain has not reached.
+    let mut ahead = post2.clone();
+    ahead.post_no = 3;
     assert_eq!(
-        g.review(0, &second, &ssigs),
-        Verdict::Veto {
-            reason: VetoReason::UnknownPrev,
-            signers: 0b1_1111
-        }
+        g.review(0, &ahead, &four(&ahead)),
+        veto(VetoReason::UnknownPost)
+    );
+
+    // The recompute still runs when the replica's post record and its checkpoints disagree.
+    let no_cp = FakeReplica {
+        checkpoints: Vec::new(),
+        posts: canonical.clone(),
+    };
+    assert_eq!(
+        guardian(&no_cp).review(0, &post, &four(&post)),
+        veto(VetoReason::UnknownCommit)
+    );
+    let no_prev = FakeReplica {
+        checkpoints: vec![cp2],
+        posts: BTreeMap::from([(2, post2.struct_hash())]),
+    };
+    assert_eq!(
+        guardian(&no_prev).review(0, &post2, &four(&post2)),
+        veto(VetoReason::UnknownPrev)
+    );
+    let bad_record = FakeReplica {
+        checkpoints: vec![cp],
+        posts: BTreeMap::from([(1, forged.struct_hash())]),
+    };
+    assert_eq!(
+        guardian(&bad_record).review(0, &forged, &four(&forged)),
+        veto(VetoReason::Differs)
     );
 }

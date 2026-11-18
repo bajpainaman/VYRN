@@ -42,8 +42,11 @@ const HALF_N: [u8; 32] = [
     0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
 ];
 
-/// ABI word of an unsigned integer: 32 bytes, big-endian.
-fn word(x: u128) -> [u8; 32] {
+/// A `uint256` as its ABI word: 32 bytes, big-endian.
+pub type U256 = [u8; 32];
+
+/// The ABI word of `x`.
+pub fn word(x: u128) -> U256 {
     let mut w = [0u8; 32];
     if let Some(tail) = w.get_mut(16..) {
         tail.copy_from_slice(&x.to_be_bytes());
@@ -86,7 +89,7 @@ impl Domain {
     }
 }
 
-/// `Post` (09 §6.2). Amounts are u128 because state balances are u128 (09 §9.3).
+/// `Post` (09 §6.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Post {
     /// Sequence number on L1; the first post is 1.
@@ -105,8 +108,9 @@ pub struct Post {
     pub wd_root: [u8; 32],
     /// Number of withdrawals in the tree.
     pub wd_count: u32,
-    /// Per-asset totals of the withdrawals, in asset order.
-    pub wd_totals: Vec<u128>,
+    /// Per-asset totals of the withdrawals, in asset order, at the ABI's uint256 width: one
+    /// account's balance is u128 (09 §9.3), but a total over many accounts can exceed it.
+    pub wd_totals: Vec<U256>,
 }
 
 impl Post {
@@ -114,7 +118,7 @@ impl Post {
     pub fn struct_hash(&self) -> [u8; 32] {
         let mut totals = Vec::with_capacity(self.wd_totals.len().saturating_mul(32));
         for t in &self.wd_totals {
-            totals.extend_from_slice(&word(*t));
+            totals.extend_from_slice(t);
         }
         keccak256_parts(&[
             &keccak256(POST_TYPE.as_bytes()),

@@ -30,7 +30,7 @@ pub enum BuildError {
     /// A withdrawal names a token the bridge does not list.
     #[error("withdrawal token is not a listed asset")]
     UnlistedToken,
-    /// A per-asset total overflows u128.
+    /// A per-asset total overflows uint256.
     #[error("withdrawal total overflows")]
     Overflow,
     /// More than u32::MAX withdrawals.
@@ -74,6 +74,10 @@ pub enum VetoReason {
     UnknownCommit,
     /// This replica has no post `post_no − 1` to chain `prev_post` from.
     UnknownPrev,
+    /// The chain has not made post `post_no`, so nothing can match it.
+    UnknownPost,
+    /// The struct hash differs from the chain's own post with the same number (`BadPost`, §6.5).
+    NotCanonical,
     /// The post differs from the one this replica computes for the same commit.
     Differs,
 }
@@ -123,6 +127,13 @@ impl<R: Replica, E: Epochs> Guardian<'_, R, E> {
             Err(e) => return Verdict::Ignore(e),
         };
         let veto = |reason| Verdict::Veto { reason, signers };
+        // 09 §6.5: the post must be the chain's post with this number. Recomputing from the
+        // commit alone would accept an older finalized checkpoint reposted under a new number.
+        match self.replica.post_hash(post.post_no) {
+            None => return veto(VetoReason::UnknownPost),
+            Some(h) if h != post.struct_hash() => return veto(VetoReason::NotCanonical),
+            Some(_) => {}
+        }
         let Some(cp) = self.replica.checkpoint(&Hash(post.commit)) else {
             return veto(VetoReason::UnknownCommit);
         };

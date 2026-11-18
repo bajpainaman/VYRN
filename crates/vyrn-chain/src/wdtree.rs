@@ -12,7 +12,7 @@
 //! produces the same roots and proofs. An empty tree has root zero (the `post2` vector: `wdCount`
 //! 0, `wdRoot` 0); OpenZeppelin has no empty tree.
 
-use crate::eip712::Address;
+use crate::eip712::{Address, U256};
 use crate::keccak::{keccak256, keccak256_parts};
 
 /// One withdrawal (09 §6.2).
@@ -109,14 +109,27 @@ pub fn verify(root: &[u8; 32], leaf: &[u8; 32], proof: &[[u8; 32]]) -> bool {
     proof.iter().fold(*leaf, |h, p| node(&h, p)) == *root
 }
 
-/// `wdTotals`: the sum per token in `assets` order. `None` if a token is not listed or a sum
-/// overflows u128.
-pub fn totals(withdrawals: &[Withdrawal], assets: &[Address]) -> Option<Vec<u128>> {
-    let mut out = vec![0u128; assets.len()];
+/// `wdTotals`: the sum per token in `assets` order, as uint256. `None` if a token is not listed
+/// or a sum overflows 2^256 (it cannot with fewer than 2^128 withdrawals).
+pub fn totals(withdrawals: &[Withdrawal], assets: &[Address]) -> Option<Vec<U256>> {
+    let mut out = vec![[0u8; 32]; assets.len()];
     for w in withdrawals {
         let i = assets.iter().position(|a| *a == w.token)?;
-        let slot = out.get_mut(i)?;
-        *slot = slot.checked_add(w.amount)?;
+        add(out.get_mut(i)?, w.amount)?;
     }
     Some(out)
+}
+
+/// `acc += x` on a big-endian uint256; `None` on overflow.
+fn add(acc: &mut U256, x: u128) -> Option<()> {
+    let mut carry = x;
+    for b in acc.iter_mut().rev() {
+        if carry == 0 {
+            return Some(());
+        }
+        let sum = u128::from(*b).checked_add(carry & 0xff)?;
+        *b = (sum & 0xff) as u8;
+        carry = (carry >> 8).checked_add(sum >> 8)?;
+    }
+    (carry == 0).then_some(())
 }

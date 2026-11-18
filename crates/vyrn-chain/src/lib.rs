@@ -27,8 +27,9 @@
 //! recovers), `UnknownSigner`, `DuplicateSigner`, `NotEnoughSignatures` (< 4 distinct). One bad
 //! signature rejects the set. [`smt::Proof::root`] returns `None` when the sibling count differs
 //! from the bitmap's population count. [`bridge::build_post`] rejects an unlisted token, a total
-//! that overflows u128, and more than u32::MAX withdrawals. [`bridge::Guardian::review`] vetoes an
-//! unknown commit, an unknown predecessor, or any field that differs from its own computation.
+//! that overflows u128, and more than u32::MAX withdrawals. [`bridge::Guardian::review`] vetoes a post that is
+//! not the chain's own post with that number, an unknown commit, an unknown predecessor, or any
+//! field that differs from its own computation.
 //!
 //! Nothing here panics on input bytes, allocates on a hot path, or runs on a pinned core: CHAIN
 //! mode's L1 and commitment work runs on the commit box and the control thread (09 §9.6).
