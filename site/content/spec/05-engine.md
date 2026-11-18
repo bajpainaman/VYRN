@@ -1813,9 +1813,14 @@ of ≤ `ENG_IDLE_SLICE_NS`.
 | Retire a segment: unlink it from its FIFO (predecessor's `succ`, or the head word) | all 16 positions assigned and none `active` or `pend`, or the level is empty | no current or later step finds a live position in it; a BBO walk that is inside it reads `succ`, which still points forward |
 | Clear the level head (level now physically empty) | after its last segment is retired | emits a CLEAR event; Lemma 7.1 |
 | Reuse a segment: `gen += 1`, clear masks, then write positions | retired, and `done_step ≥ σ + ENG_QSBR_LAG`, where `σ` was `done_step` at the retire (reader epoch) | a BBO step holds segment references only within one step, except head-cache cursors, which carry `gen` (§5.3) |
-| Push a dead slot to the free FIFO; reuse it | at the boundary where it became settled-dead; reuse after its position's segment is retired or the slot is no longer named by any position, and `ENG_QSBR_LAG` steps | the free FIFO's order is a function of boundaries only |
+| Push a dead slot to the free FIFO; reuse it | at the boundary where it became settled-dead; reuse after its position's segment is retired or the slot is no longer named by any position, and no live position's `pred_pos` chain (§4.3) can reach it, and `ENG_QSBR_LAG` steps | the free FIFO's order is a function of boundaries only; the `pred_pos` walk of `replace_ok` reads every slot on the chain back to `C*` |
 | Write lazy tombstones for a `CancelAll` | any time before the next `CancelAll` of the account | `AcctKill` already hides those orders (§4.7) |
 | Trim journal entries | `seq ≤ LaneCut[l].cut` | later batches start above `C_f[l]` |
+
+**Reclaim and `pred_pos`.** Slots are not reused yet. When they are, a reclaimed slot must never
+be reachable as a `pred_pos` (§4.3) from a live position: the `replace_ok` walk would read the new
+occupant as a predecessor. Until reclaim lands, a reused slot fails the walk's link check (its
+`root` or `gen` differs, or its `ins_seq` is not below its successor's) and the BBO core faults.
 
 **Reader epoch and ABA (Lemma 7.2).** `SnapshotLine.done_step` is the BBO core's reader epoch.
 A step that starts after `done_step = σ` cannot hold a reference taken before `σ` except a
