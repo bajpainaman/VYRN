@@ -41,7 +41,10 @@
 //!   `(resp_seq, bytes)`. *Ruled (reading of "equal" for loopback UDP in DEV):* the client's
 //!   responses must be an in-order, byte-identical subsequence of replay's; when vyrn-seq's
 //!   `tx_unsent` = 0, up to 0.1 % of replay's (at least 1) may be missing, printed as
-//!   `udp_resp_lost`. More missing, any byte mismatch, or an extra response fails. The replay side is every `lane_resp` and every fill `tx` with
+//!   `udp_resp_lost`. More missing, any byte mismatch, or an extra response fails. Every
+//!   replay line also prints the kernel's receive-drop count of the client's socket
+//!   (`/proc/net/udp`, read before it closes): a shortfall equal to it was lost on loopback,
+//!   not by vyrn-seq (a client thread starved for 300 ms drops 281, and `udp_resp_lost` is 281). The replay side is every `lane_resp` and every fill `tx` with
 //!   `resp_seq ≠ 0` (the box does not send `resp_seq` 0 TX packets yet). Fill TX `step`, `lane`
 //!   and `role`, which `output_hash` covers, are not on the wire, so the per-block output hash
 //!   itself cannot be recomputed from the box's side.
@@ -379,6 +382,21 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// The kernel's receive-drop count of the UDP socket bound to 127.0.0.1:`port` (Linux
+/// `/proc/net/udp`, last column), `None` elsewhere or if not found.
+fn udp_drops(port: u16) -> Option<u64> {
+    let t = std::fs::read_to_string("/proc/net/udp").ok()?;
+    let want = format!("0100007F:{port:04X}");
+    t.lines()
+        .skip(1)
+        .map(str::split_whitespace)
+        .find_map(|mut f| {
+            (f.nth(1)? == want)
+                .then(|| f.last()?.parse().ok())
+                .flatten()
+        })
 }
 
 fn hex(b: &[u8]) -> String {
@@ -1703,6 +1721,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
             .to_string(),
     );
     let cl_sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let cl_port = cl_sock.local_addr().map_err(|e| e.to_string())?.port();
     cl_sock
         .set_read_timeout(timeout)
         .map_err(|e| e.to_string())?;
@@ -2036,6 +2055,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
     for &i in &vals {
         val_ok.push(nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
     }
+    // Read while the client's socket is still open (it closes with its thread).
+    let cl_drops = udp_drops(cl_port).map_or_else(|| "n/a".to_owned(), |d| d.to_string());
     stop_tap.store(true, Ordering::Release);
     stop_cl.store(true, Ordering::Release);
     let frames = tap_h.join().map_err(|_| "tap thread")?;
@@ -2285,7 +2306,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     })
                 };
                 return Err(format!(
-                    "responses differ: box sent {}, replay produced {} (subsequence {subseq}, udp_resp_lost={udp_resp_lost}, bound {lost_ok}, tx_unsent {tx_unsent:?}); first difference at {at:?}: box {:?}, replay {:?}",
+                    "responses differ: box sent {}, replay produced {} (subsequence {subseq}, udp_resp_lost={udp_resp_lost}, bound {lost_ok}, tx_unsent {tx_unsent:?}, client_sock_drops={cl_drops}); first difference at {at:?}: box {:?}, replay {:?}",
                     live.len(),
                     replayed.len(),
                     show(&live),
@@ -2303,7 +2324,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 hex(&vyrn_crypto::hash::hash(&b).0)
             };
             Ok(format!(
-                "{} blocks replayed, {} responses equal (udp_resp_lost={udp_resp_lost}), responses digest {}, last output_hash {}",
+                "{} blocks replayed, {} responses equal (udp_resp_lost={udp_resp_lost}, client_sock_drops={cl_drops}), responses digest {}, last output_hash {}",
                 ready.len(),
                 live.len(),
                 digest(&live),
