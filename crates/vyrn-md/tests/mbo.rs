@@ -482,3 +482,157 @@ fn merge_rule_rebuilds_the_book_in_any_delivery_order() {
         assert_eq!(got, want, "seed {seed}");
     }
 }
+
+fn plain(b: &vyrn_md::Book) -> BTreeMap<u32, (Side, u32, u32)> {
+    b.orders()
+        .iter()
+        .map(|(o, v)| (*o, (v.side, v.tick.0, v.qty.0)))
+        .collect()
+}
+
+/// 10 §7.6 recovery: a reader that joins from a snapshot (sent and read back on the `SNAP`
+/// feed), then takes every packet of the epoch, ends with the replica's book.
+#[test]
+fn a_reader_joins_mid_stream_from_a_snapshot() {
+    use vyrn_md::{Feed, SnapEncoder, SnapReader};
+    let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+    let mut joined = 0;
+    for seed in 0..200 {
+        let (events, want) = scenario(&mut rng, 400);
+        let steps = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Step { .. }))
+            .count() as u64;
+        if steps < 2 {
+            continue;
+        }
+        let mut out: Vec<Vec<u8>> = vec![];
+        MboEncoder::new(BOOK, EPOCH)
+            .run(&mut events.iter().copied(), &mut out)
+            .unwrap();
+        let as_of = rng.below(steps);
+        // The snapshotter: a subscriber that pauses at `as_of`.
+        let mut snapper = MboSubscriber::new(BOOK, EPOCH);
+        snapper.snapshot_at(StepId(as_of));
+        let mut snap = None;
+        for p in &out {
+            snapper.on_packet(p).unwrap();
+            if snap.is_none() {
+                snap = snapper.take_snapshot().unwrap();
+            }
+        }
+        let snap = snap.unwrap_or_else(|| panic!("seed {seed}: no pause at {as_of}"));
+        assert_eq!(snap.as_of, StepId(as_of));
+        snapper.finish().unwrap();
+
+        let mut wire: Vec<Vec<u8>> = vec![];
+        SnapEncoder::new(Feed::Mbo, BOOK, EPOCH).publish(&snap, Nanos(9), &mut wire);
+        let mut reader = SnapReader::new(Feed::Mbo, BOOK, EPOCH);
+        let read = wire
+            .iter()
+            .filter_map(|p| reader.on_packet(p).unwrap())
+            .next()
+            .unwrap();
+
+        // Deliver every packet, channels interleaved at random: those before a resume point
+        // are dropped.
+        let mut sub = MboSubscriber::from_snapshot(Feed::Mbo, BOOK, EPOCH, &read);
+        let mut queues: Vec<Vec<Vec<u8>>> = vec![vec![]; 5];
+        for p in out {
+            queues[usize::from(p[0])].push(p);
+        }
+        for q in &mut queues {
+            q.reverse();
+        }
+        while queues.iter().any(|q| !q.is_empty()) {
+            let c = usize::try_from(rng.below(5)).unwrap();
+            if let Some(p) = queues[c].pop() {
+                sub.on_packet(&p)
+                    .unwrap_or_else(|e| panic!("seed {seed} as_of {as_of}: {e:?}"));
+            }
+        }
+        sub.finish().unwrap();
+        let want: BTreeMap<u32, (Side, u32, u32)> =
+            want.iter().map(|(o, v)| (*o, (v.0, v.1, v.2))).collect();
+        assert_eq!(plain(sub.book()), want, "seed {seed} as_of {as_of}");
+        joined += 1;
+    }
+    assert!(joined > 100);
+}
+
+#[test]
+fn mbo_c_round_trips_every_mbo_packet() {
+    let mut rng = Rng(0x0BAD_F00D_DEAD_BEEF);
+    let (mut raw, mut packed) = (0usize, 0usize);
+    for _ in 0..50 {
+        let (events, _) = scenario(&mut rng, 400);
+        let mut out: Vec<Vec<u8>> = vec![];
+        let mut both = vyrn_md::WithMboC::new(Vec::<Vec<u8>>::new());
+        MboEncoder::new(BOOK, EPOCH)
+            .run(&mut events.iter().copied(), &mut both)
+            .unwrap();
+        MboEncoder::new(BOOK, EPOCH)
+            .run(&mut events.iter().copied(), &mut out)
+            .unwrap();
+        // WithMboC sends each MBO packet, then its MBO-C form.
+        assert_eq!(both.inner.len(), 2 * out.len());
+        for (i, p) in out.iter().enumerate() {
+            assert_eq!(&both.inner[2 * i], p);
+            let c = &both.inner[2 * i + 1];
+            let back = vyrn_md::mbo_c_decode(c).unwrap();
+            assert_eq!(back.records, Packet::decode(p).unwrap().records);
+            raw += p.len();
+            packed += c.len();
+        }
+    }
+    assert!(packed < raw);
+}
+
+#[test]
+fn retransmit_serves_a_range_over_tcp() {
+    use std::net::{TcpListener, TcpStream};
+    use vyrn_md::{Channel, Feed, RetxRequest, RetxStore, retx_fetch};
+    let ev: Vec<Event> = (0..300).map(|i| add(0, i, u64::from(i) * 2_000)).collect();
+    let mut store = RetxStore::new(30_000);
+    let mut out: Vec<Vec<u8>> = vec![];
+    MboEncoder::new(BOOK, EPOCH)
+        .run(&mut ev.iter().copied(), &mut out)
+        .unwrap();
+    for p in &out {
+        store.store(p);
+    }
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut c, _) = l.accept().unwrap();
+        store.serve(&mut c).unwrap();
+    });
+    let mut c = TcpStream::connect(addr).unwrap();
+    let lane0: Vec<&Vec<u8>> = out.iter().filter(|p| p[0] == 0).collect();
+    let n = lane0.len() as u64;
+    let req = |from, to| RetxRequest {
+        channel: Channel {
+            feed: Feed::Mbo,
+            index: 0,
+        },
+        book: BOOK,
+        epoch16: EPOCH.low16(),
+        from_seq: from,
+        to_seq: to,
+    };
+    // The store holds the packets whose ts_base is within 30 µs of the newest one.
+    let ts = |p: &[u8]| u64::from_le_bytes(p[16..24].try_into().unwrap());
+    let newest = ts(lane0[lane0.len() - 1]);
+    let held: Vec<&Vec<u8>> = lane0
+        .iter()
+        .copied()
+        .filter(|p| newest - ts(p) <= 30_000)
+        .collect();
+    assert!(held.len() < lane0.len());
+    let got = retx_fetch(&mut c, &req(1, n)).unwrap();
+    assert_eq!(got.iter().collect::<Vec<_>>(), held);
+    assert!(retx_fetch(&mut c, &req(1, 1)).unwrap().is_empty());
+    assert_eq!(retx_fetch(&mut c, &req(n, n)).unwrap().len(), 1);
+    drop(c);
+    server.join().unwrap();
+}
