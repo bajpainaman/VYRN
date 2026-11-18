@@ -29,7 +29,7 @@ use vyrn_types::{
     StepRecord, Tick,
 };
 
-use crate::engine::{Engine, Fault, Rec, Sink, StepErr};
+use crate::engine::{CARRY_CAP, Engine, Fault, Rec, Sink, StepErr};
 
 /// One order-stream element, owned (for logs and journals).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -533,6 +533,9 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         let mut next_r = core::mem::take(&mut self.carry_routes_next);
         next.clear();
         next_r.clear();
+        // Reserved on the first call only; a no-op once the buffers have the room.
+        next.reserve(CARRY_CAP);
+        next_r.reserve(CARRY_CAP);
         let recs = Recs {
             a: &carry,
             b: lanes,
@@ -658,7 +661,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 .copied()
                 .unwrap_or(usize::MAX)
             {
-                if carry.len() >= carry.capacity() {
+                if carry.len() >= CARRY_CAP {
                     return Err(WireDiverged {
                         at: WireAt::Lane(i),
                         why: Why::Order,
@@ -683,7 +686,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 });
             };
             if i >= lane_cur {
-                if carry_r.len() >= carry_r.capacity() {
+                if carry_r.len() >= CARRY_CAP {
                     return Err(WireDiverged {
                         at: WireAt::End,
                         why: Why::Order,

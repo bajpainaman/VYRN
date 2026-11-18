@@ -162,7 +162,9 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     /// Per lane: `(session, account, token)` of each pooled session ([`Engine::pool_session`]).
     pool: Vec<Vec<(SessionId, AccountId, &'a PoolTok)>>,
     /// 07 replay: lane records carried to the next block (07 §7.1 `REP_MERGE` item 3), and the
-    /// buffer the next carry is built in. Both hold [`CARRY_CAP`] records.
+    /// buffer the next carry is built in. Each holds at most [`CARRY_CAP`] records. They are
+    /// empty until the first `replay_wire`, which reserves them, so a live engine never pays
+    /// for them.
     pub(crate) carry: Vec<PacketRecord>,
     pub(crate) carry_next: Vec<PacketRecord>,
     /// The route records of the carried packets, and the buffer the next one is built in.
@@ -267,10 +269,10 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             scratch: Vec::with_capacity(32),
             unread: None,
             pool: (0..n).map(|_| Vec::new()).collect(),
-            carry: Vec::with_capacity(CARRY_CAP),
-            carry_next: Vec::with_capacity(CARRY_CAP),
-            carry_routes: Vec::with_capacity(CARRY_CAP),
-            carry_routes_next: Vec::with_capacity(CARRY_CAP),
+            carry: Vec::new(),
+            carry_next: Vec::new(),
+            carry_routes: Vec::new(),
+            carry_routes_next: Vec::new(),
         })
     }
 
