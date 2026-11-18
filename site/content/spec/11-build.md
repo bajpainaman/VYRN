@@ -1004,7 +1004,8 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   does: a book op is `AUCTION_PHASE` while Frozen (05 §2.5 P4), a New is `BOOK_HALTED` while
   Halted, and 04 §6.9 decides the rest. At the BBO a forwarded taker is `BOOK_HALTED` or
   `AUCTION_PHASE` while Halted or Frozen, an IOC or FOK ends `OUT_AUCTION` in an auction, a Day
-  order rests without a sweep, and an auction-only order outside an auction is `AUCTION_PHASE`.
+  order rests without a sweep, and an auction-only order outside an auction is `AUCTION_PHASE`. A resting auction-only order is
+  not live outside an uncross (05 §5.1), so no bound or maker search sees it.
   Outside Continuous the published snapshot is the empty book, each version records whether
   it was Continuous, and an envelope over a version that was not is suspect, as in `Bbo::finish`
   and `Bbo::envelope`. Only a Continuous step other than Rescan widens (B, A) to the envelope

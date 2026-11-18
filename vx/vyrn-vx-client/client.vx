@@ -1936,6 +1936,14 @@ fn key_lt(c : *mut Ctx, la : u64, ra : u64, lb : u64, rb : u64) -> bool {
   }
 }
 
+// 05 §5.1 `live` for a maker or a bound: an auction-only order is live only in an uncross
+// (Bbo::ctx sets `auction: false` elsewhere), so it rests unseen in Continuous and auction
+// steps. Its open quantity, for its own events, is still bopen.
+fn blive(c : *mut Ctx, l : u64, r : u64) -> u64 {
+  unsafe { if (((*bord(c, l, r)).flags >> 1u64) & 3u64) == 3u64 { return 0u64; } }
+  return bopen(c, l, r);
+}
+
 fn bopen(c : *mut Ctx, l : u64, r : u64) -> u64 {
   let o = bord(c, l, r);
   unsafe {
@@ -1982,7 +1990,7 @@ fn best_level(c : *mut Ctx, side : u64, limit : u64) -> u64 {
       let l = (*offset_mut((*b).book_l, i)) as u64;
       let r = (*offset_mut((*b).book_r, i)) as u64;
       let o = bord(c, l, r);
-      if (*o).side != side || bopen(c, l, r) == 0u64 { continue; }
+      if (*o).side != side || blive(c, l, r) == 0u64 { continue; }
       let t = (*o).tick;
       let ok = if side == 1u64 { t <= limit } else { t >= limit };
       if !ok { continue; }
@@ -2001,7 +2009,7 @@ fn next_maker(c : *mut Ctx, side : u64, tick : u64) -> i64 {
       let l = (*offset_mut((*b).book_l, i)) as u64;
       let r = (*offset_mut((*b).book_r, i)) as u64;
       let o = bord(c, l, r);
-      if (*o).side != side || (*o).tick != tick || bopen(c, l, r) == 0u64 { continue; }
+      if (*o).side != side || (*o).tick != tick || blive(c, l, r) == 0u64 { continue; }
       if bi == NONE {
         bi = i;
       } else {
@@ -2370,7 +2378,7 @@ fn level_from(c : *mut Ctx, side : u64, from : u64) -> u64 {
       let l = (*offset_mut((*b).book_l, i)) as u64;
       let r = (*offset_mut((*b).book_r, i)) as u64;
       let o = bord(c, l, r);
-      if (*o).side != side || bopen(c, l, r) == 0u64 { continue; }
+      if (*o).side != side || blive(c, l, r) == 0u64 { continue; }
       let t = (*o).tick;
       let ok = if side == 0u64 { t <= from } else { t >= from };
       if !ok { continue; }
@@ -2601,7 +2609,7 @@ fn fill_cand(c : *mut Ctx, e : *mut LOp, i : i64) -> bool {
     let ml = (*offset_mut((*b).book_l, i)) as u64;
     let mr = (*offset_mut((*b).book_r, i)) as u64;
     let o = bord(c, ml, mr);
-    if (*o).side != side || bopen(c, ml, mr) == 0u64 { return false; }
+    if (*o).side != side || blive(c, ml, mr) == 0u64 { return false; }
     return if side == 1u64 { (*o).tick <= (*e).tick } else { (*o).tick >= (*e).tick };
   }
 }

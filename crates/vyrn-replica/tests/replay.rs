@@ -1108,7 +1108,16 @@ fn assert_vx_matches(script: &[Act], splits: impl IntoIterator<Item = usize>) {
 /// Control steps (07 §3.8, §6.8): a halt and resume, then an auction phase with a resting
 /// Day order, an IOC that ends `OUT_AUCTION`, a post-only and an auction-only order, and a return
 /// to Continuous whose exact bounds reprice the band.
-fn control_script() -> Vec<Act> {
+/// `auction_best`: the auction-only buy rests at 104 above a Day bid at 100, so after the
+/// resume it would be the best bid if it were live (05 §5.1: it is not), and a sell at 102 trades
+/// with nothing. Otherwise the post-resume sell at 300 enters in a Rescan step (the envelope over
+/// the auction's versions is suspect).
+fn control_script(auction_best: bool) -> Vec<Act> {
+    let (auc_t, day_t, sell_t) = if auction_best {
+        (104, 100, 102)
+    } else {
+        (101, 104, 300)
+    };
     use Side::{Buy, Sell};
     use Tif::{Day, Ioc};
     use vyrn_bbo::{ControlCmd, Phase};
@@ -1130,7 +1139,7 @@ fn control_script() -> Vec<Act> {
     if let vyrn_wire::Msg::New { flags, .. } = &mut post {
         flags.post_only = true;
     }
-    let auc = new(Buy, Tif::AuctionOnly, 101, 1, 7);
+    let auc = new(Buy, Tif::AuctionOnly, auc_t, 1, 7);
     vec![
         p(0, 1, 1_000, vec![new(Sell, Day, 105, 2, 1)]),
         Act::Run,
@@ -1148,7 +1157,7 @@ fn control_script() -> Vec<Act> {
             2,
             1,
             4_000,
-            vec![new(Buy, Day, 104, 1, 4), new(Buy, Ioc, 110, 1, 5)],
+            vec![new(Buy, Day, day_t, 1, 4), new(Buy, Ioc, 110, 1, 5)],
         ),
         Act::Run,
         p(1, 2, 5_000, vec![post, auc]),
@@ -1163,7 +1172,7 @@ fn control_script() -> Vec<Act> {
         Act::Poll,
         phase(Phase::Continuous),
         Act::Run,
-        p(0, 2, 6_000, vec![new(Sell, Day, 300, 1, 8)]),
+        p(0, 2, 6_000, vec![new(Sell, Day, sell_t, 1, 8)]),
         Act::Run,
         Act::Poll,
         Act::Run,
@@ -1172,7 +1181,11 @@ fn control_script() -> Vec<Act> {
 
 #[test]
 fn the_vx_client_replays_control_steps() {
-    let (live_j, store, blocks) = blocks_of(&control_script(), &[]);
+    for auction_best in [false, true] {
+        let (j, _) = live07(&control_script(auction_best));
+        assert_vx_matches(&control_script(auction_best), 0..j.recs.len() - 1);
+    }
+    let (live_j, store, blocks) = blocks_of(&control_script(false), &[]);
     let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
     check_same(&live_j, &rep);
     let reasons: Vec<_> = live_j
@@ -1198,8 +1211,6 @@ fn the_vx_client_replays_control_steps() {
         (1, 2),
         "{reasons:?}"
     );
-    let (j, _) = live07(&control_script());
-    assert_vx_matches(&control_script(), 0..j.recs.len() - 1);
     // 07 §3.8: an empty Rescan band is all ticks; both engines replay it as such.
     let Some(lib) = vx_lib() else { return };
     let mut all = blocks;
