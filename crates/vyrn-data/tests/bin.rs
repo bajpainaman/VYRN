@@ -104,7 +104,9 @@ fn serves_a_replica_exports_metrics_and_stops() {
     let t = Instant::now();
     loop {
         let m = scrape(&metrics);
-        if m.contains("vyrn_data_stored_total{role=\"data\",home=\"DEV\",src=\"1\"} 1") {
+        if m.contains("vyrn_data_stored_total{role=\"data\",home=\"DEV\",src=\"1\"} 1")
+            && m.contains("vyrn_data_events_unprinted_total{")
+        {
             break;
         }
         assert!(
@@ -122,6 +124,7 @@ fn serves_a_replica_exports_metrics_and_stops() {
     assert!(child.wait().unwrap().success());
     assert_eq!(field(&stats, "stored="), "1", "{stats}");
     assert_eq!(field(&stats, "data_frames="), "1", "{stats}");
+    assert_eq!(field(&stats, "events_unprinted="), "0", "{stats}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

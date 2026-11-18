@@ -39,7 +39,8 @@
 //! loop (a full queue drops and counts the line), and at exit `STATS stored=<n> data_frames=<n>
 //! heartbeats=<n> duplicate=<n> fetch_unauth=<n> fetch_limited=<n> events_unprinted=<n>`.
 //!
-//! **Metrics.** Every [`vyrn_data::Counters`] field as `vyrn_data_<field>_total`, labels `role`,
+//! **Metrics.** Every [`vyrn_data::Counters`] field as `vyrn_data_<field>_total`, and
+//! `vyrn_data_events_unprinted_total` (events dropped by the stdout queue), labels `role`,
 //! `home`, `src`. The loop publishes deltas every 100 ms; a std thread serves `GET` on the
 //! listener. *Reading:* 11 §8.4 says a tokio task; one blocking thread does the same job here.
 //!
@@ -245,6 +246,12 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
             .map(|(k, v)| (Cow::Borrowed(k), Cow::Owned(v))),
     );
     let mut exported = Exported::new(&mut reg);
+    let unprinted_metric = Counter::<u64>::default();
+    reg.register(
+        "vyrn_data_events_unprinted",
+        "events dropped because the stdout queue was full",
+        unprinted_metric.clone(),
+    );
     let listener = TcpListener::bind(cfg.metrics.listen).map_err(|e| format!("metrics: {e}"))?;
     let maddr = listener.local_addr().map_err(|e| e.to_string())?;
     std::thread::Builder::new()
@@ -290,6 +297,7 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
         for e in node.drain_events() {
             if events.try_send(e).is_err() {
                 unprinted = unprinted.wrapping_add(1);
+                unprinted_metric.inc();
             }
         }
         if published.elapsed() >= Duration::from_millis(100) {
@@ -306,7 +314,7 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
     // A closed stdout (the supervisor went away) is not a reason to fail the stop.
     let _ = writeln!(
         std::io::stdout(),
-        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={}",
+        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} events_unprinted={unprinted}",
         c.stored,
         c.data_frames,
         c.heartbeats,
