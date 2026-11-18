@@ -14,6 +14,8 @@
 //! | [`wdtree`] | keccak256 sorted-pair Merkle tree of `Withdrawal` (OpenZeppelin `StandardMerkleTree`) | 09 §6.2 | the post builder, [`bridge::build_post`] | `VyrnBridge.claim`, wallets |
 //! | [`smt`] | BLAKE3 sparse Merkle tree, depth 256; `AccountLeaf`, `BalanceLeaf` | 09 §9.3; contracts/README §Leaf encoding | the commit box | `VyrnBridge.escapeClaim`, light clients (09 §10.4) |
 //! | [`bridge`] | [`bridge::Checkpoint`] → `Post`; the guardian's veto decision | 09 §6.4, §6.5 | validators (build), guardians (review) | relayers, L1 |
+//! | [`session`] | `SessionOpen` (item 0x01), checks 2–4 | 09 §5.2 | wallets | every validator |
+//! | [`tesla`] | `K_seq`, `K_out`, `K_com` chain and anchor; `KeyDisclosure` (45 B) | 09 §5.3, §5.4, §5.10 | clients, sequencer node, committee members | validators' `tag_com` check, third-party auditors |
 //! | [`keccak256`] | Keccak-256 (Ethereum padding), RustCrypto `sha3` (11 §2.2) | 01 §14.11 | — | [`eip712`], [`wdtree`] |
 //!
 //! **Ordering.** Post `k` names post `k − 1` by its EIP-712 struct hash in `prev_post`; post 1 has
@@ -44,23 +46,27 @@
 //!
 //! # Not implemented yet
 //!
-//! Session open and wallet signatures (§5.2), `K_seq`/`K_com` derivation and TESLA disclosure
-//! (§5.3–§5.4, §5.10), the order LtHash (§9.4), `StateCommit` encoding and `CommitCert`
+//! The wallet signature of the `TxEnvelope` (§4.4) and `AnchorFault` (§5.4), the order LtHash (§9.4), `StateCommit` encoding and `CommitCert`
 //! verification (§9.5), the log hash chain (§9.2), slashing evidence (§8), forced inclusion (§7),
 //! L1 deposit attestation (§6.3), and the `AllocLeaf`/`SessionLeaf`/`OperatorLeaf` layouts.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod bridge;
+mod codec;
 pub mod eip712;
+pub mod session;
 pub mod smt;
+pub mod tesla;
 pub mod wdtree;
 
 use vyrn_types::Hash;
 
 pub use bridge::{Checkpoint, Guardian, Verdict, VetoReason, build_post};
 pub use eip712::{Address, Domain, Post, SigError, SignerSet, Unpause};
+pub use session::{OpenReject, SessionOpen, SessionState};
 pub use smt::{AccountLeaf, BalanceLeaf, Proof, Smt};
+pub use tesla::{ClientKeys, KcomWindow, KeyDisclosure, Traversal};
 pub use wdtree::Withdrawal;
 
 /// Keccak-256 as Ethereum uses it (pad `0x01 … 0x80`, not SHA3's `0x06`). 01 §14.11 allows it only
