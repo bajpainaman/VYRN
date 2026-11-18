@@ -968,6 +968,37 @@ or at its checkpoint, to the output hash of the blocks it has replayed and to th
 stops attesting when its output differs from the quorum's. 07 and 09 own the message format. This
 is in Requests to 07 (Interfaces) and an open question.
 
+**Client v1 (M3).** What the first client fixes where the sketch above does not. Each is a
+reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layout):
+
+- *Input.* The client takes 07's fields only, as `Engine::replay_wire` does: one input-ring slot
+  per `PacketRecord` in O-order (`MID` and Advance records included) with its payload and the
+  `RouteRecord`s of that packet inside the slot (a route joins the last packet whose range holds
+  it), and one step-ring slot per `StepRecord`. The client applies `REP_MERGE` itself and keeps a
+  lane record that is not due yet in its ring, so the shell carries nothing across blocks. A block
+  is complete when the last step ran and every lane has used its ring up or waits on a later step.
+- *Initial state.* `pbv_new` takes the account and session tables beside the config (as
+  `pbo_new` does), since `pbv_load_snapshot` has no canonical state to read in v1. The lane
+  argument of `pbv_lane_run` is a `uint32_t`.
+- *Output rings.* One per lane and one for fill TX packets; each slot holds exactly the bytes the
+  output hash takes, so the shell hashes without decoding.
+- *Subset.* New (Day, IOC, FOK, post-only), Cancel, Reduce, Heartbeat and ResendReq (no
+  LaneSeq), `SHED` records (replayed from the record alone, so their slots carry no payload,
+  05 §18 Q17), and Cross, Improve,
+  Shed, Idle and Depletion steps. Anything else (Replace, CancelAll, a triggered STP, in-packet
+  dependencies, Rescan, Control, Seal, Uncross, step payloads, snapshot and state bytes) stops
+  with `PBV_E_UNSUPPORTED` rather than guess, so a v1 Vx validator halts on it instead of
+  diverging silently.
+- *Band reference.* A lane call checks the price band against the best bid and ask after the
+  latest step its records' `fills_applied` name (the step history the BBO replayer publishes).
+  The M3 script's band (10 000 bps) never binds, so this reading is not yet checked against
+  `RustReplay`; a narrow-band workload is the next test.
+- *Threads.* `VxReplay` creates the `n + 1` threads (W-04) but does not pin them yet: pinning
+  comes with the core map (§10.1), and tests run unpinned. W-03 calls libc `sched_yield`, not
+  `vyrn_vx_spin`, because vxc cannot declare a host symbol (W-18 in `vx/FRICTION.md`).
+- *CI.* CI does not run `vx/build.sh`, so the Vx tests skip there as the oracle's do;
+  `VYRN_REQUIRE_VX=1` makes a missing `libvyrn_vx_client` a failure.
+
 **Race testing.** The Vx client's own cross-core protocol is tested with `--sanitize=thread` and
 with `VX_TASK_SEED` sweeps in CI (§9.2). The interleavings of the shell-to-client rings are
 tested by a Rust nightly ThreadSanitizer build of `vyrn-replica` linked against the TSan build of

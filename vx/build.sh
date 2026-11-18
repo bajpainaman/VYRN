@@ -97,7 +97,8 @@ blake3 = \"$(b3sum --no-names "$lib")\"
 }
 
 build vyrn-vx-oracle pbo_
-# Step 4 (the TSan build of the client) lands with the client's sources.
+# Step 4 (the TSan build of the client) is not built yet: v1 has no race tests to run it
+# (11 §5.3 "Race testing"); it lands with them.
 build vyrn-vx-client pbv_
 
 # Step 6.

@@ -69,7 +69,9 @@
 //! acted on ([`epoch`]). [`DataJoin`] joins payloads, checks `data_root` (07 §6.4 item 3) and
 //! is the engine's `Payloads` ([`data`]). [`DataFeed`] fills it from `vyrn-data` frames and
 //! reports `data_seq` gaps and silent data boxes ([`feed`]). [`RustReplay`] implements `ReplayEngine` over
-//! `vyrn_engine::Engine::replay_wire` ([`rust`], which also fixes the block output hash).
+//! `vyrn_engine::Engine::replay_wire` ([`rust`], which also fixes the block output hash), and
+//! [`VxReplay`] over `libvyrn_vx_client` ([`vx_replay`], loaded by [`vx`]); config
+//! `engine.client` ([`EngineClient`]) picks one.
 //!
 //! **Conformance.** `tests/golden/vyrn_replica_vectors.txt` at the repository root lists frame
 //! sequences and the verdict a conforming replica reaches on each one. `tests/conformance.rs`
@@ -92,6 +94,7 @@ pub mod rust;
 // Listed in UNSAFE.toml; the only module of this crate allowed to contain `unsafe`.
 #[allow(unsafe_code)]
 pub mod vx;
+pub mod vx_replay;
 
 pub use check::{StepErr, check_step};
 pub use data::{DataErr, DataJoin, full_hash};
@@ -101,10 +104,11 @@ pub use hashlag::{REP_HASHLAG_MAX_NS, check_hashlag};
 pub use lane::{LaneErr, LaneState};
 pub use order::{Fault, FaultKind, FrameErr, HeaderErr, OrderCore};
 pub use ports::{
-    BlockInputs, BlockOutputs, CanonicalStateWriter, EpochView, ReplayEngine, ReplayError,
-    StateSnapshot,
+    BlockInputs, BlockOutputs, CanonicalStateWriter, EngineClient, EpochView, ReplayEngine,
+    ReplayError, StateSnapshot,
 };
 pub use rust::{OUTPUT_DOMAIN, RustReplay, output_hash};
+pub use vx_replay::{VxAccount, VxConfig, VxReplay, VxSession};
 
 /// What a [`RustReplay`] sink sees, re-exported so a crate above this one (`vyrn-md`, layer 7)
 /// implements `Sink` with this crate as its only replay dependency (11 §1.4).

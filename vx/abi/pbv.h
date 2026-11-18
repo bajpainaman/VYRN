@@ -149,8 +149,83 @@ PBV_STATIC_ASSERT(offsetof(pbo_config, lane_first_handle) == 144, pbo_config_han
 PBV_STATIC_ASSERT(offsetof(pbo_event, msg) == 40, pbo_event_msg_offset);
 
 /* ===================================================================================== */
-/* Client: vyrn-vx-client (11 §5.3). Not built yet.                                      */
+/* Client: vyrn-vx-client, the replay-only validator engine (11 §5.3, 07 §7.1).         */
 /* ===================================================================================== */
-typedef struct pbv_client pbv_client;
+
+/* Bumped on any change to a layout, a ring, an error code or the supported subset. */
+#define PBV_ABI_VERSION 1u
+
+typedef struct pbv_ctx pbv_ctx;
+
+/* Tables, by byte offset (the client reads them byte by byte, so no struct layout is assumed).
+ * pbv_config, 64 bytes: 0 abi_version u32 (PBV_ABI_VERSION), 4 size u32 (64), 8 n_lanes u8
+ *   (1..=64), 10 book u16, 12 epoch u32, 16 tick_min u32, 20 tick_max u32, 24 tick_size u64,
+ *   32 band_bps u32 (<= 10000), 36 slot_cap u32, 40 seg_cap u32; the rest reserved.
+ * pbv_account, 80 bytes: 0 slot u32 (AcctSlot), 4 lane u8, 5 state u8 (0 active, 1 killed,
+ *   2 closed), 8 max_open u32, 12 max_qty u32, 16 max_notional u64, 24 taker_ppm i32,
+ *   28 maker_ppm i32, 32 auction_ppm i32, 36 msg_fee_improve u32, 40 msg_fee_cross u32,
+ *   48 base_free u64, 56 quote_free u128 (low word first).
+ * pbv_session, 32 bytes: 0 id u32 (SessionId; its lane is bits 12..20), 4 acct slot u32,
+ *   8 book u16, 16 k_seq[16]. */
+
+/* The shared region (pbv_shared): pbv_shared_bytes(n) bytes, 128-aligned and zeroed, owned by
+ * the Rust shell. It starts with 1 + 4(n + 1) control lines of 16 u64 words; each word has one
+ * writer, read and written with acquire/release.
+ *   line 0         w0 stop (shell)
+ *   line 1 + 4l    lane l in_head: w0 records written (shell)
+ *   line 2 + 4l    lane l in_tail (client): w0 records replayed, w1 the in_head it last saw idle,
+ *                  w2 the step its next call waits for, w3 PBV_E_*, w4 the record index (err_at)
+ *   line 3 + 4l    lane l out_head: w0 responses written (client)
+ *   line 4 + 4l    lane l out_tail: w0 responses read (shell)
+ *   line 1 + 4n    step_head: w0 steps written (shell)
+ *   line 2 + 4n    step_tail (client): w0 steps run, w1 last step done, w2 PBV_E_*, w3 the step
+ *   line 3 + 4n    tx_head: w0 TX packets written (client)
+ *   line 4 + 4n    tx_tail: w0 TX packets read (shell)
+ * Then the rings, each PBV_SLOTS slots, in this order: n input rings, n output rings, the step
+ * ring, the TX ring. Slot i of a ring is counter i mod PBV_SLOTS. */
+#define PBV_SLOTS      1024u
+#define PBV_IN_BYTES    512u /* 0 lane u8, 1 count u8, 2 flags u8, 3 n_routes u8 (<= 10),
+                                4 session u32, 8 pkt_seq u32, 12 payload_len u32, 16 rx_ts u64,
+                                24 pkt_hash u64, 32 first_lane_seq u64, 40 fills_applied u64,
+                                48 record index u64 (for errors), 64 routes (16 bytes each:
+                                lane_seq u64, cross u8), 224 payload. One slot per PacketRecord,
+                                MID and Advance records included, in O-order; a packet's
+                                RouteRecords ride in its slot. */
+#define PBV_OUT_BYTES   288u /* 0 session u32, 4 resp_seq u32, 8 echo_pkt u32, 12 n u8,
+                                13 n x record[16]: exactly the bytes H(lane l) hashes */
+#define PBV_STEP_BYTES  576u /* 0 step u64, 8 kind u8, 9 has_src u8, 10 src_lane u8, 11 cross u8
+                                (StepFlags::CROSS), 16 src_lane_seq u64, 32 cut (u64 per lane) */
+#define PBV_TX_BYTES    288u /* 0 step u64, 8 session u32, 12 resp_seq u32, 16 pkt_seq u32,
+                                20 lane u8, 21 n_rec u8, 22 role u8, 23 n_rec x record[16]:
+                                exactly the bytes H(tx) hashes */
+
+/* Errors, in the in_tail / step_tail error word. Every one is final: the shell stops. */
+#define PBV_E_MISMATCH    1u /* a record, route or response differs from what replay makes */
+#define PBV_E_ORDER       2u /* REP_MERGE cannot order a lane call against a step */
+#define PBV_E_SOURCE      3u /* a step's source op is missing or not forwarded */
+#define PBV_E_KIND        4u /* a step's kind or number differs */
+#define PBV_E_CUT         5u /* a cut moves back */
+#define PBV_E_TOO_OLD     6u /* a call needs a step older than the client's history */
+#define PBV_E_BAD_RECORD  7u /* a malformed record (a MID record first, too many MIDs) */
+#define PBV_E_UNSUPPORTED 8u /* outside v1's subset, below */
+#define PBV_E_FAULT       9u /* a ledger overflow or a capacity */
+
+/* v1 subset: New (Day, IOC, FOK, post-only), Cancel, Reduce, Heartbeat and ResendReq (no
+ * LaneSeq, no response); SHED records (from the record alone, no payload, 05 §18 Q17); Cross, Improve, Shed,
+ * Idle and Depletion steps. Replace, CancelAll, an STP that would trigger, in-packet
+ * dependencies, Rescan, Control, Seal and Uncross steps, step payloads and snapshot/state bytes
+ * stop with PBV_E_UNSUPPORTED. */
+
+uint32_t pbv_abi_version(void);
+uint64_t pbv_shared_bytes(uint32_t n_lanes);
+/* Copies the tables. NULL when the config is malformed. mem outlives the context. */
+pbv_ctx* pbv_new(const uint8_t* cfg, const uint8_t* accts, uint32_t n_accts,
+                 const uint8_t* sess, uint32_t n_sess, void* mem);
+void     pbv_lane_run(pbv_ctx* c, uint32_t lane); /* one thread per lane; returns on stop */
+void     pbv_bbo_run(pbv_ctx* c);                 /* one thread; returns on stop */
+int32_t  pbv_load_snapshot(pbv_ctx* c, const uint8_t* bytes, uint64_t len); /* v1: -PBV_E_UNSUPPORTED */
+uint64_t pbv_state_bytes(pbv_ctx* c, uint8_t* out, uint64_t cap);          /* v1: 0 */
+uint64_t pbv_siphash(uint64_t k0, uint64_t k1, const uint8_t* p, uint64_t n); /* golden check */
+void     pbv_free(pbv_ctx* c); /* after every thread returned */
 
 #endif /* VYRN_PBV_H */
