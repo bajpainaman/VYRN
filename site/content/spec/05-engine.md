@@ -31,7 +31,7 @@ This chapter specifies one book on one sequencer box. It defines:
 | D7 | The crossing lemma gives a price band `[lo, hi]` per step from the snapshot versions that the batch's lanes may have used. An empty band proves that the batch cannot cross. A non-empty band triggers a `Rescan` step that processes the band's batch entries in key order. | The slow path is exact and bounded by the band. |
 | D8 | IOC and FOK orders are always forwarded. Post-only orders are forwarded when they cross the snapshot. | Their outcome needs a decision that only the BBO core can make. A lane's snapshot is only a routing hint (`INV-ENG-1`). |
 | D9 | A lane settles a local op `t` (sends its `Ack` or `CancelAck`, releases reservations) at the first boundary with `t ≤ C_f[lane]`, where `f` is the boundary's `fills_applied`. A boundary can sit between packets or inside one (§6.2). | `f` and the boundary's position are in the `PacketRecord`, and `C_f` is in the `StepRecord`, so settlement is replayable. |
-| D10 | Responses for forwarded ops, their dependencies and every maker fill go out from the fill TX cores (A, B) in the step's own packets (01 §14.14). The lane reserves `resp_seq`s ahead. All other responses go out from the lane. | Takers and makers meet `LAT_MAX_NS`. `resp_seq` keeps one writer per number. |
+| D10 | Responses for forwarded ops, their dependencies and every maker fill go out from the fill TX cores (A, B, C; 01 §14.17.3) in the step's own packets (01 §14.14). The lane reserves `resp_seq`s ahead. All other responses go out from the lane. | Takers and makers meet `LAT_MAX_NS`. `resp_seq` keeps one writer per number. |
 | D11 | Backpressure stalls a core. Lateness is answered by deadline admission: `Reject BUSY` at the lane, or a `Shed` step at the BBO core. Both are logged. | A timing decision is replayable only if it is in the order stream (01 §14.1). |
 | D12 | A lane that stalls past `ENG_LANE_DEAD_NS` fail-stops the sequencer. Spare cores (57, 59–63) take lanes only through a cooperative handover. | A wedged writer cannot be fenced inside one coherence domain without killing the process. |
 | D13 | The lane processes a packet in two passes. Pass 1 validates, reserves, classifies and pushes each forwarded op at once with its in-packet dependency list. Pass 2 applies the independent joins and cancels (01 §14.2). | A cross at index 9 waits for 9 × 5 ns, not 9 × 14 ns. |
@@ -553,7 +553,7 @@ asserts these sizes.
 | `FillRing` | lane | `ENG_FILL_RING` × 32 B | BBO | lane | CCD 0 | per fill event |
 | `FillCons` | lane | 64 B | lane | BBO | lane | per drained batch |
 | `OsRing` | lane | `ENG_OS_RING` × 64 B | lane | stream core of its half (4 or 7) | lane | 1 per packet, pre-encoded in pass 1 |
-| `MakerSeq` | session | 16 B | lane | fill TX core of its half | lane | 1 per 8 TX-core packets of the session |
+| `MakerSeq` | session | 16 B | lane | fill TX core of its client port (06 §2.3 rule 3) | lane | 1 per 8 TX-core packets of the session |
 | `CutPub` ×4, half A / half B | box | 2 × 4 × 8 lines | cut core A / cut core B | BBO | CCD 0 | 1 per ~`CUT_REFRESH_NS` per half |
 | occupancy masks, half A / half B | box, side | 2 × 4096 × 4 B | cut core A / cut core B | BBO | CCD 0 | on SET/CLEAR events |
 | `BboFloor` | box | 64 B (two half floors) | BBO | cut cores | CCD 0 | 1 per step |
@@ -569,8 +569,8 @@ asserts these sizes.
 | `FramesOut` A, B | box | 2 × 64 B | stream core A / B | fill TX cores, other stream core | CCD 0 | per step sent |
 | `AuctionCtl` | box | 64 B | BBO | lanes | CCD 0 | per uncross |
 | `AuctionHist` | lane | 2 × `ENG_AUCTION_TICKS` × 8 B + 64 B | lane | BBO | lane | per uncross |
-| `HandoverCtl` | lane | 64 B | control role (core 0) | lane | CCD 0 | per handover (§14.1) |
-| control ring | box | 256 × 64 B | control role (core 0) | BBO | CCD 0 | per halt, phase or band command |
+| `HandoverCtl` | lane | 64 B | control role (core 51) | lane | CCD 0 | per handover (§14.1) |
+| control ring | box | 256 × 64 B | control role (core 51) | BBO | CCD 0 | per halt, phase or band command |
 
 Lane memory is on the box's one NUMA node (`06-platform.md`); "lives in" names the cache that
 holds the line in steady state.
@@ -889,7 +889,7 @@ off size field       meaning
 ### 4.15 `StepLog`, `TxRing`, `LaneCut`
 
 ```
-StepEntry (64-B header + delta lines, BBO → both stream cores and both fill TX cores):
+StepEntry (64-B header + delta lines, BBO → both stream cores and all three fill TX cores):
   0  8 step | 8 1 kind | 9 1 src_lane | 10 1 n_delta | 11 1 n_tx | 12 4 n_fills
   16 8 src_lane_seq (0 = no source) | 24 4 pub_A (low 32) | 28 4 pub_B (low 32)
   32 4 band_lo | 36 4 band_hi (Rescan only) | 40 8 fill_lanes u64 | 48 1 flags (bit 0 CONT)
@@ -1361,7 +1361,7 @@ The lane decides at two points whether the packet can still be answered within `
 state has changed at either point.
 
 ```rust
-const DEADLINE_GUARD_NS: u64 = 30;                        // 01 §14.1
+const DEADLINE_GUARD_NS: u64 = 20;                        // 01 §14.1
 fn late(l: &Lane, rx_ts: Nanos, cls: Class, at: Point) -> bool {
     let now = l.clock.now_ns();                           // TSC → PHC mapping (06), ~3 ns
     let rest = l.cfg.path_ns[cls.count][cls.kind] − if at == Commit { l.cfg.prepass_ns } else { 0 };
@@ -1378,8 +1378,8 @@ fn late(l: &Lane, rx_ts: Nanos, cls: Class, at: Point) -> bool {
 
   | `n` | `Local` = 505 + 14n | `Order` = max(510 + 5n, 505 + 14n) | admitted if `age ≤` |
   |---|---|---|---|
-  | 1 | 520 | 520 | 450 |
-  | 10 | 645 | 645 | 325 (5 ns above the 320 ns RX budget, §11.8) |
+  | 1 | 520 | 520 | 460 |
+  | 10 | 645 | 645 | 335 (15 ns above the 320 ns RX budget, §11.8) |
 
   `11` checks each entry against B3's measured maxima before a configuration is accepted.
 - **At dequeue**, a late packet costs ~20 ns: session lookup, bound-address check, one
@@ -1387,7 +1387,7 @@ fn late(l: &Lane, rx_ts: Nanos, cls: Class, at: Point) -> bool {
   `pkt_seq` (the client resends) and cannot change book state; its record is `PacketRecord
   { flags: SHED, pkt_hash: 0 }`. **At the commit point** (after the MAC and the prefetch wait) the
   same test runs without the pre-pass part, so a cold-line wait becomes `BUSY`, never lateness.
-- **The BBO core's test.** `FwdEntry.deadline = rx_ts + 970 − 355`, where 355 ns is the §11.1
+- **The BBO core's test.** `FwdEntry.deadline = rx_ts + 980 − 355`, where 355 ns is the §11.1
   path from a step's start to the first bit out (step 15, gate 60, TX 40, NIC TX 240). If `now >
   deadline` when the op would start, the BBO core emits a `Shed` step (§8.1): the op and its
   dependencies get `Reject { BUSY }` from the fill TX core in the op's reserved packet, their lane
@@ -1399,7 +1399,8 @@ fn late(l: &Lane, rx_ts: Nanos, cls: Class, at: Point) -> bool {
   burst `LANE_POLICE_BURST` = 8 (01 §14.1). A 20 ns shed is shorter than the 25 ns policed
   interval, so a lane in overload drains faster than it fills; `04` §3.5 proves that every `BUSY`
   then leaves within `LAT_MAX_NS`.
-- **Target.** Dedicated, paced lanes: `BUSY = 0`. Pooled lanes: `BUSY ≤ 1e-3` at full book load
+- **Target.** Dedicated, paced lanes: lane-stage `BUSY = 0`; total `BUSY ≤ 1e-5` at full book
+  load (crosses and improves only) and `≤ 1e-8` at ≤ 20% load (01 §14.17.2). Pooled lanes: `BUSY ≤ 1e-3` at full book load
   and `≤ 1e-6` at ≤ 20% book load (01 §14.15.5, B3). §11.8 gives the model.
 
 ### 6.9 Dedicated lanes and the pooled lane group (01 §14.15)
@@ -1408,8 +1409,8 @@ fn late(l: &Lane, rx_ts: Nanos, cls: Class, at: Point) -> bool {
 only that firm's packets queue on it. **`LANE_PACE`**: the firm's SDK leaves at least
 `path_ns[n][kind]` of the previous packet (§6.8) between two packets to the same lane. Then a
 packet finds the lane idle except for at most one work unit of boundary or idle work
-(`ENG_UNIT_NS`), and its age at dequeue is its RX time plus ≤ `ENG_UNIT_NS`: `BUSY = 0` whenever
-`RX + ENG_UNIT_NS ≤ 970 − path` (§11.8 states the margin). Only the firm's own bursts can make it
+(`ENG_UNIT_NS`), and its age at dequeue is its RX time plus ≤ `ENG_UNIT_NS`: lane-stage `BUSY = 0` whenever
+`RX + ENG_UNIT_NS ≤ 980 − path` (§11.8 states the margin). Only the firm's own bursts can make it
 wait.
 
 **Pooled lanes** (lanes 42–48, cores 56–62, one CCD). Every pool core is a full lane: its own
@@ -1425,7 +1426,7 @@ RxQueue[c] consumer lock (64 B) { lock: u32, next: u32 }   per pool core's RX VI
 
 - **Token.** Before it touches pooled account `a` (pass 1 of a packet of `a`, or B1/B2 work for
   `a`'s orders), core `c` takes `AcctTok[a]` with `CAS(holder: free → c)` (~20 ns inside the L3),
-  increments `ver`, and writes `AcctTake { acct: a, ver }` into its own `OsRing` before the work.
+  increments `ver`, and writes `AcctTake { account: a, ver, lane: c }` into its own `OsRing` before the work.
   It releases the token (`Release` store) when the packet or boundary work is done. While `c`
   holds it, `c` is the only writer of every field of `PoolAcct[a]` (`INV-WRITER` per field, in
   time slices that the token orders).
@@ -1841,7 +1842,7 @@ the dependency floor, so every explicit op with `seq ≤ P.entry[l].seq` is in `
   is logged in `StepRecord.src_*`, so replay does not repeat it (§10).
 - Starvation is impossible: a ring's head is replaced only by entries with larger keys, so every
   head becomes the minimum after finitely many steps.
-- A `Control` entry (halt, phase, band, uncross; from core 0) is executed before ring heads, at
+- A `Control` entry (halt, phase, band, uncross; from core 51) is executed before ring heads, at
   most one per loop pass.
 
 ### 8.5 Executing a forwarded op
@@ -2094,7 +2095,7 @@ Continuous ──Control(Auction)──► Auction ──Control(Frozen)──�
    order visible at `C*[l]` that is not killed, and writes its `AuctionHist` buffer (lane-written,
    control-core-read): `buy[i], sell[i]: u64` for `i = tick − lo`, then `ready = s_f` (Release).
    Lane cost: ~2 ns per order in the collar (budget), never more than `ENG_IDLE_SLICE_NS` at a time.
-4. **Price, off the BBO core.** When all lanes are ready, the control role on core 0 sums the 49
+4. **Price, off the BBO core.** When all lanes are ready, the control role on core 51 sums the 49
    histograms into cumulative demand `D(p) = Σ_{t ≥ p} buy[t]` and supply `S(p) = Σ_{t ≤ p}
    sell[t]` and calls `08`'s pure function:
 
@@ -2144,13 +2145,14 @@ The fill TX core builds each packet from its `TxEntry` and the session's TX stat
 before `FramesOut.step ≥ s` (`INV-FRAME-FIRST`). Auction (`Uncross`) fills are not caused by a
 request packet; their lanes send them after B1, like other unsolicited records.
 
-**Fill TX budget per step (01 §14.14, §14.15.3).** TX-A (core 3) sends the packets of sessions
-on lanes 0–24, TX-B (core 5) those of lanes 25–48. Each reads the step's `TxEntry`s as soon as the
+**Fill TX budget per step (01 §14.14, §14.15.3).** Each client port has one fill TX core
+(01 §14.17.3, 06 §2.3 rule 3): TX-A (core 3) writes NIC0, TX-B (core 5) NIC2 and TX-C (core 0) NIC1
+and NIC3, so a session's packets go out from the TX core of its lane's card. Each reads the step's `TxEntry`s as soon as the
 BBO core writes them, and builds and tags its packets (8-way AVX-512 SipHash, ~15 ns for up to 8,
 budget) while the stream cores frame the step (the 60 ns gate). After the gate only the CTPIO
 writes are serial, per core: `t_tx = 10 + 8k` ns for the source packet and `k` maker packets on
 the same core. A step has ≤ 8 maker fills, so `k ≤ 8` on one core in the worst case (all makers
-on one half): `t_tx ≤ 74` ns. At index 9 the taker's fill leaves at 880 ns (§11.1) and the last
+on one card): `t_tx ≤ 74` ns. At index 9 the taker's fill leaves at 880 ns (§11.1) and the last
 maker's ≤ 880 + 64 = 944 ns, inside `LAT_MAX_NS − DEADLINE_GUARD_NS`. A continuation step's
 makers leave ~15 ns per step later, so at index 9 about five steps (≤ 40 fills) fit; §18 Q15.
 
@@ -2495,8 +2497,8 @@ A replica runs `vyrn-engine` with the same lane, BBO and settlement code. Three 
 | `LaneCut[l]` read by the lane | `PacketRecord.fills_applied = f` and `C_f[l]` from `StepRecord f` |
 | snapshot routing in `classify` | op `(l, q)` is forwarded iff a `StepRecord` has `src = (l, q)` |
 | dependency lists in `FwdEntry` | recomputed from the packet's bytes by the replayed pass 1 (§6.6: a function of the messages and lane state) |
-| core 0's `uncross_price` | the replica's control role computes it from its own lanes' histograms at `C*` |
-| pool token CAS and stealing (§6.9) | `AcctTake { acct, ver }` records: a lane waits at one until the account's previous `ver` is replayed |
+| core 51's `uncross_price` | the replica's control role computes it from its own lanes' histograms at `C*` |
+| pool token CAS and stealing (§6.9) | `AcctTake { account, ver, lane }` records: a lane waits at one until the account's previous `ver` is replayed |
 
 **Scheduler.** The replica schedules lanes and the BBO core as a dataflow:
 
@@ -2652,7 +2654,7 @@ against ~460 GB/s of 12-channel DDR5-4800 (vendor).
   of token CAS per packet.
 - BBO core: 10M crosses/s × 15 ns + 20M improves or depletions/s × 3 ns ≈ **0.21** (§8.12).
 - Fill TX cores: ~30M source and ~20M maker packets/s at ~13 ns each (build 3, SipHash share 2,
-  CTPIO 8) split over two cores: **~0.33** each, above 01 §14.15.3's 0.25 (§18 Q14).
+  CTPIO 8) split over three cores: **~0.22** each, within 01 §14.15.3's 0.25 (01 §14.17.3).
 - Stream cores: ~50M `PacketRecord`s/s and 30M steps/s each, framing and `LaneCut`: 07 owns the
   budget (Q2).
 - Cut cores: one 100 ns pass each, back to back: busy 1.0 by design, like a poll loop.
@@ -2661,8 +2663,8 @@ against ~460 GB/s of 12-channel DDR5-4800 (vendor).
 
 ### 11.8 The `BUSY` rate
 
-`BUSY` happens when a packet's age at dequeue (or at the commit point) exceeds `970 −
-path_ns[n][kind]`: 450 ns for one message, 325 ns for ten (§6.8). The age is the actual NIC RX
+`BUSY` happens when a packet's age at dequeue (or at the commit point) exceeds `980 −
+path_ns[n][kind]`: 460 ns for one message, 335 ns for ten (§6.8). The age is the actual NIC RX
 time plus the lane's queueing wait.
 
 - **A single shared server cannot meet `BUSY ≤ 1e-6`.** A model of Poisson arrivals at 2M
@@ -2674,11 +2676,14 @@ time plus the lane's queueing wait.
 
   With 5–130 ns of slack, a shared single-core lane would shed 10–36% of packets. This is the
   gap that 01 §14.15 closes with lane classes.
-- **Dedicated, paced lanes: `BUSY = 0`.** A paced client never queues (§6.9); its packet waits at
-  most one `ENG_UNIT_NS` = 20 ns work unit. For ten-message packets this needs `RX ≤ 305 ns`
-  (325 − 20), 15 ns below the 320 ns RX budget; one- to eight-message packets have ≥ 20 ns of
-  margin. So `BUSY = 0` holds for every packet size only if B1 qualifies RX at ≤ 305 ns, or if
-  the work unit for dedicated lanes is ≤ 5 ns (§18 Q13).
+- **Dedicated, paced lanes: lane-stage `BUSY = 0`** (01 §14.17.2). A paced client never queues
+  in its lane (§6.9); its packet waits at most one `ENG_UNIT_NS` = 20 ns work unit. For
+  ten-message packets this needs `RX ≤ 315 ns` (335 − 20), 5 ns below the 320 ns RX budget;
+  one- to eight-message packets have ≥ 20 ns of margin. So lane-stage `BUSY = 0` holds for every
+  packet size only if B1 qualifies RX at ≤ 315 ns, or if the work unit for dedicated lanes is
+  ≤ 15 ns (§18 Q13). The BBO, TX and stream cores are shared by every client, so a dedicated
+  client's BBO-bound op can still be shed there: total `BUSY ≤ 1e-5` at full book load and
+  `≤ 1e-8` at ≤ 20% load (01 §14.17.2, B3).
 - **Pooled lanes: M/M/c with c = 7.** 01 §14.15.1 gives ≈ 1e-3 at full book load and ≤ 1e-6 at
   ≤ 20% load; the token CAS (~20 ns) and a steal (~20 ns) come out of the same slack. B3
   publishes the measured curve.
@@ -2760,7 +2765,7 @@ update   : when a step's last trade tick differs from ref by more than ENG_BAND_
 
 ### 13.3 Halts
 
-- An operator halt arrives on the control ring from core 0 (`vyrn-admin`). The BBO core executes it
+- An operator halt arrives on the control ring from core 51 (`vyrn-admin`). The BBO core executes it
   as a `Control` step: phase `Halted`, `Phase` events to every lane.
 - In `Halted`: `New` and `Replace` are rejected `BOOK_HALTED` (lane order view); `Cancel`,
   `Reduce`, `CancelAll` work; no step matches; forwarded ops that reach their step are rejected
@@ -2773,14 +2778,14 @@ update   : when a step's last trade tick differs from ref by more than ENG_BAND_
 
 ### 14.1 A lane core stalls
 
-The control role (core 0) watches every lane's `CounterLine.lock`. A lane republishes it at least
+The control role (core 51) watches every lane's `CounterLine.lock`. A lane republishes it at least
 every `ENG_BEAT_NS` (budget 1 µs) even when idle.
 
 | Silence | Action |
 |---|---|
 | < `ENG_LANE_STALL_NS` (20 µs) | count it (`eng_lane_gap{lane}`); every response the gap made late is counted in `eng_late_resp` (§14.5). The BBO core keeps running (§14.4). |
 | ≥ `ENG_LANE_STALL_NS` | alert, metric `eng_lane_stall{lane}`; the box keeps running |
-| ≥ `ENG_LANE_DEAD_NS` (1 ms) | **fail-stop the sequencer**: the control role tells both stream cores to stop sending frames and both fill TX cores to stop sending responses. Replicas see silence and fail over after `FAILOVER_SILENCE_MS` (`07`). |
+| ≥ `ENG_LANE_DEAD_NS` (1 ms) | **fail-stop the sequencer**: the control role tells both stream cores to stop sending frames and all three fill TX cores to stop sending responses. Replicas see silence and fail over after `FAILOVER_SILENCE_MS` (`07`). |
 
 **Why not take over the lane on a spare core.** A wedged thread can resume at any instruction and
 write lane memory; inside one process it cannot be fenced except by killing the process, and two
@@ -2864,7 +2869,7 @@ cores with SMIs and interrupts off. This is the fault model of the theorem, not 
 |---|---|
 | `01` | names, types, constants, wire layouts, invariants, determinism rules |
 | `02` | `REQ-LAT-1` (1 µs maximum, 01 §14.0), `REQ-THR-*` (1B msgs/s), measurement points for acks and fills |
-| `03` | core map (01 §10: cut cores 1/6, TX cores 3/5, stream cores 4/7, control 0, hasher 50), the fill TX cores' `FramesOut` wait, the pool CCD (cores 56–62), book groups (`K`) |
+| `03` | core map (01 §10: cut cores 1/6, TX cores 3/5/0, stream cores 4/7, control 51, hasher 50), the fill TX cores' `FramesOut` wait, the pool CCD (cores 56–62), book groups (`K`) |
 | `04` | packet and session checks (`check_packet`, `session_msg`), `pkt_hash`, rate limits, retention and resend, session TX state for the fill TX core, `CancelAll` scope, the handle-reuse client rule (§7.8), the `BUSY` resend rule and the backlog proof (§3.5) |
 | `06` | NIC RX timestamps, TSC↔PHC mapping for the age check, PHC skew bound `ENG_PHC_SKEW_NS`, VI polling for handover, huge pages, isolation with SMIs and interrupts off (§14.5) |
 | `07` | `PacketRecord`/`StepRecord` encoding (lanes pre-encode into `OsRing` in pass 1), the order-stream core, frame gating, failover on silence |
@@ -2974,7 +2979,7 @@ runs live and replay, selected by configuration (`C-ONEBIN`).
 
 Resolved by 01 §14 and removed: R1 (`Control` step, §14.10), R3 (Advance records, §14.11), R5
 (`Out` causes, §14.10, 4 = `EXPIRED`), R6 (`INV-ENG-1`, `-2`, §14.11), R7 (IOC, FOK and post-only
-are forwarded, §14.2), R10 (`LaneCut` writer and control on core 0, §14.11, 01 §10), the `SHED`
+are forwarded, §14.2), R10 (`LaneCut` writer, §14.11; control on core 51, 01 §10, §14.17.3), the `SHED`
 flag half of R11 (§6.6 now has `flags`), and R14's step part (15 ns steps, §14.15.2).
 
 | # | Request | Reason |
@@ -2987,7 +2992,7 @@ flag half of R11 (§6.6 now has `flags`), and R14's step part (15 ns steps, §14
 | R12 | Add `Phase::Frozen` (every book op rejected `AUCTION_PHASE`). | The freeze keeps an uncross within 1 µs per response (§8.8). |
 | R13 | Promote `INV-ENG-7` and `INV-ENG-8`. | 07 and 11 test positions and explicit ops. |
 | R14 | Add the 20 ns "lane notices `LaneCut`" term to 01 §14.2's ack path (935 → 955 typical, 965 worst). | A lane inside another packet polls `LaneCut` every `ENG_UNIT_NS` (§6.1). |
-| R15 | Add `AcctTake { acct, ver }` to the lane record stream (01 §6.6, 07). | 01 §14.15's "each core's `LaneSeq` logs the token order" does not order one account's work across two pool cores; `ver` does (Lemma 6.1). |
+| R15 | *Resolved by 01* (§14.17.4): `AcctTake { account, ver, lane }` in the lane record stream (01 §6.6, 07). | 01 §14.15's "each core's `LaneSeq` logs the token order" does not order one account's work across two pool cores; `ver` does (Lemma 6.1). |
 | R16 | Reconcile `N_LANES_REF` = 50 with the core map's 49 lanes (42 + 7), and `BBO_CROSS_NS` = 40 in §5 with 15 in §14.15.2. | Two definitions of one name. |
 
 ## 18. Open questions
@@ -3007,7 +3012,7 @@ Q9's `liq` half (`liq = 2`), Q12's percentile form (cold lines are paid before t
 | Q10 | `CancelAll` scope: session or account. | 04 | protocol review |
 | Q11 | Book groups: does the lane budget hold for K = 8 cold books per lane? | 03 | B2 with 8 books on one lane |
 | Q12' | How often does a cold-line wait in the pre-pass turn a packet into `BUSY`? | 05 | B2 with uniformly old cancel handles |
-| Q13 | Dedicated `BUSY = 0` for ten-message packets needs RX ≤ 305 ns or a ≤ 5 ns work unit (§11.8). Which? | 01, 06 | B1 RX maxima; B2 work-unit sizes |
-| Q14 | Fill TX cores at ~0.33 each vs 0.25 (§11.7); `MakerSeq` gives 8 spare numbers, which a market maker hit by many consecutive crosses can use up before its lane refills (`eng_maker_seq_wait`). | 01, 05 | B3 with a market maker at the touch |
+| Q13 | Dedicated lane-stage `BUSY = 0` for ten-message packets needs RX ≤ 315 ns or a ≤ 15 ns work unit (§11.8). Which? | 01, 06 | B1 RX maxima; B2 work-unit sizes |
+| Q14 | `MakerSeq` gives 8 spare numbers, which a market maker hit by many consecutive crosses can use up before its lane refills (`eng_maker_seq_wait`). | 01, 05 | B3 with a market maker at the touch |
 | Q15 | 01 §14.14 bounds every maker fill by the taker's first bit. At index 9 about five continuation steps (≤ 40 fills) fit; later steps' maker fills exceed `LAT_MAX_NS`. Cap the fills one taker may take, or re-budget? | 01 | decision; B3 with a 64-maker sweep |
 | Q16 | A crash after an ack but before its boundary record leaves loses the boundary's position (01 §14.16 gates on op and step records). Gate on the boundary record too? | 07 | failover test with acks in flight |
