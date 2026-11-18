@@ -1973,3 +1973,89 @@ fn the_vx_client_takes_each_logged_lowver() {
     let e = vx_replay(&store, &blocks, &lib).unwrap_err();
     assert!(e.to_string().contains("bad record"), "{e}");
 }
+
+/// A post-only New (Day).
+fn post(side: Side, tick: u32, qty: u32, tag: u32) -> vyrn_wire::Msg {
+    vyrn_wire::Msg::New {
+        flags: vyrn_wire::OrderFlags::from_byte(
+            vyrn_bbo::OrderFlags::new(side, Tif::Day, true, vyrn_bbo::Stp::None).0,
+        )
+        .unwrap(),
+        tick: vyrn_types::Tick(tick),
+        qty: vyrn_types::Qty(qty),
+        client_tag: tag,
+    }
+}
+
+/// Rescan batch takers that trade (05 §8.6, gap item 2; both found by a random-script search
+/// against mutants of the client). `post_only`: lane 1's post-only buy at 104 joins against a
+/// stale snapshot and is the batch taker of a Rescan whose book it crosses, so it ends with a
+/// batch `Reject POST_ONLY_WOULD_CROSS`, its record the lane's. Otherwise lane 2's buy at 102
+/// is a batch taker whose sweep is capped at one level: a `RESTED_IN_FLIGHT` step, its fill
+/// record held by the lane, its Ack held until a CONT Rescan ends the sweep (rule B).
+fn batch_script(post_only: bool) -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::{Day, Ioc};
+    let p = |l, a, t: u64, m| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs: vec![m],
+    };
+    let mut s = if post_only {
+        vec![
+            p(1, 2, 2_000, new(Buy, Day, 107, 2, 2)),
+            Act::Run,
+            p(1, 1, 3_000, post(Buy, 104, 2, 3)),
+            p(0, 2, 4_000, post(Sell, 101, 1, 4)),
+            p(1, 1, 5_000, new(Sell, Day, 100, 2, 5)),
+            p(2, 1, 6_000, new(Sell, Day, 106, 3, 6)),
+            p(2, 2, 7_000, post(Sell, 106, 3, 7)),
+            p(0, 2, 8_000, new(Buy, Ioc, 103, 4, 8)),
+            p(2, 1, 9_000, post(Sell, 104, 4, 9)),
+            p(0, 2, 10_000, new(Buy, Day, 105, 3, 10)),
+            p(0, 1, 11_000, post(Buy, 106, 4, 11)),
+        ]
+    } else {
+        vec![
+            Act::Run,
+            p(1, 1, 2_000, new(Sell, Day, 106, 1, 2)),
+            p(2, 1, 3_000, new(Sell, Day, 101, 2, 3)),
+            Act::Run,
+            p(1, 1, 4_000, new(Buy, Day, 105, 3, 4)),
+            p(1, 2, 5_000, cancel(Handle::new(3, 1).unwrap(), 5)),
+            p(2, 2, 6_000, post(Buy, 102, 4, 6)),
+            p(1, 1, 7_000, post(Buy, 100, 3, 7)),
+            p(2, 1, 8_000, post(Sell, 106, 3, 8)),
+            p(2, 2, 9_000, new(Sell, Day, 104, 3, 9)),
+        ]
+    };
+    s.extend([Act::Run, Act::Poll, Act::Run]);
+    s
+}
+
+#[test]
+fn the_vx_client_replays_rescan_batch_takers_that_trade() {
+    for post_only in [false, true] {
+        let script = batch_script(post_only);
+        let (live_j, store, blocks) = blocks_of(&script, &[]);
+        let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+        check_same(&live_j, &rep);
+        let rescans: Vec<_> = blocks[0]
+            .steps
+            .iter()
+            .filter(|m| m.rec.kind == StepKind::Rescan)
+            .collect();
+        assert!(
+            rescans.len() >= 2,
+            "post_only {post_only}: the script reaches Rescans"
+        );
+        let (j, _) = live07(&script);
+        let traded = j.recs.iter().any(|r| {
+            matches!(r, OwnedRec::Step(e, _) if e.kind == StepKind::Rescan.code() && e.n_fills > 0)
+        });
+        assert!(post_only || traded, "a batch taker trades");
+        assert_vx_matches(&script, 0..j.recs.len() - 1);
+    }
+}

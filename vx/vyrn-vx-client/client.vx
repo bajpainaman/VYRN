@@ -166,6 +166,7 @@ const UNCROSS_CHUNK : u64 = 6;    // ENG_UNCROSS_CHUNK
 const OUT_IOC_REST : u64 = 1;
 const OUT_AUCTION : u64 = 3;
 const RESTED_DONE : u64 = 0;
+const RESTED_IN_FLIGHT : u64 = 1;
 const ROLE_TAKER : u64 = 0;
 const ROLE_MAKER : u64 = 2;
 
@@ -229,6 +230,8 @@ struct Slot {
   filled : u64, taker_filled : u64, taker_end : u64, ix : u64, sess : i64, pkt : u64,
   has_risk : u64, r_side : u64, r_tick : u64, r_qty : u64, r_settled : u64, r_closed : u64,
   r_route : u64, r_fee_mul : u64, r_msg_fee : u64,
+  // A Rescan batch taker in a capped sweep (rule B): its Ack waits.
+  inflt : u64,
 }
 
 struct Root {
@@ -307,6 +310,11 @@ struct Bbo {
   // whether its last step was a chunk. `sealed`: the epoch's last step ran (08).
   has_fz : u64, fz : *mut u64, has_unc : u64, unc_p : u64, unc_rem_b : u64, unc_rem_s : u64,
   unc_last : u64, sealed : u64,
+  // A capped Rescan batch taker (Bbo::rcont): its lane and LaneSeq and the band; the next step
+  // must be its CONT Rescan at the same cut.
+  rc_has : u64, rc_l : u64, rc_q : u64, rc_lo : u64, rc_hi : u64,
+  // Set while that taker sweeps: makers are seen at its key (05 §5.2 visible_at), not the cut.
+  kv : u64,
 }
 
 struct Ctx {
@@ -1576,14 +1584,14 @@ fn pass2_apply(c : *mut Ctx, l : i64, op : *mut Op) -> void {
     if k == OK_CANCEL {
       (*slot(ln, (*op).v)).tomb = 1u64;
       let e = put_op(c, l, (*op).seq, OP_CANCEL);
-      (*e).root = (*op).root;
+      (*e).root = (*op).root; (*e).ts = (*ln).cur_ts;
       pend_push(ln, op, PK_CXL);
       return;
     }
     // Reduce: a keep-priority version with the smaller total.
     (*slot(ln, (*op).v)).tomb = 1u64;
     let e = put_op(c, l, (*op).seq, OP_REDUCE);
-    (*e).root = (*op).root; (*e).vslot = (*op).w; (*e).total = (*slot(ln, (*op).w)).total;
+    (*e).root = (*op).root; (*e).ts = (*ln).cur_ts; (*e).vslot = (*op).w; (*e).total = (*slot(ln, (*op).w)).total;
     pend_push(ln, op, PK_REDUCE);
   }
 }
@@ -1632,6 +1640,8 @@ fn boundary(c : *mut Ctx, l : i64, f : u64, pass : u64, next : u64) -> void {
     while (*ln).pend_n > 0i64 {
       let p : *mut Pend = offset_mut((*ln).pend, (*ln).pend_head);
       if (*p).seq > cc { break; }
+      // Rule B: an Ack waits while its version is a batch taker in flight.
+      if (*p).k == PK_ACK && (*slot(ln, (*p).v)).inflt != 0u64 { break; }
       (*ln).pend_head = ((*ln).pend_head + 1i64) % PEND_CAP;
       (*ln).pend_n = (*ln).pend_n - 1i64;
       settle(c, ln, p);
@@ -1670,21 +1680,46 @@ fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
       settle_fill(c, ln, leg, taker, (*ev).qty, (*ev).tick, ppm);
       if (*ln).err != 0u64 { return; }
       // Auction fills are unsolicited and the lane's (05 §8.9): held until the version settles.
+      let hd = slot(ln, leg);
       if (*ev).liq == LIQ_AUCTION {
-        if (*ln).n_held >= B3_CAP { fail_lane(ln, E_FAULT); return; }
-        let hp : *mut Held = offset_mut((*ln).held, (*ln).n_held);
-        (*hp).v = v; (*hp).sess = (*slot(ln, leg)).sess; (*hp).pkt = 0u64;
-        (*hp).lo = rec_lo(R_FILL, INDEX_NONE, LIQ_AUCTION, handle((*sp).root));
-        (*hp).hi = rec_hi((*ev).tick, (*ev).qty);
-        (*ln).n_held = (*ln).n_held + 1i64;
+        hold(ln, v, (*hd).sess, 0u64, rec_lo(R_FILL, INDEX_NONE, LIQ_AUCTION, handle((*sp).root)),
+             rec_hi((*ev).tick, (*ev).qty));
+      } else if taker && (*hd).explicit == 0u64 {
+        // A Rescan batch taker's fill is the lane's record (05 §8.10 rule 4).
+        hold(ln, v, (*hd).sess, (*hd).pkt, rec_lo(R_FILL, (*hd).ix, LIQ_TAKER, handle((*sp).root)),
+             rec_hi((*ev).tick, (*ev).qty));
       } else { }
       (*sp).filled = (*sp).filled + (*ev).qty;
       if taker { (*sp).taker_filled = (*sp).taker_filled + (*ev).qty; }
       (*rp).filled = (*rp).filled + (*ev).qty;
-      if (*rp).filled >= (*sp).total { (*rp).ended = 1u64; (*rp).end_detail = D_FILLED; }
+      if (*rp).filled >= (*sp).total {
+        (*rp).ended = 1u64;
+        (*rp).end_detail = D_FILLED;
+        (*sp).inflt = 0u64;
+      } else { }
       return;
     }
-    if k == EV_RESTED { return; }
+    if k == EV_RESTED {
+      // A batch taker: in flight while capped, done otherwise (rule B).
+      if (*sp).explicit == 0u64 {
+        if (*ev).cause == RESTED_IN_FLIGHT { (*sp).inflt = 1u64; }
+        if (*ev).cause == RESTED_DONE { (*sp).inflt = 0u64; }
+      } else { }
+      return;
+    }
+    (*sp).inflt = 0u64;
+    let hd = slot(ln, leg);
+    if (*ev).liq == LIQ_TAKER && (*sp).explicit == 0u64 { (*sp).taker_end = 1u64; }
+    // A batch taker's terminal record is the lane's (05 §8.10 rule 4).
+    if (*ev).liq == LIQ_TAKER && (*hd).explicit == 0u64 {
+      let h = handle((*sp).root);
+      if k == EV_OUT {
+        hold(ln, v, (*hd).sess, (*hd).pkt, rec_lo(R_OUT, (*hd).ix, (*ev).cause, h), rec_hi((*ev).qty, (*rp).tag));
+      } else {
+        hold(ln, v, (*hd).sess, (*hd).pkt, rec_lo(R_REJECT, (*hd).ix, (*ev).cause, 0u64), rec_hi(0u64, (*rp).tag));
+      }
+      if (*ln).err != 0u64 { return; }
+    } else { }
     // Out or Reject of a forwarded taker.
     let busy = k == EV_REJECT && (*ev).cause == BUSY;
     if busy { shed_leg(c, ln, leg); } else { release(c, ln, leg); }
@@ -1692,6 +1727,16 @@ fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
     let d = if k == EV_OUT { D_OUT } else { D_CANCELED };
     (*rp).ended = 1u64;
     (*rp).end_detail = d;
+  }
+}
+
+// A record the lane holds until version v settles (vyrn-lane emit).
+fn hold(ln : *mut Lane, v : u64, si : i64, pkt : u64, lo : u64, hi : u64) -> void {
+  unsafe {
+    if (*ln).n_held >= B3_CAP { fail_lane(ln, E_FAULT); return; }
+    let hp : *mut Held = offset_mut((*ln).held, (*ln).n_held);
+    (*hp).v = v; (*hp).sess = si; (*hp).pkt = pkt; (*hp).lo = lo; (*hp).hi = hi;
+    (*ln).n_held = (*ln).n_held + 1i64;
   }
 }
 
@@ -1990,6 +2035,20 @@ fn blive(c : *mut Ctx, l : u64, r : u64) -> u64 {
   return bopen(c, l, r);
 }
 
+// blive at the batch taker's key while it sweeps (Ctx::done at key k): the order joined in
+// C_{s-1} or before the key. A Cancel or Reduce in the batch after the key is UNSUPPORTED
+// (exec_rescan), so the book's state is the key's otherwise.
+fn bvis(c : *mut Ctx, l : u64, r : u64) -> u64 {
+  unsafe {
+    let b = (*c).bbo;
+    if (*b).kv != 0u64 && (*bord(c, l, r)).seq > *offset_mut((*b).prev, l as i64)
+       && !key_lt(c, l, r, (*b).rc_l, (*lop(c, (*b).rc_l as i64, (*b).rc_q)).root) {
+      return 0u64;
+    }
+  }
+  return blive(c, l, r);
+}
+
 fn bopen(c : *mut Ctx, l : u64, r : u64) -> u64 {
   let o = bord(c, l, r);
   unsafe {
@@ -2055,7 +2114,7 @@ fn next_maker(c : *mut Ctx, side : u64, tick : u64) -> i64 {
       let l = (*offset_mut((*b).book_l, i)) as u64;
       let r = (*offset_mut((*b).book_r, i)) as u64;
       let o = bord(c, l, r);
-      if (*o).side != side || (*o).tick != tick || blive(c, l, r) == 0u64 { continue; }
+      if (*o).side != side || (*o).tick != tick || bvis(c, l, r) == 0u64 { continue; }
       if bi == NONE {
         bi = i;
       } else {
@@ -2304,6 +2363,14 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
       let cl = rd64(sp, 32i64 + 8i64 * l);
       if cl < *offset_mut((*b).cut, l) { fail_bbo(c, E_CUT); return; }
     }
+    // A capped batch taker resumes before any other step, at its cut (Bbo::replay_decide).
+    let rc = (*b).rc_has != 0u64;
+    if rc {
+      if kind != K_RESCAN || has_src { fail_bbo(c, E_KIND); return; }
+      for l in 0i64..n {
+        if rd64(sp, 32i64 + 8i64 * l) != *offset_mut((*b).cut, l) { fail_bbo(c, E_CUT); return; }
+      }
+    } else { }
     // Live, a Continuous step other than Rescan passed the band test, which set (B, A) to the
     // envelope (Bbo::replay_decide).
     if (*b).phase == PH_CONT && kind != K_RESCAN { band_env(c, sp); } else { }
@@ -2329,7 +2396,8 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
       let cl = rd64(sp, 32i64 + 8i64 * l);
       let pv = *offset_mut((*b).cut, l);
       ingest(c, l as u64, pv, cl);
-      *offset_mut((*b).prev, l) = pv;
+      // A CONT step sees the taker's batch as its first step did (RCont::prev).
+      if !rc { *offset_mut((*b).prev, l) = pv; } else { }
       *offset_mut((*b).cut, l) = cl;
       sst(c, 2i64 * l + 1i64, Y_CUT, cl);
       if (*b).err != 0u64 { return; }
@@ -2377,7 +2445,11 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
     } else if kind == K_RESCAN {
       if has_src || (*b).has_cont != 0u64 || (*b).phase != PH_CONT { fail_bbo(c, E_KIND); return; }
       // An empty band is the arena's whole tick range (07 §3.8, as Engine::replay_wire reads it).
-      if plen == 0u64 {
+      // A CONT step's band is not read: the first step fixed it.
+      if plen != 0u64 && plen != 8u64 { fail_bbo(c, E_BAD_RECORD); return; }
+      if rc {
+        rescan_run(c, true);
+      } else if plen == 0u64 {
         exec_rescan(c, (*c).tick_min, (*c).tick_max);
       } else if plen == 8u64 {
         exec_rescan(c, rd32(pay, 0i64), rd32(pay, 4i64));
@@ -2463,7 +2535,7 @@ fn level_from(c : *mut Ctx, side : u64, from : u64) -> u64 {
       let l = (*offset_mut((*b).book_l, i)) as u64;
       let r = (*offset_mut((*b).book_r, i)) as u64;
       let o = bord(c, l, r);
-      if (*o).side != side || blive(c, l, r) == 0u64 { continue; }
+      if (*o).side != side || bvis(c, l, r) == 0u64 { continue; }
       let t = (*o).tick;
       let ok = if side == 0u64 { t <= from } else { t >= from };
       if !ok { continue; }
@@ -2483,10 +2555,32 @@ fn exact_bounds(c : *mut Ctx, from_b : u64, from_a : u64) -> void {
   }
 }
 
+// LaneSeq q of lane l orders after the batch taker's key (ts, rank_e, LaneSeq) (05 §5.2).
+fn after_key(c : *mut Ctx, l : i64, q : u64) -> bool {
+  unsafe {
+    let b = (*c).bbo;
+    let e = lop(c, l, q);
+    let t = lop(c, (*b).rc_l as i64, (*b).rc_q);
+    if (*e).ts != (*t).ts { return (*e).ts > (*t).ts; }
+    let ka = rank(c, l as u64);
+    let kb = rank(c, (*b).rc_l);
+    if ka != kb { return ka > kb; }
+    return q > (*b).rc_q;
+  }
+}
+
+// next_level at the key: the best visible level of `side` from `from`, no worse than `limit`.
+fn klevel(c : *mut Ctx, side : u64, from : u64, limit : u64) -> u64 {
+  let t = level_from(c, side, from);
+  if t == 0u64 { return 0u64; }
+  let ok = if side == 1u64 { t <= limit } else { t >= limit };
+  return if ok { t } else { 0u64 };
+}
+
 // Bbo::exec_rescan in replay (05 §8.6): the logged cut is taken as is. The batch taker is the
-// first in-band New of (prev, cut] in key order. v1 replays a Rescan whose taker trades with
-// nothing: one that would cross the book, or a cut with a Cancel or Reduce (which the taker's
-// key may still see), stops with PBV_E_UNSUPPORTED rather than guess.
+// first in-band New of (prev, cut] in key order; it sweeps at its key. A Cancel or Reduce of
+// the batch after the key (the taker still sees the order it ends, the replayer's book does
+// not) stops with PBV_E_UNSUPPORTED rather than guess.
 fn exec_rescan(c : *mut Ctx, lo : u64, hi : u64) -> void {
   unsafe {
     let b = (*c).bbo;
@@ -2495,13 +2589,9 @@ fn exec_rescan(c : *mut Ctx, lo : u64, hi : u64) -> void {
     for l in 0i64..(*c).n {
       let pv = *offset_mut((*b).prev, l);
       let cl = *offset_mut((*b).cut, l);
-      let mut found = false;
       for q in (pv + 1u64)..(cl + 1u64) {
         let e = lop(c, l, q);
-        let k = (*e).kind;
-        if k == OP_CANCEL || k == OP_REDUCE { fail_bbo(c, E_UNSUPPORTED); return; }
-        if found || k != OP_JOIN || (*e).tick < lo || (*e).tick > hi { continue; }
-        found = true;
+        if (*e).kind != OP_JOIN || (*e).tick < lo || (*e).tick > hi { continue; }
         if sl == NONE {
           sl = l; sq = q;
         } else {
@@ -2510,21 +2600,68 @@ fn exec_rescan(c : *mut Ctx, lo : u64, hi : u64) -> void {
             || ((*e).ts == (*s).ts && rank(c, l as u64) < rank(c, sl as u64));
           if before { sl = l; sq = q; } else { }
         }
+        break;
       }
     }
-    if sl != NONE {
-      let e = lop(c, sl, sq);
-      let r = (*e).root;
-      let o = bord(c, sl as u64, r);
-      if (*o).state != 1u64 { fail_bbo(c, E_UNSUPPORTED); return; }
-      if best_level(c, 1u64 - (*e).side, (*e).tick) != 0u64 { fail_bbo(c, E_UNSUPPORTED); return; }
-      // RESTED_DONE: the batch taker swept nothing and rests (spec follow-up F10).
-      let open = bopen(c, sl as u64, r);
+    if sl == NONE {
+      exact_bounds(c, max((*b).bb, hi), min((*b).ba, lo));
+      return;
+    }
+    (*b).rc_l = sl as u64; (*b).rc_q = sq; (*b).rc_lo = lo; (*b).rc_hi = hi;
+    for l in 0i64..(*c).n {
+      for q in (*offset_mut((*b).prev, l) + 1u64)..(*offset_mut((*b).cut, l) + 1u64) {
+        let k = (*lop(c, l, q)).kind;
+        if (k == OP_CANCEL || k == OP_REDUCE) && after_key(c, l, q) {
+          fail_bbo(c, E_UNSUPPORTED);
+          return;
+        }
+      }
+    }
+    rescan_run(c, false);
+  }
+}
+
+// Bbo::rescan_finish: runs (or, cont, resumes) the batch taker (rc_l, rc_q) and finishes the
+// step. Capped, it stays in flight (rc_has) and the bounds stay; else they are made exact.
+fn rescan_run(c : *mut Ctx, cont : bool) -> void {
+  unsafe {
+    let b = (*c).bbo;
+    let l = (*b).rc_l;
+    let e = lop(c, l as i64, (*b).rc_q);
+    let r = (*e).root;
+    (*b).rc_has = 0u64;
+    // 0: Open, 1: Capped, 2: Skipped or Killed (no status event).
+    let mut res = 2u64;
+    // Live just after its own key; the replayer's book holds it unless a later op of the batch
+    // ended it, which exec_rescan refused.
+    if (*bord(c, l, r)).state == 1u64 && blive(c, l, r) != 0u64 {
+      let side = 1u64 - (*e).side;
+      let from = if side == 1u64 { min((*b).ba, (*b).rc_lo) } else { max((*b).bb, (*b).rc_hi) };
+      (*b).kv = 1u64;
+      let at = if !cont && ((*e).flags & 8u64) != 0u64 { klevel(c, side, from, (*e).tick) } else { 0u64 };
+      if at != 0u64 {
+        (*b).kv = 0u64;
+        book_drop(c, l, r);
+        end_taker(c, l, e, NONE, EV_REJECT, POST_ONLY_WOULD_CROSS, true, at);
+      } else {
+        res = sweep(c, l, e, NONE, true, from);
+        (*b).kv = 0u64;
+        if (*b).err != 0u64 { return; }
+        if bopen(c, l, r) == 0u64 { book_drop(c, l, r); }
+      }
+    } else { }
+    if res != 2u64 {
+      let open = bopen(c, l, r);
       if open > 0u64 {
-        event(c, sl as u64, EV_RESTED, LIQ_TAKER, RESTED_DONE, (*e).vslot, handle(r), (*e).tick, open);
+        let cause = if res == 1u64 { RESTED_IN_FLIGHT } else { RESTED_DONE };
+        event(c, l, EV_RESTED, LIQ_TAKER, cause, (*e).vslot, handle(r), (*e).tick, open);
       } else { }
     } else { }
-    exact_bounds(c, max((*b).bb, hi), min((*b).ba, lo));
+    if res == 1u64 {
+      (*b).rc_has = 1u64;
+    } else {
+      exact_bounds(c, max((*b).bb, (*b).rc_hi), min((*b).ba, (*b).rc_lo));
+    }
   }
 }
 
@@ -2726,7 +2863,7 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
     }
     let mut capped = false;
     if !ended {
-      let res = sweep(c, l, e, src);
+      let res = sweep(c, l, e, src, false, 0u64);
       if (*b).err != 0u64 { return; }
       if res == 1u64 {
         capped = true;
@@ -2761,6 +2898,8 @@ fn end_taker(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, kind : u64, code : 
     (*o).state = 3u64;
     let h = handle(r);
     event(c, l, kind, LIQ_TAKER, code, (*e).vslot, h, (*e).tick, open);
+    // A batch taker (src NONE) has no TX record: its lane sends it (05 §8.10 rule 4).
+    if src == NONE { return; }
     if reject {
       tx_push(c, src, rec_lo(R_REJECT, (*e).ix, code, detail), rec_hi(0u64, (*e).tag));
     } else {
@@ -2839,7 +2978,8 @@ fn fillable(c : *mut Ctx, l : u64, e : *mut LOp) -> u64 {
 }
 
 // The capped sweep (D14): one level, or ENG_STEP_FILLS fills, per step. 1 = capped, 0 = open.
-fn sweep(c : *mut Ctx, l : u64, e : *mut LOp, src : i64) -> u64 {
+// A batch taker (kb) searches from `from` at its key (bvis) and has no TX record.
+fn sweep(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, kb : bool, from : u64) -> u64 {
   unsafe {
     let b = (*c).bbo;
     let r = (*e).root;
@@ -2850,7 +2990,7 @@ fn sweep(c : *mut Ctx, l : u64, e : *mut LOp, src : i64) -> u64 {
     loop {
       if bopen(c, l, r) == 0u64 { return 0u64; }
       if levels >= 1u64 || work >= STEP_FILLS { return 1u64; }
-      let lvl = touch(c, side, (*e).tick);
+      let lvl = if kb { klevel(c, side, from, (*e).tick) } else { touch(c, side, (*e).tick) };
       if lvl == 0u64 { return 0u64; }
       let mut level_qty = 0u64;
       while work < STEP_FILLS {
@@ -2877,7 +3017,7 @@ fn sweep(c : *mut Ctx, l : u64, e : *mut LOp, src : i64) -> u64 {
       }
       if level_qty > 0u64 {
         event(c, l, EV_FILL, LIQ_TAKER, 0u64, (*e).vslot, h, lvl, level_qty);
-        tx_push(c, src, rec_lo(R_FILL, (*e).ix, LIQ_TAKER, h), rec_hi(lvl, level_qty));
+        if !kb { tx_push(c, src, rec_lo(R_FILL, (*e).ix, LIQ_TAKER, h), rec_hi(lvl, level_qty)); }
       }
       levels = levels + 1u64;
     }
