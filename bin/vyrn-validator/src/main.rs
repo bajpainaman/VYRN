@@ -61,6 +61,7 @@ use vyrn_chain as _;
 use vyrn_data::frame::Fetch;
 use vyrn_nic::TxClass;
 use vyrn_nic::frame::{Endpoint, FrameHdr};
+use vyrn_replica::feed::Gap;
 use vyrn_replica::{BlockInputs, DataErr, DataFeed, DataJoin};
 use vyrn_wire::TxRing;
 
@@ -390,8 +391,9 @@ struct DataRx<const N: usize, R, T> {
     me: Endpoint,
     boxes: Vec<std::net::SocketAddrV4>,
     max_range: u64,
-    /// RANGE fetches not sent yet: at most `FETCH_BURST` go out per poll, the rest wait here.
-    fetches: VecDeque<(FrameHdr, Fetch)>,
+    /// Gaps not fully fetched yet, with the box to ask: at most `FETCH_BURST` RANGE fetches go
+    /// out per poll and a gap's `from` moves past them. One entry per gap, however long.
+    fetches: VecDeque<(FrameHdr, Gap)>,
 }
 
 /// RANGE fetches sent per data poll.
@@ -427,12 +429,27 @@ impl<const N: usize, R: RxRing, T: TxRing> DataRx<N, R, T> {
                     port: to.port(),
                 },
             };
-            self.fetches
-                .extend(g.fetches(self.max_range).map(|q| (hdr, q)));
+            self.fetches.push_back((hdr, g));
         }
-        for (hdr, q) in self.fetches.drain(..self.fetches.len().min(FETCH_BURST)) {
-            if let Ok(n) = frame::build(&hdr, &Fetch::encode(&q), &mut wire) {
-                let _ = self.tx.send(wire.get(..n).unwrap_or(&[]));
+        let mut budget = FETCH_BURST;
+        while budget > 0
+            && let Some((hdr, g)) = self.fetches.front_mut()
+        {
+            let mut done = g.from > g.to;
+            for q in g.fetches(self.max_range).take(budget).collect::<Vec<_>>() {
+                budget -= 1;
+                if let Fetch::Range { to, .. } = q {
+                    match to.checked_add(1) {
+                        Some(next) if next <= g.to => g.from = next,
+                        _ => done = true,
+                    }
+                }
+                if let Ok(n) = frame::build(hdr, &Fetch::encode(&q), &mut wire) {
+                    let _ = self.tx.send(wire.get(..n).unwrap_or(&[]));
+                }
+            }
+            if done {
+                self.fetches.pop_front();
             }
         }
         k
