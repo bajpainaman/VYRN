@@ -1504,8 +1504,11 @@ The packets kept are the lane verdicts `Accepted` and `Shed`.
   first, whose `rx_ts` is within 50 ms of the newest one put.
   - A packet loses its index entry only when its bucket holds more than four live packets, under
     0.1% at the design load. Such a packet is a miss.
-  - The bucket hash is murmur3's `fmix64` of `session << 32 | pkt_seq`. It is not keyed, because
-    only packets that passed the MAC and `pkt_seq` checks reach it.
+  - The bucket hash is murmur3's `fmix64` of `session << 32 | pkt_seq`, not keyed. A packet shed
+    at dequeue (§6.8 test D) is retained without a MAC check, because its `SHED` record is logged
+    and the sequencer holds the only copy a replica can fetch. Such a packet must still name an open
+    session and a `pkt_seq` inside its V5 window, so a sender cannot aim several keys at one bucket.
+    A record joins only the variant its `pkt_hash` names (07 §5.4).
 - **Determinism.** Retention changes no engine state and no output. Replay neither reads it nor
   rebuilds it.
 

@@ -18,8 +18,12 @@
 //! it is the oldest of the four, and a lookup checks the slot's key. A packet can lose its index
 //! entry only when a bucket holds more than 4 live packets: at a mean of ≤ 0.5 per bucket that is
 //! under 0.1% of them (`a_full_ring_finds_almost_every_live_packet`). Such a packet is a miss,
-//! which the other sources cover. The bucket hash is not keyed: only packets that passed the MAC
-//! and the `pkt_seq` check reach it, so a client cannot choose its keys.
+//! which the other sources cover. The bucket hash is not keyed. A packet shed at dequeue (05 §6.8
+//! test D) is retained without a MAC check, because its `SHED` record is logged and the sequencer
+//! is the only source of its bytes. Such a packet still names an open session and a `pkt_seq` in
+//! its V5 window, so a sender picks among a few thousand keys against ≥ 2 × slots buckets and
+//! cannot aim several at one bucket. A record joins only the variant its `pkt_hash` names (07
+//! §5.4), so foreign bytes never enter a block.
 //!
 //! **Window.** A packet is served while its `rx_ts` is within [`REP_SEQ_PKT_RETAIN_NS`] of the
 //! newest `rx_ts` put. Size the slots as peak packet rate × window; fewer slots shorten the
@@ -31,6 +35,8 @@ use vyrn_types::{MAX_REQ_PAYLOAD, Nanos, PktHash, SessionId};
 pub const REP_SEQ_PKT_RETAIN_NS: u64 = 50_000_000;
 
 const WAYS: usize = 4;
+/// The most variants one [`Retain::find`] returns: one bucket's ways.
+pub const MAX_VARIANTS: usize = WAYS;
 
 /// One retained packet: its exact UDP payload and the fields the lane already computed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

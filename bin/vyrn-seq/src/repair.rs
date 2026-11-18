@@ -18,7 +18,8 @@
 //! **Rate** (07 §5.5, 13 §2, DAV-2): each answer takes one token per packet it carries, and a miss
 //! takes one, from a box bucket of `REP_SEQ_DATA_MAX_PPS` = 50k/s. Each packet also takes one
 //! token from its session's bucket of `DAV_SESSION_REPAIR_PPS` = 2,000/s. Each bucket holds 10 ms
-//! of tokens. A request either bucket cannot cover gets no answer and counts `repair_limited`;
+//! of tokens, and at least `MAX_VARIANTS` (4). A request either bucket cannot cover gets no answer
+//! and counts `repair_limited`;
 //! the replica asks again or moves on (07 §5.5).
 
 use std::collections::BTreeMap;
@@ -71,8 +72,9 @@ impl Bucket {
 }
 
 fn cap(rate: u64) -> u64 {
-    // At least one token, so a low rate still serves.
-    BURST_NS.saturating_mul(rate).max(SEC)
+    // At least the largest answer's tokens, so a low rate still serves every key.
+    let most = u64::try_from(vyrn_engine::retain::MAX_VARIANTS).unwrap_or(u64::MAX);
+    BURST_NS.saturating_mul(rate).max(most.saturating_mul(SEC))
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -338,6 +340,13 @@ mod tests {
         assert_eq!(ok, 500);
         assert_eq!(b.stats.limited, 100);
         assert!(b.sessions.is_empty(), "misses create no session bucket");
+        // A rate below MAX_VARIANTS per 10 ms still answers a key with several variants.
+        let mut lo = Server::new(16, vec![R], 100, 100);
+        for t in 0..4 {
+            lo.put(kept(7, 1, 0xA + t));
+        }
+        let reply = lo.serve(R, &key(7, 1), 0).unwrap().to_vec();
+        assert_eq!(decode(&reply).unwrap().n_pkts, 4);
         // Many distinct hit sessions: idle buckets are pruned at the retention's capacity.
         let mut c = Server::new(16, vec![R], 50_000, 2_000);
         for q in 0..200u32 {
