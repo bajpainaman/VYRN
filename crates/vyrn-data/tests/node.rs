@@ -709,3 +709,43 @@ fn the_two_epoch_boundary_keys_copies_by_epoch16() {
     r.node.poll(Nanos(3));
     assert_eq!(r.node.counters().epoch, 4);
 }
+
+/// #183 (a): a redirect the TX queue refuses waits and is sent after the next turn's reap, in
+/// order, behind the earlier ones; past the retry queue's two kind-5 batches it is dropped and
+/// counted. Every redirect is sent once or counted dropped.
+#[test]
+fn redirects_a_full_tx_queue_refuses_are_retried_next_turn_in_order() {
+    let mut r = rig(MemStore::default());
+    let mut c = client_rx(&mut r);
+    r.send(&req(5, 1, &[Msg::Heartbeat], &K), 0);
+    r.node.poll(Nanos(0));
+    let asked: Vec<(SessionId, u32)> = (0..1000).map(|i| (SessionId(5), i)).collect();
+    // No reap between sends: the 512-slot queue fills.
+    r.node.redirect(0, 2, &asked);
+    let k = *r.node.counters();
+    let cap = 2 * frame::MAX_BATCH as u64;
+    assert_eq!(k.redirect_retried, cap, "the retry queue fills");
+    assert!(k.redirect_dropped > 0);
+    assert_eq!(k.redirects + k.redirect_retried + k.redirect_dropped, 1000);
+    let mut got = drain_rx(&mut c);
+    let sent_now = got.len() as u64;
+    assert_eq!(sent_now, k.redirects);
+    r.node.poll(Nanos(1));
+    got.extend(drain_rx(&mut c));
+    let k = *r.node.counters();
+    assert_eq!(
+        k.redirects,
+        sent_now + cap,
+        "every queued one sent after the reap"
+    );
+    let from: Vec<u32> = got
+        .iter()
+        .map(|b| Redirect::open(b, &K).unwrap().resend_from)
+        .collect();
+    let want: Vec<u32> = (0..(sent_now + cap) as u32).collect();
+    assert_eq!(from, want, "in order, the dropped ones the newest");
+    // The queue is empty again: a new redirect goes out at once.
+    r.node.redirect(0, 2, &[(SessionId(5), 7)]);
+    assert_eq!(drain_rx(&mut c).len(), 1);
+    assert_eq!(r.node.counters().redirect_retried, cap);
+}

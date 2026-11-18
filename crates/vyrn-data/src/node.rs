@@ -15,7 +15,7 @@ use vyrn_wire::{RX_BURST, RxPkt, RxRing, TxRing};
 use crate::frame::{Fetch, FetchMsg, MAX_BATCH};
 use crate::ingest::{DataHome, Event, HomeConfig, Reject};
 use crate::redirect::Redirect;
-use crate::serve::{Fanout, Gate, Responder, send_to};
+use crate::serve::{Fanout, Gate, Pending, Responder, send_redirect};
 
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -114,6 +114,11 @@ pub struct Counters {
     pub redirects: u64,
     /// A redirect asked for a session with no known address or key: nothing was sent.
     pub redirect_unknown: u64,
+    /// A redirect a full TX queue or hop ring refused, queued to retry next turn (the refusal
+    /// itself is also counted in `tx_full` or `hop_full`, once per turn it is refused).
+    pub redirect_retried: u64,
+    /// A refused redirect dropped because the retry queue was full.
+    pub redirect_dropped: u64,
 }
 
 impl Counters {
@@ -190,6 +195,7 @@ pub struct DataNode<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> {
     events: Vec<Event>,
     counters: Counters,
     gate: Gate,
+    pending: Pending,
 }
 
 impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
@@ -206,6 +212,7 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
             tx,
             store,
             counters: Counters::default(),
+            pending: Pending::default(),
         }
     }
 
@@ -266,7 +273,11 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
     /// number of packets and fetches handled.
     pub fn poll(&mut self, now: Nanos) -> usize {
         self.tx.reap();
-        let mut work = self.poll_ingest(now);
+        let mut work = 0;
+        if !self.pending.is_empty() {
+            work = self.retry_redirects();
+        }
+        work = work.saturating_add(self.poll_ingest(now));
         work = work.saturating_add(self.poll_fetch(now));
         self.fanout
             .timers(now, &mut self.tx, &mut self.counters, &self.cfg);
@@ -388,21 +399,31 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
     /// heard from is counted in `redirect_unknown`: another live box knows its address.
     pub fn redirect(&mut self, down: u8, to: u8, sessions: &[(SessionId, u32)]) {
         for &(session, resend_from) in sessions {
-            let (Some(dst), Some(key)) = (self.home.source(session), self.home.key(session)) else {
-                bump(&mut self.counters.redirect_unknown);
-                continue;
-            };
             let r = Redirect {
                 down,
                 to,
                 session,
                 resend_from,
             };
-            let b = r.seal(key);
+            // Behind earlier refused ones, so a session's redirects leave in order.
             let (tx, c) = (&mut self.tx, &mut self.counters);
-            if send_to(tx, &mut self.resp.wire, c, self.cfg.me, dst, &b) {
-                bump(&mut self.counters.redirects);
+            let wire = &mut self.resp.wire;
+            if !self.pending.is_empty() || !send_redirect(&self.home, tx, wire, c, self.cfg.me, r) {
+                self.pending.push(r, &mut self.counters);
             }
         }
+    }
+
+    /// The redirects a full TX queue refused on an earlier turn ([`Pending`]).
+    fn retry_redirects(&mut self) -> usize {
+        let (tx, c, wire, me) = (
+            &mut self.tx,
+            &mut self.counters,
+            &mut self.resp.wire,
+            self.cfg.me,
+        );
+        let home = &self.home;
+        self.pending
+            .retry(|r| send_redirect(home, tx, wire, c, me, r))
     }
 }
