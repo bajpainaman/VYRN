@@ -29,10 +29,10 @@
 //! |---|---|
 //! | `seq` | the box exits 0, `records` equals the packets sent, `seal_violations=0`, at least 2 blocks |
 //! | `validators` | each validator reports heights `0..=H` contiguous with the box's `first_step`/`last_step`, every verdict `Valid`, no `FAULT` (R5 for `REP_E_HASHLAG`) |
-//! | `replay` | the tap's `OrderCore` readies the same blocks, holding every packet sent exactly once, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box |
+//! | `replay` | the tap's `OrderCore` readies the same blocks, holding every packet sent exactly once, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box (R1); the tap Nacks its own ORDER holes, at most as many as its socket dropped (R17) |
 //! | `replica-out` | with `--data` every validator replays (`[replay]`) and its `out=<hex>` on each `BLOCK` line equals the tap's output hash of that block; one stopped at `REP_E_HASHLAG` is compared on the blocks it printed (R5); SKIP while no validator replays |
 //! | `finality` | with `--finality` (default 4 validators, a DEV roster as in `bin/vyrn-validator/tests/committee.rs`, `[consensus]` in every validator and the box): while the box still runs, the box's listener (`FINAL height=<h> ... from=<votes\|cert>`) and every validator that did not stop print `FINAL` through the box's last block. A validator's `OUT_OF_ORDER`, `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT` line fails `validators`; `REP_E_HASHLAG` follows R5 and R6. SKIP without it |
-//! | `dropcopy` | with `--dropcopy` (needs `--data` and `--finality`): an observer (`vyrn-validator`, `role = "observer"`, data destination `n + 1`, in the box's order list on both paths (R12) and every validator's `[consensus] observers`) replays every block into its output ring and finalizes from the validators' certificates; `vyrn-dropcopy` serves the ring over Noise, and one client per session logs in to its account's stream. Each stream's served records, without stage markers, equal an in-process `DropCopy` over the tap's `RustReplay` byte for byte, with gapless seqs, and end in a `DC_FINAL`; every record with a `resp_seq` (acks, cancels, outs, taker fills) names a response packet the client received (10 §8.3). It prints a DEV timing of those records after their response packets (R9); SKIP without it |
+//! | `dropcopy` | with `--dropcopy` (needs `--data` and `--finality`): an observer (`vyrn-validator`, `role = "observer"`, data destination `n + 1`, in the box's order list on both paths (R12) and every validator's `[consensus] observers`) replays every block into its output ring and finalizes from the validators' certificates; `vyrn-dropcopy` serves the ring over Noise, and one client per session logs in to its account's stream. Each stream's served records, without stage markers, equal an in-process `DropCopy` over the tap's `RustReplay` byte for byte, with gapless seqs, and end in a `DC_FINAL`; every record with a `resp_seq` (acks, cancels, outs, taker fills) names a response packet the client received (10 §8.3), or one replay produced that R1 counts as lost at the client's socket. It prints a DEV timing of those records after their response packets (R9); SKIP without it |
 //! | `failover` | with `--data-kill` (R13): the home data box is killed mid-run, the validators reach Q `DataDown`s and REDIRECT, the backup admits a sealed one and redirects every session, and every session moves copy 2; SKIP without it |
 //! | `voter-restart` | with `--restart-voter` (R17): the killed victim restarts from its own config and journal without `--fresh` (no `FRESH_JOURNAL` line), and no node reports a `VOTER_FAULT` naming its voter index (unproven: no injected equivocation, R17). `validators`, `replica-out` and `finality` hold it, as `validator-<n−1>r`, to every block and `FINAL` through the end; SKIP without it |
 //! | `voter-kill` | with `--kill-voter` (R16): at half the packets, once it has finalized a height, the last validator is killed; its blocks were the box's, and the box finalizes through the block holding the first packet sent after the victim was reaped (cut after it died), with the `n − 1` left. `finality` then needs the box and every running validator through the last block, with Q of the whole committee; SKIP without it |
@@ -46,7 +46,9 @@
 //!   the shortfall at most `client_sock_drops`, the kernel's receive-drop count for the client's
 //!   socket (`/proc/net/udp`, read before it closes); if that count cannot be read, strict
 //!   equality. The replay line prints `shortfall=` and `client_sock_drops=` side by side. A
-//!   response missing for any other reason, a byte mismatch, or an extra one fails. Why: a
+//!   response missing for any other reason, a byte mismatch, or an extra one fails. `dropcopy` takes the same
+//!   reading: a drop-copy record whose response packet the client never got passes only if that
+//!   response is one of replay's the client is short of. Why: a
 //!   client thread starved on a loaded host drops a contiguous burst at its socket, not
 //!   vyrn-seq (a 300 ms client stall drops 281, and the shortfall is 281). In the loaded
 //!   `--dropcopy` run d-28 the same starvation also stopped validator-0 at `REP_E_HASHLAG`
@@ -204,6 +206,20 @@
 //!   no injected equivocation, so a `VOTER_FAULT` path that never fires would pass it vacuously;
 //!   proving it needs a DEV signing hook in vyrn-validator's voter that signs a second
 //!   `Notarize` for another payload in one view.
+//! - R18. The tap repairs its own ORDER holes, as a path-A replica does (07 §4.9, §4.10): with
+//!   `--finality` (the box's CTRL port) its thread runs `vyrn_replica::Paths` (one path) and
+//!   Nacks each hole with R14's DEV timers and 8 tries. Without it the tap keeps arrival order.
+//!   Why: on a loaded 2-vCPU host the tap's thread, descheduled, overflowed its socket: 2 of 103
+//!   loaded runs failed `replay` with `tap order core: OutOfOrder`, and both times the hole
+//!   (8 and 46 frames) equalled the kernel's receive-drop count for that socket. It was a drop,
+//!   not a reorder. *Ruled (as R1):* the frames only a retransmit delivered (`tap_repaired`)
+//!   may be at most the frames lost to the tap: its socket's kernel drop count (`/proc/net/udp`,
+//!   read before it closes), plus, with `--tap-order-loss N`, the relay's drops and its socket's;
+//!   without that count, none. A hole given up fails. `--tap-order-loss N` relays the tap's order
+//!   socket and drops every N-th datagram, retransmits included; `replay` then also needs the
+//!   relay to have dropped and the tap to have repaired at least one frame. The replay line
+//!   prints `tap_sock_drops=`, `tap_relay_dropped=`, `tap_repaired=`, `tap_nacks=`, `tap_gaps=`
+//!   and `tap_too_old=`.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -402,6 +418,10 @@ struct Cli {
     /// does.
     #[arg(long, value_name = "N")]
     tap_loss: Option<u64>,
+    /// Relay the tap's order socket and drop every N-th datagram the box sends it (R17; needs
+    /// --finality): the tap must Nack its holes, as a replica does.
+    #[arg(long, value_name = "N")]
+    tap_order_loss: Option<u64>,
     /// With --data-kill, print DR4 timing (slowest kill-to-redirect, packets expired at the
     /// dead home) as a DEV figure instead of gating on it (R15: a 2-vCPU host holding 2 000
     /// redirects cannot show the 100 ms bound).
@@ -928,17 +948,91 @@ fn data_tap(
     })
 }
 
-/// The order frames the tap received, until `stop`.
-fn tap(sock: UdpSocket, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<Vec<Vec<u8>>> {
+/// What the tap's order repair did (R17): Nacks sent, holes given up, `NackTooOld`s received,
+/// and frames that only a retransmit delivered.
+#[derive(Default)]
+struct TapRepair {
+    nacks: u64,
+    gaps: u64,
+    too_old: u64,
+    repaired: u64,
+}
+
+/// The order frames the tap received, until `stop`, in `frame_seq` order. With `nack` (the
+/// box's CTRL, and the port the box has for the tap) the tap repairs its holes as a path-A replica does (R17, 07 §4.10); without it
+/// the frames stay in arrival order.
+fn tap(
+    sock: UdpSocket,
+    nack: Option<(SocketAddrV4, u16)>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<(Vec<Vec<u8>>, TapRepair)> {
+    use vyrn_log::frame::{FrameFlags, FrameHeader};
+    use vyrn_log::nack::{Nack, NackTooOld};
+    use vyrn_replica::paths::{Ask, Repair};
     std::thread::spawn(move || {
         let mut frames = Vec::new();
+        let mut st = TapRepair::default();
         let mut buf = [0u8; 65536];
+        let mut paths = nack.map(|_| vyrn_replica::Paths::new(BookId(BOOK), 0, 1).one_path());
+        if paths.is_some() {
+            // Poll the holes often enough for the DEV hole wait.
+            let _ = sock.set_read_timeout(Some(Duration::from_millis(1)));
+        }
+        let timers = Repair {
+            hole_wait_ns: REP_DEV_HOLE_WAIT_US.saturating_mul(1000),
+            retry_ns: REP_DEV_RETRY_US.saturating_mul(1000),
+            tries: 8,
+        };
+        let t0 = Instant::now();
+        let mut asks = Vec::new();
         while !stop.load(Ordering::Acquire) {
-            if let Ok(k) = sock.recv(&mut buf) {
-                frames.push(buf.get(..k).unwrap_or_default().to_vec());
+            let got = sock.recv(&mut buf).ok().and_then(|k| buf.get(..k));
+            let (Some(ps), Some((to, port))) = (paths.as_mut(), nack) else {
+                frames.extend(got.map(<[u8]>::to_vec));
+                continue;
+            };
+            let now = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            if let Some(f) = got {
+                if let Some(t) = NackTooOld::decode(f) {
+                    st.too_old = st.too_old.saturating_add(1);
+                    ps.too_old(t.path, t.epoch16, t.tenure, t.stream, t.oldest_seq);
+                } else {
+                    ps.rx_at(vyrn_replica::Path::A, f, now, &mut |d: &[u8], _| {
+                        let rtx = FrameHeader::parse(d)
+                            .is_ok_and(|(h, _)| h.flags & FrameFlags::RETRANSMIT != 0);
+                        st.repaired = st.repaired.saturating_add(u64::from(rtx));
+                        frames.push(d.to_vec());
+                    });
+                }
+            }
+            asks.clear();
+            ps.poll(now, &timers, false, &mut asks);
+            for a in &asks {
+                match *a {
+                    Ask::Nack {
+                        path,
+                        key,
+                        from,
+                        to: last,
+                    } => {
+                        let n = Nack {
+                            path,
+                            epoch16: key.0,
+                            tenure: key.1,
+                            stream: key.3,
+                            port,
+                            from_seq: from,
+                            to_seq: last,
+                        };
+                        st.nacks = st.nacks.saturating_add(1);
+                        // UDP: a lost Nack is asked again at the next retry.
+                        let _ = sock.send_to(&n.encode(), to);
+                    }
+                    Ask::Gap { .. } => st.gaps = st.gaps.saturating_add(1),
+                }
             }
         }
-        frames
+        (frames, st)
     })
 }
 
@@ -1487,6 +1581,10 @@ fn run(cli: &Cli) -> Result<bool, String> {
     if cli.tap_loss.is_some_and(|n| n < 2) || (cli.tap_loss.is_some() && (!cli.data || cli.keyed)) {
         return Err("--tap-loss needs --data, no --keyed, and N >= 2 (R14)".into());
     }
+    if cli.tap_order_loss.is_some_and(|n| n < 2) || (cli.tap_order_loss.is_some() && !cli.finality)
+    {
+        return Err("--tap-order-loss needs --finality and N >= 2 (R17)".into());
+    }
     if cli.drop_rtx && cli.drop_path_b.is_none() {
         return Err("--drop-rtx needs --drop-path-b".into());
     }
@@ -1795,15 +1893,23 @@ fn run(cli: &Cli) -> Result<bool, String> {
     }
 
     let tap_sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let tap_port = tap_sock.local_addr().map_err(|e| e.to_string())?.port();
     tap_sock
         .set_read_timeout(timeout)
         .map_err(|e| e.to_string())?;
-    order.push(
-        tap_sock
-            .local_addr()
-            .map_err(|e| e.to_string())?
-            .to_string(),
-    );
+    // R17: --tap-order-loss puts a lossy relay in front of the tap's order socket; the box
+    // knows the tap by the relay's address.
+    let tap_order_relay = match cli.tap_order_loss {
+        Some(every) => Some(relay(
+            Arc::new(std::sync::atomic::AtomicU16::new(tap_port)),
+            |n, every, _| n.is_multiple_of(every),
+            every,
+            Arc::clone(&stop_tap),
+        )?),
+        None => None,
+    };
+    let tap_as = tap_order_relay.as_ref().map_or(tap_port, |(a, _)| a.port());
+    order.push(format!("127.0.0.1:{tap_as}"));
     let cl_sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let cl_port = cl_sock.local_addr().map_err(|e| e.to_string())?.port();
     cl_sock
@@ -1835,7 +1941,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .map(|a| a.parse().map_err(|e| format!("lane address {a}: {e}")))
         .collect::<Result<_, String>>()?;
 
-    let tap_h = tap(tap_sock, Arc::clone(&stop_tap));
+    let tap_h = tap(
+        tap_sock,
+        cons.as_ref().map(|c| (c.ctrl, tap_as)),
+        Arc::clone(&stop_tap),
+    );
     let stop_cl = Arc::new(AtomicBool::new(false));
     let (redir_tx, redir_rx) = channel();
     let cl_h = client(
@@ -2229,9 +2339,20 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // Read while the client's socket is still open (it closes with its thread).
     let cl_drops = udp_drops(cl_port);
     let cl_drops_s = cl_drops.map_or_else(|| "n/a".to_owned(), |d| d.to_string());
+    // R17: the frames lost before the tap's thread read them: its socket's drops, and with
+    // --tap-order-loss the relay's socket drops too (the relay's own drops are added below).
+    let tap_drops = udp_drops(tap_port).and_then(|d| match &tap_order_relay {
+        Some((a, _)) => udp_drops(a.port()).map(|r| d.saturating_add(r)),
+        None => Some(d),
+    });
+    let tap_drops_s = tap_drops.map_or_else(|| "n/a".to_owned(), |d| d.to_string());
     stop_tap.store(true, Ordering::Release);
     stop_cl.store(true, Ordering::Release);
-    let frames = tap_h.join().map_err(|_| "tap thread")?;
+    let (frames, tap_rep) = tap_h.join().map_err(|_| "tap thread")?;
+    let tap_order_dropped = match tap_order_relay {
+        Some((_, h)) => Some(h.join().map_err(|_| "tap order relay thread")?),
+        None => None,
+    };
     let mut data_frames = match data_h {
         Some(h) => Some(h.join().map_err(|_| "data tap thread")?),
         None => None,
@@ -2369,6 +2490,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let mut barrier: Option<u64> = None;
     let mut dc_inproc = Vec::new();
     let mut resp_times = Vec::new();
+    let mut resp_lost: Vec<(u32, u32)> = Vec::new();
     rep.check(
         "replay",
         (|| {
@@ -2379,9 +2501,40 @@ fn run(cli: &Cli) -> Result<bool, String> {
             )
             .map_err(|e| e.to_string())?;
             let mut ready = Vec::new();
-            for f in &frames {
-                core.on_frame(f, 0)
-                    .map_err(|e| format!("tap order core: {e:?}"))?;
+            // R17: only frames the tap's own socket dropped may need a retransmit; without
+            // that count, none may.
+            let rep_s = format!(
+                "tap_sock_drops={tap_drops_s} tap_relay_dropped={} tap_repaired={} tap_nacks={} tap_gaps={} tap_too_old={}",
+                tap_order_dropped.map_or_else(|| "n/a".to_owned(), |d| d.to_string()),
+                tap_rep.repaired, tap_rep.nacks, tap_rep.gaps, tap_rep.too_old
+            );
+            let allowed = tap_drops
+                .unwrap_or(0)
+                .saturating_add(tap_order_dropped.unwrap_or(0));
+            if tap_rep.repaired > allowed || tap_rep.gaps > 0 {
+                return Err(format!("tap order repair beyond the frames lost to it: {rep_s}"));
+            }
+            if tap_order_dropped.is_some_and(|d| d == 0 || tap_rep.repaired == 0) {
+                return Err(format!("--tap-order-loss: the relay dropped or the tap repaired nothing: {rep_s}"));
+            }
+            let seq_of = |f: &[u8]| {
+                vyrn_log::FrameHeader::parse(f)
+                    .ok()
+                    .map(|(h, _)| (h.tenure, h.stream, h.frame_seq))
+            };
+            for (i, f) in frames.iter().enumerate() {
+                core.on_frame(f, 0).map_err(|e| {
+                    let got = seq_of(f);
+                    let prev = frames.get(..i).and_then(|p| {
+                        p.iter().rev().filter_map(|g| seq_of(g)).find(|x| {
+                            got.is_some_and(|(t, s, _)| (x.0, x.1) == (t, s))
+                        })
+                    });
+                    format!(
+                        "tap order core: {e:?} at frame {i} of {}: (tenure, stream, frame_seq) {got:?} after {prev:?}, {rep_s}",
+                        frames.len()
+                    )
+                })?;
                 while let Some(b) = core.take_ready() {
                     ready.push(b);
                 }
@@ -2490,6 +2643,12 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     show(&replayed)
                 ));
             }
+            // R1: the responses the client's socket dropped, which `dropcopy` may not find.
+            resp_lost = replayed
+                .iter()
+                .filter(|r| !live.contains(r))
+                .map(|r| (r.0, r.1))
+                .collect();
             let digest = |v: &[Resp]| {
                 let mut b = Vec::new();
                 for (s, q, e, rs) in v {
@@ -2501,7 +2660,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 hex(&vyrn_crypto::hash::hash(&b).0)
             };
             Ok(format!(
-                "{} blocks replayed, {} responses equal (shortfall={shortfall} client_sock_drops={cl_drops_s}), responses digest {}, last output_hash {}",
+                "{} blocks replayed, {} responses equal (shortfall={shortfall} client_sock_drops={cl_drops_s}; {rep_s}), responses digest {}, last output_hash {}",
                 ready.len(),
                 live.len(),
                 digest(&live),
@@ -2775,11 +2934,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 // R14: path B lost one frame and repair filled it: the drop copy is whole.
                 (Ok(true), None) if let Some(d) = pathb_dropped => repaired(n, d, "observer")
                     .and_then(|r| {
-                        dropcopy::check(&dc_got, &resp_times, &dc_inproc)
+                        dropcopy::check(&dc_got, &resp_times, &dc_inproc, &resp_lost)
                             .map(|c| format!("{r}; {c}"))
                     }),
                 (Ok(true), None) if !dc_errs.is_empty() => Err(dc_errs.join("; ")),
-                (Ok(true), None) => dropcopy::check(&dc_got, &resp_times, &dc_inproc),
+                (Ok(true), None) => dropcopy::check(&dc_got, &resp_times, &dc_inproc, &resp_lost),
             }
         }),
         _ => Report::skip("dropcopy", "off (enable with --dropcopy)"),
