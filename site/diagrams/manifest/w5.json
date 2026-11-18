@@ -1,7 +1,7 @@
 [
   {
     "slug": "04-protocol",
-    "asciiIndex": 0,
+    "ascii": "f9f377cff6de",
     "file": "04-protocol-00",
     "width": 1040,
     "height": 680,
@@ -9,7 +9,7 @@
   },
   {
     "slug": "04-protocol",
-    "asciiIndex": 2,
+    "ascii": "7fb1445d5c73",
     "file": "04-protocol-02",
     "width": 1160,
     "height": 620,
@@ -17,7 +17,7 @@
   },
   {
     "slug": "04-protocol",
-    "asciiIndex": 3,
+    "ascii": "59285fa18a0b",
     "file": "04-protocol-03",
     "width": 1160,
     "height": 1070,
@@ -25,7 +25,7 @@
   },
   {
     "slug": "04-protocol",
-    "asciiIndex": 4,
+    "ascii": "12fb8ac2628a",
     "file": "04-protocol-04",
     "width": 1180,
     "height": 820,
@@ -33,7 +33,7 @@
   },
   {
     "slug": "04-protocol",
-    "asciiIndex": 6,
+    "ascii": "4cecdc3f5c17",
     "file": "04-protocol-06",
     "width": 1160,
     "height": 790,
@@ -41,7 +41,7 @@
   },
   {
     "slug": "04-protocol",
-    "asciiIndex": 8,
+    "ascii": "82bde3ad2bc0",
     "file": "04-protocol-08",
     "width": 1180,
     "height": 810,
@@ -49,7 +49,7 @@
   },
   {
     "slug": "04-protocol",
-    "asciiIndex": 9,
+    "ascii": "3250b2afb7e7",
     "file": "04-protocol-09",
     "width": 1160,
     "height": 810,
@@ -57,7 +57,7 @@
   },
   {
     "slug": "04-protocol",
-    "asciiIndex": 11,
+    "ascii": "827754e501e5",
     "file": "04-protocol-11",
     "width": 1190,
     "height": 1110,
@@ -65,7 +65,7 @@
   },
   {
     "slug": "05-engine",
-    "asciiIndex": 0,
+    "ascii": "12c50f7e374b",
     "file": "05-engine-00",
     "width": 1200,
     "height": 890,
@@ -73,7 +73,7 @@
   },
   {
     "slug": "05-engine",
-    "asciiIndex": 23,
+    "ascii": "3db3544988bc",
     "file": "05-engine-23",
     "width": 1160,
     "height": 790,
@@ -81,7 +81,7 @@
   },
   {
     "slug": "05-engine",
-    "asciiIndex": 26,
+    "ascii": "f060f3b03a70",
     "file": "05-engine-26",
     "width": 1120,
     "height": 660,

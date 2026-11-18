@@ -39,13 +39,14 @@ requires ASCII; the drawing never replaces it). Read the Excalidraw skill first:
 
 ## Files you own (write nothing else)
 
-For each diagram, `NN` = its `asciiIndex` from `diagrams/inventory.json`, zero-padded to 2:
+For each diagram, `NN` = its `asciiIndex` from `diagrams/inventory.json` when you draw it, zero-padded to 2
+(the file name only; it is not renamed when the block later moves):
 
 - Source: `/Users/namanbajpai/plankbook/site/diagrams/<slug>-NN.excalidraw`
 - Export: `/Users/namanbajpai/plankbook/site/public/diagrams/<slug>-NN.svg`
 - Preview PNGs only under your own scratch dir: `/tmp/vyrn-diagrams/<your-worker-name>/`
 - Your manifest: `/Users/namanbajpai/plankbook/site/diagrams/manifest/<your-worker-name>.json`, a JSON array of
-  `{ "slug": "<slug>", "asciiIndex": <n>, "file": "<slug>-NN", "width": <viewBox w>, "height": <viewBox h>, "alt": "<2–4 sentence description of what the diagram shows and argues>" }`.
+  `{ "slug": "<slug>", "ascii": "<the block's hash from inventory.json>", "file": "<slug>-NN", "width": <viewBox w>, "height": <viewBox h>, "alt": "<2–4 sentence description of what the diagram shows and argues>" }`.
   Read width and height from the SVG's `viewBox`.
 
 Do not edit the spec, `content/`, any `.tsx`/`.ts`/`.css` file, or another worker's files.
@@ -70,6 +71,7 @@ both from the repository root and commit the result:
 (cd site && node scripts/sync-spec.mjs && node scripts/diagram-inventory.mjs)
 ```
 
-If a block before an existing figure moved, that figure's `asciiIndex` in `diagrams/manifest/*.json` is now
-wrong. Set it to the block's new index in `inventory.json` and keep `file` unchanged. Check the new block is
-the one the figure's `alt` describes, then run `(cd site && pnpm exec vitest run lib/diagrams.test.ts)`.
+A figure is keyed by the `hash` of its block's text (`ascii` in `diagrams/manifest/*.json`), so a block that
+only moves keeps its figure and needs nothing more. If you change the text of a block that has a figure, the
+figure no longer shows and `(cd site && pnpm exec vitest run lib/diagrams.test.ts)` fails. Check the drawing
+still matches the new ASCII (redraw it if not), then set its `ascii` to the block's new `hash`.
