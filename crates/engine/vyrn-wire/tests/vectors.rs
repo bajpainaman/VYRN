@@ -1,5 +1,6 @@
 //! The 04 §11 protocol conformance vectors. `tests/golden/vyrn_proto_vectors.out` is the output of
-//! `python3 -I vyrn_proto_vectors.py`; this test builds the same 20 packets with `vyrn-wire`,
+//! `python3 -I vyrn_proto_vectors.py`; this test builds the same 20 packets with `vyrn-wire`
+//! (V19 is a data-tier `DataRedirect`, 04 §7.6, which `vyrn-data` tests),
 //! compares them byte for byte, parses each back, and repeats the script's checks.
 
 use std::collections::BTreeMap;
@@ -23,7 +24,7 @@ const E: u32 = 1000;
 const E16: u16 = 0x03e8;
 const BOOK: BookId = BookId(1);
 
-/// Vector name ("V1" … "V20") → bytes, from the script's hex dump.
+/// Vector name ("V1" … "V21") → bytes, from the script's hex dump; V19 is left to `vyrn-data`.
 fn golden() -> BTreeMap<String, Vec<u8>> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -55,7 +56,8 @@ fn golden() -> BTreeMap<String, Vec<u8>> {
     for (name, len) in &lens {
         assert_eq!(out[name].len(), *len, "{name} length in the dump");
     }
-    assert_eq!(out.len(), 20);
+    assert_eq!(out.len(), 21);
+    out.remove("V19");
     out
 }
 
@@ -375,7 +377,7 @@ fn built() -> Vec<(&'static str, Pkt)> {
         ("V17", p(vec![busy(0, 6)], a, 7, 6, false)),
         ("V18", r(vec![ioc_buy], a, 6, None, true)),
         (
-            "V19",
+            "V20",
             r(
                 vec![
                     Msg::New {
@@ -392,7 +394,7 @@ fn built() -> Vec<(&'static str, Pkt)> {
                 false,
             ),
         ),
-        ("V20", p(vec![busy(0, 7), busy(1, 7)], a, 9, 7, false)),
+        ("V21", p(vec![busy(0, 7), busy(1, 7)], a, 9, 7, false)),
     ]
 }
 
@@ -455,21 +457,21 @@ fn the_scripts_checks_hold() {
     assert_ne!(v2.tag(), v13.tag());
 
     // A lane BUSY is in stream: it takes the next resp_seq (7 after V15's 6) and echoes the
-    // shed pkt_seq; V20 runs one BUSY per message of V19, its Heartbeat included.
+    // shed pkt_seq; V21 runs one BUSY per message of V20, its Heartbeat included.
     let v17 = Response::parse(&g["V17"]).unwrap();
     assert!(!v17.is_out_of_stream());
     assert_eq!(
         (v17.header().resp_seq.get(), v17.header().echo_pkt.get()),
         (7, 6)
     );
-    let v20 = Response::parse(&g["V20"]).unwrap();
+    let v21 = Response::parse(&g["V21"]).unwrap();
     assert_eq!(
-        (v20.header().resp_seq.get(), v20.header().echo_pkt.get()),
+        (v21.header().resp_seq.get(), v21.header().echo_pkt.get()),
         (9, 7)
     );
     assert_eq!(
-        v20.records().collect::<Result<Vec<_>, _>>().unwrap().len(),
-        usize::from(Request::parse(&g["V19"]).unwrap().header().count)
+        v21.records().collect::<Result<Vec<_>, _>>().unwrap().len(),
+        usize::from(Request::parse(&g["V20"]).unwrap().header().count)
     );
 
     let (v16, v18) = (

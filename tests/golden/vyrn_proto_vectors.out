@@ -117,14 +117,19 @@ V18 req A: resend of V16, same pkt_seq and content, bit0 = 1 (48 B)
   020: 37 e2 a3 17 d7 27 2c 64 00 00 00 00 00 00 00 00
   tag_seq=0x642c27d717a3e237  tag_com=0x0000000000000000
 
-V19 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload) (64 B)
+V19 redir A: DataRedirect data[0] down -> data[1], resend_from 5, tag under K_seq (24 B)
+  000: 44 52 01 00 01 00 00 00 07 30 10 00 05 00 00 00
+  010: 79 96 aa 52 44 74 04 21
+  tag=0x2104744452aa9679
+
+V20 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload) (64 B)
   000: 07 30 10 00 07 00 00 00 02 00 e8 03 01 00 00 00
   010: 01 01 00 00 a5 86 01 00 01 00 00 00 99 99 99 99
   020: 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
   030: fc 00 f4 62 6c 63 16 ae 00 00 00 00 00 00 00 00
   tag_seq=0xae16636c62f400fc  tag_com=0x0000000000000000
 
-V20 resp A: lane shed of V19, BUSY run: one Reject BUSY per message, detail = expected 7 (56 B)
+V21 resp A: lane shed of V20, BUSY run: one Reject BUSY per message, detail = expected 7 (56 B)
   000: 07 30 10 00 09 00 00 00 02 00 e8 03 07 00 00 00
   010: 83 00 18 00 07 00 00 00 00 00 00 00 00 00 00 00
   020: 83 01 18 00 07 00 00 00 00 00 00 00 00 00 00 00
@@ -136,5 +141,6 @@ check OK: V1 with one tag bit flipped fails (bound source: close session)
 check OK: V10 tag_com = SipHash(K_COM, bytes 0..32)
 check OK: V13 tag differs from V2 tag
 check OK: V17 is in stream (resp_seq 7), echo_pkt 6, Reject BUSY 24 at index 0, detail 6 >= 1, tag 0
-check OK: V20 answers every message of V19 (count 2, Heartbeat included) with BUSY, detail 7, tag 0
 check OK: V18 has V16's logical content (D3) and verifies
+check OK: V19 tag = SipHash(K_SEQ, bytes 0..16), not K_OUT
+check OK: V21 answers every message of V20 (count 2, Heartbeat included) with BUSY, detail 7, tag 0

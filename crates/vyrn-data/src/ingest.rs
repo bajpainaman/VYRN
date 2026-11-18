@@ -47,6 +47,8 @@ pub enum Reject {
     Book,
     #[error("no key for the session")]
     UnknownSession,
+    #[error("epoch16 is not one this home serves")]
+    Epoch,
     #[error("bad MAC")]
     BadMac,
     #[error("duplicate")]
@@ -111,11 +113,35 @@ pub enum Event {
     },
 }
 
+/// One epoch's MAC keys. `epoch16` `None` takes every `epoch16`.
+#[derive(Debug)]
+struct Keys {
+    epoch16: Option<u16>,
+    map: BTreeMap<SessionId, [u8; 16]>,
+}
+
+impl Keys {
+    fn serves(&self, epoch16: u16) -> bool {
+        self.epoch16.is_none_or(|e| e == epoch16)
+    }
+}
+
+/// The two-epoch boundary (08 §4.6). A home holds one key table, for every `epoch16`, as 07 §5.4
+/// filters none. From T the new home also holds epoch e + 1's keys ([`DataHome::add_epoch`]);
+/// `epoch16` then picks the table, and a copy of neither epoch is dropped as [`Reject::Epoch`]
+/// before its MAC is checked, so it raises no `DataBadMac` (08 §8.2 F5, P8). After activation,
+/// and at the old home after `EPO_REDIRECT_HOLD_S`, the owner retires epoch e
+/// ([`DataHome::retire_epoch`]). Dedupe windows and the ring span both epochs: sessions and
+/// `pkt_seq` carry over the boundary (04 H8), so a resend under e + 1 of a packet first sent
+/// under e is a D3 variant.
 #[derive(Debug)]
 pub struct DataHome {
     mode: Mode,
     books: Vec<BookId>,
-    keys: BTreeMap<SessionId, [u8; 16]>,
+    /// `None` once its last epoch is retired: then no copy is taken.
+    keys: Option<Keys>,
+    /// Epoch e + 1 during the boundary.
+    next: Option<Keys>,
     dedupe: Dedupe,
     ring: Ring,
 }
@@ -127,8 +153,54 @@ impl DataHome {
             books: cfg.books,
             // Every keyed session gets its window now, so ingest never inserts one.
             dedupe: Dedupe::with_sessions(cfg.keys.keys().copied()),
-            keys: cfg.keys,
+            keys: Some(Keys {
+                epoch16: None,
+                map: cfg.keys,
+            }),
+            next: None,
             ring: Ring::new(cfg.ring_slots, cfg.index_key),
+        }
+    }
+
+    /// From T (08 §4.6): also accept copies with the low 16 bits of `next` under `keys`, its
+    /// `K_seq(next, ·)` or `K_com(next, ·)`. The table held now becomes `current`'s alone; the
+    /// caller names it, since a hold or a planned skip means `next` need not be `current + 1`. A
+    /// table already added is replaced. Cold path: new sessions get their dedupe windows here.
+    pub fn add_epoch(&mut self, current: u32, next: u32, keys: BTreeMap<SessionId, [u8; 16]>) {
+        let e16 = epoch16_of(next);
+        if let Some(k) = &mut self.keys {
+            k.epoch16 = Some(epoch16_of(current));
+        }
+        self.dedupe.add_sessions(keys.keys().copied());
+        self.next = Some(Keys {
+            epoch16: Some(e16),
+            map: keys,
+        });
+    }
+
+    /// Stops accepting copies of `epoch`: after activation at the new home, after
+    /// `EPO_REDIRECT_HOLD_S` at the old one (08 §4.6). Retiring the older table makes the added one
+    /// the only one; retiring the only table leaves the home serving no epoch. Already stored
+    /// copies stay in the ring and age out.
+    pub fn retire_epoch(&mut self, epoch: u32) {
+        let e16 = epoch16_of(epoch);
+        if self.next.as_ref().is_some_and(|k| k.epoch16 == Some(e16)) {
+            self.next = None;
+        } else if self.keys.as_ref().is_some_and(|k| k.serves(e16)) {
+            self.keys = self.next.take();
+        }
+    }
+
+    /// Whether a copy with this `epoch16` reaches the MAC check.
+    pub fn serves(&self, epoch16: u16) -> bool {
+        self.keys_for(epoch16).is_some()
+    }
+
+    fn keys_for(&self, epoch16: u16) -> Option<&BTreeMap<SessionId, [u8; 16]>> {
+        match (&self.next, &self.keys) {
+            (Some(n), _) if n.serves(epoch16) => Some(&n.map),
+            (_, Some(k)) if k.serves(epoch16) => Some(&k.map),
+            _ => None,
         }
     }
 
@@ -141,9 +213,13 @@ impl DataHome {
         self.dedupe.source(session)
     }
 
-    /// `session`'s MAC key (`K_seq` or `K_com`), which also tags its `DataRedirect`.
+    /// `session`'s MAC key (`K_seq` or `K_com`), which also tags its `DataRedirect`: the newest
+    /// epoch's during the boundary, as the client sends under e + 1 from T (04 H2).
     pub fn key(&self, session: SessionId) -> Option<&[u8; 16]> {
-        self.keys.get(&session)
+        self.next
+            .as_ref()
+            .and_then(|n| n.map.get(&session))
+            .or_else(|| self.keys.as_ref().and_then(|k| k.map.get(&session)))
     }
 
     /// Runs 07 §5.2 steps 1–5 on one UDP payload. An event, if any, is written to `event`.
@@ -176,7 +252,11 @@ impl DataHome {
         if !self.books.contains(&book) {
             return Err(Reject::Book);
         }
-        let key = self.keys.get(&session).ok_or(Reject::UnknownSession)?;
+        let key = self
+            .keys_for(h.epoch16.get())
+            .ok_or(Reject::Epoch)?
+            .get(&session)
+            .ok_or(Reject::UnknownSession)?;
         let ok = match self.mode {
             Mode::Base => req.verify_seq(key),
             Mode::Chain => req.verify_com(key),
@@ -250,6 +330,11 @@ pub fn same_logical(a: &[u8], b: &[u8]) -> bool {
     }
     let (a, b) = (signed(a), signed(b));
     a.len() == b.len() && a.get(..9) == b.get(..9) && a.get(12..) == b.get(12..)
+}
+
+/// The low 16 bits of an epoch, as packets carry it (01 §6.1).
+pub fn epoch16_of(epoch: u32) -> u16 {
+    (epoch & 0xFFFF) as u16
 }
 
 /// `PktHash`: the first 8 bytes of the full hash, little-endian (01 §3).

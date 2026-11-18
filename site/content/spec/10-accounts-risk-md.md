@@ -1659,6 +1659,107 @@ Neither is possible after finality (01 §14.19 B).
   stream for the epoch. That hash is a leaf of the statement tree (§10), so a client can prove
   that its drop copy is the one the quorum signed.
 
+### 8.4 Rebuilding the drop copy from replay output
+
+`vyrn-dropcopy` reads the same replay events as `vyrn-md` (11 §1.3): the drop copy is a tap of
+`SinkStream` (§7.9), which hands it every resolved lane op, in its interval's order, and every
+released step with its fill TX records, in TX order. So the streams are a function of the log
+alone, whatever order the lanes' outputs interleave in, and a live engine driving the same
+adapter gives the same bytes. The rules below are readings of §8.1–§8.3, 05 §8.10 and §5; each
+carries its label.
+
+1. **Source.** The drop copy is a `Tap` of `SinkStream`, not a second adapter, and takes its
+   release order (§7.9 item 7). \[Likely\]
+2. **Lane ops.** An `Ack` of a `New` is `DC_ACK`, a `CancelAck` (of a `Cancel` or a `Reduce`)
+   `DC_CANCEL` with `qty` = canceled, a lane `Out` `DC_OUT`. `step` is the op's LaneSeq,
+   `ordinal` its message index, `resp_seq` the lane response packet's. A `Reject` changes no
+   order state and has no record; the client's trading session has it. \[Likely\]
+3. **Canonical stream.** Every record except `DC_FINAL` and `DC_SETTLED` is canonical: those two
+   mark stages of earlier records (§8.2), and their position depends on when the quorum signed,
+   not on the log. The `DC_EOD` hash covers the canonical records only. \[Guessing\]
+4. **Fills.** Maker `Fill` `k` of step `s` (its position among the step's maker `Fill`s in TX
+   order, as `MD_EXEC`'s ordinal, §7.9 item 4) gives the maker's `DC_FILL` and the taker's,
+   both `(s, k)`, at the match's tick and qty. The taker's per-level `Fill` record equals the
+   sum of its `DC_FILL`s at that level. A maker's fee is per fill; the taker's step fee,
+   `ceil(Σ N × taker_ppm / D)` (§5.1), is on its last `DC_FILL` of the step. `resp_seq` is the
+   TX packet's; a TX-core packet without a reservation (makers, continuations) takes its
+   `MakerSeq` number at the fill TX core (05 §8.10 rule 2), which no replay output carries, so
+   its records carry `resp_seq` 0 and reconcile by `(session, step, ordinal)` in place of
+   §8.3's `(session, resp_seq, ordinal)`. \[Guessing\]
+5. **Residuals and outs.** A taker `Ack` is a `DC_ACK` with the source's LaneSeq and `qty` = what
+   rests after its taker fills over the run of `CONT` steps (as §7.9 item 5). A taker `Out`
+   (an IOC's remainder) is a `DC_OUT` with `flags.bit1`, the step's id and the order's limit
+   tick; a maker `Out(STP)` is a `DC_OUT` with the step's id. A `Shed` step's `BUSY` has no
+   record. \[Likely\]
+6. **`DC_EOD`.** Four records per stream at epoch end, `ordinal` 0–3, five LE u64 words at bytes
+   8–47: 0 totals (fills, base bought, base sold, quote bought, quote sold); 1 fees (net fee as
+   i64, message fees, 0, 0, 0); 2 closing balances (quote free, quote reserved, base free, base
+   reserved, 0), summed over a master's accounts; 3 the hash (`n` canonical records before it,
+   then their BLAKE3 hash at bytes 16–47). Message fees are each accepted forwarded `New`'s class
+   fee (§5.3), once, at its first step; joins pay 0 and a shed pays nothing (§3.11). Summed over
+   the account streams, the fees equal the lanes' `fee_acc` (§5.5). A master's balances that
+   do not fit a u64 are an error (`DcError::Overflow`), never clamped. \[Guessing\]
+7. **`DC_FINAL`.** One per final block, after every step up to its last step `s` is released,
+   on every stream holding a canonical record released at a step ≤ `s` that no earlier
+   `DC_FINAL` covers (a lane op is released with the step that closes its interval); `step` =
+   `s`, bytes 24–31 the block's `Height`. Records of a later block that were released before an
+   earlier block became final still get the later block's `DC_FINAL`. \[Likely\]
+8. **Streams.** One per account and one per master. A record goes to its account's stream, to its
+   master's stream, and, for a master's own orders, to both of the master's. Each stream has its
+   own seq, from 1 per epoch. \[Likely\]
+
+Not rebuilt yet: `DC_REVERT` (replay has no revert path yet), `DC_SETTLED`, `DC_ALLOC` and
+`DC_ROUTE` (no replay output carries them; the codec has them), and every case `SinkStream`
+leaves `Unsupported` (§7.9).
+
+### 8.5 Session wire, authentication and subscription
+
+Little-endian, fixed-size frames over the §8.3 transport. \[Guessing\] for every field below:
+§8.3 fixes only TCP, the gapless sequence and the replay window. Not built yet: the Noise or
+TLS 1.3 layer. The login is signed inside the stream, so it carries over unchanged inside either.
+
+```
+Frame (server → client, 64 B)
+  0 1 kind     1 RECORD 2 HEARTBEAT 3 HELLO 4 ACCEPT 5 REJECT 6 END
+  1 1 flags    0
+  2 2 book     BookId
+  4 4 epoch    Epoch of seq
+  8 8 seq      RECORD: its stream seq; HEARTBEAT: the last seq sent; ACCEPT: the first seq
+               that follows; END: the epoch's last seq; else 0
+ 16 48 body    RECORD: the record; HELLO: challenge (32 B); ACCEPT: the stream's newest seq
+               (u64); REJECT: reason (u16); else 0
+
+Login (client → server, 128 B)
+  0 4 magic    "VDC1"          4 1 kind 1      5 1 flags   bit 0: the master stream
+  6 2 book     8 4 account     12 4 epoch      16 8 from   first seq wanted, ≥ 1
+ 24 4 signer   `account` or its master          28 4 0
+ 32 32 challenge, as HELLO sent it
+ 64 64 Ed25519 (ZIP-215 verify) over "vyrn v1 dropcopy login" ‖ bytes 0..64
+```
+
+1. **Authentication.** The server sends `HELLO` with a fresh 32-byte challenge per connection;
+   the client answers with one login signed by the signer's account key. A signature over
+   another challenge is refused, so a captured login cannot be replayed. A connection whose
+   128 login bytes are not all in `DC_LOGIN_TIMEOUT_MS = 5_000` (config) after `HELLO` is
+   dropped, however slowly they trickle in, so an unauthenticated client holds no server
+   resources past it.
+2. **Subscription.** An account reads its own stream; a master reads its master stream and each
+   sub-account's own stream. Nobody else reads a stream (§8: "each account, and each master").
+3. **Checks**, in order, the first failure a `REJECT` that ends the connection: form (1
+   `Malformed`), book (4), signer key and signature (2 `Auth`), rule 2 (3 `Denied`), the stream
+   exists in that epoch (7), the epoch is in the replay window of `MD_DC_REPLAY_EPOCHS` (5), and
+   `1 ≤ from ≤ newest + 1` (6 `Range`).
+4. **Sequencing and gap recovery.** `ACCEPT`, then every record from `from` on, gapless. A
+   previous epoch's stream ends with `END(last seq)` and the current epoch's follows from seq 1.
+   An idle stream sends `HEARTBEAT(last seq sent)` every `DC_HEARTBEAT_MS = 100` (config), so a
+   client sees a gap or a stall at the next frame; it recovers by reconnecting with `from` =
+   its last seq + 1. A record goes out as soon as the store holds it, not at the next
+   heartbeat (§8.2's budget). The server reads nothing after the login: a client that closes is
+   noticed at the next write, at the latest its next heartbeat, and a subscriber that does not
+   drain its stream for `DC_WRITE_TIMEOUT_MS = 1_000` (config) is dropped. A session
+   whose epoch leaves the replay window before it caught up gets `REJECT(5)` and is closed; it
+   rebuilds from the statement (§10).
+
 ## 9. Surveillance
 
 Surveillance runs on observer replicas and archive boxes, from the finalized log. It never runs on
