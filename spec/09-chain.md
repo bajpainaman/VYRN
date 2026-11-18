@@ -718,8 +718,8 @@ delay bound of the model (01 §14.0 fact 3):
 | `tag_com` of the last payload, exclusion list | 0.05 | 20 ns per packet, incremental; keys precomputed (§5.4) |
 | Hops 2–4: proposal, notarize, finalize → `Q_CHAIN` at every voter and at the sequencer | 2.45 | |
 | Vote signature checks | 0.10 | 0.15 under scheme 1 (hybrid, 01 §14.20): the ML-DSA parts run in parallel with the batched Ed25519 parts |
-| **No fault** | **5.31** | was 4.85 with F1 data homes; 5.36 under scheme 1 (+0.05 vote checks; notarize signed from the `RangeFix`, 07 §6.3) |
-| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault; under scheme 1, 8.16 (margin 0.84 ms to the 9.00 ms gate of `FIN_GATE_BLOCKS` = 8, 01 §14.20 D) |
+| **No fault** | **5.31** | was 4.85 with F1 data homes; 6.11 under scheme 1 (+0.05 vote checks, +0.75 because the leader signs its proposal after its `verify`, since the proposal carries `excl_root`; 07 §6.5a) |
+| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault; under scheme 1, 8.91 (margin 0.09 ms to the 9.00 ms gate of `FIN_GATE_BLOCKS` = 8; open question PQ-9, 01 §14.20) |
 | or a data box redirect (07 §5.7, 3 ms in place of 0.71) | **7.60** | |
 | or the sequencer is the fault | 07 failover; its seal must be final ≤ 9 ms after the last frame | |
 
@@ -728,7 +728,7 @@ after h starts, so the margin is 0.89 ms in the worst one-fault case. With the o
 before h + 8 opens, 8.00 ms) the data home outside F1 would leave −0.11 ms and halt the book at
 every leader fault, which is why the count changed. The order is sent ≤ 0.05 ms before its
 `rx_ts` (the client is in F1), and the finality notice reaches it ≤ 0.05 ms after the
-certificate, so **every accepted order is final ≤ 8.21 ms after it is sent, within
+certificate, so **every accepted order is final ≤ 8.21 ms after it is sent (9.01 ms under scheme 1), within
 `FINALITY_MAX_MS` = 10**. The order's `tag_com` verdict, and so whether its fills stand or are
 busted, is part of the same final block. The TESLA schedule adds nothing to this path: members
 derive every `K_com` before its interval (§5.4), and disclosure (§5.10) comes seconds after

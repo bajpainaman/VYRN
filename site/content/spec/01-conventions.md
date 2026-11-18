@@ -817,14 +817,17 @@ and the differential tests of 11 §2.5a pass.
   parallel with the data lag, so it adds nothing to the maximum (07 §6.6). Votes are signed
   speculatively, in parallel with the hops that precede them (07 §6.5a). The leader fixes its
   proposal range before its `verify` and announces it in an Ed25519-signed `RangeFix` (07 §6.3,
-  PQ-8), so voter and leader sign the one notarize the view can carry, and no signature is made
-  after the proposal arrives in the fault-free case. Vote checking costs 0.10 → 0.15 ms (max,
-  budget). Finality: typical 2.59 → 2.69 ms, max with no fault 5.65 → 5.70 ms, max with one fault
-  8.65 → 8.70 ms (reserve 1.30 ms). CHAIN's worst case moves from 8.11 to 8.16 ms from block start
+  PQ-8), so voter and leader sign the one notarize the view can carry, and in BASE no signature is
+  made after the proposal arrives in the fault-free case. `RangeFix` is a hint: no voter rejects a
+  proposal for differing from it, so a forged one costs a late signature, never finality. Vote checking costs 0.10 → 0.15 ms (max,
+  budget). BASE finality: typical 2.59 → 2.69 ms, max with no fault 5.65 → 5.70 ms, max with one fault
+  8.65 → 8.70 ms (reserve 1.30 ms). In CHAIN the proposal also carries `excl_root`, known only
+  after the leader's `verify`, so the leader signs its proposal then and hop 2 starts up to 0.75 ms
+  later (07 §6.5a): CHAIN's worst case moves from 8.11 to 8.91 ms from block start
   (09 §4.8). [Likely: budgets built from the measured figures; the speculative signing depends on
   open question PQ-3]
 - **The finality gate** keeps `FIN_GATE_BLOCKS` = 8: block h is final ≤ 7.70 ms after it closes
-  (BASE spare 0.30 ms; CHAIN 0.84 ms; 07 §6.8, 09 §4.6). [Likely]
+  (BASE spare 0.30 ms; CHAIN 0.09 ms, see PQ-9; 07 §6.8, 09 §4.6). [Likely]
 - **The cost of a fixed range.** A header that reaches the leader after it sent its `RangeFix`
   waits for the next view instead of joining the current proposal. Before PQ-8 the cutoff was the
   leader's `verify` completion, so the window in which that happens grows by at most the leader's
@@ -875,7 +878,7 @@ an epoch boundary.
 |---|---|---|
 | PQ-1 | Is ML-DSA-44 (category 2) enough for live keys? | Yes: live keys use ML-DSA-44; cold keys stay ML-DSA-65 (A). |
 | PQ-2 | Accept `libcrux-ml-dsa` at 0.0.11 with our own cargo-vet audit, or require an independent audit first? | `libcrux-ml-dsa` with VYRN's own audit; `E_pq` waits for that audit and the differential tests of 11 §2.5a. |
-| PQ-8 | Remove the voter's notarize misprediction with a proposal range fixed before the proposal arrives? | Yes: the leader's `RangeFix` (07 §6.3, §6.5a). Maxima 5.70 / 8.70 ms; `FIN_GATE_BLOCKS` stays 8. |
+| PQ-8 | Remove the voter's notarize misprediction with a proposal range fixed before the proposal arrives? | Yes: the leader's `RangeFix` (07 §6.3, §6.5a). BASE maxima 5.70 / 8.70 ms; `FIN_GATE_BLOCKS` stays 8. In CHAIN the leader still signs after `verify` (PQ-9). `RangeFix` is a hint: voters never reject a proposal for differing from it. |
 | — | Codex review of #51: operator identity keys need an ML-DSA-65 transaction scheme | Adopted: `TxEnvelope.scheme` 3 (09 §4.4). |
 | — | Codex review of #51: forged classical evidence after the switch | Adopted: SG7 (09 §8.1 item 2a). |
 
@@ -888,3 +891,4 @@ an epoch boundary.
 | PQ-5 | The L1 bridge: when does governance deploy the post-quantum bridge and raise `PqAlarm`, and is a 10% daily cap on the old bridge acceptable until then? | at the first Ethereum post-quantum verifier VYRN can afford (09 §6.8) | owner, 09 |
 | PQ-6 | Make key agreement hybrid (X25519 + ML-KEM-768) for session keys and the p2p handshake? | not in this change | owner, 04, 09 |
 | PQ-7 | Release keys on hardware tokens (11 §9.5): which token holds an ML-DSA-65 key? | an HSM with ML-DSA support for the ML-DSA half, the current tokens for the Ed25519 half | owner, 11 |
+| PQ-9 | CHAIN under scheme 1 is 8.91 ms from block start in the one-fault case, 0.09 ms inside the 9.00 ms gate, because the leader can sign its proposal only after `verify` gives `excl_root` (07 §6.5a, 09 §4.8). Accept the 0.09 ms margin, raise CHAIN's `FIN_GATE_BLOCKS` to 9 (margin 1.09 ms), give CHAIN validators 4 PQ cores (leader sign ≤ 0.40 ms, margin 0.44 ms), or commit each range's `excl_root` one view later (no added cost, but a bust verdict becomes final one view after its fill)? | accept the margin; B-CHN-3 and B-PQ-2 on CHAIN decide whether to raise the gate | owner, 07, 09 |
