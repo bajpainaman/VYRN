@@ -1171,7 +1171,8 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
 
     /// Item 3 for the pending blocks, in height order: a block whose payloads are all joined
     /// passes or contradicts; a missing payload waits. While the front block misses one, every
-    /// payload the pending blocks miss (up to `fetch::FETCH_KEYS_MAX`) is fetched by key once it
+    /// payload the pending blocks miss (up to `fetch::FETCH_KEYS_MAX`, from the front, a round at
+    /// most every `fetch::ROUND_NS`) is fetched by key once it
     /// has been missing `REP_DATA_WAIT_US`, from each of 07 §5.5's sources in turn, each key on
     /// its own timer (`fetch.rs`, reading (j)), so a lost RANGE request or reply, or a data box
     /// that lacks a burst, does not stall the queue.
@@ -1217,8 +1218,10 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                         // Every key the pending blocks miss escalates at once (07 §5.5, `fetch.rs`
                         // reading (j)), so a burst lost at the data box reaches source 3 while
                         // the sequencer still retains it.
+                        if !self.sources.begin_round(now) {
+                            return;
+                        }
                         let join = Self::join(&mut self.join, &mut self.replay);
-                        self.sources.begin_round();
                         let missing = self
                             .pending
                             .iter()

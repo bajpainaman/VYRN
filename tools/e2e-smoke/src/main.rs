@@ -420,7 +420,7 @@ struct Cli {
     #[arg(long)]
     dropcopy: bool,
     /// Skip copy 2 of N consecutive packets from the middle of the run (R19; needs --data, not
-    /// --data-kill): the data box never holds them, as when its socket overflows, so every
+    /// --data-kill or --keyed): the data box never holds them, as when its socket overflows, so every
     /// replica must fetch them from the sequencer's retention (07 §5.5 source 3).
     #[arg(long, value_name = "N")]
     copy2_gap: Option<usize>,
@@ -1688,9 +1688,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
         return Err("--tap-order-loss needs --finality and N >= 2 (R18)".into());
     }
     if cli.copy2_gap.is_some_and(|n| n == 0)
-        || (cli.copy2_gap.is_some() && (!cli.data || cli.data_kill))
+        || (cli.copy2_gap.is_some() && (!cli.data || cli.data_kill || cli.keyed))
     {
-        return Err("--copy2-gap needs --data, no --data-kill, and N >= 1 (R19)".into());
+        // --keyed: the tap cannot ask the keyed sequencer (R8), so it could not replay the gap
+        // (Codex r4617948341, Vercel r4617946688).
+        return Err("--copy2-gap needs --data, no --data-kill or --keyed, and N >= 1 (R19)".into());
     }
     if cli.drop_rtx && cli.drop_path_b.is_none() {
         return Err("--drop-rtx needs --drop-path-b".into());

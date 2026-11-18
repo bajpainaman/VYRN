@@ -1222,7 +1222,8 @@ unresolved 300 µs after its ORDER frame is fetched from source 1, and each furt
 its payload moves to the next source (2, then 3, then 1 again), skipping any source the replica
 has not configured. Source 2's peer turns round-robin across fetches. **Every unresolved record
 escalates on its own (reading, `vyrn-validator`):** a replica asks for all of them at once, at most
-1,024 keys per round, not for one key after another. Source 3 holds a packet only
+128 keys per round from the front block on and a round at most every 100 µs, not for one key
+after another. Source 3 holds a packet only
 `REP_SEQ_PKT_RETAIN_MS` after the newest one it took, so a burst lost at the data box (a socket
 overflow) that is walked one key at a time, at up to 3 × 300 µs a key, outlives that window: 89
 lost packets stalled every replica on `Missing` for good.

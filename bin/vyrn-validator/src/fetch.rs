@@ -9,7 +9,8 @@
 //! burst of lost packets reaches source 3 within one escalation, not one after another: the
 //! sequencer retains a packet only `REP_SEQ_PKT_RETAIN_MS` = 50 ms (07 §5.5, reading (j)).
 //! A round ([`Sources::begin_round`], [`Sources::end_round`]) asks at most [`FETCH_KEYS_MAX`]
-//! keys and forgets the keys it no longer names.
+//! keys, from the front block on, forgets the keys it no longer names, and runs at most every
+//! [`ROUND_NS`].
 //!
 //! **`PeerDataFetch`** (reading (a), accepted). The request is the same KEY fetch as `DataFetch`
 //! and `SeqDataReq`. A replica answers on its data port, so `[[data.peer]]` lists the peers'
@@ -55,8 +56,12 @@ pub const PEER_KEEP: usize = 16_384;
 /// `REP_SEQ_DATA_MAX_PPS`, reused as each replica's peer-serving rate (reading (d)).
 const PEER_MAX_PPS: u64 = 50_000;
 const BURST_NS: u64 = 10_000_000;
-/// Missing keys one round of [`Sources`] escalates at once (reading (j)).
-pub const FETCH_KEYS_MAX: usize = 1024;
+/// Missing keys one round of [`Sources`] escalates at once (reading (j)): a burst this size
+/// reaches source 3 in one escalation, a longer one in turns of this many.
+pub const FETCH_KEYS_MAX: usize = 128;
+/// The least time between two rounds, so a replica far behind (catching up from a restart) does
+/// not rescan its pending blocks on every poll.
+pub const ROUND_NS: u64 = 100_000;
 const SEC: u64 = 1_000_000_000;
 
 /// Fetches sent and served, printed at exit as `FETCH box=<n> peer=<n> seq=<n>
@@ -87,16 +92,30 @@ enum Stage {
     Seq,
 }
 
+/// One missing key's escalation.
+#[derive(Clone, Copy, Debug)]
+struct Esc {
+    /// The stage asked last (`None`: not asked yet), and since when.
+    last: Option<Stage>,
+    at: u64,
+    /// The round that last named it.
+    round: u64,
+    /// Its own peer cursor, so each key turns through every peer whatever the other keys do
+    /// (Vercel r4617946666).
+    peer: usize,
+}
+
 /// The fetch sources and the escalation of each missing key the pending blocks wait for.
 pub struct Sources {
     boxes: Vec<Target>,
     peers: Vec<Target>,
     seq: Option<Target>,
     next_peer: usize,
-    /// Per missing key: the stage asked last (`None`: not asked yet), since when, and the round
-    /// that last named it.
-    missing: BTreeMap<(SessionId, u32), (Option<Stage>, u64, u64)>,
+    /// Per missing key, its escalation.
+    missing: BTreeMap<(SessionId, u32), Esc>,
     round: u64,
+    /// When the last round began (`None`: none yet).
+    round_at: Option<u64>,
     pub counts: Counts,
 }
 
@@ -109,6 +128,7 @@ impl Sources {
             next_peer: 0,
             missing: BTreeMap::new(),
             round: 0,
+            round_at: None,
             counts: Counts::default(),
         }
     }
@@ -144,15 +164,24 @@ impl Sources {
         }
     }
 
-    /// Starts a round of [`Sources::due`] calls.
-    pub fn begin_round(&mut self) {
+    /// Starts a round of [`Sources::due`] calls at `now`, unless one began less than
+    /// [`ROUND_NS`] ago: then `false`, and the caller skips this round.
+    pub fn begin_round(&mut self, now: u64) -> bool {
+        if self
+            .round_at
+            .is_some_and(|t| now.saturating_sub(t) < ROUND_NS)
+        {
+            return false;
+        }
+        self.round_at = Some(now);
         self.round = self.round.wrapping_add(1);
+        true
     }
 
     /// Ends a round: keys it did not name (joined, or released) are forgotten.
     pub fn end_round(&mut self) {
         let r = self.round;
-        self.missing.retain(|_, x| x.2 == r);
+        self.missing.retain(|_, x| x.round == r);
     }
 
     /// A pending block misses `(session, pkt_seq)` at `now`: the targets to KEY-fetch it from
@@ -160,16 +189,23 @@ impl Sources {
     pub fn due(&mut self, session: SessionId, pkt_seq: u32, now: u64) -> Vec<Target> {
         let key = (session, pkt_seq);
         let round = self.round;
-        let (last, at) = match self.missing.get_mut(&key) {
-            Some(x) => {
-                x.2 = round;
-                (x.0, x.1)
-            }
-            None => {
-                self.missing.insert(key, (None, now, round));
-                return Vec::new();
-            }
+        let Some(x) = self.missing.get_mut(&key) else {
+            // A new key's peer turns start where the last new key's left off.
+            let peer = self.next_peer;
+            self.next_peer = self.next_peer.wrapping_add(1);
+            self.missing.insert(
+                key,
+                Esc {
+                    last: None,
+                    at: now,
+                    round,
+                    peer,
+                },
+            );
+            return Vec::new();
         };
+        x.round = round;
+        let (last, at) = (x.last, x.at);
         if now.saturating_sub(at) < REP_DATA_WAIT_NS {
             return Vec::new();
         }
@@ -186,7 +222,11 @@ impl Sources {
         else {
             return Vec::new();
         };
-        self.missing.insert(key, (Some(stage), now, round));
+        let Some(x) = self.missing.get_mut(&key) else {
+            return Vec::new();
+        };
+        x.last = Some(stage);
+        x.at = now;
         match stage {
             Stage::Boxes => {
                 self.counts.boxes = self.counts.boxes.saturating_add(1);
@@ -194,8 +234,8 @@ impl Sources {
             }
             Stage::Peer => {
                 self.counts.peer = self.counts.peer.saturating_add(1);
-                let i = self.next_peer % self.peers.len().max(1);
-                self.next_peer = i.saturating_add(1);
+                let i = x.peer % self.peers.len().max(1);
+                x.peer = i.saturating_add(1);
                 self.peers.get(i).copied().into_iter().collect()
             }
             Stage::Seq => {
@@ -440,10 +480,10 @@ mod tests {
             "then back to the boxes"
         );
         assert_eq!(s.due(k, 1, 5 * w), vec![t(12)], "the next peer");
-        // Another key starts over, and the peer cursor keeps turning.
+        // Another key starts over, its peer turns one past the last new key's.
         assert!(s.due(k, 2, 5 * w).is_empty());
         assert_eq!(s.due(k, 2, 6 * w), vec![t(1), t(2)]);
-        assert_eq!(s.due(k, 2, 7 * w), vec![t(11)]);
+        assert_eq!(s.due(k, 2, 7 * w), vec![t(12)]);
         assert_eq!((s.counts.boxes, s.counts.peer, s.counts.seq), (3, 3, 1));
         // Unconfigured sources are skipped.
         let mut s = Sources::new(Vec::new(), Vec::new(), Some(t(21)));
@@ -462,7 +502,7 @@ mod tests {
         let mut s = Sources::new(vec![t(1)], vec![t(11)], Some(t(21)));
         let (k, w) = (SessionId(5), REP_DATA_WAIT_NS);
         let round = |s: &mut Sources, keys: &[u32], now: u64| {
-            s.begin_round();
+            assert!(s.begin_round(now));
             let out: Vec<Vec<Target>> = keys.iter().map(|&q| s.due(k, q, now)).collect();
             s.end_round();
             out
@@ -473,8 +513,27 @@ mod tests {
         // Key 2 joined: it drops out; 1 and 3 reach the sequencer at the same time.
         assert_eq!(round(&mut s, &[1, 3], 3 * w), vec![vec![t(21)]; 2]);
         // Key 2 missing again starts over.
-        assert_eq!(round(&mut s, &[2], 3 * w), vec![vec![]]);
+        assert_eq!(round(&mut s, &[2], 4 * w), vec![vec![]]);
         assert_eq!(s.missing.len(), 1);
+        // Two keys with two peers: each still turns through both peers (Vercel r4617946666).
+        let mut s = Sources::new(Vec::new(), vec![t(11), t(12)], None);
+        let mut got: [Vec<Target>; 2] = [Vec::new(), Vec::new()];
+        for c in 0..5u64 {
+            assert!(s.begin_round(c * w));
+            for (q, g) in (1u32..).zip(got.iter_mut()) {
+                g.extend(s.due(k, q, c * w));
+            }
+            s.end_round();
+        }
+        for g in &got {
+            assert!(g.contains(&t(11)) && g.contains(&t(12)), "{g:?}");
+        }
+        let mut s = Sources::new(vec![t(1)], vec![t(11)], Some(t(21)));
+        assert!(s.begin_round(4 * w));
+        s.end_round();
+        // Rounds are at least ROUND_NS apart.
+        assert!(!s.begin_round(4 * w + ROUND_NS - 1));
+        assert!(s.begin_round(4 * w + ROUND_NS));
     }
 
     /// A keyed target gets the 40-byte form that opens under its key; an unkeyed one the 32.
