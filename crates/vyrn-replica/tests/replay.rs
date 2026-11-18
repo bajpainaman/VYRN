@@ -208,8 +208,19 @@ fn frames_on(layout: Layout, j: &Journal, store: &Store, cuts: &[usize]) -> Vec<
     let mut out = Vec::new();
     let mut cut = vec![LaneSeq(0); N];
     let mut pending = false;
-    // Each Control step carries the command the control role queued for it (07 §3.8).
-    let mut cmds = j.cmds.iter();
+    // Each Control step carries the command the control role queued for it, and the Uncross
+    // step that opens an uncross its p* and Q (07 §3.8). An uncross's chunks are separated
+    // only by Idle steps, so an Uncross step opens one unless the last other step was Uncross.
+    use vyrn_bbo::ControlCmd;
+    let mut cmds = j
+        .cmds
+        .iter()
+        .filter(|c| matches!(c, ControlCmd::Phase { .. } | ControlCmd::Band { .. }));
+    let mut uncs = j.cmds.iter().filter_map(|c| match *c {
+        ControlCmd::Uncross { price, qty } => Some((price, qty)),
+        _ => None,
+    });
+    let mut last = StepKind::Idle;
     for (i, r) in j.recs.iter().enumerate() {
         match r {
             OwnedRec::Packet(p) => {
@@ -236,6 +247,13 @@ fn frames_on(layout: Layout, j: &Journal, store: &Store, cuts: &[usize]) -> Vec<
                 if kind == StepKind::Control {
                     let c = cmds.next().expect("a Control step without a command");
                     payload.extend_from_slice(&vyrn_engine::control_payload(c).unwrap());
+                }
+                if kind == StepKind::Uncross && last != StepKind::Uncross {
+                    let (p, q) = uncs.next().expect("an Uncross step without a command");
+                    payload.extend_from_slice(&vyrn_engine::uncross_payload(p, q));
+                }
+                if !matches!(kind, StepKind::Idle | StepKind::Depletion) {
+                    last = kind;
                 }
                 let src = (e.src_lane_seq.0 != 0).then_some((e.src_lane, e.src_lane_seq));
                 let flags = if src.is_some() && e.flags & vyrn_bbo::STEP_CROSS != 0 {
@@ -1223,6 +1241,274 @@ fn the_vx_client_replays_control_steps() {
     let (_, rust_hashes) = replay(&live_j, &store, &all).unwrap();
     let vx = vx_replay(&store, &all, &lib).unwrap();
     assert_eq!(vec![vx[0].2], rust_hashes);
+}
+
+/// An auction (05 §8.8) through Control and Uncross steps, then a Seal (08). Four sells of 1 at
+/// 103, 104, 104 (an auction-only one) and 105, four buys of 1 at 107, 106, 106 and 105; the
+/// control role uncrosses Q = 4 at p* = 105, which takes two chunks of at most
+/// `ENG_UNCROSS_CHUNK` = 6 fills. `extra` adds a resting sell at 105 that the uncross leaves.
+fn auction_script(extra: bool) -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::{AuctionOnly, Day};
+    use vyrn_bbo::{ControlCmd, Phase};
+    let phase = |phase, lo, hi| {
+        Act::Cmd(ControlCmd::Phase {
+            phase,
+            lo: vyrn_types::Tick(lo),
+            hi: vyrn_types::Tick(hi),
+        })
+    };
+    let p = |l, a, t: u64, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs,
+    };
+    let mut s = vec![
+        phase(Phase::Auction, 0, 0),
+        Act::Run,
+        p(
+            0,
+            1,
+            1_000,
+            vec![new(Sell, Day, 103, 1, 1), new(Sell, Day, 105, 1, 2)],
+        ),
+        p(
+            1,
+            1,
+            1_100,
+            vec![new(Buy, Day, 107, 1, 3), new(Buy, Day, 106, 1, 4)],
+        ),
+        p(
+            2,
+            1,
+            1_200,
+            vec![new(Sell, Day, 104, 1, 5), new(Sell, AuctionOnly, 104, 1, 6)],
+        ),
+        p(
+            2,
+            2,
+            1_300,
+            vec![new(Buy, Day, 106, 1, 7), new(Buy, Day, 105, 1, 8)],
+        ),
+    ];
+    if extra {
+        s.push(p(1, 2, 1_400, vec![new(Sell, Day, 105, 3, 9)]));
+    }
+    s.extend([
+        Act::Run,
+        Act::Poll,
+        phase(Phase::Frozen, 1, TICK_MAX),
+        Act::Run,
+        Act::Cmd(ControlCmd::Uncross {
+            price: vyrn_types::Tick(105),
+            qty: 4,
+        }),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(0, 1, 5_000, vec![new(Buy, Day, 101, 1, 10)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        Act::Cmd(ControlCmd::Seal),
+        Act::Run,
+    ]);
+    s
+}
+
+/// M3 for 1b: Uncross and Seal steps on the Vx client match `RustReplay` byte for byte at every
+/// block split. Each fill is p* to the orders at p* or better in price-time order, as the
+/// oracle's `allocate` gives it (`vyrn-vx-oracle`).
+#[test]
+fn the_vx_client_replays_an_uncross_and_a_seal() {
+    for extra in [false, true] {
+        let (live_j, store, blocks) = blocks_of(&auction_script(extra), &[]);
+        let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+        check_same(&live_j, &rep);
+        let kinds: Vec<_> = blocks[0].steps.iter().map(|m| m.rec.kind).collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == StepKind::Uncross).count(),
+            2,
+            "two chunks: {kinds:?}"
+        );
+        assert_eq!(kinds.last(), Some(&StepKind::Seal), "{kinds:?}");
+        // The oracle's allocation, by hand: (lane, client tag of the order, qty), all at 105.
+        let mut fills: Vec<(u8, u32)> = live_j
+            .resp
+            .iter()
+            .flat_map(|(l, p)| p.records().iter().map(move |r| (l.0, *r)))
+            .filter_map(|(l, r)| match r {
+                vyrn_bbo::Record::Fill { liq, tick, qty, .. } if liq == vyrn_bbo::LIQ_AUCTION => {
+                    assert_eq!((tick.0, qty.0), (105, 1));
+                    Some((l, 0))
+                }
+                _ => None,
+            })
+            .collect();
+        fills.sort_unstable();
+        assert_eq!(
+            fills,
+            vec![
+                (0, 0),
+                (0, 0),
+                (1, 0),
+                (1, 0),
+                (2, 0),
+                (2, 0),
+                (2, 0),
+                (2, 0)
+            ],
+            "buys 107 and 106 on lane 1, 106 and 105 on lane 2; sells 103 and 105 on lane 0, \
+             104 and the auction-only 104 on lane 2"
+        );
+        let (j, _) = live07(&auction_script(extra));
+        assert_vx_matches(&auction_script(extra), 0..j.recs.len() - 1);
+    }
+}
+
+/// A Rescan whose exact bounds change a later decision (found by a search over small
+/// Continuous scripts): a crossing envelope makes the step a Rescan, and the bounds it makes
+/// exact, `(max(B, band_hi), min(A, band_lo))`, are what the next packets classify and are
+/// band-checked against. A client that kept (B, A) through the Rescan diverges here.
+fn rescan_bounds_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::{Day, Ioc};
+    let p = |l, a, t: u64, m| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs: vec![m],
+    };
+    vec![
+        p(2, 2, 1_000, new(Buy, Day, 105, 1, 1)),
+        p(0, 1, 2_000, cancel(Handle::new(1, 1).unwrap(), 2)),
+        p(2, 2, 3_000, new(Buy, Ioc, 100, 2, 3)),
+        p(0, 1, 4_000, new(Buy, Day, 101, 1, 4)),
+        p(2, 1, 5_000, cancel(Handle::new(2, 1).unwrap(), 5)),
+        p(2, 1, 6_000, new(Sell, Day, 104, 2, 6)),
+        p(0, 1, 7_000, new(Sell, Ioc, 303, 2, 7)),
+        Act::Run,
+        Act::Poll,
+        p(0, 3, 8_000, new(Buy, Day, 104, 1, 8)),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+    ]
+}
+
+#[test]
+fn the_vx_client_makes_the_bounds_exact_after_a_rescan() {
+    let (live_j, store, blocks) = blocks_of(&rescan_bounds_script(), &[]);
+    let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    assert!(
+        blocks[0]
+            .steps
+            .iter()
+            .any(|m| m.rec.kind == StepKind::Rescan),
+        "the script reaches a Rescan"
+    );
+    let (j, _) = live07(&rescan_bounds_script());
+    assert_vx_matches(&rescan_bounds_script(), 0..j.recs.len() - 1);
+}
+
+/// An auction, a resume and Continuous packets whose first step after the resume is a Rescan:
+/// lane 0's ops in its cut may hold a version of the auction, so the envelope is suspect (found
+/// by a search over small scripts).
+fn flag_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::{Day, Ioc};
+    use vyrn_bbo::{ControlCmd, Phase};
+    let phase = |phase| {
+        Act::Cmd(ControlCmd::Phase {
+            phase,
+            lo: vyrn_types::Tick(0),
+            hi: vyrn_types::Tick(0),
+        })
+    };
+    let p = |l, a, t: u64, m| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs: vec![m],
+    };
+    vec![
+        p(0, 2, 1_000, new(Buy, Ioc, 104, 2, 1)),
+        p(2, 2, 2_000, new(Sell, Day, 102, 1, 2)),
+        Act::Run,
+        phase(Phase::Auction),
+        Act::Run,
+        phase(Phase::Continuous),
+        Act::Run,
+        p(0, 2, 3_000, new(Sell, Day, 223, 2, 3)),
+        Act::Poll,
+        Act::Run,
+        p(0, 2, 4_000, new(Buy, Day, 242, 1, 4)),
+        p(0, 1, 5_000, new(Sell, Day, 103, 2, 5)),
+        p(0, 3, 6_000, new(Buy, Day, 263, 1, 6)),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+    ]
+}
+
+/// Both engines over `blocks` with no response log: `RustReplay`'s output hashes and the Vx
+/// client's.
+fn unchecked_hashes(
+    store: &Store,
+    blocks: &[BlockInputs<N>],
+    lib: &std::path::Path,
+) -> (Vec<Hash>, Vec<Hash>) {
+    let mut data = DataJoin::default();
+    for ((_, s, q, _), b) in &store.0 {
+        data.put(*s, *q, b.clone());
+    }
+    let (bbo, mut sh) = new_box();
+    let mut rep = RustReplay::new(
+        engine(bbo, &mut sh),
+        data,
+        vyrn_engine::NoResponses,
+        Journal::default(),
+    );
+    let rust = blocks
+        .iter()
+        .map(|b| rep.replay_block(b).unwrap().output_hash)
+        .collect();
+    let vx = vx_replay(store, blocks, lib)
+        .unwrap()
+        .iter()
+        .map(|x| x.2)
+        .collect();
+    (rust, vx)
+}
+
+/// The not-Continuous flag of a snapshot version (05 §8.6, `Bbo::envelope`). In a live log it
+/// never changes a decision the client makes: an envelope over a flagged version is suspect, so
+/// live always takes a Rescan there, and replay reads the kind from the record. So the case is
+/// a forged log replayed by both engines without a response log: [`flag_script`]'s Rescan
+/// rewritten as an Idle step. Over the suspect envelope `RustReplay` widens (B, A) to
+/// (tick_max, 0), which changes the outputs; a client without the flag widens over the
+/// Continuous versions only and diverges from it.
+#[test]
+fn the_vx_client_treats_a_non_continuous_version_as_suspect() {
+    let (live_j, store, mut blocks) = blocks_of(&flag_script(), &[]);
+    let (rep, live_h) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let Some(lib) = vx_lib() else { return };
+    let r = blocks[0]
+        .steps
+        .iter_mut()
+        .find(|m| m.rec.kind == StepKind::Rescan)
+        .unwrap();
+    r.rec.kind = StepKind::Idle;
+    r.payload.clear();
+    let (rust, vx) = unchecked_hashes(&store, &blocks, &lib);
+    assert_ne!(rust, live_h, "the forged step changes the outputs");
+    assert_eq!(vx, rust);
 }
 
 /// `snap_lag` (05 §6.5, 07 §7.1) on the Vx client: each packet is classified against the

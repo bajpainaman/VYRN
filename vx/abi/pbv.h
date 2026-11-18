@@ -222,9 +222,10 @@ typedef struct pbv_ctx pbv_ctx;
 
 /* v1 subset: New (Day, IOC, FOK, post-only), Cancel, Reduce, Heartbeat and ResendReq (no
  * LaneSeq, no response); SHED records (from the record alone, no payload, 05 §18 Q17); Cross, Improve, Shed,
- * Idle, Depletion and Control steps (Phase and Band, 07 §3.8; PBV_ABI_VERSION 4). Replace,
- * CancelAll, an STP that would trigger, in-packet dependencies, Rescan, Seal and Uncross steps
- * and snapshot/state bytes stop with PBV_E_UNSUPPORTED; a malformed step payload is
+ * Idle, Depletion, Control (Phase and Band, 07 §3.8; PBV_ABI_VERSION 4), non-trading Rescan,
+ * Uncross and Seal steps. Replace, CancelAll, an STP that would trigger, in-packet
+ * dependencies, a trading Rescan batch taker and snapshot/state bytes stop with
+ * PBV_E_UNSUPPORTED; a malformed step payload is
  * PBV_E_BAD_RECORD. */
 
 uint32_t pbv_abi_version(void);
