@@ -29,7 +29,9 @@
 //! lanes' write-once arena fields and this core's own state, except the deadline test of
 //! [`admit`], which reads the clock and whose result is logged as a `Shed` step (01 §14.1).
 //! The cut, source and kind of every step are in its [`StepEntry`], so replay never repeats a
-//! choice (05 §10).
+//! choice (05 §10): [`Bbo::replay_step`] executes a [`ReplayStep`] (built with
+//! [`ReplayStep::from_log`]) with the logged cut, source, kind, `CONT` flag and `Rescan` band,
+//! reads no clock, and refuses a record that cannot come next ([`Diverge`]).
 //!
 //! **Rejects and outcomes this core decides** (05 §2.3–§2.5, §8.5): `BOOK_HALTED` (P1),
 //! `AUCTION_PHASE` (Frozen), `TOO_LATE` (a `Replace` or dependency `Cancel` whose order had no
@@ -60,7 +62,7 @@ pub mod mem;
 mod out;
 mod view;
 
-pub use bbo::{Bbo, Config};
+pub use bbo::{Bbo, Config, Diverge, ReplayStep};
 pub use codec::{
     ControlCmd, CutDelta, DEP_CANCEL, DEP_ENDED, DEP_JOIN, FillEvent, FillKind, FwdDep, FwdEntry,
     INDEX_MAKER, LIQ_AUCTION, LIQ_MAKER, LIQ_TAKER, MAX_RECORDS, MSG_NEW, MSG_REPLACE, OUT_AUCTION,

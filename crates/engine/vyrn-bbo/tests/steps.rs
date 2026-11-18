@@ -208,6 +208,29 @@ fn shed_at_deadline_plus_one_not_at_deadline() {
 }
 
 #[test]
+fn never_late_is_on_time_for_every_deadline() {
+    // Replay's clock: no op is late. A fixed `now = 0` would be late for 2^31 < deadline (0 −
+    // deadline wraps into 1..2^31 − 1), half of every 4.29 s wrap of rx_ts.
+    for d in [
+        0u32,
+        1,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0x8000_0001,
+        0xC000_0000,
+        u32::MAX,
+    ] {
+        assert!(!admit::late(&NeverLate, d), "deadline {d:#x}");
+    }
+    // The step itself: a buy with deadline 2^31 + 1 rests (Improve), it is not shed.
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    x.forward(1, 1, day(Side::Buy), 100, 1, 1, 0, &[], 0x8000_0001);
+    x.publish_cut();
+    assert_eq!(x.step(&mut bbo, &NeverLate).kind(), StepKind::Improve);
+}
+
+#[test]
 fn dependency_record_index_is_source_index_minus_back() {
     // Pinned behaviour (spec follow-up F2): FwdDep has no message index, so the dependency's
     // record uses source index − back. Packet A: [join ask 102, buy 103] → dep index 1 − 1 = 0

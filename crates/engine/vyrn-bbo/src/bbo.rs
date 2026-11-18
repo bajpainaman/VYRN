@@ -22,7 +22,7 @@ use crate::book::{
 use crate::codec::{
     ControlCmd, CutDelta, DEP_ENDED, DEP_JOIN, FillEvent, FillKind, FwdDep, FwdEntry, INDEX_MAKER,
     LIQ_AUCTION, LIQ_MAKER, LIQ_TAKER, MSG_NEW, OUT_AUCTION, OUT_FINISHED, OUT_IOC_REST, OUT_STP,
-    Phase, RESTED_DONE, RESTED_IN_FLIGHT, Record, STEP_CONT, TxEntry, encode_records,
+    Phase, RESTED_DONE, RESTED_IN_FLIGHT, Record, STEP_CONT, StepEntry, TxEntry, encode_records,
 };
 use crate::cut::{Cut, HalfPair, SrcRule, step_cut};
 use crate::io::{Poll, Ports};
@@ -184,6 +184,58 @@ enum Sweep {
     Killed,
 }
 
+/// One logged step as [`Bbo::replay_step`] executes it (01 §6.6 `StepRecord` plus R2's band
+/// and the `CONT` flag, as [`StepEntry`] carries them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayStep {
+    pub kind: StepKind,
+    /// `None` = no source (`src_lane_seq = 0`).
+    pub src: Option<(LaneId, LaneSeq)>,
+    /// `StepEntry.flags & STEP_CONT`.
+    pub cont: bool,
+    /// The `Rescan` band `(lo, hi)`; read only for a `Rescan` that is not a continuation.
+    pub band: (Tick, Tick),
+    /// `C_s`, every lane.
+    pub cut: Cut,
+}
+
+impl ReplayStep {
+    /// From a `StepLog` entry and its `n_delta` cut deltas, applied to `prev = C_{s−1}`.
+    /// `None` if the kind is unknown, the deltas are not `n_delta` long or name a lane
+    /// `≥ MAX_LANES`.
+    pub fn from_log(prev: &Cut, e: &StepEntry, deltas: &[CutDelta]) -> Option<Self> {
+        let kind = StepKind::from_code(e.kind)?;
+        if deltas.len() != usize::from(e.n_delta) {
+            return None;
+        }
+        let mut cut = *prev;
+        for d in deltas {
+            *cut.get_mut(usize::from(d.lane.0))? = d.seq;
+        }
+        Some(Self {
+            kind,
+            src: (e.src_lane_seq.0 != 0).then_some((e.src_lane, e.src_lane_seq)),
+            cont: e.flags & STEP_CONT != 0,
+            band: (e.band_lo, e.band_hi),
+            cut,
+        })
+    }
+}
+
+/// Why [`Bbo::replay_step`] refused a record (11 `fz_replay_cuts`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Diverge {
+    /// The cut is below `C_{s−1}` on some lane, or names a lane the book does not have.
+    Cut,
+    /// The named source is not the head of its lane's forwarded ops (or not the op in flight
+    /// for a `CONT` step), or a step that needs a source has none.
+    Source,
+    /// The kind cannot come next: a continuation is pending and this is not it, a `Rescan`
+    /// outside Continuous, a `Control` with no command queued, a step after `Seal`, or the
+    /// executed step's kind differs from the record's (e.g. `Improve` logged, `Cross` decided).
+    Kind,
+}
+
 /// The BBO core of one book.
 pub struct Bbo {
     cfg: Config,
@@ -300,7 +352,17 @@ impl Bbo {
         if self.sealed {
             return Poll::Idle;
         }
-        // 05 §8.3: both half-cuts, then the ring heads.
+        self.intake(vis, p);
+        if self.st.fault {
+            return Poll::Fault;
+        }
+        self.decide(src, clock);
+        self.end_step(vis, p)
+    }
+
+    /// 05 §8.3: both half-cuts, then the ring heads, `Pend` retirement and one control command.
+    #[inline(always)]
+    fn intake<V: Visibility>(&mut self, vis: &V, p: &mut Ports<'_, '_, V>) {
         if let Some(a) = p.half_a.try_read_newest(vis)
             && a.0 >= self.pair.a.0
         {
@@ -321,10 +383,11 @@ impl Bbo {
                 None => self.st.fault = true,
             }
         }
-        if self.st.fault {
-            return Poll::Fault;
-        }
-        self.decide(src, clock);
+    }
+
+    /// After a decision: fault, or publish the decided step (05 §8.2 `finish_step`).
+    #[inline(always)]
+    fn end_step<V: Visibility>(&mut self, vis: &V, p: &mut Ports<'_, '_, V>) -> Poll {
         if self.st.fault || self.out.overflow {
             self.st.fault = true;
             return Poll::Fault;
@@ -334,6 +397,166 @@ impl Bbo {
         } else {
             Poll::Idle
         }
+    }
+
+    /// Replays one logged step (05 §10 rows 4–5): its cut, source, kind (including `Shed` and
+    /// `CONT`) and `Rescan` band come from `rec`, not from `step_cut`, `pick_source`, the band
+    /// test or the deadline test. No clock is read. Inputs are read as [`Bbo::poll`] reads them
+    /// (half-cuts, ring heads, `Pend` retirement, one control command), and the step is
+    /// published to the same ports in the same order.
+    ///
+    /// The caller runs lane `l`'s pass 1 for the record's source and pass 2 for every op
+    /// `≤ rec.cut[l]` first (the 05 §10 scheduler). A step held by a full ring
+    /// ([`Poll::Stalled`]) is resumed by the next call, which ignores its `rec`.
+    ///
+    /// `Err` means the record cannot be the next step of this core; the core faults and every
+    /// later call returns [`Poll::Fault`].
+    pub fn replay_step<V: Visibility, S: BookSource>(
+        &mut self,
+        vis: &V,
+        p: &mut Ports<'_, '_, V>,
+        src: &S,
+        rec: &ReplayStep,
+    ) -> Result<Poll, Diverge> {
+        if self.st.fault {
+            return Ok(Poll::Fault);
+        }
+        if self.held {
+            return Ok(self.publish(vis, p));
+        }
+        if self.sealed {
+            self.st.fault = true;
+            return Err(Diverge::Kind);
+        }
+        self.intake(vis, p);
+        if self.st.fault {
+            return Ok(Poll::Fault);
+        }
+        if let Err(d) = self.replay_decide(src, rec) {
+            self.st.fault = true;
+            self.held = false;
+            return Err(d);
+        }
+        Ok(self.end_step(vis, p))
+    }
+
+    fn replay_decide<S: BookSource>(&mut self, src: &S, rec: &ReplayStep) -> Result<(), Diverge> {
+        let prev = self.cut;
+        let n = self.n;
+        let bad_cut = rec
+            .cut
+            .iter()
+            .zip(prev.iter())
+            .enumerate()
+            .any(|(l, (x, p))| x < p || (l >= n && x.0 != 0));
+        if bad_cut {
+            return Err(Diverge::Cut);
+        }
+        let c = rec.cut;
+        let none = rec.src.is_none() && !rec.cont;
+        if let Some(r) = self.rcont {
+            // A capped batch taker resumes before any other step (05 §8.6).
+            if rec.kind != StepKind::Rescan || !rec.cont || rec.src.is_some() {
+                return Err(Diverge::Kind);
+            }
+            // The band was fixed by the first step of the sweep; a CONT record's band is not read.
+            if c != r.cut {
+                return Err(Diverge::Cut);
+            }
+            self.out.reset(self.next);
+            self.rescan_finish(src, r, true);
+            return self.replay_check(rec);
+        }
+        if self.phase == Phase::Continuous && rec.kind != StepKind::Rescan {
+            // Live, this step passed the band test, which set (B, A) to the envelope. Replay
+            // sets them the same way even if the envelope overlaps: wider bounds only start
+            // searches further out (05 §8.6), they never change a result.
+            let (lo, hi) = self.band_env(&c, &prev);
+            self.bid = hi;
+            self.ask = lo;
+        }
+        match rec.kind {
+            StepKind::Rescan => {
+                if !none || self.phase != Phase::Continuous {
+                    return Err(Diverge::Kind);
+                }
+                self.exec_rescan::<true, S>(src, c, rec.band);
+            }
+            StepKind::Cross | StepKind::Improve | StepKind::Shed => {
+                let (lane, q) = rec.src.ok_or(Diverge::Source)?;
+                let l = usize::from(lane.0);
+                let f = if rec.cont {
+                    match self.cont {
+                        Some(f) if f.lane == l && f.e.lane_seq == q => f,
+                        _ => return Err(Diverge::Source),
+                    }
+                } else {
+                    if self.cont.is_some() || self.unc.is_some() {
+                        return Err(Diverge::Kind);
+                    }
+                    match self.q.get(l).and_then(LaneQ::head) {
+                        Some(f) if f.e.lane_seq == q => *f,
+                        _ => return Err(Diverge::Source),
+                    }
+                };
+                if rec.kind == StepKind::Shed {
+                    if rec.cont {
+                        return Err(Diverge::Kind);
+                    }
+                    self.exec_shed(f, c);
+                } else {
+                    self.exec_fwd(src, f, c, rec.cont);
+                }
+            }
+            StepKind::Idle | StepKind::Depletion => {
+                if !none || self.cont.is_some() {
+                    return Err(Diverge::Kind);
+                }
+                if let Some(u) = self.unc.as_mut() {
+                    if !u.last_chunk {
+                        return Err(Diverge::Kind);
+                    }
+                    u.last_chunk = false;
+                }
+                self.exec_idle(src, c);
+                // Idle or Depletion is a bounds observation, not a decision (05 §8.7): the
+                // record names it.
+                self.out.entry.kind = rec.kind.code();
+            }
+            StepKind::Uncross if self.unc.is_some() => {
+                if !none {
+                    return Err(Diverge::Kind);
+                }
+                self.out.reset(self.next);
+                self.uncross_chunk(src, &c);
+                self.finish(c, StepKind::Uncross, None, false, None);
+            }
+            StepKind::Control | StepKind::Seal | StepKind::Uncross => {
+                if !none || self.cont.is_some() || self.unc.is_some() {
+                    return Err(Diverge::Kind);
+                }
+                let cmd = self.ctl.take().ok_or(Diverge::Kind)?;
+                self.exec_control(src, cmd, c);
+            }
+        }
+        if self.st.fault {
+            return Ok(()); // reported by end_step as Poll::Fault
+        }
+        self.replay_check(rec)
+    }
+
+    /// The decided step is the logged one: kind, `CONT`, source and cut.
+    fn replay_check(&self, rec: &ReplayStep) -> Result<(), Diverge> {
+        let e = &self.out.entry;
+        let src_ok = match rec.src {
+            Some((l, q)) => e.src_lane == l && e.src_lane_seq == q,
+            None => e.src_lane_seq.0 == 0,
+        };
+        let same = e.kind == rec.kind.code()
+            && (e.flags & STEP_CONT != 0) == rec.cont
+            && src_ok
+            && self.cut == rec.cut;
+        if same { Ok(()) } else { Err(Diverge::Kind) }
     }
 
     fn poll_rings<V: Visibility>(&mut self, vis: &V, p: &mut Ports<'_, '_, V>) {
@@ -434,7 +657,7 @@ impl Bbo {
         if self.phase == Phase::Continuous
             && let Some(band) = self.band_test(&c, &prev)
         {
-            self.exec_rescan(src, c, band);
+            self.exec_rescan::<false, S>(src, c, band);
             return;
         }
         if let Some((f, cont)) = chosen {
@@ -522,7 +745,9 @@ impl Bbo {
         (mb, ma)
     }
 
-    fn band_test(&mut self, c: &Cut, prev: &Cut) -> Option<(Tick, Tick)> {
+    /// `(lo, hi)`: the lowest ask and highest bid any op in `(prev, c]` may hold (05 §8.6).
+    #[inline(always)]
+    fn band_env(&self, c: &Cut, prev: &Cut) -> (Tick, Tick) {
         let (mut hi, mut lo) = (self.bid, self.ask);
         for l in 0..self.n {
             if c.get(l) > prev.get(l) {
@@ -531,6 +756,11 @@ impl Bbo {
                 lo = lo.min(ma);
             }
         }
+        (lo, hi)
+    }
+
+    fn band_test(&mut self, c: &Cut, prev: &Cut) -> Option<(Tick, Tick)> {
+        let (lo, hi) = self.band_env(c, prev);
         if lo <= hi {
             Some((lo, hi))
         } else {
@@ -1517,7 +1747,13 @@ impl Bbo {
     // -----------------------------------------------------------------------------------------
     // Rescan (05 §8.6)
 
-    fn exec_rescan<S: BookSource>(&mut self, src: &S, c: Cut, band: (Tick, Tick)) {
+    /// `REPLAY`: `c` is the logged cut, so the partial-cut choices below are not repeated (05 §10).
+    fn exec_rescan<const REPLAY: bool, S: BookSource>(
+        &mut self,
+        src: &S,
+        c: Cut,
+        band: (Tick, Tick),
+    ) {
         let s = self.next;
         self.out.reset(s);
         let prev = self.cut;
@@ -1568,7 +1804,8 @@ impl Bbo {
             .filter_map(|(l, x)| x.map(|(k, q, slot)| (k, l, q, slot)))
             .min_by_key(|x| x.0);
         let mut cr = c;
-        if count > 1
+        if !REPLAY
+            && count > 1
             && let Some((_, sl, _, _)) = star
         {
             for l in 0..self.n {
@@ -1585,7 +1822,7 @@ impl Bbo {
         // Ops after the taker's key stay out of this step's cut, so no lane settles one (05 §7.6)
         // while a capped sweep of the taker still runs in CONT steps. Any cut between C_{s−1}
         // and the rule is a valid partial cut (05 §3.3); the ops held back enter later steps.
-        if let Some((key, _, _, _)) = star {
+        if !REPLAY && let Some((key, _, _, _)) = star {
             self.clamp_after_key(src, &prev, &mut cr, key);
         }
         match star {
