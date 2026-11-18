@@ -17,6 +17,11 @@ vyrn-chain = { workspace = true }
 vyrn-consensus = { workspace = true }
 vyrn-crypto = { workspace = true }
 vyrn-data = { workspace = true }
+vyrn-cut = { workspace = true }
+vyrn-risk = { workspace = true }
+vyrn-bbo = { workspace = true }
+vyrn-lane = { workspace = true }
+vyrn-engine = { workspace = true }
 vyrn-epoch = { workspace = true }
 commonware-consensus = { workspace = true }
 commonware-runtime = { workspace = true }
