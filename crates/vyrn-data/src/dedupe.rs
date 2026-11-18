@@ -83,6 +83,13 @@ impl Dedupe {
         }
     }
 
+    /// Adds a window for each of `sessions` that has none; existing windows are kept.
+    pub fn add_sessions(&mut self, sessions: impl IntoIterator<Item = SessionId>) {
+        for s in sessions {
+            self.wins.entry(s).or_default();
+        }
+    }
+
     /// Marks `pkt_seq` (≥ 1) of `session`. A session without a window gets one, which
     /// allocates.
     pub fn mark(&mut self, session: SessionId, pkt_seq: u32) -> Seen {

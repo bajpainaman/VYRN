@@ -79,6 +79,8 @@ pub struct Counters {
     pub header: u64,
     pub book: u64,
     pub unknown_session: u64,
+    /// A copy whose `epoch16` is neither epoch this home serves (08 §4.6).
+    pub epoch: u64,
     pub bad_mac: u64,
     pub duplicate: u64,
     pub late: u64,
@@ -112,6 +114,7 @@ impl Counters {
             Reject::Header => &mut self.header,
             Reject::Book => &mut self.book,
             Reject::UnknownSession => &mut self.unknown_session,
+            Reject::Epoch => &mut self.epoch,
             Reject::BadMac => &mut self.bad_mac,
             Reject::Duplicate => &mut self.duplicate,
             Reject::Late => &mut self.late,
@@ -283,6 +286,16 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
 
     pub fn home(&self) -> &DataHome {
         &self.home
+    }
+
+    /// The two-epoch boundary (08 §4.6): [`DataHome::add_epoch`] on this box's home.
+    pub fn add_epoch(&mut self, epoch: u32, keys: BTreeMap<SessionId, [u8; 16]>) {
+        self.home.add_epoch(epoch, keys);
+    }
+
+    /// [`DataHome::retire_epoch`] on this box's home.
+    pub fn retire_epoch(&mut self, epoch: u32) {
+        self.home.retire_epoch(epoch);
     }
 
     pub fn store(&self) -> &S {
