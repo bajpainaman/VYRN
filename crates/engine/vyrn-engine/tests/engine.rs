@@ -310,6 +310,113 @@ fn replay_rejects_a_changed_record_at_its_index() {
 }
 
 #[test]
+fn a_join_dependency_matches_on_entry() {
+    // vyrn-sim livelock (spec follow-up F4): lane 1 rests Sell 97; one lane-0 packet sends Buy
+    // 98 (forwarded), Sell 97 (a join against the stale ask, so a Join dependency of the Buy
+    // 101 after it) and Buy 101. Resting the dependency without matching left 98/97 crossed and
+    // `Rescan` found nothing to do, forever. The sequential outcome (05 §3.7, the oracle) has
+    // Sell 97 trade on entry. Expected records, by hand: (index, Fill or Ack, tick, qty).
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    use vyrn_bbo::Record;
+    let run = |asks: Vec<vyrn_wire::Msg>, pkt: Vec<vyrn_wire::Msg>| {
+        let p = |l, a, rx_ts, msgs| Act::Pkt {
+            l,
+            a,
+            rx_ts,
+            now: rx_ts,
+            msgs,
+        };
+        let s = vec![
+            p(1, 3, 1_000, asks),
+            Act::Run,
+            p(0, 1, 2_000, pkt),
+            Act::Run,
+        ];
+        let (j, store, _, _) = live(&s);
+        let (r, rep) = replay(&j.recs, &store);
+        assert_eq!(r, Ok(()));
+        assert_eq!(rep.tx, j.tx);
+        j.tx.iter()
+            .filter(|(h, _)| h.session == sid(0, 1))
+            .flat_map(|(_, r)| r.iter())
+            .filter_map(|r| match *r {
+                Record::Fill {
+                    index, tick, qty, ..
+                } if index != vyrn_bbo::INDEX_MAKER => Some((index, 'F', tick.0, qty.0)),
+                Record::Ack { index, tick, .. } => Some((index, 'A', tick.0, 0)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        run(
+            vec![new(Sell, Day, 97, 7, 1)],
+            vec![
+                new(Buy, Day, 98, 18, 2),
+                new(Sell, Day, 97, 18, 3),
+                new(Buy, Day, 101, 1, 4),
+            ]
+        ),
+        vec![
+            (0, 'F', 97, 7),
+            (0, 'A', 98, 0),
+            (1, 'F', 98, 11),
+            (1, 'A', 97, 0),
+            (2, 'F', 97, 1),
+        ]
+    );
+    // Two levels to cross: the dependency's sweep is capped (D14) and resumes in a CONT step.
+    // Lane 1 also rests Sell 99, so Buy 99 is a Cross by every snapshot replay may show it.
+    assert_eq!(
+        run(
+            vec![new(Sell, Day, 97, 7, 1), new(Sell, Day, 99, 1, 6)],
+            vec![
+                new(Buy, Day, 98, 18, 2),
+                new(Buy, Day, 99, 2, 3),
+                new(Sell, Day, 97, 18, 4),
+                new(Buy, Day, 101, 1, 5),
+            ]
+        ),
+        vec![
+            (0, 'F', 97, 7),
+            (0, 'A', 98, 0),
+            (1, 'F', 99, 1),
+            (1, 'A', 99, 0),
+            (2, 'F', 99, 1),
+            (2, 'F', 98, 11),
+            (2, 'A', 97, 0),
+            (3, 'F', 97, 1),
+        ]
+    );
+    // A cancel between the capped dependency and its source stays out of the CONT steps' cut:
+    // in index order Sell 97 sweeps the 11 at 98 before the Buy 98 is canceled (the cancel's
+    // record is the lane's).
+    assert_eq!(
+        run(
+            vec![new(Sell, Day, 97, 7, 1), new(Sell, Day, 99, 1, 6)],
+            vec![
+                new(Buy, Day, 98, 18, 2),
+                new(Buy, Day, 99, 2, 3),
+                new(Sell, Day, 97, 18, 4),
+                cancel(Handle::new(1, 1).unwrap(), 7),
+                new(Buy, Day, 101, 1, 5),
+            ]
+        ),
+        vec![
+            (0, 'F', 97, 7),
+            (0, 'A', 98, 0),
+            (1, 'F', 99, 1),
+            (1, 'A', 99, 0),
+            (2, 'F', 99, 1),
+            (2, 'F', 98, 11),
+            (2, 'A', 97, 0),
+            (4, 'F', 97, 1),
+        ]
+    );
+}
+
+#[test]
 fn the_same_script_gives_the_same_bytes() {
     let a = live(&script());
     let b = live(&script());

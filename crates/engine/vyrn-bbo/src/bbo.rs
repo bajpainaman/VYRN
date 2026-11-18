@@ -11,6 +11,9 @@
 //! - **Partial `Rescan` cut.** When a band holds more than `ENG_RESCAN_MAX` = 1 in-band batch
 //!   entry, the cut keeps only the one with the smallest key (05 §8.6).
 //! - **Step cap.** STP removals count toward `ENG_STEP_FILLS` with fills (spec follow-up).
+//! - **Join dependency sweep.** A Join dependency matches on entry (§3.7, F4). A step in which
+//!   one traded or ended ends after it; the later dependencies and the source run in `CONT`
+//!   steps, so a step holds one capped sweep.
 
 use vyrn_cut::{Floor, Line32, Line64, Snapshot, Visibility};
 use vyrn_types::{Epoch, Handle, LaneId, LaneSeq, RejectReason, StepId, StepKind, Tick};
@@ -163,8 +166,22 @@ impl Taker {
 /// batch join, whose records the lane emits at B3, 05 §8.10 rule 4).
 #[derive(Clone, Copy, Debug)]
 enum Role {
-    Fwd { head: TxEntry, index: u8, tag: u32 },
+    /// `g`: the record group in the deps packet (a Join dependency's index), 0 for the source.
+    Fwd {
+        head: TxEntry,
+        index: u8,
+        tag: u32,
+        g: u8,
+    },
     Batch,
+}
+
+/// A forwarded op whose Join dependency `i` swept (05 §3.7 (4)): dependency `i` (still in
+/// flight when `mid`), the dependencies after it and then the source run in `CONT` steps.
+#[derive(Clone, Copy, Debug)]
+struct DCont {
+    i: usize,
+    mid: bool,
 }
 
 /// A `Rescan` batch taker whose sweep hit the step cap (D14): it resumes in the next step at
@@ -260,6 +277,8 @@ pub struct Bbo {
     q: Vec<LaneQ>,
     ctl: Option<ControlCmd>,
     cont: Option<Fwd>,
+    /// With `cont`: the source has not run yet.
+    dcont: Option<DCont>,
     rcont: Option<RCont>,
     pair: HalfPair,
     out: StepOut,
@@ -297,6 +316,7 @@ impl Bbo {
             q: vec![LaneQ::default(); n],
             ctl: None,
             cont: None,
+            dcont: None,
             rcont: None,
             pair: HalfPair::default(),
             out: StepOut::default(),
@@ -656,8 +676,17 @@ impl Bbo {
         }
         let k = self.pair.k();
         let prev = self.cut;
-        let floors: [Option<LaneSeq>; MAX_LANES] =
-            core::array::from_fn(|l| self.q.get(l).and_then(LaneQ::min_floor));
+        // Until its source has run, a forwarded op whose dependency swept keeps its floor: no
+        // later op of its lane (a cancel of a maker the dependency still sweeps) enters a cut
+        // before the op it follows in index order (05 §3.7 (2)).
+        let pending = self.cont.filter(|_| self.dcont.is_some());
+        let floors: [Option<LaneSeq>; MAX_LANES] = core::array::from_fn(|l| {
+            let q = self.q.get(l).and_then(LaneQ::min_floor);
+            match pending.filter(|f| f.lane == l).map(|f| f.floor()) {
+                Some(h) => Some(q.map_or(h, |x| x.min(h))),
+                None => q,
+            }
+        });
         let chosen = match self.cont {
             Some(f) => Some((f, true)),
             None if self.unc.is_some() || self.ctl.is_some() => None,
@@ -1155,7 +1184,7 @@ impl Bbo {
                 ..FillEvent::default()
             },
         );
-        if let Role::Fwd { head, index, .. } = role {
+        if let Role::Fwd { head, index, g, .. } = role {
             let r = Record::Fill {
                 index,
                 liq: LIQ_TAKER,
@@ -1163,7 +1192,7 @@ impl Bbo {
                 tick: lvl,
                 qty: vyrn_types::Qty(qty),
             };
-            self.out.record(head, 0, r);
+            self.out.record(head, g, r);
         }
     }
 
@@ -1196,8 +1225,8 @@ impl Bbo {
                 ..FillEvent::default()
             },
         );
-        if let (Role::Fwd { head, .. }, Some(r)) = (role, rec) {
-            self.out.record(head, 0, r);
+        if let (Role::Fwd { head, g, .. }, Some(r)) = (role, rec) {
+            self.out.record(head, g, r);
         }
     }
 
@@ -1262,14 +1291,20 @@ impl Bbo {
                 ..FillEvent::default()
             },
         );
-        if let Role::Fwd { head, index, tag } = role {
+        if let Role::Fwd {
+            head,
+            index,
+            tag,
+            g,
+        } = role
+        {
             let r = Record::Ack {
                 index,
                 handle: t.handle(),
                 tick: t.tick,
                 client_tag: tag,
             };
-            self.out.record(head, 0, r);
+            self.out.record(head, g, r);
         }
     }
 
@@ -1407,6 +1442,12 @@ impl Bbo {
         if !cont && let Some(q) = self.q.get_mut(lane) {
             q.pop();
         }
+        // The dependencies still to apply, from the first one; `None` once the source has run.
+        let deps_from = if cont {
+            self.dcont.take()
+        } else {
+            Some(DCont { i: 0, mid: false })
+        };
         let Some(v) = src.slot(lid, e.vslot) else {
             self.st.fault = true;
             return;
@@ -1419,7 +1460,7 @@ impl Bbo {
             v,
             vslot: e.vslot,
             seq: e.lane_seq,
-            first: !cont,
+            first: deps_from.is_some(),
         };
         let tag = if e.msg_type() == MSG_NEW {
             e.client_tag()
@@ -1427,7 +1468,7 @@ impl Bbo {
             src.client_tag(lid, v.root)
         };
         let has_deps = f.n > 0;
-        let src_head = if cont {
+        let src_head = if deps_from.is_none() {
             role_head(s, lid, e.session, 0, e.pkt_seq, false)
         } else {
             let rs = if has_deps {
@@ -1437,8 +1478,10 @@ impl Bbo {
             };
             role_head(s, lid, e.session, rs, e.pkt_seq, false)
         };
-        if !cont && has_deps {
-            let h = role_head(s, lid, e.session, e.resp_seq, e.pkt_seq, true);
+        if deps_from.is_some_and(|d| d.i < f.n) {
+            // A `CONT` step's dependency records take a continuation packet (05 §8.10 rule 2).
+            let rs = if cont { 0 } else { e.resp_seq };
+            let h = role_head(s, lid, e.session, rs, e.pkt_seq, true);
             self.out.open(h);
             self.out.deps_head = Some(h);
         }
@@ -1447,6 +1490,7 @@ impl Bbo {
             head: src_head,
             index: e.index(),
             tag,
+            g: 0,
         };
         let prev = self.cut;
         let mut done = false;
@@ -1458,7 +1502,19 @@ impl Bbo {
                     self.st.set_explicit(lane, d.slot, seq);
                 }
             }
-            self.apply_deps(src, &f, &c, &prev);
+        }
+        if let Some(from) = deps_from {
+            if let Some(next) = self.apply_deps(src, &f, &c, &prev, from) {
+                self.cont = Some(f);
+                self.dcont = Some(next);
+                let kind = if cont || self.out.entry.n_fills > 0 {
+                    StepKind::Cross
+                } else {
+                    StepKind::Improve
+                };
+                self.finish(c, kind, Some((lane, &e)), cont, None);
+                return;
+            }
             done = self.entry_checks(src, &t, role, &c);
         }
         let mut capped = false;
@@ -1580,26 +1636,42 @@ impl Bbo {
         false
     }
 
-    /// 05 §8.5 `apply_deps`, §3.7 (4): the dependencies in index order, before the source.
-    fn apply_deps<S: BookSource>(&mut self, src: &S, f: &Fwd, c: &Cut, prev: &Cut) {
+    /// 05 §8.5 `apply_deps`, §3.7 (4): the dependencies in index order from `from`, before the
+    /// source. `Some` when a Join dependency swept: the step ends there and the rest resumes at
+    /// the returned point in the next (`CONT`) step.
+    fn apply_deps<S: BookSource>(
+        &mut self,
+        src: &S,
+        f: &Fwd,
+        c: &Cut,
+        prev: &Cut,
+        from: DCont,
+    ) -> Option<DCont> {
         let lane = f.lane;
         let lid = LaneId(lane_u8(lane));
-        let Some(head) = self.out.deps_head else {
-            return;
-        };
-        for (i, d) in f.deps().iter().enumerate() {
+        let head = self.out.deps_head?;
+        for (i, d) in f.deps().iter().enumerate().skip(from.i) {
             let g = u8::try_from(i).unwrap_or(u8::MAX);
             let seq = LaneSeq(f.e.lane_seq.0.saturating_sub(u64::from(d.back)));
             // Spec follow-up F2: FwdDep carries no message index; this is exact only when no
             // session-only message sits between the dependency and the source.
             let index = f.e.index().saturating_sub(d.back);
+            if i == from.i && from.mid {
+                if let Some(mid) = self.join_dep(src, f, d, g, index, c, prev, head, true) {
+                    return Some(DCont {
+                        i: if mid { i } else { i.saturating_add(1) },
+                        mid,
+                    });
+                }
+                continue;
+            }
             let found = match d.kind {
                 DEP_JOIN => src.slot(lid, d.slot).map(|v| (d.slot, v, false)),
                 _ => self.ctx(src, c, prev, None).current_version(lane, d.slot),
             };
             let Some((vslot, v, ended)) = found else {
                 self.st.fault = true;
-                return;
+                return None;
             };
             let handle = Handle::new(v.root, v.gen_).unwrap_or(Handle(0));
             let tag = src.client_tag(lid, v.root);
@@ -1652,25 +1724,13 @@ impl Bbo {
                     {
                         rm.np_seq = seq.0;
                     }
-                    let side = d.flags.side();
-                    self.st.pend_insert(PendEnt {
-                        lane,
-                        slot: d.slot,
-                        seq,
-                        step: self.next,
-                        side,
-                        tick: d.tick,
-                        dep: g,
-                    });
-                    // Spec follow-up F4: a dependency Join is not matched on entry (05 §8.5).
-                    self.rest_bound(side, d.tick);
-                    ev.qty = v.total.saturating_sub(r.filled);
-                    rec = Record::Ack {
-                        index,
-                        handle,
-                        tick: d.tick,
-                        client_tag: tag,
-                    };
+                    if let Some(mid) = self.join_dep(src, f, d, g, index, c, prev, head, false) {
+                        return Some(DCont {
+                            i: if mid { i } else { i.saturating_add(1) },
+                            mid,
+                        });
+                    }
+                    continue;
                 }
             } else {
                 let open = if r.killed || ended {
@@ -1697,6 +1757,104 @@ impl Bbo {
             self.out.event(lid, ev);
             self.out.record(head, g, rec);
         }
+        None
+    }
+
+    /// A Join dependency enters like any `New`: it matches on entry before the source, at the
+    /// source's cut (05 §3.7: the sequential outcome; spec follow-up F4, as the oracle does),
+    /// with the sweep's cap (D14). Then it rests (`Pend` leaf, `Dep` event, `Ack`) unless it has
+    /// ended. `Some(capped)` when it traded or ended, which ends the step; `resume`: a `CONT`
+    /// step of its capped sweep.
+    #[allow(clippy::too_many_arguments)]
+    fn join_dep<S: BookSource>(
+        &mut self,
+        src: &S,
+        f: &Fwd,
+        d: &FwdDep,
+        g: u8,
+        index: u8,
+        c: &Cut,
+        prev: &Cut,
+        head: TxEntry,
+        resume: bool,
+    ) -> Option<bool> {
+        let lane = f.lane;
+        let lid = LaneId(lane_u8(lane));
+        let Some(v) = src.slot(lid, d.slot) else {
+            self.st.fault = true;
+            return None;
+        };
+        let t = Taker {
+            lane,
+            side: d.flags.side(),
+            tick: d.tick,
+            total: v.total,
+            v,
+            vslot: d.slot,
+            seq: LaneSeq(f.e.lane_seq.0.saturating_sub(u64::from(d.back))),
+            first: !resume,
+        };
+        let tag = src.client_tag(lid, v.root);
+        let role = Role::Fwd {
+            head,
+            index,
+            tag,
+            g,
+        };
+        let opp = t.side.opposite();
+        let crosses = resume
+            || self.phase == Phase::Continuous && {
+                let from = self.bound(opp);
+                let empty = if opp == Side::Buy { NO_BID } else { NO_ASK };
+                from != empty && next_level(&self.ctx(src, c, c, None), opp, from, t.tick).is_some()
+            };
+        let n_ev = self.out.events().len();
+        if crosses {
+            if !resume && v.flags.post_only() {
+                self.reject_taker(&t, role, RejectReason::PostOnlyWouldCross, 0);
+                return Some(false);
+            }
+            let from = self.bound(opp);
+            if self.sweep(src, &t, role, c, prev, None, from, true) == Sweep::Capped {
+                return Some(true);
+            }
+        }
+        let worked = self.out.events().len() != n_ev;
+        let open = t.open(&self.st);
+        if open > 0 {
+            self.st.pend_insert(PendEnt {
+                lane,
+                slot: d.slot,
+                seq: t.seq,
+                step: self.next,
+                side: t.side,
+                tick: d.tick,
+                dep: g,
+            });
+            self.rest_bound(t.side, d.tick);
+            let ord = self.out.ordinal;
+            self.out.event(
+                lid,
+                FillEvent {
+                    handle: t.handle(),
+                    vslot: d.slot,
+                    tick: d.tick,
+                    qty: open,
+                    kind: FillKind::Dep.code(),
+                    liq: d.kind,
+                    ordinal: ord,
+                    ..FillEvent::default()
+                },
+            );
+            let r = Record::Ack {
+                index,
+                handle: t.handle(),
+                tick: d.tick,
+                client_tag: tag,
+            };
+            self.out.record(head, g, r);
+        }
+        worked.then_some(false)
     }
 
     /// 05 §8.1 `Shed`: the source and its dependencies get `Reject BUSY`; nothing is applied.
