@@ -22,7 +22,7 @@ use vyrn_log::{
 };
 use vyrn_types::{
     AccountId, AcctTake, BlockHeader, BookId, Epoch, Hash, Height, LaneId, LaneSeq, Nanos,
-    PacketFlags, PacketRecord, PktHash, SessionId, StepId, StepKind,
+    PacketFlags, PacketRecord, PktHash, RouteRecord, SessionId, StepFlags, StepId, StepKind,
 };
 
 /// A deterministic source of choices from proptest's random words.
@@ -215,6 +215,13 @@ impl Model {
             (l.rx, l.fa, l.next) = (rx, fa, first + u64::from(count));
             l.awaiting.push_back(first);
             recs.push(LaneRec::Pkt(rec));
+            if count > 0 && p.n(3) == 0 {
+                recs.push(LaneRec::Route(RouteRecord {
+                    lane: LaneId(lane),
+                    lane_seq: LaneSeq(first + p.n(u64::from(count))),
+                    cross: p.coin(),
+                }));
+            }
         }
         Some(Section::LaneRun {
             lane: LaneId(lane),
@@ -247,6 +254,7 @@ impl Model {
                 Home {
                     src_lane: LaneId(self.lanes[i]),
                     src_lane_seq: LaneSeq(seq),
+                    flags: if p.n(2) == 1 { StepFlags::CROSS } else { 0 },
                     payload: vec![],
                 }
             } else {
@@ -254,6 +262,7 @@ impl Model {
                 Home {
                     src_lane: LaneId(0xFF),
                     src_lane_seq: LaneSeq(0),
+                    flags: 0,
                     payload: (0..n).map(|_| p.n(256) as u8).collect(),
                 }
             }

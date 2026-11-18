@@ -44,11 +44,12 @@ Outputs are indented and follow the input that produced them:
 
 | Line | Meaning |
 |---|---|
-| `step S kind=K src=L:Q flags=F cut=C0,C1,C2` | a `StepEntry` (05 §8.1): kind code, source (0:0 = none), flags (bit 0 `CONT`), cut |
+| `step S kind=K src=L:Q flags=F cut=C0,C1,C2` | a `StepEntry` (05 §8.1): kind code, source (0:0 = none), flags (bit 0 `CONT`, bit 1 `CROSS`: the source's lane route, 05 §4.15), cut |
 | `ev L KIND vslot=V h=H tick=T qty=Q liq=X cause=C` | a `FillEvent` to lane `L` (05 §4.12; kinds 1 Fill, 2 Rested, 3 Out, 4 Reject, 8 Dep) |
 | `tx SID resp=R echo=E role=X REC...` | a fill TX core packet (05 §8.10 rules 1–2): `resp=0` takes the next `MakerSeq` number |
 | `resp L SID resp=R echo=E gate=G REC...` | a lane response packet; `gate` is `none`, `pkt:Q` or `step:S` (05 §8.10) |
 | `log L SID pkt=P count=N flags=F first=Q fills_applied=S` | a `PacketRecord` (01 §6.6; flags bit 0 `SHED`, 1 `ADVANCE`, 2 `MID`, 3 `PASS2`) |
+| `route L seq=Q cross=B` | a `RouteRecord` (01 §6.6): op `Q`, classified Cross (`true`) or Improve, was rejected by the lane |
 
 `REC` is one 16-byte record (01 §6.4) in hex.
 

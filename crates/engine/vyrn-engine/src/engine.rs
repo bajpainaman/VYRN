@@ -403,8 +403,11 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             sink.lane_resp(id, &p);
         }
         for r in lane.drain_log() {
-            let LogRec::Packet(p) = r;
-            sink.record(&Rec::Packet(p));
+            // A `RouteRecord` (G9) is not in this crate's journal yet; replay wiring is the
+            // engine's follow-up (`routes_of`).
+            if let LogRec::Packet(p) = r {
+                sink.record(&Rec::Packet(p));
+            }
         }
         if lane.fault() {
             return Err(Fault::Lane(id));

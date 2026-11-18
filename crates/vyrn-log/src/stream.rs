@@ -31,6 +31,7 @@
 //! h        u8   bits 0–3 count (≤ 10), bit 4 SEQ_EXC, bit 5 LSEQ_EXC, bit 6 FA_NZ, bit 7 SHED
 //! slot     LEB  < 4096 a session slot; 4096 an Advance record; 4097 an AcctTake
 //! — AcctTake (pooled lanes only, h = 0): account LEB (u32), ver LEB (u32); nothing else —
+//! — RouteRecord (slot 4098): h bits 0–3 back, bits 4–6 0, bit 7 CROSS; nothing else —
 //! rx_ts    ZZ   rx_ts − prev_rx_ts
 //! [FA_NZ]  LEB  fills_applied − prev_fills_applied      (≥ 1)
 //! [LSEQ]   LEB  first_lane_seq − next_lane_seq          (≥ 1)
@@ -42,6 +43,9 @@
 //! `count = 0` and only `FA_NZ` may be set (`RepErr::Count`). A record on a slot that no
 //! `SessionBind` bound is `RepErr::Range`. `AcctTake.lane_seq` is not on the wire: it is the
 //! lane's `next_lane_seq` at the take, the LaneSeq of the first op that may use the token.
+//! `RouteRecord.lane_seq` is `last − back`, where `last` is the last LaneSeq of the lane's
+//! preceding non-Advance PacketRecord; `back` ≥ its `count` (or no such record) is
+//! `RepErr::Count`. Advance records may sit between the two.
 //!
 //! # Step half-record (07 §3.8)
 //!
@@ -50,7 +54,8 @@
 //!                   6 Control, 7 Seal, 8 Uncross (9–15: RepErr::Kind)
 //!          bit 4 HOME, bits 5–6 mode (0 SAME, 1 DENSE, 2 SPARSE, 3: RepErr::Cut), bit 7 OTHER
 //! gap      LEB  step − prev_step − 1
-//! [HOME]   src_lane u8 (0xFF = none); [src ≠ 0xFF] ZZ (src_lane_seq − cut[src_lane]), where
+//! [HOME]   src u8: 0xFF = none, else bits 0–5 src_lane, bit 6 0, bit 7 CROSS
+//!          (`StepRecord.flags` bit 1, `StepFlags::CROSS`); [src ≠ 0xFF] ZZ (src_lane_seq − cut[src_lane]), where
 //!          cut is this record's new half-cut; [Rescan, Control, Seal, Uncross] plen LEB, bytes
 //! [DENSE]  |H| × LEB (cut[l] − prev_cut[l])
 //! [SPARSE] bitmap ceil(|H|/8) bytes (bit i of byte i/8, LSB first = lane H.start + 8·(i/8) + i%8),
@@ -91,7 +96,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use vyrn_types::{
     AccountId, AcctTake, Epoch, Hash, Height, LaneId, LaneSeq, MAX_MSGS_PER_PKT,
-    MAX_SESSIONS_PER_LANE, Nanos, PacketFlags, PacketRecord, PktHash, SessionId, StepId, StepKind,
+    MAX_SESSIONS_PER_LANE, Nanos, PacketFlags, PacketRecord, PktHash, RouteRecord, SessionId,
+    StepFlags, StepId, StepKind,
 };
 
 use crate::leb::{self, Reader};
@@ -101,6 +107,8 @@ use crate::{Layout, RepErr};
 pub const REP_SLOT_ADVANCE: u16 = 4096;
 /// The slot value of an `AcctTake` (`MAX_SESSIONS_PER_LANE + 1`).
 pub const REP_SLOT_TAKE: u16 = 4097;
+/// The slot value of a `RouteRecord` (`MAX_SESSIONS_PER_LANE + 2`).
+pub const REP_SLOT_ROUTE: u16 = 4098;
 const _: () = assert!(REP_SLOT_ADVANCE as usize == MAX_SESSIONS_PER_LANE);
 
 /// Section tags (07 §3.4).
@@ -126,6 +134,16 @@ const MODE_SAME: u8 = 0;
 const MODE_DENSE: u8 = 1;
 const MODE_SPARSE: u8 = 2;
 const NO_SRC: u8 = 0xFF;
+/// The home record's `src` byte, bit 7: `StepFlags::CROSS` (07 §3.8). Lanes are < 64.
+const SRC_CROSS: u8 = 0x80;
+
+/// The LaneSeq a `RouteRecord` with `back` names: `back` ops before the last op of the lane's
+/// preceding PacketRecord `(first, count)`, which must contain it.
+fn route_seq((first, count): (u64, u8), back: u8) -> Result<u64, RepErr> {
+    let k = count.checked_sub(back).and_then(|k| k.checked_sub(1));
+    let k = k.ok_or(RepErr::Count)?;
+    first.checked_add(u64::from(k)).ok_or(RepErr::Range)
+}
 
 /// 07's 4-bit wire code of a step kind.
 pub const fn wire_kind(k: StepKind) -> u8 {
@@ -177,6 +195,8 @@ pub enum LaneRec {
     /// A packet or an Advance record. `pkt_hash` is 0 here; the `HashRun` supplies it.
     Pkt(PacketRecord),
     Take(AcctTake),
+    /// The route of an op its lane classified Cross or Improve, then rejected (07 §3.6).
+    Route(RouteRecord),
 }
 
 /// The home part of a step half-record.
@@ -186,6 +206,8 @@ pub struct Home {
     pub src_lane: LaneId,
     /// 0 when the kind has no source.
     pub src_lane_seq: LaneSeq,
+    /// `StepRecord.flags`: `StepFlags::CROSS` or 0; 0 when the kind has no source.
+    pub flags: u8,
     /// Empty unless the kind carries a payload (05 owns its bytes).
     pub payload: Vec<u8>,
 }
@@ -318,6 +340,8 @@ struct LaneDec {
     next_lane_seq: u64,
     prev_rx_ts: u64,
     prev_fa: u64,
+    /// `(first_lane_seq, count)` of the last non-Advance PacketRecord (`RouteRecord.back`).
+    last_pkt: (u64, u8),
     awaiting: VecDeque<u64>,
     table: usize,
 }
@@ -366,6 +390,7 @@ impl SubstreamState {
                 next_lane_seq: 1,
                 prev_rx_ts: 0,
                 prev_fa: 0,
+                last_pkt: (0, 0),
                 awaiting: VecDeque::new(),
                 table,
             });
@@ -698,7 +723,18 @@ impl SubstreamState {
                 lane_seq: LaneSeq(d.next_lane_seq),
             }));
         }
-        if slot > REP_SLOT_TAKE {
+        if slot == REP_SLOT_ROUTE {
+            if h & 0x70 != 0 {
+                return Err(RepErr::Count);
+            }
+            let lane_seq = route_seq(d.last_pkt, h & H_COUNT)?;
+            return Ok(LaneRec::Route(RouteRecord {
+                lane: LaneId(lane),
+                lane_seq: LaneSeq(lane_seq),
+                cross: h & H_SHED != 0,
+            }));
+        }
+        if slot > REP_SLOT_ROUTE {
             return Err(RepErr::Range);
         }
         let advance = slot == REP_SLOT_ADVANCE;
@@ -779,6 +815,21 @@ impl SubstreamState {
                 leb::put_u64(out, u64::from(REP_SLOT_TAKE));
                 leb::put_u64(out, u64::from(t.account.0));
                 leb::put_u64(out, u64::from(t.ver));
+                return Ok(());
+            }
+            LaneRec::Route(t) => {
+                let (first, count) = d.last_pkt;
+                let back = first
+                    .checked_add(u64::from(count))
+                    .and_then(|e| e.checked_sub(1))
+                    .and_then(|last| last.checked_sub(t.lane_seq.0))
+                    .and_then(|b| u8::try_from(b).ok())
+                    .ok_or(RepErr::Count)?;
+                if t.lane.0 != lane || route_seq(d.last_pkt, back)? != t.lane_seq.0 {
+                    return Err(RepErr::Count);
+                }
+                out.push(back | if t.cross { H_SHED } else { 0 });
+                leb::put_u64(out, u64::from(REP_SLOT_ROUTE));
                 return Ok(());
             }
             LaneRec::Pkt(p) => p,
@@ -864,6 +915,7 @@ impl SubstreamState {
         d.prev_fa = p.fills_applied.0;
         d.next_lane_seq = next;
         if !advance {
+            d.last_pkt = (p.first_lane_seq.0, p.count);
             d.awaiting.push_back(p.first_lane_seq.0);
         }
         Ok(())
@@ -1036,7 +1088,12 @@ impl SubstreamState {
         let mut home = None;
         let mut src_delta = 0i64;
         if is_home {
-            let src = r.u8()?;
+            let b = r.u8()?;
+            let (src, flags) = match b {
+                NO_SRC => (NO_SRC, 0),
+                _ if b & SRC_CROSS != 0 => (b & !SRC_CROSS, StepFlags::CROSS),
+                _ => (b, 0),
+            };
             self.check_step_shape(kind, Some(src), other, mode)?;
             if src != NO_SRC {
                 src_delta = r.leb_i64()?;
@@ -1050,6 +1107,7 @@ impl SubstreamState {
             home = Some(Home {
                 src_lane: LaneId(src),
                 src_lane_seq: LaneSeq(0),
+                flags,
                 payload,
             });
         } else {
@@ -1132,7 +1190,15 @@ impl SubstreamState {
         out.push(b0);
         leb::put_u64(out, gap);
         if let Some(h) = &s.home {
-            out.push(h.src_lane.0);
+            if h.flags & !StepFlags::CROSS != 0 || (h.src_lane.0 == NO_SRC && h.flags != 0) {
+                return Err(RepErr::Kind);
+            }
+            let cross = if h.flags & StepFlags::CROSS != 0 {
+                SRC_CROSS
+            } else {
+                0
+            };
+            out.push(h.src_lane.0 | cross);
             if h.src_lane.0 == NO_SRC {
                 if h.src_lane_seq.0 != 0 {
                     return Err(RepErr::Range);

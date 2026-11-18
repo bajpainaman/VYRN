@@ -3,8 +3,8 @@
 //! list (§6.6). The boundary (§6.2, §7.4–§7.6) is in `settle.rs`.
 
 use vyrn_bbo::{
-    DEP_CANCEL, DEP_JOIN, FwdDep, FwdEntry, JEnt, JKind, NO_ASK, OrderFlags, OrderSlot, Phase,
-    Record, Side, SlotKind, Stp, Tif, encode_fwd,
+    DEP_CANCEL, DEP_JOIN, FWD_CROSS, FWD_INDEX, FwdDep, FwdEntry, JEnt, JKind, NO_ASK, OrderFlags,
+    OrderSlot, Phase, Record, Side, SlotKind, Stp, Tif, encode_fwd,
 };
 use vyrn_cut::{
     Consumer, Counter, CounterLine, ENG_FILL_RING, ENG_FWD_RING, LaneCut, LaneCutEntry, Line32,
@@ -16,7 +16,7 @@ use vyrn_risk::{
 };
 use vyrn_types::{
     BookId, Epoch, Handle, LaneId, LaneSeq, MSG_BYTES, Nanos, PacketFlags, PacketRecord, PktHash,
-    Qty, RejectReason, SessionId, StepId, Tick,
+    Qty, RejectReason, RouteRecord, SessionId, StepId, Tick,
 };
 use vyrn_wire::{Msg, Request, session_lane};
 
@@ -275,6 +275,9 @@ pub struct Lane<'a, V: Visibility, const NA: usize> {
     pub(crate) mids: [Option<Mid>; 20],
     /// The packet's boundaries are the caller's `mids` (replay): no `LaneCut` polls inside it.
     pub(crate) scripted: bool,
+    /// The route `route_of` gave the op in pass 1, until the packet loop logs a `RouteRecord`
+    /// for it on a reject (G9) or the next op starts.
+    classified: Option<Route>,
     /// Replay routes (05 §10): `Some` while a [`Lane::replay_packet`] runs; the listed ops are
     /// forwarded with their route, every other op is local.
     pub(crate) forced: Option<[Option<(LaneSeq, Route)>; MAX_OPS]>,
@@ -401,6 +404,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             mids: [None; 20],
             scripted: false,
             forced: None,
+            classified: None,
             acct_ix: (0..u32::try_from(NA).unwrap_or(0)).collect(),
             b3: Vec::with_capacity(4096),
             dep_cancels: Vec::with_capacity(64),
@@ -797,8 +801,20 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             let res = match (hdr, m) {
                 (Some(r), _) => Err(r),
                 (None, Err(e)) => Err(rej(e.reason, e.detail)),
-                (None, Ok(m)) => self.pass1(vis, ix, raw, m, prio_ts),
+                (None, Ok(m)) => {
+                    self.classified = None;
+                    self.pass1(vis, ix, raw, m, prio_ts)
+                }
             };
+            // G9: a Cross or Improve the lane rejects itself has no step; log its route, so
+            // replay charges and rejects it the same way (01 §6.6, 10 M8).
+            if let (Err(_), Some(r)) = (&res, self.classified.take()) {
+                self.out.log(LogRec::Route(RouteRecord {
+                    lane: self.cfg.lane,
+                    lane_seq: self.seq,
+                    cross: r == Route::Cross,
+                }));
+            }
             match res {
                 Ok(op) => {
                     if let Some(slot) = self.ops.get_mut(self.n_ops) {
@@ -1053,6 +1069,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                 let f = bbo_flags(flags);
                 let side = f.side();
                 let route = self.route_of(seq, side, f.tif(), tick);
+                self.classified = route;
                 let fit = self.slots_free(1) && self.fifo.can_assign(side, tick, ts);
                 let risk = self.check_new(si, f, tick, qty, route, ts, fit)?;
                 let v = self.take_slot();
@@ -1097,9 +1114,9 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                     tag: client_tag,
                     ..base
                 };
-                if route.is_some() {
+                if let Some(r) = route {
                     op.explicit = true;
-                    self.forward(vis, raw, &mut op, ts)?;
+                    self.forward(vis, raw, &mut op, ts, r == Route::Cross)?;
                 }
                 Ok(op)
             }
@@ -1145,6 +1162,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                 }
                 let side = f.side();
                 let route = self.route_of(seq, side, f.tif(), tick);
+                self.classified = route;
                 let fit = self.slots_free(1) && self.fifo.can_assign(side, tick, ts);
                 let risk = self.check_new(si, f, tick, qty, route, ts, fit)?;
                 let w = self.take_slot();
@@ -1193,9 +1211,9 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                     tag: rp.tag,
                     ..base
                 };
-                if route.is_some() {
+                if let Some(r) = route {
                     op.explicit = true;
-                    self.forward(vis, raw, &mut op, ts)?;
+                    self.forward(vis, raw, &mut op, ts, r == Route::Cross)?;
                 }
                 Ok(op)
             }
@@ -1384,6 +1402,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         raw: &[u8; MSG_BYTES],
         op: &mut Op,
         ts: Nanos,
+        cross: bool,
     ) -> Result<(), RiskReject> {
         let Some(j_side) = op.side else {
             return Ok(());
@@ -1488,7 +1507,8 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         let vslot = if op.k == OpK::Replace { op.w } else { op.v };
         let mut msg = *raw;
         if let Some(b) = msg.get_mut(2) {
-            *b = op.ix;
+            // 05 §4.12: the index, and the route risk charged (10 M8) for replay (05 §10).
+            *b = (op.ix & FWD_INDEX) | if cross { FWD_CROSS } else { 0 };
         }
         let e = FwdEntry {
             lane_seq: op.seq,

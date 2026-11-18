@@ -198,6 +198,7 @@ fn fwd(kind: StepKind, lane: u8, q: u64, cont: bool, cut: &[u64]) -> ReplayStep 
         kind,
         src: Some((LaneId(lane), LaneSeq(q))),
         cont,
+        cross: false,
         band: (Tick(0), Tick(0)),
         cut: cut_of(cut),
     }
@@ -349,6 +350,14 @@ fn replay_refuses_records_that_cannot_come_next() {
         &[fwd(StepKind::Improve, 0, 1, false, &[1, 0, 0])],
         Diverge::Source,
     );
+    // The logged route is Cross; lane 1 forwarded the op as an Improve (FwdEntry CROSS clear).
+    refuse(
+        &[ReplayStep {
+            cross: true,
+            ..first
+        }],
+        Diverge::Kind,
+    );
     // A cut below C_{s−1}, and a cut entry for lane 3 of a 3-lane book.
     refuse(
         &[first, fwd(StepKind::Improve, 2, 1, false, &[0, 0, 1])],
@@ -372,6 +381,7 @@ fn replay_refuses_records_that_cannot_come_next() {
         kind,
         src: None,
         cont: false,
+        cross: false,
         band: (Tick(1), Tick(200)),
         cut: cut_of(&[0, 1, 0]),
     };

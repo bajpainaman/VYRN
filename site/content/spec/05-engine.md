@@ -813,7 +813,8 @@ off size field                                  off size field
  20   4  deadline  latest BBO step start, low    16   4  tick      fill price, or limit for Out
               32 bits of PTP ns (§6.8)           20   4  qty
  24  16  msg   (the 16-B message; byte 2 =      24   1  kind      Fill | Rested | Out | Reject |
-              index, byte 3 = n_dep)                         Dep | Phase | Band | Uncross
+              index in bits 0–3 and CROSS in                 Dep | Phase | Band | Uncross
+              bit 7, byte 3 = n_dep)
  40   4  handle  root + gen                     25   1  liq       0 maker, 1 taker, 2 auction
  44   4  vslot   version slot written for it    26   2  cause     Out cause / Reject reason
  48   4  session                                28   4  ordinal   fill ordinal in the step
@@ -829,6 +830,13 @@ FwdDep (16 B, 4 per line; ceil(n_dep / 4) lines follow their FwdEntry in the rin
  12  4 slot    Join: its new slot (written in pass 1); Cancel: the position slot it ends
 ```
 
+- **`CROSS`** (`msg` byte 2, bit 7) is the route the lane classified the op with (§6.5): 1
+  `Cross`, 0 `Improve`. Lane risk charges its buckets by that route (10 M8), and the step kind
+  does not show it: a `Cross` that ends without a fill (STP, or the book moved after the
+  snapshot) steps as `Improve`, and an `Improve` that trades steps as `Cross` (§8.1). The BBO
+  core copies the bit into `StepEntry.flags` (§4.15) and decides nothing on it. Wire bytes 2–3
+  are 0 (01 §6.2) and the index is 0–9, so bits 4–6 stay 0. An op the lane classifies and then
+  rejects is never pushed; its route goes into a `RouteRecord` instead (§10).
 - Both rings are SPSC. An entry is new when its first word is greater than the consumer's last
   seen value; `lane_seq` and `step` grow strictly, so no separate producer index exists. The
   consumer skips `ceil(n_dep / 4)` lines after an entry, so dependency lines are never parsed as
@@ -892,7 +900,8 @@ off size field       meaning
 StepEntry (64-B header + delta lines, BBO → both stream cores and both fill TX cores):
   0  8 step | 8 1 kind | 9 1 src_lane | 10 1 n_delta | 11 1 n_tx | 12 4 n_fills
   16 8 src_lane_seq (0 = no source) | 24 4 pub_A (low 32) | 28 4 pub_B (low 32)
-  32 4 band_lo | 36 4 band_hi (Rescan only) | 40 8 fill_lanes u64 | 48 1 flags (bit 0 CONT)
+  32 4 band_lo | 36 4 band_hi (Rescan only) | 40 8 fill_lanes u64
+  48 1 flags (bit 0 CONT; bit 1 CROSS: the source's FwdEntry CROSS, steps with a source only)
   49 15 rsv
   then ceil(n_delta / 4) lines of { lane: u8, rsv: [u8;7], seq: LaneSeq } × 4
 
@@ -1278,6 +1287,10 @@ fn classify(l: &Lane, o: &NewOrder) -> Route {
 }
 ```
 
+A `Forward` from the IOC/FOK line or a `// cross` line sets `op.cross`; one from an
+`// improve` line leaves it clear. Risk charges by it (10 M8), and the lane logs it for replay
+(§4.12, §10).
+
 `bid = 0` means no bid and `ask = u32::MAX` means no ask, so with an empty side every passive
 order on that side is an improve. A Halted-phase snapshot never reaches `classify` for a `New`,
 because `admit` rejects it with `BOOK_HALTED`.
@@ -1299,7 +1312,8 @@ fn forward(l: &mut Lane, s: &Session, ix: u8, m: Msg, op: &mut Op, ops: &mut OpL
     l.write_slot(op.v);                                    // the BBO core may read it (§8.5)
     let e = FwdEntry { lane_seq: op.seq, prio_ts: op.ts, snap_ver: l.snap.version as u32,
                        deadline: l.bbo_deadline(op, &deps),            // §6.8
-                       msg: m.with_index(ix).with_ndep(deps.len()), handle: root_handle(op.v),
+                       msg: m.with_index(ix).with_cross(op.cross).with_ndep(deps.len()),  // §4.12
+                       handle: root_handle(op.v),
                        vslot: op.v, session: s.id, resp_seq: rs, pkt_seq: cur_pkt_seq,
                        acct_ix: s.acct_ix as u16,
                        applied_back: (op.seq − l.applied) as u16 };
@@ -1751,7 +1765,10 @@ Aliasing is deterministic, so it never forks replicas.
 | 9 | `Uncross` | control ring | one chunk of the auction allocation; the last chunk sets `Continuous` | §8.8 |
 
 The codes are this chapter's (§17 R11 asks 01 to adopt them; 01 §14.10 names the kinds).
-`StepRecord.src_lane_seq = 0` means "no source". The record of a `Rescan` carries the band in
+`StepRecord.src_lane_seq = 0` means "no source". A step with a source sets `StepEntry.flags`
+bit 1 `CROSS` from its `FwdEntry` (§4.12): the kind is what the step did, `CROSS` is how the lane
+routed the op, and the two differ for a Cross that ends without a fill or an Improve that trades.
+The record of a `Rescan` carries the band in
 `StepEntry.band_lo/hi`; request R2 asks 01 to add it to `StepRecord`.
 
 `Seal` is issued by 08 while the book is `Frozen` or `Halted`, once every lane's counter is in
@@ -2129,7 +2146,7 @@ a market-structure rule, not a latency exemption: every message in it is answere
 
 | Output of step `s` | Ring | Content |
 |---|---|---|
-| `StepEntry` | `StepLog` | kind, source, changed cut entries, band, `fill_lanes`, `CONT` |
+| `StepEntry` | `StepLog` | kind, source, changed cut entries, band, `fill_lanes`, `CONT`, `CROSS` |
 | maker `Fill` | `FillRing[maker lane]` | one per fill, `liq = 0` (`2` in an uncross) |
 | taker `Fill` | `FillRing[taker lane]` | one per level, `liq = 1` (for the `LaneSeq` source and for Rescan takers) |
 | `Rested`/`Out`/`Reject`/`Dep` | `FillRing[taker lane]` | final status of the source op, of each dependency, or of a Rescan taker |
@@ -2491,12 +2508,21 @@ A replica runs `vyrn-engine` with the same lane, BBO and settlement code. Three 
 | deadline admission at the lane | `PacketRecord.flags.SHED`: answer `BUSY`, apply nothing; no clock is read |
 | `LaneCut` polls inside a packet | `MID` Advance records: run the boundary before the named op and pass |
 | two cut cores → half-cuts | `StepRecord.cut` is the step's cut `C_s`; `step_cut` and partial-cut choices are not repeated |
-| `pick_source` over ring heads, band test, the BBO deadline test | `StepRecord.src_*`, `kind` (incl. `Shed`, `CONT`) and the `Rescan` band (request R2; without it, the band is all ticks, which is correct by the superset corollary of Lemma 9.7) |
+| `pick_source` over ring heads, band test, the BBO deadline test | `StepRecord.src_*`, `kind` (incl. `Shed`, `CONT`, `CROSS`) and the `Rescan` band (request R2; without it, the band is all ticks, which is correct by the superset corollary of Lemma 9.7) |
 | `LaneCut[l]` read by the lane | `PacketRecord.fills_applied = f` and `C_f[l]` from `StepRecord f` |
-| snapshot routing in `classify` | op `(l, q)` is forwarded iff a `StepRecord` has `src = (l, q)` |
+| snapshot routing in `classify` | op `(l, q)` is forwarded iff a `StepRecord` has `src = (l, q)`, with route `Cross` iff that record has `flags.CROSS`, else `Improve`. An op that a `RouteRecord` names (01 §6.6) takes its route (`cross`) and is rejected by the lane as live. Every other op is local (`Join`). The step kind never gives the route (§4.12) |
 | dependency lists in `FwdEntry` | recomputed from the packet's bytes by the replayed pass 1 (§6.6: a function of the messages and lane state) |
 | core 0's `uncross_price` | the replica's control role computes it from its own lanes' histograms at `C*` |
 | pool token CAS and stealing (§6.9) | `AcctTake { acct, ver }` records: a lane waits at one until the account's previous `ver` is replayed |
+
+**Routes (10 M8).** Lane risk charges a `New` or new-priority `Replace` by its route before it
+forwards or rejects it, so replay must give pass 1 the live route, not one derived from the step
+kind or the replayed snapshot. Two records carry it, both in 07's stream: `StepRecord.flags.CROSS`
+for a forwarded op, and a `RouteRecord` for an op the lane classified `Cross` or `Improve` and
+then rejected itself (for example `POST_ONLY_WOULD_CROSS`), which no step names. The lane writes
+the `RouteRecord` in pass 1, at the reject, into its order ring after the packet's
+`PacketRecord`. `vyrn-lane`'s `Lane::replay_packet(vis, p, clock, mids, routes)` takes the union
+of both as `routes`.
 
 **Scheduler.** The replica schedules lanes and the BBO core as a dataflow:
 

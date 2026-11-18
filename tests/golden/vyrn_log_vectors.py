@@ -125,6 +125,24 @@ out("ex311.sections", hx(
     " 50 00 07 00"     # Cross | HOME | SPARSE; gap 0; src 7; zigzag(0)
     " 88100000"        # bitmap of 25 lanes: bits 3, 7, 12
     " 02 0a 01"))      # deltas
+# The same step as an Improve whose lane classified it Cross (STP left no fill): the src byte
+# carries StepRecord.flags CROSS in bit 7 (07 §3.8), 0x80 | lane 7.
+out("ex311.cross_route.sections", hx(
+    "07 01 0a ac02 8008"
+    " 40 01"
+    " 51 00 87 00"     # Improve | HOME | SPARSE; gap 0; src 0x87 = CROSS | lane 7; zigzag(0)
+    " 88100000 02 0a 01"))
+# RouteRecord (07 §3.6) after lane 7's packet (LaneSeqs 1..10): op 8 was classified Cross and
+# rejected by the lane. h = CROSS (bit 7) | back 2 (10 - 8); slot 4098 = LEB 82 20.
+out("ex311.route.sections", hx(
+    "07 02"            # LaneRun tag lane 7, k = 2
+    " 0a ac02 8008"    # the packet record above
+    " 82 8220"))       # RouteRecord: h = 0x80 | 2; slot REP_SLOT_ROUTE
+# back 10 >= count 10, and a reserved h bit (0x10): both REP_E_COUNT.
+out("ex311.bad_route_back.sections", hx("07 02 0a ac02 8008 8a 8220"))
+out("ex311.bad_route_bits.sections", hx("07 02 0a ac02 8008 12 8220"))
+# src byte bit 6 set (0x47): no lane of the half, REP_E_CUT.
+out("ex311.bad_src_bit6.sections", hx("07 01 0a ac02 8008 40 01 51 00 47 00 88100000 02 0a 01"))
 print()
 
 # ---------------------------------------------------------------- one block on two substreams

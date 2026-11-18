@@ -19,7 +19,7 @@ use vyrn_log::{
 };
 use vyrn_types::{
     AccountId, AcctTake, BlockHeader, BookId, Epoch, Hash, Height, LaneId, LaneSeq, Nanos,
-    PacketFlags, PacketRecord, PktHash, SessionId, StepId, StepKind,
+    PacketFlags, PacketRecord, PktHash, RouteRecord, SessionId, StepFlags, StepId, StepKind,
 };
 
 fn golden() -> BTreeMap<String, String> {
@@ -135,6 +135,7 @@ fn worked_example_07_3_11() {
             home: Some(Home {
                 src_lane: LaneId(7),
                 src_lane_seq: LaneSeq(10),
+                flags: 0,
                 payload: vec![],
             }),
             cut,
@@ -145,11 +146,100 @@ fn worked_example_07_3_11() {
     assert_eq!(enc.len(), 20, "07 §3.11: 20 bytes");
 
     let mut dec = ref_state();
-    dec.encode_sections(&[bind], BodyKind::Order).unwrap();
+    dec.encode_sections(std::slice::from_ref(&bind), BodyKind::Order)
+        .unwrap();
     assert_eq!(
         dec.decode_sections(&enc, BodyKind::Order).unwrap(),
         sections
     );
+
+    // The step as an Improve that its lane classified Cross: StepRecord.flags CROSS rides in
+    // bit 7 of the src byte, at no extra byte.
+    let bound = || {
+        let mut st = ref_state();
+        st.encode_sections(std::slice::from_ref(&bind), BodyKind::Order)
+            .unwrap();
+        st
+    };
+    let mut cross = sections.clone();
+    if let Section::StepRun(hs) = &mut cross[1] {
+        hs[0].kind = StepKind::Improve;
+        hs[0].home.as_mut().unwrap().flags = StepFlags::CROSS;
+    }
+    let enc = bound().encode_sections(&cross, BodyKind::Order).unwrap();
+    assert_eq!(enc, bytes(&g, "ex311.cross_route.sections"));
+    assert_eq!(enc.len(), 20);
+    assert_eq!(
+        bound().decode_sections(&enc, BodyKind::Order).unwrap(),
+        cross
+    );
+    assert_eq!(
+        bound().decode_sections(&bytes(&g, "ex311.bad_src_bit6.sections"), BodyKind::Order),
+        Err(RepErr::Cut)
+    );
+    // G9: a RouteRecord after the packet, 3 bytes; bad back and reserved bits are rejected.
+    let pkt = sections[0].clone();
+    let Section::LaneRun { recs, .. } = &pkt else {
+        unreachable!()
+    };
+    let route = vec![Section::LaneRun {
+        lane: LaneId(7),
+        recs: vec![
+            recs[0],
+            LaneRec::Route(RouteRecord {
+                lane: LaneId(7),
+                lane_seq: LaneSeq(8),
+                cross: true,
+            }),
+        ],
+    }];
+    let enc = bound().encode_sections(&route, BodyKind::Order).unwrap();
+    assert_eq!(enc, bytes(&g, "ex311.route.sections"));
+    assert_eq!(enc.len(), 10, "a RouteRecord costs 3 bytes");
+    assert_eq!(
+        bound().decode_sections(&enc, BodyKind::Order).unwrap(),
+        route
+    );
+    for k in [
+        "ex311.bad_route_back.sections",
+        "ex311.bad_route_bits.sections",
+    ] {
+        assert_eq!(
+            bound().decode_sections(&bytes(&g, k), BodyKind::Order),
+            Err(RepErr::Count),
+            "{k}"
+        );
+    }
+    let mut beyond = route.clone();
+    if let Section::LaneRun { recs, .. } = &mut beyond[0]
+        && let LaneRec::Route(r) = &mut recs[1]
+    {
+        r.lane_seq = LaneSeq(11);
+    }
+    assert_eq!(
+        bound().encode_sections(&beyond, BodyKind::Order),
+        Err(RepErr::Count),
+        "a RouteRecord names an op of the preceding packet"
+    );
+    // CROSS needs a source, and no other flag bit exists.
+    for (src, flags) in [(0xFF, StepFlags::CROSS), (7, 1)] {
+        let mut bad = cross.clone();
+        if let Section::StepRun(hs) = &mut bad[1] {
+            if src == 0xFF {
+                hs[0].kind = StepKind::Idle;
+            }
+            let h = hs[0].home.as_mut().unwrap();
+            if src == 0xFF {
+                h.src_lane = LaneId(0xFF);
+                h.src_lane_seq = LaneSeq(0);
+            }
+            h.flags = flags;
+        }
+        assert_eq!(
+            bound().encode_sections(&bad, BodyKind::Order),
+            Err(RepErr::Kind)
+        );
+    }
 }
 
 const PREV: Hash = Hash([0x11; 32]);
@@ -227,6 +317,7 @@ fn bodies(g: &BTreeMap<String, String>) -> (Vec<Body>, Vec<Body>, BlockHeader) {
                     home: Some(Home {
                         src_lane: LaneId(0),
                         src_lane_seq: LaneSeq(4),
+                        flags: 0,
                         payload: vec![],
                     }),
                     cut: vec![LaneSeq(4), LaneSeq(0)],
@@ -238,6 +329,7 @@ fn bodies(g: &BTreeMap<String, String>) -> (Vec<Body>, Vec<Body>, BlockHeader) {
                     home: Some(Home {
                         src_lane: LaneId(0xFF),
                         src_lane_seq: LaneSeq(0),
+                        flags: 0,
                         payload: vec![1, 2],
                     }),
                     cut: vec![LaneSeq(4), LaneSeq(0)],
@@ -530,6 +622,7 @@ fn a_failed_encode_poisons_the_encoder() {
             home: Some(Home {
                 src_lane: LaneId(0xFF),
                 src_lane_seq: LaneSeq(0),
+                flags: 0,
                 payload: vec![0; 70_000],
             }),
             cut: vec![LaneSeq(4), LaneSeq(0)],
