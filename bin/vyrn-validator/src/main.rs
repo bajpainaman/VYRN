@@ -400,7 +400,8 @@ struct DataRx<const N: usize, R> {
 const FETCH_BURST: usize = 16;
 
 impl<const N: usize, R: RxRing> DataRx<N, R> {
-    /// Polls the queue once; sends a RANGE fetch for every gap. Returns the frames taken.
+    /// Polls the queue and the repair socket once; sends queued fetches. Returns the datagrams
+    /// taken.
     fn poll(&mut self, now: u64) -> usize {
         let mut burst = [RxPkt::empty(); RX_BURST];
         let k = self.rx.poll(&mut burst);
@@ -416,9 +417,14 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             }
         }
         self.rx.release(k);
-        // Answers to KEY fetches, on the repair socket.
+        // Answers to KEY fetches, on the repair socket: at most `RX_BURST` per poll, like the
+        // data queue, so a flood of datagrams cannot hold the order thread here.
         let mut buf = [0u8; frame::MAX_FRAME_BYTES];
-        while let Ok(n) = self.repair.recv(&mut buf) {
+        let mut answers = 0;
+        while answers < RX_BURST
+            && let Ok(n) = self.repair.recv(&mut buf)
+        {
+            answers += 1;
             if let Ok(fed) = self
                 .feed
                 .on_frame(&mut self.join, buf.get(..n).unwrap_or(&[]), now)
@@ -452,7 +458,7 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 self.fetches.pop_front();
             }
         }
-        k
+        k + answers
     }
 
     /// Item 3 for the pending blocks, in height order: a block whose payloads are all joined
