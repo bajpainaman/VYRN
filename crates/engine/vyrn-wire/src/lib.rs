@@ -56,7 +56,7 @@ use vyrn_types::RejectReason;
 
 /// The protocol version this crate parses and builds: `proto_version` at session open (04 §4.4,
 /// §12). Session open, not the packet, carries it.
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
 /// `CancelAck.handle` of a `CancelAll` summary (04 §6.6). Never a real handle.
 pub const PROTO_HANDLE_ALL: u32 = 0xFFFF_FFFF;
 /// `index` of a record that answers a packet or the session, not one message.
