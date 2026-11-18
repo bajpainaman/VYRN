@@ -56,7 +56,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use vyrn_log::block::header_hash;
-use vyrn_types::{BlockHeader, Ed25519Sig, Epoch, Height, PubKey};
+use vyrn_types::{BlockHeader, Ed25519Sig, Epoch, Height, PubKey, StepId};
 
 /// `REP_VERIFY_WAIT_MS` (07 §6.4).
 pub const VERIFY_WAIT: Duration = Duration::from_millis(4);
@@ -220,13 +220,25 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
             let last = run.iter().find(|r| header_hash(r) == h.prev)?;
             (last.height, last.last_step)
         };
+        self.seal_cand(Height(parent.height.0.checked_add(1)?), seal, star, star_step)
+    }
+
+    /// The seal range `first ..= seal.header.height` on top of `H*` = `star`, if the seal header
+    /// sits on it (height and steps) and the range fits `REP_MAX_SEAL_RANGE`.
+    fn seal_cand(
+        &self,
+        first: Height,
+        seal: Seal,
+        star: Height,
+        star_step: StepId,
+    ) -> Option<SealCand> {
+        let h = &seal.header;
         if h.epoch != self.epoch
             || star.0.checked_add(1) != Some(h.height.0)
             || star_step.0.checked_add(1) != Some(h.first_step.0)
         {
             return None;
         }
-        let first = Height(parent.height.0.checked_add(1)?);
         let excl = self.source.excl_root(self.epoch, first, h.height);
         let proposal = seal_proposal(self.epoch, first, h, excl).ok()?;
         let digest = Digest(seal_digest(&proposal, &seal.ext).0);
@@ -292,6 +304,27 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
                     (Digest(p.digest().0) == *digest).then(|| (p, tip_at(&p, last)))
                 })
             });
+            // A seal starting at any held height up to `H*`, within REP_MAX_SEAL_RANGE.
+            if hit.is_none()
+                && let Some(seal) = self.source.seal(self.epoch)
+                && let Some(at) = walk.iter().position(|h| header_hash(h) == seal.header.prev)
+            {
+                let star = &walk[at];
+                let span = usize::try_from(MAX_SEAL_RANGE - 1).unwrap_or(63);
+                let firsts = walk[at.saturating_sub(span - 1)..=at]
+                    .iter()
+                    .map(|f| f.height)
+                    .chain(star.height.0.checked_add(1).map(Height));
+                let found = firsts.into_iter().find_map(|first| {
+                    self.seal_cand(first, seal.clone(), star.height, star.last_step)
+                        .filter(|c| c.digest == *digest)
+                });
+                if let Some(c) = found {
+                    let e = c.entry();
+                    lock(&self.known).tips.insert(*digest, e.clone());
+                    return Some(e);
+                }
+            }
         }
         let (p, tip) = hit?;
         let e = Entry::headers(p, tip);
@@ -411,9 +444,9 @@ where
                                 Verdict::Pending => {}
                             }
                         }
-                        // Every possible range is held and none matches: a contradiction.
-                        (None, true) => break false,
-                        (None, false) => {}
+                        // Even a full run that matches nothing proves no contradiction: the
+                        // payload may be a seal this voter's source does not hold yet (07 §9.4).
+                        (None, _) => {}
                     }
                 }
                 if clock.current() >= deadline {
@@ -885,6 +918,34 @@ mod tests {
             assert!(app.verify(ctx(4, 3, p12), on12).await.await.unwrap());
             // Nothing extends the seal: a leader whose parent is the seal declines.
             assert!(app.propose(ctx(5, 1, want)).await.await.is_err());
+        });
+    }
+
+    #[test]
+    fn a_seal_over_an_unseen_parent_is_rebuilt_from_headers() {
+        with_app(20, |app, src, _| async move {
+            // Only genesis is known; the finalized seal covers 17..=21 on top of an unseen 1..=16.
+            let seal = seal_of(&src, 20);
+            src.depose(seal.clone());
+            let e = app.resolve(&seal_payload(&seal, 17)).unwrap();
+            assert_eq!(e.proposal.map(|p| p.first_height), Some(Height(17)));
+            assert_eq!((e.tip.height, e.seal), (Height(21), Some(seal.ext)));
+        });
+    }
+
+    #[test]
+    fn a_long_seal_waits_for_its_headers_and_candidate() {
+        with_app(20, |mut app, src, g| async move {
+            let seal = seal_of(&src, 20);
+            // This voter holds 1..=16 and no candidate yet: a full kind-0 run, no match.
+            let late: Vec<_> = (17..=20).map(|h| src.header(Height(h)).unwrap()).collect();
+            src.0.lock().unwrap().retain(|h, _| h.0 <= 16);
+            let rx = app.verify(ctx(1, 0, g), seal_payload(&seal, 1)).await;
+            for h in late {
+                src.insert(h);
+            }
+            src.depose(seal);
+            assert!(rx.await.unwrap());
         });
     }
 

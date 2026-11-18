@@ -1849,6 +1849,22 @@ seal header  { height: Hs, epoch, book, first_step: last_step(H*) + 1,
 - Voters run §6.4 items 1, 3 and 4 on the range and §9.3 items 3 and 4 on the tail.
   Finalization of the seal proposal makes the seal block final. Its certificate stands in for
   `seq_sig`.
+- **Where a voter gets the seal.** `Relay` is a no-op (§6.3), so a seal payload, like any other,
+  travels as its digest alone. Each voter holds its own seal candidate: the seal header and
+  `REP_SealExt` it computes from the reports it holds (§9.3 is a pure function of them), or that
+  its replica received from the leader. It accepts a seal payload only when the payload is that
+  candidate on top of the view's parent; any other seal payload stays pending and is refused at
+  `REP_VERIFY_WAIT_MS`, and the view nullifies. A later leader holding the same reports proposes
+  the same seal. A full run of signed headers that matches no kind-0 range is therefore no
+  contradiction while a seal may still arrive.
+- **The checks split.** A voter checks §6.4 item 1 itself for the signed headers `(parent.last,
+  H*]` and for the seal header's link to `H*` (`prev`, height, `first_step`). Items 2–5 for the
+  signed headers are the same check as for a kind-0 range. Items 3–4 for the seal header and
+  §9.3 items 3–4 for the tail are the seal check. `excl_root` covers the unavailable packets
+  and, in CHAIN, the excluded ones (09).
+- **A deposed leader proposes only the seal.** From deposition on (§9.2), a leader never
+  proposes a kind-0 range. When the seal does not extend the view's parent, for example when the
+  parent is already the seal, it proposes nothing and the view nullifies (INV-REP-5).
 - After the seal is final, `next_seq` emits frame 1 of tenure `next_tenure` with `TenureStart{
   first_step: last_step(Hs) + 1, first_height: Hs + 1, prev_header_hash: header_hash(Hs), lane
   bases, prev_cut = lane_bounds }`.
