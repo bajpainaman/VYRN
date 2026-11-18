@@ -13,17 +13,19 @@
 //! **Per data box** (indexed by the frame's `src`). `DATA` frames to one destination carry
 //! `data_seq` 1, 2, … with no gap, and a `DATA_HB` carries the last `DATA` sent (`vyrn-data` crate
 //! docs). The feed keeps the highest `data_seq` seen and returns a missing run as
-//! [`Fed::gap`], the `DataFetch{from, to}` (a RANGE fetch) to send to that box. A `DATA` frame at
+//! [`Fed::gap`]: the box's `src` and the `DataFetch{from, to}` (a RANGE fetch) to send it, whose
+//! `dst` is this replica's index in the box's destination list, given at [`DataFeed::new`]. A `DATA` frame at
 //! or below the highest is a resend that a RANGE fetch asked for: its packets are stored and the
 //! position stays. `FETCH_RESP` frames carry no stream position. [`DataFeed::silent`] lists the
 //! boxes heard from once and silent for `REP_DATA_SILENCE_MS` (07 §5.3), for `DataDown{d}`.
 //!
-//! **Rejects** ([`FeedErr`]): a frame that `vyrn_data::frame::decode` refuses, a `src` beyond the
-//! configured boxes, and a `DATA` or `FETCH_RESP` frame of another book. A rejected frame changes
-//! nothing. A packet that does not parse or names another book is dropped and counted in
-//! [`Fed::dropped`]; its frame's other packets are still stored.
+//! **Rejects** ([`FeedErr`]): a frame that `vyrn_data::frame::decode` refuses, and a `src` beyond
+//! the configured boxes. A rejected frame changes nothing. A data box sends every book it serves
+//! on one `data_seq` per destination, so a frame of another book still moves the box's position
+//! and liveness; its packets, like any that do not parse or name another book, are dropped and
+//! counted in [`Fed::dropped`].
 
-use vyrn_data::frame::{FrameErr, Kind, decode};
+use vyrn_data::frame::{Fetch, FrameErr, Kind, decode};
 use vyrn_types::BookId;
 use vyrn_wire::Request;
 
@@ -39,8 +41,6 @@ pub enum FeedErr {
     Frame(FrameErr),
     #[error("data box {0} is not configured")]
     Src(u8),
-    #[error("data frame of book {0:?}, not the served book")]
-    Book(BookId),
 }
 
 /// What one frame did.
@@ -50,8 +50,9 @@ pub struct Fed {
     pub stored: u32,
     /// Packets that did not parse or named another book.
     pub dropped: u32,
-    /// `(src, from, to)`: `DATA` frames `from..=to` of data box `src` were never received.
-    pub gap: Option<(u8, u64, u64)>,
+    /// `(src, fetch)`: `DATA` frames of data box `src` were never received; `fetch` is the
+    /// `Fetch::Range` that asks it for them.
+    pub gap: Option<(u8, Fetch)>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -66,14 +67,18 @@ struct Source {
 #[derive(Clone, Debug)]
 pub struct DataFeed {
     book: BookId,
+    /// This replica's index in every data box's destination list (the RANGE fetch's `dst`).
+    me: u8,
     sources: Vec<Source>,
 }
 
 impl DataFeed {
-    /// A feed for `book` from data boxes `0..n_boxes` (the frames' `src`).
-    pub fn new(book: BookId, n_boxes: u8) -> Self {
+    /// A feed for `book` from data boxes `0..n_boxes` (the frames' `src`), for the replica at
+    /// index `me` of their destination lists.
+    pub fn new(book: BookId, n_boxes: u8, me: u8) -> Self {
         Self {
             book,
+            me,
             sources: vec![Source::default(); usize::from(n_boxes)],
         }
     }
@@ -87,15 +92,11 @@ impl DataFeed {
     ) -> Result<Fed, FeedErr> {
         let f = decode(payload).map_err(FeedErr::Frame)?;
         let src = f.hdr.src;
-        let book = self.book;
+        let (book, me) = (self.book, self.me);
         let s = self
             .sources
             .get_mut(usize::from(src))
             .ok_or(FeedErr::Src(src))?;
-        // A heartbeat and an empty fetch answer carry book 0.
-        if f.n_pkts > 0 && f.hdr.book != book {
-            return Err(FeedErr::Book(f.hdr.book));
-        }
         let mut fed = Fed::default();
         let announced = match f.hdr.kind {
             Kind::Data | Kind::DataHb => Some(f.hdr.data_seq),
@@ -108,7 +109,8 @@ impl DataFeed {
                 _ => seq,
             };
             if last_missing > s.high {
-                fed.gap = Some((src, s.high.saturating_add(1), last_missing));
+                let (from, to) = (s.high.saturating_add(1), last_missing);
+                fed.gap = Some((src, Fetch::Range { dst: me, from, to }));
             }
             s.high = s.high.max(seq);
         }

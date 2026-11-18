@@ -391,8 +391,10 @@ fn payloads_from_a_data_box_replay_the_live_run() {
         ip: Ipv4Addr::new(10, 0, 0, last),
         port,
     };
+    // The replica is destination 1 of data box 0, so a RANGE fetch's `dst` is not the box's `src`.
     let (ingest_ep, fetch_ep, replica_ep, client) =
         (ep(1, 19998), ep(1, 19997), ep(2, 20000), ep(9, 4000));
+    let other_ep = ep(2, 20001);
     let ports = (0..2u8)
         .map(|i| PortConfig {
             id: PortId(i),
@@ -423,7 +425,7 @@ fn payloads_from_a_data_box_replay_the_live_run() {
         ring_slots: 64,
     };
     let mut node = DataNode::new(
-        NodeConfig::new(home, 0, ingest_ep, vec![replica_ep]),
+        NodeConfig::new(home, 0, ingest_ep, vec![other_ep, replica_ep]),
         ingest,
         fetch,
         tx,
@@ -467,7 +469,7 @@ fn payloads_from_a_data_box_replay_the_live_run() {
     assert_eq!(frames.len(), store.0.len(), "one DATA frame per packet");
     assert!(frames.len() >= 3);
 
-    let mut feed = DataFeed::new(BOOK, 1);
+    let mut feed = DataFeed::new(BOOK, 1, 1);
     let mut join = DataJoin::default();
     let mut gaps = vec![];
     for (i, f) in frames.iter().enumerate() {
@@ -478,9 +480,14 @@ fn payloads_from_a_data_box_replay_the_live_run() {
         assert_eq!((fed.stored, fed.dropped), (1, 0));
         gaps.extend(fed.gap);
     }
+    let range = Fetch::Range {
+        dst: 1,
+        from: 2,
+        to: 2,
+    };
     assert_eq!(
         gaps,
-        vec![(0, 2, 2)],
+        vec![(0, range)],
         "DATA 3 reveals that DATA 2 is missing"
     );
     assert!(
@@ -490,8 +497,7 @@ fn payloads_from_a_data_box_replay_the_live_run() {
         ),
         "no vote while a payload is missing"
     );
-    let (src, from, to) = gaps[0];
-    inject(fetch_ep, &Fetch::Range { dst: src, from, to }.encode());
+    inject(fetch_ep, &gaps[0].1.encode());
     node.poll(Nanos(0));
     for f in drain(&mut rx) {
         let fed = feed.on_frame(&mut join, &f, 0).unwrap();
