@@ -248,6 +248,68 @@ fn a_take_must_sit_right_before_its_record_not_before_its_route() {
 }
 
 #[test]
+fn a_foreign_route_between_a_take_and_its_packet_diverges_at_the_take() {
+    // Coordinator ruling on #135: a take sits right before its packet's group (the packet's
+    // own route records and the packet). A route record of another packet between them is
+    // `Why::Mismatch` at the take's index, whether that route is from the same lane or not.
+    let tok = PoolTok::new();
+    let mut sh = box_shared();
+    let mut e = pooled_engine(&mut sh, &tok, true);
+    let mut s = Takes::default();
+    let store = feed(
+        &mut e,
+        &[
+            (0, 1, order(Side::Sell, Tif::Day, Stp::None, 200, 2, 1)),
+            (1, 1, order(Side::Buy, Tif::Ioc, Stp::None, 200, 1, 2)),
+            (1, 1, order(Side::Buy, Tif::Ioc, Stp::None, 200, 1, 3)),
+        ],
+        &mut s,
+    );
+    let recs = &s.j.recs;
+    let groups: Vec<usize> = (0..recs.len() - 2)
+        .filter(|&i| {
+            matches!(
+                (&recs[i], &recs[i + 1], &recs[i + 2]),
+                (OwnedRec::Take(_), OwnedRec::Packet(_), OwnedRec::Route(_))
+            )
+        })
+        .collect();
+    assert_eq!(
+        groups.len(),
+        2,
+        "each pooled IOC logs [Take, Packet, Route]"
+    );
+    let (first, second) = (groups[0], groups[1]);
+    let OwnedRec::Route(foreign) = recs[first + 2] else {
+        unreachable!()
+    };
+    let replay = |recs: &[OwnedRec]| {
+        let rtok = PoolTok::new();
+        let mut rsh = box_shared();
+        let mut r = pooled_engine(&mut rsh, &rtok, true);
+        r.replay(recs, &store, &mut NoResponses, &mut Journal::default())
+    };
+    assert_eq!(replay(recs), Ok(()));
+    let other_lane = vyrn_types::RouteRecord {
+        lane: LaneId(2),
+        ..foreign
+    };
+    for r in [foreign, other_lane] {
+        let mut bad = recs.clone();
+        bad.insert(second + 1, OwnedRec::Route(r));
+        assert_eq!(
+            replay(&bad),
+            Err(Diverged {
+                index: second,
+                why: Why::Mismatch
+            }),
+            "foreign route on lane {}",
+            r.lane.0
+        );
+    }
+}
+
+#[test]
 fn a_held_token_fail_stops_the_lane() {
     let tok = PoolTok::new();
     let mut sh = box_shared();

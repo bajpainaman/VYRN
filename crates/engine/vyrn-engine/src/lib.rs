@@ -77,8 +77,10 @@
 //!   because the lane does not report which accounts a boundary touched. The account's ledger
 //!   and sessions stay lane-local (`vyrn-lane` has no shared `PoolAcct`). [`Engine::replay`]
 //!   checks `AcctTake` records ([`OwnedRec::Take`]): each is part of the lane call of the record
-//!   it covers, and must be reproduced right before it with the same `ver` ([`Why::Mismatch`]
-//!   at the take otherwise). [`Engine::replay_wire`] does not take them yet.
+//!   it covers, and must be reproduced right before that packet's group (its own route
+//!   records and the packet, in emitted order) with the same `ver`. Otherwise replay fails
+//!   with [`Why::Mismatch`] at the take, including when a route record of another packet, on
+//!   any lane, sits between them. [`Engine::replay_wire`] does not take them yet.
 //! - Control steps carry their kind, not their command, in the order stream. A replayer
 //!   queues the commands through [`Engine::command`] before [`Engine::replay`].
 //! - On a delayed backend (`Sim`), a step's lines may become visible after `Bbo::poll`

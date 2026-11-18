@@ -914,7 +914,13 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                         _ => lane_run
                             .enumerate()
                             .find_map(|(k, q)| q.filter(|q| !is_advance(q)).map(|q| (k, q)))
-                            .ok_or(at(Why::BadRecord))?,
+                            // A take whose packet's group does not follow it is misplaced
+                            // (05 §6.9, #135 ruling); a route with no packet is malformed.
+                            .ok_or(at(if matches!(r, OwnedRec::Take(_)) {
+                                Why::Mismatch
+                            } else {
+                                Why::BadRecord
+                            }))?,
                     };
                     let before = run.get(..k).unwrap_or(&[]);
                     // The lane's records from `i` on, through its MID and route records after
