@@ -3684,8 +3684,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vyrn-consensus",
- "vyrn-engine",
- "vyrn-epoch",
+ "vyrn-crypto",
  "vyrn-log",
  "vyrn-types",
 ]

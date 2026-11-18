@@ -7,12 +7,12 @@ license-file.workspace = true
 publish = false
 description = "The replica: two-path order frames, data fetch, replay engine (Rust or Vx), state roots, votes."
 
+# vyrn-engine (replay) and vyrn-epoch sit behind this crate's own traits, `ReplayEngine` and
+# `EpochView` (src/ports.rs), until those crates land; the wiring is a listed follow-up.
 [dependencies]
 vyrn-types = { workspace = true }
-vyrn-engine = { workspace = true }
 vyrn-consensus = { workspace = true }
 vyrn-log = { workspace = true }
-vyrn-epoch = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
@@ -23,3 +23,6 @@ thiserror = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+vyrn-crypto = { workspace = true }
