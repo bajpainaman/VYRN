@@ -13,6 +13,7 @@
 //! - items 2–5 (order bytes, payloads, tags, fences) are [`BlockSource::check_body`].
 
 use crate::proposal::{Proposal, ProposalKind};
+use crate::tail::SealExt;
 use std::sync::{Arc, PoisonError, RwLock};
 use vyrn_log::block::{check_anchor, header_hash, verify_seq_sig};
 use vyrn_log::store::BlockStore;
@@ -38,8 +39,35 @@ pub trait BlockSource: Clone + Send + Sync + 'static {
     /// Vote-rule items 2–5 for `first ..= last` (07 §6.4). BASE sources ignore item 4.
     fn check_body(&self, epoch: Epoch, first: Height, last: Height) -> Verdict;
 
-    /// `excl_root` for `first ..= last`: 32 zero bytes in BASE, 09's root in CHAIN.
+    /// `excl_root` for `first ..= last`: 32 zero bytes in BASE, 09's root in CHAIN. For a seal
+    /// range it also covers the seal's unavailable packets (07 §9.4).
     fn excl_root(&self, epoch: Epoch, first: Height, last: Height) -> Hash;
+
+    /// The seal of this epoch's deposed tenure, once this voter has seen it deposed and holds
+    /// the seal it would propose or accept (07 §9.2–9.4); `None` while the tenure is live. From
+    /// the first `Some`, this voter proposes only the seal (INV-REP-5).
+    ///
+    /// Spec gap: 07 §9.4 does not say how a voter learns the leader's seal header and
+    /// `REP_SealExt` behind a 32-byte payload, since `Relay` is a no-op. Reading: the source
+    /// holds the candidate (computed from the reports it holds, or received from the leader by
+    /// the source itself), and a seal payload that is not this candidate is never accepted.
+    fn seal(&self, _epoch: Epoch) -> Option<Seal> {
+        None
+    }
+
+    /// 07 §9.4's checks on the tail of `seal`: §6.4 items 3 and 4 for the seal header and §9.3
+    /// items 3 and 4 (consistency, data). The signed headers below it get [`check_body`]
+    /// (BlockSource::check_body) as any range does.
+    fn check_seal(&self, _epoch: Epoch, _seal: &Seal) -> Verdict {
+        Verdict::Invalid
+    }
+}
+
+/// A seal candidate (07 §9.4): the seal header on top of `H*` and its `REP_SealExt`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seal {
+    pub header: BlockHeader,
+    pub ext: SealExt,
 }
 
 /// Where one epoch's Simplex instance starts: the HandoffRecord's last block (07 §6.3, 08).
@@ -206,13 +234,24 @@ pub(crate) mod mem {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
+    /// Headers by height, and the seal candidate once a test deposes the tenure.
     #[derive(Clone, Default)]
-    pub struct MemSource(pub Arc<Mutex<BTreeMap<Height, BlockHeader>>>);
+    pub struct MemSource(
+        pub Arc<Mutex<BTreeMap<Height, BlockHeader>>>,
+        pub Arc<Mutex<Option<Seal>>>,
+    );
 
     impl MemSource {
         pub fn insert(&self, h: BlockHeader) {
             if let Ok(mut m) = self.0.lock() {
                 m.insert(h.height, h);
+            }
+        }
+
+        /// Deposes the tenure: from now on `seal` answers `s` and `check_seal` accepts only it.
+        pub fn depose(&self, s: Seal) {
+            if let Ok(mut m) = self.1.lock() {
+                *m = Some(s);
             }
         }
     }
@@ -226,6 +265,16 @@ pub(crate) mod mem {
         }
         fn excl_root(&self, _: Epoch, _: Height, _: Height) -> Hash {
             Hash([0; 32])
+        }
+        fn seal(&self, _: Epoch) -> Option<Seal> {
+            self.1.lock().ok()?.clone()
+        }
+        fn check_seal(&self, _: Epoch, s: &Seal) -> Verdict {
+            if self.seal(Epoch(0)).as_ref() == Some(s) {
+                Verdict::Valid
+            } else {
+                Verdict::Invalid
+            }
         }
     }
 }

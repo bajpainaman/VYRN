@@ -27,8 +27,7 @@ pub const PROPOSAL_CONTEXT: &[u8] = b"vyrn      v1 proposal";
 pub enum ProposalKind {
     /// A range of signed headers (07 §6.3).
     Headers = 0,
-    /// The seal of a deposed tenure (07 §9.4). Encoded and decoded here; this crate does not yet
-    /// propose or vote for one.
+    /// The seal of a deposed tenure (07 §9.4); [`crate::voter`] proposes and verifies it.
     Seal = 1,
 }
 

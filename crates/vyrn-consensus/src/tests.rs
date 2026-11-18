@@ -4,7 +4,9 @@
 //! them. Every certificate a voter reports is re-checked with [`verify_finality_cert`].
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use crate::source::Seal;
 use crate::source::mem::MemSource;
+use crate::tail::{SealExt, seal_header};
 use crate::voter::{Timeouts, VoterConfig, config};
 use crate::{Committee, FinalityCert, FinalizeVote, Genesis, Listener, verify_finality_cert};
 use commonware_consensus::simplex::{Engine, max_payload_size, scheme::ed25519::Scheme};
@@ -15,7 +17,7 @@ use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 use vyrn_log::block::{header_hash, sign_header};
-use vyrn_types::{BLOCK_NS, BlockHeader, BookId, Epoch, Hash, Height, Mode, StepId};
+use vyrn_types::{BLOCK_NS, BlockHeader, BookId, Epoch, Hash, Height, Mode, SessionId, StepId};
 
 const SEQ_SEED: [u8; 32] = [0x99; 32];
 const EPOCH: Epoch = Epoch(3);
@@ -38,11 +40,34 @@ fn genesis_header() -> BlockHeader {
     }
 }
 
-/// The sequencer: one header per block, signed with `seq_key`. It never votes.
-fn sequencer(ctx: deterministic::Context, source: MemSource) -> Handle<()> {
+/// The seal a deposed tenure ends with after `last` (07 §9.4), as every voter's source computes it.
+fn seal_on(last: &BlockHeader) -> Seal {
+    Seal {
+        header: seal_header(
+            last,
+            StepId(last.last_step.0 + 3),
+            Hash([0x5A; 32]),
+            Hash([0x5B; 32]),
+        ),
+        ext: SealExt {
+            end_frame_seq: [40, 41],
+            next_seq: 1,
+            next_tenure: 1,
+            unavail: vec![(SessionId(3), 7)],
+        },
+    }
+}
+
+/// The sequencer: one header per block, signed with `seq_key`. It never votes. With `stop`, it
+/// dies after that height and the voters' sources depose its tenure with [`seal_on`].
+fn sequencer(ctx: deterministic::Context, source: MemSource, stop: Option<u64>) -> Handle<()> {
     ctx.child("sequencer").spawn(move |ctx| async move {
         let mut prev = genesis_header();
         loop {
+            if stop == Some(prev.height.0) {
+                source.depose(seal_on(&prev));
+                return;
+            }
             ctx.sleep(Duration::from_nanos(BLOCK_NS)).await;
             let h = BlockHeader {
                 height: Height(prev.height.0 + 1),
@@ -72,6 +97,11 @@ struct Run {
 /// Runs an n-voter committee until every live voter holds a certificate at or above `target`.
 /// Voter `crash` (if any) is stopped once every voter has finalized `crash_at`.
 fn run(mode: Mode, target: u64, crash: Option<(usize, u64)>) -> Run {
+    run_with(mode, target, crash, None)
+}
+
+/// [`run`], with the sequencer dying after height `stop`, if any.
+fn run_with(mode: Mode, target: u64, crash: Option<(usize, u64)>, stop: Option<u64>) -> Run {
     deterministic::Runner::new(
         // A 1 µs cycle: the default 1 ms per event-loop turn would swamp 2 ms Simplex timeouts.
         deterministic::Config::new()
@@ -125,7 +155,7 @@ fn run(mode: Mode, target: u64, crash: Option<(usize, u64)>) -> Run {
             last_step: g.last_step,
         };
         let source = MemSource::default();
-        let _seq = sequencer(ctx.child("seq"), source.clone());
+        let _seq = sequencer(ctx.child("seq"), source.clone(), stop);
 
         let quota = Quota::per_second(NonZeroU32::new(1_000_000).unwrap());
         let mut engines = Vec::new();
@@ -272,5 +302,34 @@ fn certificates_from_the_engine_survive_the_wire_format() {
     assert_eq!(
         verify_finality_cert(&short, &r.committee),
         Err(crate::CertErr::TooFew { got: 2, need: 3 })
+    );
+}
+
+#[test]
+fn a_deposed_tenure_finalizes_its_seal() {
+    // The sequencer dies after height 12; the seal header is height 13 (07 §9.4).
+    let r = run_with(Mode::Base, 13, None, Some(12));
+    check(&r);
+    let seals: Vec<_> = r
+        .certs
+        .iter()
+        .flatten()
+        .chain(&r.listened)
+        .filter(|c| c.proposal.kind == crate::ProposalKind::Seal)
+        .collect();
+    assert!(!seals.is_empty(), "no voter finalized the seal");
+    for c in seals {
+        assert_eq!(c.proposal.last_height, Height(13));
+        assert_eq!(c.seal.as_ref().map(|e| e.next_seq), Some(1));
+        // The REP_SealExt travels in the certificate's bytes, and the decoded one still verifies.
+        let back = FinalityCert::decode(&c.encode()).unwrap();
+        assert_eq!(verify_finality_cert(&back, &r.committee), Ok(()));
+    }
+    // Nothing above the seal is ever final (INV-REP-5).
+    assert!(
+        r.certs
+            .iter()
+            .flatten()
+            .all(|c| c.proposal.last_height <= Height(13))
     );
 }

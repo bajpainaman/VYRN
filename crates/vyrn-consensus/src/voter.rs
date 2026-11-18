@@ -12,15 +12,23 @@
 //!
 //! A voter does not need the proposal bytes to vote: given the parent it rebuilds every candidate
 //! range from its own headers and matches the payload digest, so the payload never travels.
+//!
+//! **Seal** (07 §9.4). Once [`BlockSource::seal`] answers, the tenure is deposed at this voter: as
+//! leader it proposes only the kind-1 seal on top of its parent, with payload [`seal_digest`], and
+//! as voter it accepts a seal payload only when it is its source's candidate on top of the
+//! context's parent and [`BlockSource::check_body`] (the signed headers) and
+//! [`BlockSource::check_seal`] (the tail) both pass. Certificates and finalize votes of a seal
+//! carry its `REP_SealExt` (07 §6.5).
 
 use crate::cert::{FinalityCert, NAMESPACE};
 use crate::evidence::{FaultKind, VoterFault};
 use crate::membership::{Committee, VoterOrder};
 use crate::observer::FinalizeVote;
-use crate::proposal::{MAX_HDRS_PER_PROPOSAL, Proposal};
+use crate::proposal::{MAX_HDRS_PER_PROPOSAL, MAX_SEAL_RANGE, Proposal};
 use crate::source::{
-    BlockSource, Genesis, Tip, Verdict, chain_after, proposal_for, proposal_range,
+    BlockSource, Genesis, Seal, Tip, Verdict, chain_after, proposal_for, proposal_range,
 };
+use crate::tail::{SealExt, seal_digest, seal_proposal};
 use commonware_actor::Feedback;
 use commonware_codec::{DecodeExt, Encode};
 use commonware_consensus::{
@@ -47,6 +55,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use vyrn_log::block::header_hash;
 use vyrn_types::{BlockHeader, Ed25519Sig, Epoch, Height, PubKey};
 
 /// `REP_VERIFY_WAIT_MS` (07 §6.4).
@@ -98,10 +107,52 @@ pub enum VoterErr {
 /// of B blocks clears in about B/16 views). A voter further behind catches up from a snapshot.
 pub const RECOVER_HEIGHTS: usize = 4096;
 
-/// Payloads this voter has seen, by digest: the proposal and the tip it ends at.
+/// What one payload stands for: its proposal (none for genesis), a seal's `REP_SealExt`, and the
+/// tip it ends at.
+#[derive(Clone, Debug)]
+struct Entry {
+    proposal: Option<Proposal>,
+    seal: Option<SealExt>,
+    tip: Tip,
+}
+
+impl Entry {
+    const fn headers(proposal: Proposal, tip: Tip) -> Self {
+        Self {
+            proposal: Some(proposal),
+            seal: None,
+            tip,
+        }
+    }
+}
+
+/// A seal on top of one parent: the payload it would be and what checks it.
+struct SealCand {
+    seal: Seal,
+    proposal: Proposal,
+    digest: Digest,
+    /// `H*`, the last signed header under the seal header.
+    signed_last: Height,
+}
+
+impl SealCand {
+    fn entry(&self) -> Entry {
+        Entry {
+            proposal: Some(self.proposal),
+            seal: Some(self.seal.ext.clone()),
+            tip: Tip {
+                height: self.seal.header.height,
+                hash: self.proposal.last_hash,
+                last_step: self.seal.header.last_step,
+            },
+        }
+    }
+}
+
+/// Payloads this voter has seen, by digest.
 #[derive(Default)]
 struct Known {
-    tips: BTreeMap<Digest, (Option<Proposal>, Tip)>,
+    tips: BTreeMap<Digest, Entry>,
     /// `(view, payload)` this voter verified or proposed in that view: what `certify` answers.
     accepted: BTreeSet<(u64, Digest)>,
 }
@@ -110,7 +161,7 @@ impl Known {
     /// Drops what a finalization at `view` ending at `height` makes unnecessary: tips below the
     /// final one and verdicts of earlier views.
     fn prune(&mut self, view: u64, height: Height) {
-        self.tips.retain(|_, (_, t)| t.height >= height);
+        self.tips.retain(|_, e| e.tip.height >= height);
         self.accepted.retain(|(v, _)| *v >= view);
     }
 }
@@ -150,23 +201,77 @@ fn tip_at(p: &Proposal, last: &BlockHeader) -> Tip {
 }
 
 impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
-    fn accept(&self, view: u64, digest: Digest, proposal: Proposal, tip: Tip) {
+    fn accept(&self, view: u64, digest: Digest, entry: Entry) {
         let mut k = lock(&self.known);
-        k.tips.insert(digest, (Some(proposal), tip));
+        k.tips.insert(digest, entry);
         k.accepted.insert((view, digest));
+    }
+
+    /// The seal on top of `parent`, when the source holds one whose header sits on `parent` or on
+    /// a held signed header above it, within `REP_MAX_SEAL_RANGE` (07 §9.4).
+    fn seal_after(&self, parent: Tip) -> Option<SealCand> {
+        let seal = self.source.seal(self.epoch)?;
+        let h = &seal.header;
+        let (star, star_step) = if h.prev == parent.hash {
+            (parent.height, parent.last_step)
+        } else {
+            let max = usize::try_from(MAX_SEAL_RANGE - 1).unwrap_or(63);
+            let run = chain_after(&self.source, self.epoch, &self.seq_key, parent, max);
+            let last = run.iter().find(|r| header_hash(r) == h.prev)?;
+            (last.height, last.last_step)
+        };
+        if h.epoch != self.epoch
+            || star.0.checked_add(1) != Some(h.height.0)
+            || star_step.0.checked_add(1) != Some(h.first_step.0)
+        {
+            return None;
+        }
+        let first = Height(parent.height.0.checked_add(1)?);
+        let excl = self.source.excl_root(self.epoch, first, h.height);
+        let proposal = seal_proposal(self.epoch, first, h, excl).ok()?;
+        let digest = Digest(seal_digest(&proposal, &seal.ext).0);
+        Some(SealCand {
+            seal,
+            proposal,
+            digest,
+            signed_last: star,
+        })
+    }
+
+    /// 07 §9.4: §6.4 on the signed headers of the seal range, then the source's tail checks.
+    fn check_seal(&self, c: &SealCand) -> Verdict {
+        let first = c.proposal.first_height;
+        let signed = if c.signed_last >= first {
+            self.source.check_body(self.epoch, first, c.signed_last)
+        } else {
+            Verdict::Valid
+        };
+        match signed {
+            Verdict::Valid => self.source.check_seal(self.epoch, &c.seal),
+            v => v,
+        }
     }
 
     /// The proposal and tip of `digest`: known, or rebuilt from held headers. A parent in a
     /// context is notarized (Q voters verified it), so a voter that missed it, or several
     /// proposals before it, finds it as any range of ≤ 16 valid headers above its lowest known tip.
-    fn resolve(&self, digest: &Digest) -> Option<(Option<Proposal>, Tip)> {
+    fn resolve(&self, digest: &Digest) -> Option<Entry> {
         let tips: Vec<Tip> = {
             let k = lock(&self.known);
             if let Some(hit) = k.tips.get(digest) {
-                return Some(*hit);
+                return Some(hit.clone());
             }
-            k.tips.values().map(|(_, t)| *t).collect()
+            k.tips.values().map(|e| e.tip).collect()
         };
+        // A seal on top of a known tip.
+        if let Some(c) = tips
+            .iter()
+            .find_map(|t| self.seal_after(*t).filter(|c| c.digest == *digest))
+        {
+            let e = c.entry();
+            lock(&self.known).tips.insert(*digest, e.clone());
+            return Some(e);
+        }
         // Cheap: a range right after a known tip.
         let mut hit = tips.iter().find_map(|t| self.find(*t, digest).0);
         // Deep: any range above the lowest known tip.
@@ -189,8 +294,9 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
             });
         }
         let (p, tip) = hit?;
-        lock(&self.known).tips.insert(*digest, (Some(p), tip));
-        Some((Some(p), tip))
+        let e = Entry::headers(p, tip);
+        lock(&self.known).tips.insert(*digest, e.clone());
+        Some(e)
     }
 
     /// The candidate after `parent` whose digest is `payload`, with whether the run is complete.
@@ -221,12 +327,29 @@ where
         self.context
             .child("propose")
             .spawn(move |clock| async move {
-                let Some((_, parent)) = app.resolve(&context.parent.1) else {
+                let Some(parent) = app.resolve(&context.parent.1).map(|e| e.tip) else {
                     return; // An unknown parent: decline (consensus drops the view).
                 };
                 let max = usize::try_from(MAX_HDRS_PER_PROPOSAL).unwrap_or(16);
                 // Wait for at least one header whose body verifies (07 §6.3).
                 while !tx.is_closed() {
+                    // A deposed tenure: the seal or nothing (07 §9.2, INV-REP-5).
+                    if let Some(c) = app.seal_after(parent) {
+                        match app.check_seal(&c) {
+                            Verdict::Valid => {
+                                app.accept(view, c.digest, c.entry());
+                                tx.send_lossy(c.digest);
+                                return;
+                            }
+                            Verdict::Invalid => return,
+                            Verdict::Pending => {}
+                        }
+                        clock.sleep(POLL).await;
+                        continue;
+                    }
+                    if app.source.seal(app.epoch).is_some() {
+                        return; // Deposed, and the seal does not extend this parent.
+                    }
                     let run = chain_after(&app.source, app.epoch, &app.seq_key, parent, max);
                     if let Some(last) = run.last() {
                         let p = proposal_for(&app.source, app.epoch, parent, last);
@@ -236,7 +359,7 @@ where
                         {
                             Verdict::Valid => {
                                 let digest = Digest(p.digest().0);
-                                app.accept(view, digest, p, tip_at(&p, last));
+                                app.accept(view, digest, Entry::headers(p, tip_at(&p, last)));
                                 tx.send_lossy(digest);
                                 return;
                             }
@@ -262,7 +385,18 @@ where
                 if tx.is_closed() {
                     return;
                 }
-                if let Some((_, parent)) = app.resolve(&context.parent.1) {
+                let parent = app.resolve(&context.parent.1).map(|e| e.tip);
+                let seal = parent.and_then(|t| app.seal_after(t).filter(|c| c.digest == payload));
+                if let Some(c) = seal {
+                    match app.check_seal(&c) {
+                        Verdict::Valid => {
+                            app.accept(view, payload, c.entry());
+                            break true;
+                        }
+                        Verdict::Invalid => break false,
+                        Verdict::Pending => {}
+                    }
+                } else if let Some(parent) = parent {
                     match app.find(parent, &payload) {
                         (Some((p, tip)), _) => {
                             match app
@@ -270,7 +404,7 @@ where
                                 .check_body(app.epoch, p.first_height, p.last_height)
                             {
                                 Verdict::Valid => {
-                                    app.accept(view, payload, p, tip);
+                                    app.accept(view, payload, Entry::headers(p, tip));
                                     break true;
                                 }
                                 Verdict::Invalid => break false,
@@ -350,7 +484,8 @@ impl<E, S: Clone> Clone for Finalized<E, S> {
 impl<E: Clock + Spawner, S: BlockSource> Finalized<E, S> {
     fn cert(&self, f: &Finalization<Scheme, Digest>) -> Option<FinalityCert> {
         // A finalization of a payload this voter never saw is rebuilt from its headers.
-        let proposal = self.app.resolve(&f.proposal.payload)?.0?;
+        let entry = self.app.resolve(&f.proposal.payload)?;
+        let proposal = entry.proposal?;
         let mut sigs: Vec<(u8, Ed25519Sig)> = f
             .certificate
             .signers
@@ -370,8 +505,7 @@ impl<E: Clock + Spawner, S: BlockSource> Finalized<E, S> {
             parent_view: f.proposal.parent.get(),
             proposal,
             sigs,
-            // This voter never proposes or verifies a seal yet (07 §9.4 follow-up).
-            seal: None,
+            seal: entry.seal,
         })
     }
 }
@@ -389,7 +523,8 @@ impl<E: Clock + Spawner, S: BlockSource> Finalized<E, S> {
         if f.attestation.signer != self.me {
             return None;
         }
-        let proposal = self.app.resolve(&f.proposal.payload)?.0?;
+        let entry = self.app.resolve(&f.proposal.payload)?;
+        let proposal = entry.proposal?;
         let sig: &[u8] = f.attestation.signature.get()?.as_ref();
         Some(FinalizeVote {
             epoch: self.epoch,
@@ -398,7 +533,7 @@ impl<E: Clock + Spawner, S: BlockSource> Finalized<E, S> {
             proposal,
             index: self.committee.voter_of(self.me)?,
             sig: sig.try_into().ok()?,
-            seal: None,
+            seal: entry.seal,
         })
     }
 }
@@ -486,9 +621,14 @@ where
     let elector = cfg.committee.elector();
     let genesis = Digest(cfg.genesis.hash.0);
     let known = Arc::new(Mutex::new(Known::default()));
-    lock(&known)
-        .tips
-        .insert(genesis, (None, Tip::from(cfg.genesis)));
+    lock(&known).tips.insert(
+        genesis,
+        Entry {
+            proposal: None,
+            seal: None,
+            tip: Tip::from(cfg.genesis),
+        },
+    );
     let (out, certs) = mpsc::unbounded_channel();
     let (votes, votes_rx) = mpsc::unbounded_channel();
     let (faults, faults_rx) = mpsc::unbounded_channel();
@@ -634,7 +774,14 @@ mod tests {
             let (src, genesis) = chain(n);
             let known = Arc::new(Mutex::new(Known::default()));
             let g = Digest(genesis.hash.0);
-            lock(&known).tips.insert(g, (None, genesis));
+            lock(&known).tips.insert(
+                g,
+                Entry {
+                    proposal: None,
+                    seal: None,
+                    tip: genesis,
+                },
+            );
             let app = App {
                 context: Arc::new(ctx.child("app")),
                 source: src.clone(),
@@ -684,6 +831,63 @@ mod tests {
         });
     }
 
+    fn seal_of(src: &MemSource, star: u64) -> Seal {
+        let last = src.header(Height(star)).unwrap();
+        Seal {
+            header: crate::tail::seal_header(
+                &last,
+                StepId(last.last_step.0 + 2),
+                Hash([0x5A; 32]),
+                Hash([0x5B; 32]),
+            ),
+            ext: SealExt {
+                end_frame_seq: [9, 8],
+                next_seq: 1,
+                next_tenure: 1,
+                unavail: vec![(vyrn_types::SessionId(3), 7)],
+            },
+        }
+    }
+
+    fn seal_payload(seal: &Seal, first: u64) -> Digest {
+        let p = seal_proposal(EPOCH, Height(first), &seal.header, Hash([0; 32])).unwrap();
+        Digest(seal_digest(&p, &seal.ext).0)
+    }
+
+    #[test]
+    fn a_deposed_leader_proposes_the_seal_and_voters_verify_it() {
+        with_app(5, |mut app, src, g| async move {
+            let seal = seal_of(&src, 5);
+            let want = seal_payload(&seal, 1);
+            src.depose(seal.clone());
+            // The leader proposes the seal over 1..=6 (five signed headers and the seal header),
+            // not the kind-0 range it would have proposed before.
+            let got = app.propose(ctx(1, 0, g)).await.await.unwrap();
+            assert_eq!(got, want);
+            assert!(app.verify(ctx(1, 0, g), want).await.await.unwrap());
+            // The same seal with another REP_SealExt is not this voter's candidate.
+            let mut other = seal.clone();
+            other.ext.next_seq = 2;
+            assert!(
+                !app.verify(ctx(2, 0, g), seal_payload(&other, 1))
+                    .await
+                    .await
+                    .unwrap()
+            );
+            // Its entry keeps the REP_SealExt for the certificate.
+            let e = app.resolve(&want).unwrap();
+            assert_eq!(e.seal, Some(seal.ext.clone()));
+            assert_eq!(e.tip.height, Height(6));
+            // On top of a notarized 1..=2, the seal starts at 3.
+            let p12 = digest(&src, 1, 2);
+            assert!(app.verify(ctx(3, 0, g), p12).await.await.unwrap());
+            let on12 = seal_payload(&seal, 3);
+            assert!(app.verify(ctx(4, 3, p12), on12).await.await.unwrap());
+            // Nothing extends the seal: a leader whose parent is the seal declines.
+            assert!(app.propose(ctx(5, 1, want)).await.await.is_err());
+        });
+    }
+
     #[test]
     fn finalization_prunes_tips_and_verdicts() {
         let mut k = Known::default();
@@ -694,7 +898,14 @@ mod tests {
         };
         for v in 1..=10u64 {
             let d = Digest([u8::try_from(v).unwrap(); 32]);
-            k.tips.insert(d, (None, tip(v)));
+            k.tips.insert(
+                d,
+                Entry {
+                    proposal: None,
+                    seal: None,
+                    tip: tip(v),
+                },
+            );
             k.accepted.insert((v, d));
         }
         k.prune(8, Height(8));
