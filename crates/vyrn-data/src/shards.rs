@@ -338,6 +338,12 @@ impl<T: TxRing> ShardCore<T> {
         &self.counters
     }
 
+    /// Redirects waiting for room on this shard's TX queue. [`ShardCore::poll`] counts them as
+    /// work, so a drain loop does not stop the shard while any wait.
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Fetches and redirects the last [`ShardCore::poll`] served; see [`RxCore::fetches`].
     pub fn fetches(&self) -> usize {
         self.fetches
@@ -352,7 +358,8 @@ impl<T: TxRing> ShardCore<T> {
         self.events.drain(..)
     }
 
-    /// Handles up to `RX_BURST` entries of `rx`; stored packets go on to `out`.
+    /// Handles up to `RX_BURST` entries of `rx`; stored packets go on to `out`. Returns the
+    /// entries handled plus the redirects still waiting for the TX queue.
     pub fn poll<S: BlockStore>(
         &mut self,
         rx: &mut ShardRx<'_>,
@@ -440,7 +447,9 @@ impl<T: TxRing> ShardCore<T> {
                 }
             }
         }
-        n
+        // Waiting redirects are work: a drain loop must not stop the shard while any wait
+        // (Codex on #194).
+        n.saturating_add(self.pending.len())
     }
 }
 
@@ -562,5 +571,7 @@ fn lite(cfg: &NodeConfig) -> NodeConfig {
         fetch_epoch: cfg.fetch_epoch,
         fetch_rate: cfg.fetch_rate,
         fetch_burst: cfg.fetch_burst,
+        fetch_box_rate: cfg.fetch_box_rate,
+        fetch_box_burst: cfg.fetch_box_burst,
     }
 }

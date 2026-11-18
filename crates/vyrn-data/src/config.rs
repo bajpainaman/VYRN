@@ -104,6 +104,11 @@ pub struct FetchCfg {
     pub rate: u64,
     #[serde(default = "d_burst")]
     pub burst: u64,
+    /// The box-wide budget for KEY, BLOCK and RANGE fetches ([`crate::NodeConfig::fetch_box_rate`]).
+    #[serde(default = "d_box_rate")]
+    pub box_rate: u64,
+    #[serde(default = "d_box_burst")]
+    pub box_burst: u64,
 }
 
 fn d_rate() -> u64 {
@@ -112,12 +117,20 @@ fn d_rate() -> u64 {
 fn d_burst() -> u64 {
     256
 }
+fn d_box_rate() -> u64 {
+    100_000
+}
+fn d_box_burst() -> u64 {
+    1024
+}
 
 impl Default for FetchCfg {
     fn default() -> Self {
         Self {
             rate: d_rate(),
             burst: d_burst(),
+            box_rate: d_box_rate(),
+            box_burst: d_box_burst(),
         }
     }
 }
