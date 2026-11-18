@@ -1755,9 +1755,12 @@ carries its label.
     it had handed on when the block became ready, has arrived on both paths. That covers the
     block's frames, and at most a few later ones of the other substream. So it sends a record
     only when it holds the step's frames from both paths (§8.2), and `flags.bit2` stays 1. An
-    observer without path B does not start. A block held `REP_PATH_DOWN_MS` (07 §4.9) for a
-    frame one path lost is reported (`DURABLE_WAIT`) and stays held: repair (07 §4.10) is not
-    built yet, and the drop copy waits rather than send a record it cannot attest. Once
+    observer without path B does not start. A frame one path lost is asked of the sequencer on
+    that path (07 §4.10, sequencer retransmit), and the retransmitted copy counts for the port it
+    arrives on, compared as above. A block held `REP_PATH_DOWN_MS` (07 §4.9) for a frame repair
+    has not brought is reported (`DURABLE_WAIT`) and stays held, and once repair gives the frame
+    up (`ORDER_GAP`) only peer repair, not built yet, could bring it: the drop copy waits rather
+    than send a record it cannot attest. Once
     `OBS_MAX_UNFINAL` blocks wait, the observer prints `DURABLE_FAULT` and stops replay for the
     rest of the run: it does not resume when the frame arrives later, and its queued blocks
     release their payloads without being replayed. Its drop copy is then rebuilt from the

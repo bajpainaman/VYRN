@@ -52,6 +52,8 @@ pub struct Counts {
     pub final_height: AtomicU64,
     /// The gate wants the book halted (07 §6.8 `HaltReq`); the engine loop applies changes.
     pub halt_req: AtomicBool,
+    /// Nacks dropped because the stream core's queue was full.
+    pub nacks_dropped: AtomicU64,
 }
 
 /// `REP_GATE_AUCTION_MS` (07 §6.8): a longer halt reopens through an auction.
@@ -88,6 +90,7 @@ impl Finality {
         seq_key: PubKey,
         closed: Arc<dyn Fn() -> u64 + Send + Sync>,
         stop: Arc<AtomicBool>,
+        nacks: std::sync::mpsc::SyncSender<crate::rtx::Req>,
     ) -> Result<Self, String> {
         let bytes = roster_bytes(&c.roster)?;
         let n = u8::try_from(Mode::Base.n()).unwrap_or(u8::MAX);
@@ -130,6 +133,7 @@ impl Finality {
                         &*closed,
                         &stop,
                         &counts,
+                        &nacks,
                     );
                 })
                 .map_err(|e| e.to_string())?
@@ -160,12 +164,21 @@ fn listen(
     closed: &(dyn Fn() -> u64 + Send + Sync),
     stop: &AtomicBool,
     counts: &Counts,
+    nacks: &std::sync::mpsc::SyncSender<crate::rtx::Req>,
 ) {
     let mut buf = [0u8; 9216];
     let mut gate = Gate::default();
     let mut since: Option<Instant> = None;
     while !stop.load(Ordering::Acquire) {
-        if let Ok((n, _)) = sock.recv_from(&mut buf) {
+        if let Ok((n, from)) = sock.recv_from(&mut buf) {
+            // A replica's Nack (07 §4.10): to the stream core, which owns the frame ring.
+            let dgram = buf.get(..n).unwrap_or(&[]);
+            if let (Some(nk), SocketAddr::V4(f)) = (vyrn_log::nack::Nack::decode(dgram), from) {
+                if nacks.try_send((*f.ip(), nk)).is_err() {
+                    counts.nacks_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
             let before = l.final_height();
             let from = match ctrl::decode(buf.get(..n).unwrap_or(&[])) {
                 Ok(Ctrl::Vote(v)) => {

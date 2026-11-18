@@ -78,9 +78,15 @@
 //!   requires) and `vyrn-seq` sends it `PATH_B` copies (`[replication] order_b`); with
 //!   `--two-path` every validator does too, and every check above then runs over the deduplicated
 //!   two-path stream. `--drop-path-b N` relays the observer's path B and drops its `N`-th
-//!   datagram: the `dropcopy` check then requires that the observer print `DURABLE_WAIT
-//!   height=h`, replay exactly blocks `0..h`, and that the box went past `h`. Its drop copy is
-//!   not compared then: it holds what the observer could not attest (10 §8.2).
+//!   datagram; repair then fills it (R14).
+//! - R14. Repair (07 §4.10, sequencer retransmit). Every replica gets `[repair]` with the box's
+//!   CTRL port and DEV timers (2 ms, 20 ms). With `--drop-path-b N` the `dropcopy` check requires
+//!   that the observer Nacked, gave up no hole, never printed `DURABLE_WAIT`, and that its drop
+//!   copy is whole. `--drop-rtx` also drops every retransmit to it: it must print
+//!   `ORDER_GAP ... path=B` and `DURABLE_WAIT height=h`, replay exactly blocks `0..h`, and the box
+//!   must go past `h`; its drop copy is not compared then (10 §8.2). `--drop-path-a N` relays
+//!   validator 0's path A and drops its `N`-th datagram: the `repair` check requires a Nack and no
+//!   given-up hole, and `finality` that it finalized through the last block.
 //! - R13. `--data-kill` (needs `--keyed`): a backup `vyrn-data` box (`src = 1`, roster data
 //!   box 1 with `BOX1_XCHG`, the same destinations) runs beside the home box, and every validator
 //!   lists both (`[data] boxes`) with a DEV `silence_us` of `KILL_SILENCE_US`. The client sends
@@ -211,6 +217,19 @@ const KILL_SILENCE_US: u64 = 50_000;
 const CLIENT_RETAIN: Duration = Duration::from_millis(100);
 /// `--keyed` (R7): the relay to validator 0 drops every this-many-th datagram.
 const LOSS_EVERY: u64 = 25;
+/// R14: the replicas' DEV repair timers, in µs.
+const REP_DEV_HOLE_WAIT_US: u64 = 2_000;
+const REP_DEV_RETRY_US: u64 = 20_000;
+
+/// R14: a replica's `[repair]`: the box's CTRL port, and the port the box has for it on each
+/// path when a relay stands in front of it.
+#[derive(Clone, Copy)]
+struct Rep {
+    nack: SocketAddrV4,
+    order_as: Option<u16>,
+    order_b_as: Option<u16>,
+}
+
 /// With `--dev-hashlag-us`, the observer's `[replay] hashlag_us` (R5): 200 ms, DEV only.
 const OBS_DEV_HASHLAG_US: u64 = 200_000;
 const LANES: usize = 2;
@@ -291,6 +310,14 @@ struct Cli {
     /// does.
     #[arg(long, value_name = "N")]
     tap_loss: Option<u64>,
+    /// With --drop-path-b, also drop every retransmit to the observer's path B (R14): repair
+    /// cannot fill the copy, so the observer must report `ORDER_GAP` and hold the block.
+    #[arg(long)]
+    drop_rtx: bool,
+    /// Relay validator 0's path A and drop its N-th datagram (needs --finality, R14): it must
+    /// Nack the frame, get it retransmitted and finalize through the last block.
+    #[arg(long, value_name = "N")]
+    drop_path_a: Option<u64>,
     /// Add a backup data box and kill the home box mid-run: the validators reach Q DataDowns
     /// and REDIRECT, and the client moves copy 2 (R13; needs --keyed).
     #[arg(long)]
@@ -503,12 +530,20 @@ fn field<'a>(l: &'a str, k: &str) -> Option<&'a str> {
         .find_map(|f| f.strip_prefix(k)?.strip_prefix('='))
 }
 
-/// R12 (`--drop-path-b`): path B lost one of the observer's frames, so the observer holds the
-/// block it belongs to (`DURABLE_WAIT height=h`) and replays exactly the blocks below it, while
-/// the box went past it.
+/// R14 (`--drop-path-b N --drop-rtx`): path B lost one of the observer's frames and every
+/// retransmit of it, so repair gives up (`ORDER_GAP ... path=B`) and the observer holds the block
+/// it belongs to (`DURABLE_WAIT height=h`), replaying exactly the blocks below it, while the box
+/// went past it.
 fn durable_hold(n: &Node, dropped: u64, top: Option<u64>) -> Result<String, String> {
-    if dropped != 1 {
-        return Err(format!("the relay dropped {dropped} datagrams, not 1"));
+    if dropped == 0 {
+        return Err("the relay dropped nothing".into());
+    }
+    if !n
+        .lines
+        .iter()
+        .any(|l| l.starts_with("ORDER_GAP ") && l.ends_with(" path=B"))
+    {
+        return Err("no ORDER_GAP path=B: repair did not give up on the dropped copy".into());
     }
     let h: u64 = line(n, "DURABLE_WAIT height=")
         .and_then(|v| v.parse().ok())
@@ -527,6 +562,23 @@ fn durable_hold(n: &Node, dropped: u64, top: Option<u64>) -> Result<String, Stri
         )),
         _ => Err(format!("held at {h}, but the box's last block is {top:?}")),
     }
+}
+
+/// R14: a relay dropped one datagram of `who` and repair filled it: it sent a Nack, the box
+/// retransmitted, and no hole was given up.
+fn repaired(n: &Node, dropped: u64, who: &str) -> Result<String, String> {
+    if dropped != 1 {
+        return Err(format!("the relay dropped {dropped} datagrams, not 1"));
+    }
+    let st = line(n, "REPAIR ").ok_or_else(|| format!("{who} printed no REPAIR line"))?;
+    let nacks: u64 = field(st, "nacks").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if nacks == 0 || field(st, "gaps") != Some("0") {
+        return Err(format!("{who}: REPAIR {st}"));
+    }
+    if n.lines.iter().any(|l| l.starts_with("DURABLE_WAIT ")) {
+        return Err(format!("{who} held a block that repair should have filled"));
+    }
+    Ok(format!("1 datagram dropped and repaired ({nacks} Nacks)"))
 }
 
 /// `"a", "b"`: a TOML array's items.
@@ -758,11 +810,14 @@ fn tap(sock: UdpSocket, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<Vec<Ve
 }
 
 /// A UDP relay to `127.0.0.1:port` that drops the datagrams `drop` picks by their 1-based
-/// count, until `stop`: `--keyed` (R7) drops every `LOSS_EVERY`-th, `--drop-path-b` (R12) one.
-/// Returns its address and, on join, how many it dropped.
+/// count and bytes, until `stop`: `--keyed` (R7) drops every `LOSS_EVERY`-th,
+/// `--drop-path-b`/`--drop-path-a` (R12, R14) one, and `--drop-rtx` also every retransmit.
+/// `port` may be set after the relay starts (0 drops), so a node's config can name the relay
+/// before the node has bound its own port. Returns its address and, on join, how many it
+/// dropped.
 fn relay(
-    port: u16,
-    drop: fn(u64, u64) -> bool,
+    port: Arc<std::sync::atomic::AtomicU16>,
+    drop: fn(u64, u64, &[u8]) -> bool,
     arg: u64,
     stop: Arc<AtomicBool>,
 ) -> Result<(SocketAddr, std::thread::JoinHandle<u64>), String> {
@@ -776,10 +831,12 @@ fn relay(
         while !stop.load(Ordering::Acquire) {
             if let Ok(k) = sock.recv(&mut buf) {
                 n += 1;
-                if drop(n, arg) {
+                let b = buf.get(..k).unwrap_or_default();
+                let to = port.load(Ordering::Acquire);
+                if to == 0 || drop(n, arg, b) {
                     dropped += 1;
                 } else {
-                    let _ = sock.send_to(buf.get(..k).unwrap_or_default(), ("127.0.0.1", port));
+                    let _ = sock.send_to(b, ("127.0.0.1", to));
                 }
             }
         }
@@ -1083,6 +1140,7 @@ fn validator_config(
     observer: Option<(&Path, SocketAddrV4)>,
     order_b: bool,
     silence_us: Option<u64>,
+    repair: Option<Rep>,
 ) -> Result<PathBuf, String> {
     let key = hex(&vyrn_crypto::ed25519::public_key(&SEQ_SEED));
     let data_port = data.and_then(|(_, ps, _)| ps.get(i).copied()).unwrap_or(0);
@@ -1099,7 +1157,7 @@ fn validator_config(
     };
     // DEV: a larger hashlag bound, or keyed fetches to peers whose roster keys are unusable
     // (R8: only validator 0 has a real xchg_key), which only a DEV validator sends unsealed.
-    let dev = if hashlag_us.is_some() || keyed || silence_us.is_some() {
+    let dev = if hashlag_us.is_some() || keyed || silence_us.is_some() || repair.is_some() {
         "dev = true\n"
     } else {
         ""
@@ -1179,6 +1237,19 @@ seq_keys = ["{key}"]
             c.roster_hash,
             hex(&[0; 32]),
         ));
+    }
+    if let Some(rp) = repair {
+        // R14: DEV repair timers (07 §4.9's 5 µs and 50 µs need a pinned host).
+        s.push_str(&format!(
+            "\n[repair]\nnack = \"{}\"\nhole_wait_us = {REP_DEV_HOLE_WAIT_US}\nretry_us = {REP_DEV_RETRY_US}\n",
+            rp.nack
+        ));
+        if let Some(p) = rp.order_as {
+            s.push_str(&format!("order_as = {p}\n"));
+        }
+        if let Some(p) = rp.order_b_as {
+            s.push_str(&format!("order_b_as = {p}\n"));
+        }
     }
     let p = dir.join(format!("validator-{i}.toml"));
     std::fs::write(&p, s).map_err(|e| e.to_string())?;
@@ -1274,6 +1345,14 @@ fn run(cli: &Cli) -> Result<bool, String> {
     if cli.tap_loss.is_some_and(|n| n < 2) || (cli.tap_loss.is_some() && (!cli.data || cli.keyed)) {
         return Err("--tap-loss needs --data, no --keyed, and N >= 2 (R14)".into());
     }
+    if cli.drop_rtx && cli.drop_path_b.is_none() {
+        return Err("--drop-rtx needs --drop-path-b".into());
+    }
+    if cli.drop_path_a.is_some_and(|n| n == 0) || (cli.drop_path_a.is_some() && !cli.finality) {
+        return Err(
+            "--drop-path-a needs --finality (repair Nacks the box's CTRL) and N >= 1".into(),
+        );
+    }
     if cli.data_shards == 0 || (cli.data_shards > 1 && !cli.data) {
         return Err("--data-shards needs --data and N >= 1".into());
     }
@@ -1367,8 +1446,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
             && let (Some(d), Some(&p)) = (dests.get_mut(1), val_data.first())
         {
             let (addr, h) = relay(
-                p,
-                |n, every| n.is_multiple_of(every),
+                Arc::new(std::sync::atomic::AtomicU16::new(p)),
+                |n, every, _| n.is_multiple_of(every),
                 LOSS_EVERY,
                 Arc::clone(&stop_tap),
             )?;
@@ -1425,6 +1504,31 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .map_or_else(Vec::new, |(bs, _)| bs.iter().map(|b| b.fetch).collect());
     let silence_us = cli.data_kill.then_some(KILL_SILENCE_US);
 
+    // R14: relays in front of validator 0's path A (--drop-path-a) and the observer's path B
+    // (--drop-path-b), bound now so the nodes' `[repair]` can name them; their targets are set
+    // once the nodes print their ports.
+    let stop_relay = Arc::new(AtomicBool::new(false));
+    let relay_for = |k: Option<u64>, rtx: bool| -> Result<_, String> {
+        let Some(k) = k else { return Ok(None) };
+        let port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let drop: fn(u64, u64, &[u8]) -> bool = if rtx {
+            |n, k, b| n == k || b.get(16).is_some_and(|f| f & 2 != 0)
+        } else {
+            |n, k, _| n == k
+        };
+        let (addr, h) = relay(Arc::clone(&port), drop, k, Arc::clone(&stop_relay))?;
+        Ok(Some((addr, port, h)))
+    };
+    let relay_a = relay_for(cli.drop_path_a, false)?;
+    let relay_b = relay_for(cli.drop_path_b, cli.drop_rtx)?;
+    let rep_of = |a: Option<&(SocketAddr, _, _)>, b: Option<&(SocketAddr, _, _)>| {
+        cons.as_ref().map(|c| Rep {
+            nack: c.ctrl,
+            order_as: a.map(|x| x.0.port()),
+            order_b_as: b.map(|x| x.0.port()),
+        })
+    };
+
     let vals: Vec<usize> = (0..n_val)
         .map(|i| {
             let data = data_node
@@ -1443,6 +1547,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 None,
                 cli.two_path,
                 silence_us,
+                rep_of(relay_a.as_ref().filter(|_| i == 0), None),
             )?;
             let mut c = command(
                 &bin_dir.join("vyrn-validator"),
@@ -1474,6 +1579,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 Some((&ring, ctrl)),
                 true,
                 silence_us,
+                rep_of(None, relay_b.as_ref()),
             )?;
             let mut c = command(
                 &bin_dir.join("vyrn-validator"),
@@ -1501,35 +1607,32 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 .is_some_and(|n| line(n, "READY vyrn-validator order=").is_some())
         })
     })?;
-    let mut order: Vec<String> = vals
-        .iter()
-        .chain(&obs)
-        .filter_map(|&i| {
-            nodes
-                .0
-                .get(i)
-                .and_then(|n| line(n, "READY vyrn-validator order="))
-                .map(str::to_owned)
-        })
-        .collect();
+    // A relay in front of a node: the box sends to the relay, which forwards to the node.
+    let via = |i: usize,
+               prefix: &str,
+               r: Option<&(SocketAddr, Arc<std::sync::atomic::AtomicU16>, _)>|
+     -> Result<Option<String>, String> {
+        let Some(a) = nodes.0.get(i).and_then(|n| line(n, prefix)) else {
+            return Ok(None);
+        };
+        Ok(Some(match r {
+            Some((addr, port, _)) => {
+                let to: SocketAddrV4 = a.parse().map_err(|e| format!("{prefix}{a}: {e}"))?;
+                port.store(to.port(), Ordering::Release);
+                addr.to_string()
+            }
+            None => a.to_owned(),
+        }))
+    };
+    let mut order = Vec::new();
     // Path B (R12): every replica that printed ORDER_B; with --drop-path-b the observer's goes
-    // through a relay that drops one datagram.
-    let stop_relay = Arc::new(AtomicBool::new(false));
-    let mut pathb_h = None;
+    // through a relay that drops one datagram (R14: and with --drop-rtx every retransmit).
     let mut order_b = Vec::new();
     for &i in vals.iter().chain(&obs) {
-        let Some(b) = nodes.0.get(i).and_then(|n| line(n, "ORDER_B order=")) else {
-            continue;
-        };
-        match cli.drop_path_b {
-            Some(k) if obs == Some(i) => {
-                let to: SocketAddrV4 = b.parse().map_err(|e| format!("ORDER_B {b}: {e}"))?;
-                let (addr, h) = relay(to.port(), |n, k| n == k, k, Arc::clone(&stop_relay))?;
-                order_b.push(addr.to_string());
-                pathb_h = Some(h);
-            }
-            _ => order_b.push(b.to_owned()),
-        }
+        let ra = relay_a.as_ref().filter(|_| vals.first() == Some(&i));
+        order.extend(via(i, "READY vyrn-validator order=", ra)?);
+        let rb = relay_b.as_ref().filter(|_| obs == Some(i));
+        order_b.extend(via(i, "ORDER_B order=", rb)?);
     }
 
     let tap_sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
@@ -1808,7 +1911,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // client stream ends in a DC_FINAL (10 §8.4 item 7); only then does it stop.
     let obs_wait = match obs {
         // R12: the observer holds the block whose frame path B lost; nothing drains.
-        Some(o) if cli.drop_path_b.is_some() => {
+        Some(o) if cli.drop_rtx => {
             let r = nodes.wait(&rx, Instant::now() + wait, "observer DURABLE_WAIT", |ns| {
                 ns.get(o).is_some_and(|n| {
                     stopped(n).is_some() || line(n, "DURABLE_WAIT height=").is_some()
@@ -1852,7 +1955,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
     };
     stop_dc.store(true, Ordering::Release);
     stop_relay.store(true, Ordering::Release);
-    let pathb_dropped = pathb_h.map(|h| h.join().unwrap_or(0));
+    let pathb_dropped = relay_b.map(|r| r.2.join().unwrap_or(0));
+    let patha_dropped = relay_a.map(|r| r.2.join().unwrap_or(0));
     let mut dc_got = Vec::new();
     let mut dc_errs = Vec::new();
     for (g, h) in dc_clients {
@@ -2271,6 +2375,12 @@ fn run(cli: &Cli) -> Result<bool, String> {
     } else {
         Report::skip("finality", "off (enable with --finality)");
     }
+    // R14: validator 0 lost one path A frame and repair filled it (`finality` above checks it
+    // still finalized through the last block).
+    match (patha_dropped, vals.first().and_then(|&i| nodes.0.get(i))) {
+        (Some(d), Some(n)) => rep.check("repair", repaired(n, d, "validator-0")),
+        _ => Report::skip("repair", "off (enable with --drop-path-a, R14)"),
+    }
     match (obs, obs_wait) {
         (Some(o), Some(w)) => rep.check("dropcopy", {
             let n = nodes.0.get(o).ok_or("observer")?;
@@ -2278,7 +2388,18 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 (_, Some(f)) => Err(format!("observer: {f}")),
                 (Err(e), None) => Err(e),
                 (Ok(false), None) => Err("observer did not stop cleanly".into()),
-                (Ok(true), None) if let Some(d) = pathb_dropped => durable_hold(n, d, top),
+                (Ok(true), None) if cli.drop_rtx => {
+                    durable_hold(n, pathb_dropped.unwrap_or(0), top)
+                }
+                (Ok(true), None) if pathb_dropped.is_some() && !dc_errs.is_empty() => {
+                    Err(dc_errs.join("; "))
+                }
+                // R14: path B lost one frame and repair filled it: the drop copy is whole.
+                (Ok(true), None) if let Some(d) = pathb_dropped => repaired(n, d, "observer")
+                    .and_then(|r| {
+                        dropcopy::check(&dc_got, &resp_times, &dc_inproc)
+                            .map(|c| format!("{r}; {c}"))
+                    }),
                 (Ok(true), None) if !dc_errs.is_empty() => Err(dc_errs.join("; ")),
                 (Ok(true), None) => dropcopy::check(&dc_got, &resp_times, &dc_inproc),
             }

@@ -116,8 +116,12 @@ jobs:
         run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --dev-hashlag-us 50000 --strict-hashlag
       - name: 4 validators and an observer on two replication paths, vyrn-dropcopy, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R12)
         run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --two-path --dev-hashlag-us 50000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
-      - name: the observer holds the block whose path-B frame was dropped, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R12)
+      - name: observer path B loses one frame and sequencer retransmit repairs it, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R12, R14)
         run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --drop-path-b 300 --dev-hashlag-us 50000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
+      - name: observer path B loses one frame and every retransmit, so it holds the block, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R14)
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --drop-path-b 300 --drop-rtx --dev-hashlag-us 50000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
+      - name: validator 0 path A loses one frame, repaired, finalizes through the last block, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R14)
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --drop-path-a 300 --dev-hashlag-us 50000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
 
   actionlint:
     runs-on: ubuntu-24.04
@@ -155,8 +159,9 @@ jobs:
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_admin_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_admin_vectors.out"
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_session_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_session_vectors.out"
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_data_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_data_vectors.out"
+          python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_nack_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_nack_vectors.out"
           # The JSON form of the same vectors (tests/golden/README.md).
-          for v in proto log session data admin reject; do
+          for v in proto log session data admin reject nack; do
             python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_${v}_vectors.py" --json | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_${v}_vectors.json"
           done
       - name: derive_key and signing contexts are spelled the same in spec and code

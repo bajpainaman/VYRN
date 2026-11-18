@@ -21,6 +21,7 @@
 //! | `[nic] data_port`, `[data] boxes = ["ip:port"], me, max_range, xchg, seq_repair = "ip:port", seq_box = 0, silence_us = 1000, [[data.peer]] voter, addr` | optional: the data RX queue (07 §5.4); `boxes[i]` is data box `src = i`, `me` this replica's index in their destination lists; with `xchg` (needs `[consensus]`) every fetch to `boxes[d]` is sealed under `K_fetch(e, me, d)` (08 §9.6). `[[data.peer]]` are the other replicas (roster voter index, `[nic] data_port`) and `seq_repair` is `vyrn-seq` box `seq_box`'s `[repair]` port: 07 §5.5 sources 2 and 3 (`fetch.rs`), sealed too with `xchg`. Without `[data]` vote-rule item 3 is not checked (DEV) |
 //! | `dev = false` | `true` marks a DEV validator: only then may `[replay] hashlag_us` differ from 1000 |
 //! | `[replay] tick_min, tick_max, win_center, slot_cap, hashlag_us, [[replay.session]] lane, slot, account, k_seq, quote, base` | optional, needs `[data]`: replay of every block that passes item 3 on `vyrn-engine` (`replay.rs`), built from the sequencer's `[engine]` and `[[dev_session]]` (no state snapshot encoding yet). `hashlag_us` (DEV only, default 1000 = the spec's 1 ms, 07 §3.7) is the `REP_E_HASHLAG` bound, for unpinned DEV hosts |
+//! | `[repair] nack, hole_wait_us, retry_us, tries, order_as, order_b_as` | optional: sequencer retransmit (07 §4.10). Holes are Nacked to `nack`, the box's `[consensus] ctrl`, after `hole_wait_us` (5), again every `retry_us` (50), and given up after `tries` (8) or a `NackTooOld`, printing `ORDER_GAP tenure= stream= from= to= path=`. Other timers are DEV only. `order_as`/`order_b_as`: the port the box has for this replica when a relay stands in front of it. Prints `REPAIR nacks= gaps= too_old=` at exit |
 //! | `[consensus] roster, roster_hash, genesis_hash, home, seq_order, observers, delta_ms, storage` | optional: the Simplex voter (`consensus.rs`); committee and peers from the roster file (08 §9.6), checked against `roster_hash`; `membership.seq_keys[0]` must be the roster's primary `seq_key` |
 //!
 //! **Start sequence** (11 §10.1): load and check config → resolve keys → build the order core
@@ -35,7 +36,7 @@
 //! `BLOCK height=<h> first_step=<s> last_step=<s> lanes=<k> steps=<k> verdict=<Valid|Invalid|Pending>`
 //! (07 §6.4 items 2 and 5, the precondition for a vote). A sequencer fault prints
 //! `FAULT <code> height=<h>` once; the core then refuses every later frame. A frame that is not
-//! its substream's next prints `OUT_OF_ORDER next_height=<h>` once per stall (no repair yet). With `[data]` it also
+//! its substream's next prints `OUT_OF_ORDER next_height=<h>` once per stall (without `[repair]`). With `[data]` it also
 //! polls the data RX queue: one `DataFeed::on_frame` per payload into the `DataJoin`, a
 //! `DataFetch` RANGE to the box for every gap, and item 3 (`DataJoin::check`) for each ready
 //! block before the voter may vote for it; a block whose data contradicts its header prints
@@ -107,7 +108,8 @@ use vyrn_consensus::Verdict;
 use vyrn_log::{LaneRec, Layout};
 use vyrn_nic::frame;
 use vyrn_nic::{BackendKind, KernelUdp, NicBackend, NicConfig, PortConfig, PortId, RxBind};
-use vyrn_replica::{EpochView, FrameErr, OrderCore};
+use vyrn_replica::paths::{Ask, Repair};
+use vyrn_replica::{EpochView, FrameErr, Nack, NackTooOld, OrderCore};
 use vyrn_types::{BookId, Epoch, Hash, Height, LaneId, PacketFlags, PubKey, StepId};
 use vyrn_wire::{RX_BURST, RxPkt, RxRing};
 
@@ -147,6 +149,41 @@ struct Config {
     consensus: Option<consensus::Section>,
     #[serde(default)]
     replay: Option<replay::Section>,
+    #[serde(default)]
+    repair: Option<RepairCfg>,
+}
+
+/// `[repair]` (module docs): sequencer retransmit (07 §4.10).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairCfg {
+    /// The sequencer's `REP_UDP_CTRL` (`vyrn-seq`'s `[consensus] ctrl`).
+    nack: SocketAddrV4,
+    #[serde(default = "d_hole_wait_us")]
+    hole_wait_us: u64,
+    #[serde(default = "d_retry_us")]
+    retry_us: u64,
+    #[serde(default = "d_tries")]
+    tries: u32,
+    /// The ORDER port the sequencer has for this box on path A and on path B, when it is not
+    /// the one bound here (a relay or NAT in front of it). A Nack names it, and the sequencer
+    /// serves only a port it has configured.
+    #[serde(default)]
+    order_as: Option<u16>,
+    #[serde(default)]
+    order_b_as: Option<u16>,
+}
+
+/// `REP_HOLE_WAIT_US`, `REP_NACK_RETRY_US` (07 §4.9).
+const fn d_hole_wait_us() -> u64 {
+    5
+}
+const fn d_retry_us() -> u64 {
+    50
+}
+/// Asks before a hole is given up (`ORDER_GAP`).
+const fn d_tries() -> u32 {
+    8
 }
 
 /// `[observer]` (module docs).
@@ -311,6 +348,20 @@ impl Config {
                 );
             }
             _ => {}
+        }
+        if let Some(r) = &c.repair {
+            if r.hole_wait_us == 0 || r.retry_us == 0 || r.tries == 0 {
+                return bad(
+                    "repair",
+                    "hole_wait_us, retry_us and tries must be at least 1",
+                );
+            }
+            if !c.dev && (r.hole_wait_us != d_hole_wait_us() || r.retry_us != d_retry_us()) {
+                return bad(
+                    "repair.hole_wait_us/retry_us",
+                    "other than 5 and 50 (07 §4.9) are DEV only: set dev = true",
+                );
+            }
         }
         match c.replay.as_ref().and_then(|r| r.hashlag_us) {
             Some(0) => return bad("replay.hashlag_us", "must be at least 1"),
@@ -604,6 +655,22 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
         // Path B's receive context (`vyrn_replica::Paths`): this book, epoch and sequencers.
         let senders = u8::try_from(cfg.membership.seq_keys.len()).unwrap_or(u8::MAX);
         let ctx = (BookId(cfg.book), Epoch(cfg.epoch).low16(), senders);
+        let repair = match &cfg.repair {
+            Some(r) => Some(Rep {
+                sock: UdpSocket::bind(SocketAddrV4::new(ip, 0)).map_err(|e| e.to_string())?,
+                to: r.nack,
+                ports: [
+                    r.order_as.unwrap_or(addr.port()),
+                    r.order_b_as.or(addr_b.map(|b| b.port())).unwrap_or(0),
+                ],
+                timers: Repair {
+                    hole_wait_ns: r.hole_wait_us.saturating_mul(1000),
+                    retry_ns: r.retry_us.saturating_mul(1000),
+                    tries: r.tries,
+                },
+            }),
+            None => None,
+        };
         std::thread::Builder::new()
             .name("vyrn-validator/order".into())
             .spawn(move || {
@@ -613,6 +680,7 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                     data,
                     gate,
                     ctx,
+                    repair,
                     &source,
                     &stop,
                     &stats,
@@ -1314,6 +1382,15 @@ fn send(repair: &UdpSocket, boxes: &[SocketAddrV4], keys: &[[u8; 16]], q: &Fetch
     };
 }
 
+/// The order thread's repair state: where Nacks go, this box's ORDER port per path (each
+/// Nack's `port`), and the timers.
+struct Rep {
+    sock: UdpSocket,
+    to: SocketAddrV4,
+    ports: [u16; 2],
+    timers: Repair,
+}
+
 /// Sets the flag when dropped.
 struct StopOnDrop<'a>(&'a AtomicBool);
 
@@ -1333,6 +1410,7 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     mut data: Option<DataRx<N, D>>,
     gate: bool,
     ctx: (BookId, u16, u8),
+    repair: Option<Rep>,
     source: &consensus::Source,
     stop: &AtomicBool,
     stats: &Stats,
@@ -1343,7 +1421,14 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     let mut burst = [RxPkt::empty(); RX_BURST];
     let mut faulted = false;
     let mut stalled = false;
-    let mut paths = rxs[1].is_some().then(|| Paths::new(ctx.0, ctx.1, ctx.2));
+    // Two paths, or path A alone with `[repair]` (reorder and gap repair, 07 §4.9).
+    let mut paths = match (rxs[1].is_some(), repair.is_some()) {
+        (true, _) => Some(Paths::new(ctx.0, ctx.1, ctx.2)),
+        (false, true) => Some(Paths::new(ctx.0, ctx.1, ctx.2).one_path()),
+        (false, false) => None,
+    };
+    let mut asks = Vec::new();
+    let mut rep_stats = [0u64; 3]; // nacks sent, gaps given up, NackTooOld received
     // Gated observer only: the newest frame the order core accepted per substream. A block's
     // mark is its value when the block becomes ready (`report` queues it), not at the end of
     // the poll. A frame the core refuses (another tenure's, out of order) is not in it.
@@ -1361,6 +1446,12 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                 let Ok(f) = frame::parse(rx.bytes(p)) else {
                     continue;
                 };
+                // The sequencer's answer to a Nack for frames its ring no longer holds.
+                if let (Some(t), Some(ps)) = (NackTooOld::decode(f.payload), paths.as_mut()) {
+                    rep_stats[2] = rep_stats[2].saturating_add(1);
+                    ps.too_old(t.path, t.tenure, t.stream, t.oldest_seq);
+                    continue;
+                }
                 stats.frames.fetch_add(1, Ordering::Relaxed);
                 let mut on = |payload: &[u8]| {
                     delivered += 1;
@@ -1422,6 +1513,51 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                 data.as_mut(),
             );
         }
+        // Repair (07 §4.10): Nack each hole that is due; report one repair gave up on.
+        if let (Some(r), Some(ps)) = (repair.as_ref(), paths.as_mut()) {
+            asks.clear();
+            ps.poll(now(), &r.timers, gate, &mut asks);
+            for a in &asks {
+                match *a {
+                    Ask::Nack {
+                        path,
+                        key,
+                        from,
+                        to,
+                    } => {
+                        let n = Nack {
+                            path,
+                            epoch16: key.0,
+                            tenure: key.1,
+                            stream: key.3,
+                            port: r.ports[usize::from(path == RepPath::B)],
+                            from_seq: from,
+                            to_seq: to,
+                        };
+                        rep_stats[0] = rep_stats[0].saturating_add(1);
+                        // UDP: a lost Nack is asked again at the next retry.
+                        let _ = r.sock.send_to(&n.encode(), r.to);
+                    }
+                    Ask::Gap {
+                        path,
+                        key,
+                        from,
+                        to,
+                    } => {
+                        rep_stats[1] = rep_stats[1].saturating_add(1);
+                        let p = match path {
+                            Some(RepPath::A) => "A",
+                            Some(RepPath::B) => "B",
+                            None => "both",
+                        };
+                        println!(
+                            "ORDER_GAP tenure={} stream={} from={from} to={to} path={p}",
+                            key.1, key.3
+                        );
+                    }
+                }
+            }
+        }
         if k == 0 && dk == 0 {
             // kernel_udp only (class E): an idle order thread parks instead of spinning, so
             // several boxes and their voters share a small host. The socket holds what arrives.
@@ -1430,6 +1566,12 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     }
     if let Some(d) = data.as_mut() {
         d.finals();
+    }
+    if repair.is_some() {
+        println!(
+            "REPAIR nacks={} gaps={} too_old={}",
+            rep_stats[0], rep_stats[1], rep_stats[2]
+        );
     }
     if let Some(d) = data.as_ref() {
         let c = d.sources.counts;

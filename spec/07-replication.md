@@ -946,6 +946,48 @@ costs ~15 ns of the stream core per frame. Each stream core serves at most `REP_
 and the replica falls back to its peers. A frame that has left the ring gets
 `NackTooOld { oldest_seq }`.
 
+**Wire** (`vyrn_log::nack`, vectors in `tests/golden/vyrn_nack_vectors.*`). Every integer is
+little-endian. \[Guessing\]
+
+```text
+Nack (24 B)                              NackTooOld (16 B)
+off size field                           off size field
+  0   1  type      0x31                    0   1  type        0x32
+  1   1  path      0 A, 1 B                1   1  path        0 A, 1 B
+  2   2  epoch16                           2   2  epoch16
+  4   1  tenure                            4   1  tenure
+  5   1  stream    0 A, 1 B                5   1  stream
+  6   2  port      the requester's ORDER   6   2  reserved    0
+                   port on `path`
+  8   8  from_seq  >= 1                    8   8  oldest_seq  the oldest frame the ring holds
+ 16   8  to_seq    from_seq <= to_seq < from_seq + 1024
+```
+
+A datagram of another length or type, a `path` or `stream` above 1, a nonzero reserved field or
+a range outside those bounds is refused. `port` lets a replica name itself when several share
+one IPv4 or a relay or NAT stands in front of it (`vyrn-validator` `[repair] order_as`,
+`order_b_as`).
+
+**Who is served** (ruled). The stream core serves a Nack only if its source IPv4 and `port` name
+one of its configured replicas on that path (`[replication] order` for A, `order_b` for B), and it
+sends every retransmitted frame, and a `NackTooOld`, to that configured address, never to the
+datagram's source. A forged Nack therefore cannot reflect frames to a third party, and
+`REP_RTX_MAX_FPS` bounds what it costs the box. A Nack for another epoch or tenure is refused.
+The `NackTooOld` goes to the replica's ORDER port on the Nack's path, where the replica tells it
+from a frame by its first byte. In this build the Nack reaches the stream core through the
+finality listener on `[consensus] ctrl` and a bounded queue; the ring is in DRAM (`Vec` per frame,
+reused), not the NIC's DMA ring. \[Likely\]
+
+**The replica's side** (`vyrn_replica::Paths::poll`). Two kinds of hole are asked for: a delivery
+gap (frames below a held one that no path delivered), on every path the box has, and on a gated
+observer a missing copy (a frame in `(both, next)` that one path has not brought), on that path.
+Each is asked after `REP_HOLE_WAIT_US`, again every `REP_NACK_RETRY_US`, and given up after
+`[repair] tries` asks (default 8) or a `NackTooOld` below it: the replica prints
+`ORDER_GAP tenure= stream= from= to= path=A|B|both` once. Peer repair, below, is not built, so a
+given-up hole stays a hole. Production keeps 5 µs and 50 µs. DEV only: `vyrn-validator`'s
+`[repair] hole_wait_us` and `retry_us` (with `dev = true`) take other values for unpinned hosts;
+`tools/e2e-smoke` uses 2 ms and 20 ms. \[Likely\]
+
 **Peer repair (fallback, and the only source for older frames).** `RepairReq { epoch, tenure,
 stream, from_seq, to_seq }` goes to one peer (a voter or the standby), chosen in round-robin order by
 index. Peers serve from their in-memory frame store (`REP_PEER_RING_MS` = 2000 ms,

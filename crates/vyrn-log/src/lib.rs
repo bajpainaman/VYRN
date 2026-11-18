@@ -32,6 +32,7 @@ pub mod frame;
 pub mod layout;
 pub mod leb;
 pub mod merge;
+pub mod nack;
 pub mod store;
 pub mod stream;
 pub mod writer;
