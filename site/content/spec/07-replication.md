@@ -1425,8 +1425,9 @@ comparing their outputs. One case needs 05's op-level scheduler (05 §10) and is
 `cut_f` already covers. A lane call cannot stop mid-packet for a step, so a replica rejects such a
 record with `REP_E_ORDER` until 05 defines a split lane call.
 
-**Fields replay derives.** 07's `StepRecord` carries the kind, the source, the cut and the kind
-payload. Everything else in 05's `StepEntry` is an output of the replayed step, not an input:
+**Fields replay derives.** 07's `StepRecord` carries the kind, the source with its `CROSS`
+route bit (§3.8), the cut and the kind payload; the lane's route records (§3.6) carry the route
+of each op it classified and rejected itself. Everything else in 05's `StepEntry` is an output of the replayed step, not an input:
 `n_tx`, `n_fills`, `fill_lanes`, the half-cut publication ids `pub_a`/`pub_b`, and the `CONT`
 flag. The replay BBO core knows whether a continuation is pending, and when it is, the next step
 must be that continuation (05 §8.5, §8.6). The `Rescan` band is the kind payload (§3.8):

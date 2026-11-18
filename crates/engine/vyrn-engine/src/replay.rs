@@ -12,17 +12,23 @@
 //! - a packet record (with the `MID` Advance records the lane wrote while processing it): the
 //!   packet, fetched from [`Payloads`], through `vyrn_lane::Lane::replay_packet` with a late
 //!   clock iff `SHED`, its `MID` records as `Mid` boundaries at `(f, C_f[l])` (05 §6.2, §10 row
-//!   3), and its forwarded ops taken from the later `StepRecord`s that name them (§10 row 7).
+//!   3), and its ops' routes taken from the later `StepRecord`s that name them (their
+//!   `STEP_CROSS` bit, §10 row 7) and from its `Route` records (ops the lane rejected itself).
+//!   A `Route` record is part of its packet's lane call and is compared like the packet's.
 
 use vyrn_bbo::admit::{FixedClock, NeverLate};
 use vyrn_bbo::{
-    Cut, CutDelta, Diverge, MAX_LANES, Record, ReplayStep, STEP_CONT, StepEntry, TxEntry,
+    Cut, CutDelta, Diverge, MAX_LANES, Record, ReplayStep, STEP_CONT, STEP_CROSS, StepEntry,
+    TxEntry,
 };
 use vyrn_cut::LaneCutEntry;
 use vyrn_cut::Visibility;
 use vyrn_lane::{Mid, RespPkt, RxIn};
 use vyrn_risk::Route;
-use vyrn_types::{LaneId, LaneSeq, PacketFlags, PacketRecord, StepId, StepKind, StepRecord, Tick};
+use vyrn_types::{
+    LaneId, LaneSeq, PacketFlags, PacketRecord, RouteRecord, StepFlags, StepId, StepKind,
+    StepRecord, Tick,
+};
 
 use crate::engine::{Engine, Fault, Rec, Sink, StepErr};
 
@@ -33,12 +39,14 @@ use crate::engine::{Engine, Fault, Rec, Sink, StepErr};
 pub enum OwnedRec {
     Packet(PacketRecord),
     Step(StepEntry, [CutDelta; MAX_LANES]),
+    Route(RouteRecord),
 }
 
 impl OwnedRec {
     pub fn of(r: &Rec<'_>) -> Self {
         match r {
             Rec::Packet(p) => Self::Packet(*p),
+            Rec::Route(x) => Self::Route(*x),
             Rec::Step(e, d) => {
                 let mut a = [CutDelta::default(); MAX_LANES];
                 for (x, y) in a.iter_mut().zip(d.iter()) {
@@ -52,6 +60,7 @@ impl OwnedRec {
     pub fn as_rec(&self) -> Rec<'_> {
         match self {
             Self::Packet(p) => Rec::Packet(*p),
+            Self::Route(x) => Rec::Route(*x),
             Self::Step(e, d) => Rec::Step(*e, d.get(..usize::from(e.n_delta)).unwrap_or(&[])),
         }
     }
@@ -128,9 +137,36 @@ struct Tee<'s, S, R> {
     inner: &'s mut S,
     log: &'s mut R,
     pkts: &'s mut Vec<PacketRecord>,
+    /// The call's route records, in output order.
+    routes: [RouteRecord; MAX_ROUTES],
+    n_routes: usize,
     step: Option<OwnedRec>,
     bad_resp: bool,
 }
+
+impl<'s, S, R> Tee<'s, S, R> {
+    fn new(inner: &'s mut S, log: &'s mut R, pkts: &'s mut Vec<PacketRecord>) -> Self {
+        pkts.clear();
+        Self {
+            inner,
+            log,
+            pkts,
+            routes: [NO_ROUTE; MAX_ROUTES],
+            n_routes: 0,
+            step: None,
+            bad_resp: false,
+        }
+    }
+    fn routes(&self) -> &[RouteRecord] {
+        self.routes.get(..self.n_routes).unwrap_or(&[])
+    }
+}
+
+const NO_ROUTE: RouteRecord = RouteRecord {
+    lane: LaneId(0),
+    lane_seq: LaneSeq(0),
+    cross: false,
+};
 
 impl<S: Sink, R: Responses> Sink for Tee<'_, S, R> {
     fn record(&mut self, r: &Rec<'_>) {
@@ -138,6 +174,16 @@ impl<S: Sink, R: Responses> Sink for Tee<'_, S, R> {
             Rec::Packet(p) => {
                 if self.pkts.len() < self.pkts.capacity() {
                     self.pkts.push(*p);
+                }
+            }
+            Rec::Route(x) => {
+                // More than one per op is a lane fault that the compare reports.
+                match self.routes.get_mut(self.n_routes) {
+                    Some(d) => {
+                        *d = *x;
+                        self.n_routes = self.n_routes.saturating_add(1);
+                    }
+                    None => self.bad_resp = true,
                 }
             }
             Rec::Step(..) => self.step = Some(OwnedRec::of(r)),
@@ -174,7 +220,7 @@ fn same_step(a: &OwnedRec, b: &OwnedRec) -> bool {
             },
             d,
         )),
-        OwnedRec::Packet(_) => None,
+        OwnedRec::Packet(_) | OwnedRec::Route(_) => None,
     };
     let (x, y) = (strip(a), strip(b));
     x.is_some() && x == y
@@ -183,7 +229,7 @@ fn same_step(a: &OwnedRec, b: &OwnedRec) -> bool {
 fn packet_of(r: &OwnedRec) -> Option<&PacketRecord> {
     match r {
         OwnedRec::Packet(p) => Some(p),
-        OwnedRec::Step(..) => None,
+        OwnedRec::Step(..) | OwnedRec::Route(_) => None,
     }
 }
 
@@ -192,72 +238,73 @@ const MAX_MIDS: usize = 20;
 /// Forwarded ops one packet can hold.
 const MAX_ROUTES: usize = 10;
 
-/// The forwarded ops of packet `pk` and their routes (05 §10: op `(l, q)` is forwarded iff a
-/// `StepRecord` has `src = (l, q)`), from the steps after it in `recs`. A lane's sources come
-/// in `LaneSeq` order (its `FwdRing` is FIFO), so the scan stops at the first later one.
-///
-/// TEMPORARY (lane follow-up 18): the route comes from [`route_of_kind`] until the log carries
-/// the route the live lane classified (a `FwdEntry` route bit copied into a `StepRecord` flag,
-/// in progress). Switching is a change to that one function.
-/// TEMPORARY: the route of a step's source, from the step's kind (`Improve` → `Improve`,
-/// `Cross` and `Shed` → `Cross`); `None` for kinds that have no forwarded source. A `Cross`
-/// that STP stops before any fill is logged as `Improve`, and a shed `Improve` as `Shed`, so
-/// both replay with the other route's risk bucket: a known divergence (PR gap G7).
-fn route_of_kind(kind: StepKind) -> Option<Route> {
-    match kind {
-        StepKind::Improve => Some(Route::Improve),
-        StepKind::Cross | StepKind::Shed => Some(Route::Cross),
-        _ => None,
-    }
-}
-
-/// `routes_of` over journal records (`CONT` steps name an op already routed).
-fn journal_sources(recs: &[OwnedRec]) -> impl Iterator<Item = (LaneId, LaneSeq, StepKind)> + '_ {
-    recs.iter().filter_map(|r| match r {
-        OwnedRec::Step(e, _) if e.src_lane_seq.0 != 0 && e.flags & STEP_CONT == 0 => {
-            Some((e.src_lane, e.src_lane_seq, StepKind::from_code(e.kind)?))
-        }
-        _ => None,
-    })
-}
-
-/// `routes_of` over 07 steps. A `CONT` step repeats its source, which the dedup below drops.
-fn wire_sources<'a>(
-    steps: &'a [WireStep<'a>],
-) -> impl Iterator<Item = (LaneId, LaneSeq, StepKind)> + 'a {
-    steps
-        .iter()
-        .filter_map(|w| w.src.map(|(l, q)| (l, q, w.kind)))
-}
-
+/// The routes of packet `pk`'s classified ops (05 §10 row 7, 07 §3.6): each op a later step
+/// names as its source, with that step's `CROSS` bit, and each op of `rejected` (the packet's
+/// route records: ops the lane classified and then rejected itself). Every other op is `Join`.
+/// A lane's sources come in `LaneSeq` order (its `FwdRing` is FIFO), so the scan of `srcs`
+/// stops at the first later one.
 fn routes_of(
-    srcs: impl Iterator<Item = (LaneId, LaneSeq, StepKind)>,
+    srcs: impl Iterator<Item = (LaneId, LaneSeq, bool)>,
+    rejected: impl Iterator<Item = RouteRecord>,
     pk: &PacketRecord,
     out: &mut [(LaneSeq, Route); MAX_ROUTES],
 ) -> usize {
     let lo = pk.first_lane_seq.0;
     let hi = lo.saturating_add(u64::from(pk.count));
+    let route = |cross: bool| if cross { Route::Cross } else { Route::Improve };
     let mut n = 0usize;
-    for (lane, seq, kind) in srcs {
+    let mut put = |seq: LaneSeq, r: Route, n: &mut usize| {
+        if out.iter().take(*n).any(|(s, _)| *s == seq) {
+            return;
+        }
+        if let Some(d) = out.get_mut(*n) {
+            *d = (seq, r);
+            *n = n.saturating_add(1);
+        }
+    };
+    for x in rejected.filter(|x| in_packet(pk, x)) {
+        put(x.lane_seq, route(x.cross), &mut n);
+    }
+    for (lane, seq, cross) in srcs {
         if lane != pk.lane {
             continue;
         }
-        let Some(route) = route_of_kind(kind) else {
-            continue;
-        };
-        let q = seq.0;
-        if q >= hi {
+        if seq.0 >= hi {
             break;
         }
-        if q < lo || out.iter().take(n).any(|(s, _)| s.0 == q) {
-            continue;
-        }
-        if let Some(d) = out.get_mut(n) {
-            *d = (seq, route);
-            n = n.saturating_add(1);
+        if seq.0 >= lo {
+            put(seq, route(cross), &mut n);
         }
     }
     n
+}
+
+/// `x` names an op of packet `pk`.
+fn in_packet(pk: &PacketRecord, x: &RouteRecord) -> bool {
+    let lo = pk.first_lane_seq.0;
+    x.lane == pk.lane
+        && !is_advance(pk)
+        && lo <= x.lane_seq.0
+        && x.lane_seq.0 < lo.saturating_add(u64::from(pk.count))
+}
+
+/// `routes_of` sources over journal records (`CONT` steps name an op already routed).
+fn journal_sources(recs: &[OwnedRec]) -> impl Iterator<Item = (LaneId, LaneSeq, bool)> + '_ {
+    recs.iter().filter_map(|r| match r {
+        OwnedRec::Step(e, _) if e.src_lane_seq.0 != 0 && e.flags & STEP_CONT == 0 => {
+            Some((e.src_lane, e.src_lane_seq, e.flags & STEP_CROSS != 0))
+        }
+        _ => None,
+    })
+}
+
+/// `routes_of` sources over 07 steps. A `CONT` step repeats its source, which the dedup drops.
+fn wire_sources<'a>(
+    steps: &'a [WireStep<'a>],
+) -> impl Iterator<Item = (LaneId, LaneSeq, bool)> + 'a {
+    steps
+        .iter()
+        .filter_map(|w| w.src.map(|(l, q)| (l, q, w.cross)))
 }
 
 fn is_advance(p: &PacketRecord) -> bool {
@@ -276,6 +323,9 @@ pub struct WireStep<'p> {
     pub kind: StepKind,
     /// `None`: the kind has no source (07 `src_lane` 0xFF).
     pub src: Option<(LaneId, LaneSeq)>,
+    /// `StepRecord.flags & StepFlags::CROSS` (07 §3.8 src byte bit 7): the route the source's
+    /// lane classified, `Cross` when set, `Improve` when clear. Read only when `src` is set.
+    pub cross: bool,
     /// `cut[l]` for every lane of the box.
     pub cut: &'p [LaneSeq],
     /// The kind payload; for `Rescan`, `band_lo` u32 LE then `band_hi` u32 LE, or empty for all
@@ -290,6 +340,7 @@ impl<'p> WireStep<'p> {
             step: rec.step,
             kind: rec.kind,
             src: (rec.src_lane_seq.0 != 0).then_some((rec.src_lane, rec.src_lane_seq)),
+            cross: rec.flags & StepFlags::CROSS != 0,
             cut: &rec.cut,
             payload,
         }
@@ -344,6 +395,9 @@ const NO_REC: PacketRecord = PacketRecord {
 struct Recs<'a> {
     a: &'a [PacketRecord],
     b: &'a [PacketRecord],
+    /// The carried route records, then this block's.
+    ra: &'a [RouteRecord],
+    rb: &'a [RouteRecord],
 }
 
 impl Recs<'_> {
@@ -355,6 +409,9 @@ impl Recs<'_> {
             None => self.a.get(i),
             Some(k) => self.b.get(k),
         }
+    }
+    fn routes(&self) -> impl Iterator<Item = RouteRecord> + '_ {
+        self.ra.iter().chain(self.rb).copied()
     }
 }
 
@@ -442,10 +499,13 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
     }
 
     /// Replays one block's 07 inputs (07 §7.1): `lanes` holds every lane's records, each lane in
-    /// O-order (other lanes' records may sit between them, as in a decoded block), and `steps`
-    /// the merged steps in StepId order. The two are merged by `REP_MERGE`. Steps compare only
-    /// what 07 carries (kind, source, cut, checked by `Bbo::replay_step`); packet records compare
-    /// byte for byte; responses compare against `log`.
+    /// O-order (other lanes' records may sit between them, as in a decoded block), `routes` the
+    /// block's route records (07 §3.6, any order: each joins the lane call of the packet that
+    /// holds its `(lane, lane_seq)`, and must equal the route record that call emits), and
+    /// `steps` the merged steps in StepId order. The two are merged by `REP_MERGE`. Steps
+    /// compare only what 07 carries (kind, source, `CROSS`, cut, checked by `Bbo::replay_step`);
+    /// packet records compare byte for byte; responses compare against `log`. A route record
+    /// no packet of the inputs holds is [`Why::BadRecord`] at [`WireAt::End`].
     ///
     /// Blocks are replayed by calling this once per block, in height order, on the same engine.
     /// A lane record that is not settled by the block (not yet due, or a packet with an op above
@@ -455,6 +515,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
     pub fn replay_wire<P: Payloads, S: Sink, R: Responses>(
         &mut self,
         lanes: &[PacketRecord],
+        routes: &[RouteRecord],
         steps: &[WireStep<'_>],
         payloads: &P,
         log: &mut R,
@@ -463,17 +524,32 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         let mut buf = core::mem::take(&mut self.scratch);
         let carry = core::mem::take(&mut self.carry);
         let mut next = core::mem::take(&mut self.carry_next);
+        let carry_r = core::mem::take(&mut self.carry_routes);
+        let mut next_r = core::mem::take(&mut self.carry_routes_next);
         next.clear();
+        next_r.clear();
         let recs = Recs {
             a: &carry,
             b: lanes,
+            ra: &carry_r,
+            rb: routes,
         };
-        let r = self.wire_in(recs, steps, payloads, log, sink, &mut buf, &mut next);
+        let r = self.wire_in(
+            recs,
+            steps,
+            payloads,
+            log,
+            sink,
+            &mut buf,
+            (&mut next, &mut next_r),
+        );
         buf.clear();
         self.scratch = buf;
         // On success `next` is the new carry; on an error replay stops anyway.
         self.carry = next;
         self.carry_next = carry;
+        self.carry_routes = next_r;
+        self.carry_routes_next = carry_r;
         r
     }
 
@@ -486,7 +562,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         log: &mut R,
         sink: &mut S,
         buf: &mut Vec<PacketRecord>,
-        carry: &mut Vec<PacketRecord>,
+        (carry, carry_r): (&mut Vec<PacketRecord>, &mut Vec<RouteRecord>),
     ) -> Result<(), WireDiverged> {
         let n = self.lanes.len();
         if (0..lanes.len()).any(|i| lanes.get(i).is_some_and(|r| usize::from(r.lane.0) >= n)) {
@@ -556,19 +632,13 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             let rs = ReplayStep {
                 kind: w.kind,
                 src: w.src,
+                cross: w.cross,
                 // 07 has no CONT bit: a pending continuation must be the next step (07 §7.1).
                 cont: self.bbo.continuing(),
                 band,
                 cut,
             };
-            buf.clear();
-            let mut tee = Tee {
-                inner: sink,
-                log,
-                pkts: buf,
-                step: None,
-                bad_resp: false,
-            };
+            let mut tee = Tee::new(sink, log, buf);
             self.step_call(&rs, &mut tee).map_err(at)?;
             if tee.bad_resp {
                 return Err(at(Why::Response));
@@ -612,6 +682,28 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     });
                 }
                 carry.push(*r);
+            }
+        }
+        // A route record belongs to a packet of its lane in these inputs (07 §3.6): replayed
+        // (and compared in that lane call) or carried with it.
+        for x in lanes.routes() {
+            let lane_cur = cur.get(usize::from(x.lane.0)).copied().unwrap_or(0);
+            let Some(i) =
+                (0..lanes.len()).find(|&i| lanes.get(i).is_some_and(|p| in_packet(p, &x)))
+            else {
+                return Err(WireDiverged {
+                    at: WireAt::End,
+                    why: Why::BadRecord,
+                });
+            };
+            if i >= lane_cur {
+                if carry_r.len() >= carry_r.capacity() {
+                    return Err(WireDiverged {
+                        at: WireAt::End,
+                        why: Why::Order,
+                    });
+                }
+                carry_r.push(x);
             }
         }
         Ok(())
@@ -673,19 +765,27 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     at: WireAt::Lane(i),
                     why,
                 };
-                buf.clear();
-                let mut tee = Tee {
-                    inner: sink,
-                    log,
-                    pkts: buf,
-                    step: None,
-                    bad_resp: false,
-                };
+                let mut tee = Tee::new(sink, log, buf);
                 let mids = c.mids.get(..c.n_mid).unwrap_or(&[]);
-                self.lane_call(l, &c.rec, mids, wire_sources(later), payloads, &mut tee)
-                    .map_err(at)?;
+                let rejected = lanes.routes().filter(|x| in_packet(&c.rec, x));
+                self.lane_call(
+                    l,
+                    &c.rec,
+                    mids,
+                    wire_sources(later),
+                    rejected,
+                    payloads,
+                    &mut tee,
+                )
+                .map_err(at)?;
                 if tee.bad_resp {
                     return Err(at(Why::Response));
+                }
+                // The call's route records must be the packet's input route records, in order.
+                let mut want_r = lanes.routes().filter(|x| in_packet(&c.rec, x));
+                let same_r = tee.routes().iter().all(|g| want_r.next() == Some(*g));
+                if !same_r || want_r.next().is_some() {
+                    return Err(at(Why::Mismatch));
                 }
                 let want = core::iter::once(&c.rec).chain(mids.iter());
                 if buf.len() != c.n_mid.saturating_add(1)
@@ -724,13 +824,16 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
     }
 
     /// One replayed lane call: a non-`MID` Advance record is the lane's idle poll; a packet goes
-    /// through `Lane::replay_packet` with `mids` as its boundaries and the routes `srcs` give.
+    /// through `Lane::replay_packet` with `mids` as its boundaries and the routes that `srcs`
+    /// (later steps) and `rejected` (its route records) give.
+    #[allow(clippy::too_many_arguments)]
     fn lane_call<P: Payloads, S: Sink>(
         &mut self,
         l: usize,
         rec: &PacketRecord,
         mids: &[PacketRecord],
-        srcs: impl Iterator<Item = (LaneId, LaneSeq, StepKind)>,
+        srcs: impl Iterator<Item = (LaneId, LaneSeq, bool)>,
+        rejected: impl Iterator<Item = RouteRecord>,
         payloads: &P,
         sink: &mut S,
     ) -> Result<(), Why> {
@@ -762,7 +865,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             };
         }
         let mut routes = [(LaneSeq(0), Route::Join); MAX_ROUTES];
-        let n_route = routes_of(srcs, rec, &mut routes);
+        let n_route = routes_of(srcs, rejected, rec, &mut routes);
         let bytes = payloads.get(rec).ok_or(Why::NoPayload)?;
         let rx = RxIn {
             bytes,
@@ -790,14 +893,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         let mut i = 0usize;
         while let Some(r) = recs.get(i) {
             let at = |why| Diverged { index: i, why };
-            buf.clear();
-            let mut tee = Tee {
-                inner: sink,
-                log,
-                pkts: buf,
-                step: None,
-                bad_resp: false,
-            };
+            let mut tee = Tee::new(sink, log, buf);
             let used = match r {
                 OwnedRec::Step(e, d) => {
                     let deltas = d.get(..usize::from(e.n_delta)).unwrap_or(&[]);
@@ -811,33 +907,51 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     }
                     1
                 }
-                OwnedRec::Packet(p) => {
-                    let l = usize::from(p.lane.0);
+                OwnedRec::Packet(_) | OwnedRec::Route(_) => {
+                    let lane = match r {
+                        OwnedRec::Packet(p) => p.lane,
+                        OwnedRec::Route(x) => x.lane,
+                        OwnedRec::Step(..) => LaneId(0),
+                    };
+                    let l = usize::from(lane.0);
                     let run = recs.get(i..).unwrap_or(&[]);
-                    // A packet's MID records: the lane's MID records right before it in the
-                    // run and right after it, up to the lane's next other record (05 §6.2).
+                    // A packet's lane call: the lane's MID and route records right before it in
+                    // the run and its MID records right after it, up to the lane's next other
+                    // record (05 §6.2; the lane writes route records in pass 1).
                     let lane_run = run.iter().map_while(|x| match x {
-                        OwnedRec::Packet(q) if q.lane == p.lane => Some(q),
+                        OwnedRec::Packet(q) if q.lane == lane => Some(Some(q)),
+                        OwnedRec::Route(q) if q.lane == lane => Some(None),
                         _ => None,
                     });
-                    let (k, pk) = if is_advance(p) && !is_mid(p) {
-                        (0, p)
-                    } else {
-                        lane_run
+                    let (k, pk) = match r {
+                        OwnedRec::Packet(p) if is_advance(p) && !is_mid(p) => (0, p),
+                        _ => lane_run
                             .enumerate()
-                            .find(|(_, q)| !is_advance(q))
-                            .ok_or(at(Why::BadRecord))?
+                            .find_map(|(k, q)| q.filter(|q| !is_advance(q)).map(|q| (k, q)))
+                            .ok_or(at(Why::BadRecord))?,
                     };
+                    let before = run.get(..k).unwrap_or(&[]);
+                    // The lane's records from `i` on, through its MID and route records after
+                    // the packet: the call's input route records sit anywhere in it.
+                    let span = run.iter().take_while(|x| match x {
+                        OwnedRec::Packet(q) => q.lane == lane && (is_mid(q) || !is_advance(q)),
+                        OwnedRec::Route(q) => q.lane == lane,
+                        OwnedRec::Step(..) => false,
+                    });
                     let mut mids = [NO_REC; MAX_MIDS];
                     let mut n_mid = 0usize;
                     if !is_advance(pk) {
-                        let after = run.iter().skip(k.saturating_add(1)).map_while(|x| match x {
-                            OwnedRec::Packet(q) if q.lane == p.lane && is_mid(q) => Some(q),
-                            _ => None,
-                        });
-                        for m in run
+                        let after = run
                             .iter()
-                            .take(k)
+                            .skip(k.saturating_add(1))
+                            .map_while(|x| match x {
+                                OwnedRec::Packet(q) if q.lane == lane && is_mid(q) => Some(Some(q)),
+                                OwnedRec::Route(q) if q.lane == lane => Some(None),
+                                _ => None,
+                            })
+                            .flatten();
+                        for m in before
+                            .iter()
                             .filter_map(packet_of)
                             .filter(|q| is_mid(q))
                             .chain(after)
@@ -847,26 +961,43 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                         }
                     }
                     let mids = mids.get(..n_mid).unwrap_or(&[]);
-                    self.lane_call(l, pk, mids, journal_sources(run), payloads, &mut tee)
-                        .map_err(at)?;
+                    let rejected = span.filter_map(|x| match x {
+                        OwnedRec::Route(q) => Some(*q),
+                        _ => None,
+                    });
+                    self.lane_call(
+                        l,
+                        pk,
+                        mids,
+                        journal_sources(run),
+                        rejected,
+                        payloads,
+                        &mut tee,
+                    )
+                    .map_err(at)?;
                     if tee.bad_resp {
                         return Err(at(Why::Response));
                     }
-                    tee.pkts.len()
+                    // The call's output, packets and route records in output order, must be
+                    // the next records of the input.
+                    let (n_pk, n_rt) = (tee.pkts.len(), tee.n_routes);
+                    let used = n_pk.saturating_add(n_rt);
+                    let want = recs.get(i..i.saturating_add(used)).unwrap_or(&[]);
+                    let mut gp = tee.pkts.iter();
+                    let mut gr = tee.routes().iter();
+                    let same = n_pk > 0
+                        && want.len() == used
+                        && want.iter().all(|w| match w {
+                            OwnedRec::Packet(p) => gp.next() == Some(p),
+                            OwnedRec::Route(x) => gr.next() == Some(x),
+                            OwnedRec::Step(..) => false,
+                        });
+                    if !same {
+                        return Err(at(Why::Mismatch));
+                    }
+                    used
                 }
             };
-            if let OwnedRec::Packet(_) = r {
-                let want = recs.get(i..i.saturating_add(used)).unwrap_or(&[]);
-                let same = used > 0
-                    && want.len() == used
-                    && want
-                        .iter()
-                        .zip(buf.iter())
-                        .all(|(w, g)| *w == OwnedRec::Packet(*g));
-                if !same {
-                    return Err(at(Why::Mismatch));
-                }
-            }
             i = i.saturating_add(used);
         }
         Ok(())

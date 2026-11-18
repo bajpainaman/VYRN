@@ -17,7 +17,9 @@ use vyrn_lane::{
     Ports, RespPkt, Rx, RxIn,
 };
 use vyrn_risk::Route;
-use vyrn_types::{AccountId, AcctTake, LaneId, LaneSeq, PacketRecord, SessionId, StepId};
+use vyrn_types::{
+    AccountId, AcctTake, LaneId, LaneSeq, PacketRecord, RouteRecord, SessionId, StepId,
+};
 
 /// Steps whose cut replay keeps for `MID` boundaries (`ENG_STEP_LOG`).
 pub(crate) const STEP_HIST: usize = ENG_STEP_LOG;
@@ -36,6 +38,10 @@ pub enum Rec<'d> {
     Packet(PacketRecord),
     /// A step with its changed cut entries (05 §4.15).
     Step(StepEntry, &'d [CutDelta]),
+    /// The route of an op its lane classified `Cross` or `Improve` and then rejected itself
+    /// (07 §3.6 `RouteRecord`, G9). The lane writes it in pass 1, so it comes before its
+    /// packet's `PacketRecord` in the lane's output.
+    Route(RouteRecord),
 }
 
 /// Where the engine's outputs go. Called on the engine's thread, in output order.
@@ -159,6 +165,9 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     /// buffer the next carry is built in. Both hold [`CARRY_CAP`] records.
     pub(crate) carry: Vec<PacketRecord>,
     pub(crate) carry_next: Vec<PacketRecord>,
+    /// The route records of the carried packets, and the buffer the next one is built in.
+    pub(crate) carry_routes: Vec<RouteRecord>,
+    pub(crate) carry_routes_next: Vec<RouteRecord>,
 }
 
 impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
@@ -260,6 +269,8 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             pool: (0..n).map(|_| Vec::new()).collect(),
             carry: Vec::with_capacity(CARRY_CAP),
             carry_next: Vec::with_capacity(CARRY_CAP),
+            carry_routes: Vec::with_capacity(CARRY_CAP),
+            carry_routes_next: Vec::with_capacity(CARRY_CAP),
         })
     }
 
@@ -460,9 +471,14 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
         }
         let pool = self.pool.get(l).map_or(&[][..], Vec::as_slice);
         for r in lane.drain_log() {
-            // A `RouteRecord` (G9) is not in this crate's journal yet; replay wiring is the
-            // engine's follow-up (`routes_of`).
-            let LogRec::Packet(p) = r else { continue };
+            let p = match r {
+                LogRec::Packet(p) => p,
+                // An op's route (07 §3.6) covers no account write, so it takes no token.
+                LogRec::Route(x) => {
+                    sink.record(&Rec::Route(x));
+                    continue;
+                }
+            };
             if let Some((_, account, tok)) = pool.iter().find(|(s, _, _)| *s == p.session) {
                 // Spec gap (PR body): the engine plays every pool core on one thread, so the
                 // lane's work for this record is already done and no other core can have
