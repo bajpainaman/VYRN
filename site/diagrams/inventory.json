@@ -332,13 +332,13 @@
   {
    "asciiIndex": 23,
    "heading": "7.7 Latency of a local ack (a maximum)",
-   "line": 1672,
+   "line": 1676,
    "ascii": "op applied, counter published ─► its cut core reads it          ≤ 100 ns (CUT_REFRESH_NS)\n  ─► the BBO core finishes the step in progress                  ≤ ENG_STEP_MAX_NS = 15\n  ─► the next step takes that half-cut and finishes              ≤ 15\n  ─► order-stream core queues the step's frame, writes LaneCut[l] ≤ 40\n  ─► lane polls LaneCut within ENG_UNIT_NS, even inside another packet (§6.1)   ≤ 20\n  ─► frame-gate check, B1–B3 with the pre-built response, lane TX doorbell     ≤ 10 + 20"
   },
   {
    "asciiIndex": 26,
    "heading": "8.8 Auction mode (engine side; 08-epochs.md owns the rule)",
-   "line": 2070,
+   "line": 2074,
    "ascii": "Continuous ──Control(Auction)──► Auction ──Control(Frozen)──► Frozen ──Uncross × m──► Continuous\n     │                              ▲\n     └──Control(Halted)──► Halted ──┘ (Control(Auction); a halt ends by auction)"
   }
  ],

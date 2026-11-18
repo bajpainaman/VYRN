@@ -1600,9 +1600,13 @@ fn settle_fill(l: &mut Lane, r: RootIx, ev: &FillEvent) {
     let o = &mut l.order[r]; let a = &mut l.acct[o.acct_ix];
     let v = slot(ev.vslot);                             // the version that traded
     let n = ev.qty as u64 * px(ev.tick);
-    // A maker fill pays now; a taker fill adds n to the step's taker notional, which TakerEnd
-    // charges once (10 §4.4).
-    let fee = if ev.liq == MAKER { fee(n, a.fee.maker_ppm) } else { l.taker_notional += n; 0 };
+    // Maker and auction fills pay now; a taker fill adds n to the step's taker notional,
+    // which TakerEnd charges once (10 §4.4).
+    let fee = match ev.liq {
+        MAKER   => fee(n, a.fee.maker_ppm),
+        AUCTION => fee(n, a.fee.auction_ppm),           // liq = 2, uncross fills (§8.8)
+        _       => { l.taker_notional += n; 0 }
+    };
     match v.side() {
         Buy => {
             let used = ev.qty as u64 * rpl(v.tick);     // limit of the version that traded

@@ -290,35 +290,39 @@ fn kill(b : *mut Book, i : i64, cause : u64) -> void {
   release(b, i, open(b, i));
   end(b, i, cause);
 }
-// One side of a fill of q lots at tick f, without its fee; returns the notional n (10 §4.4).
+// One side of a fill of q lots at tick f (10 §4.4). Returns the quote credit before the fee
+// (buy: the released reservation minus the notional; sell: the notional) without adding it to
+// quote_free: `charge` adds it net of the fee, so a balance that ends in range never overflows
+// on the way.
 fn settle(b : *mut Book, i : i64, q : u64, f : u64) -> u64 {
   let o = ord(b, i);
   unsafe {
     let a = acct(b, (*o).acct);
     let n = mul(b, q, px(b, f));
+    let mut cr = n;
     if (*o).side == 0u64 {
       let rel = mul(b, q, rpl(b, (*o).tick));
       (*a).quote_resv = sub(b, (*a).quote_resv, rel);
-      (*a).quote_free = add(b, (*a).quote_free, sub(b, rel, n));
+      cr = sub(b, rel, n);
       (*a).base_free = add(b, (*a).base_free, q);
     } else {
       (*a).base_resv = sub(b, (*a).base_resv, q);
-      (*a).quote_free = add(b, (*a).quote_free, n);
     }
     (*o).filled = (*o).filled + q;
-    return n;
+    return cr;
   }
 }
-// The fee on notional n at rate ppm (negative = rebate), from quote_free to fee_acc[lane]
-// (10 §4.4 apply_fee): ceil for a charge, floor for a rebate. Maker and auction fills pay per
-// fill; a taker pays once per step on the step's total notional (10 §3.3, settle.rs taker_end).
-fn charge(b : *mut Book, ai : i64, n : u64, ppm : i64) -> void {
+// Credits cr to quote_free net of the fee on notional n at rate ppm (negative = rebate); the fee
+// goes to fee_acc[lane] (10 §4.4 apply_fee): ceil for a charge, floor for a rebate. cr ≥ fee
+// (the release lemma, 10 §3.2, and ppm < 10^6). Maker and auction fills pay per fill; a taker
+// pays once per step on the step's total notional (10 §3.3, settle.rs taker_end).
+fn charge(b : *mut Book, ai : i64, cr : u64, n : u64, ppm : i64) -> void {
   unsafe {
     let a = acct(b, ai);
     let mut fee = 0u64;
     let mut rebate = 0u64;
     if ppm >= 0i64 { fee = fee_ceil(b, n, ppm as u64); } else { rebate = fee_floor(b, n, (0i64 - ppm) as u64); }
-    (*a).quote_free = add(b, sub(b, (*a).quote_free, fee), rebate);
+    (*a).quote_free = add(b, add(b, (*a).quote_free, sub(b, cr, fee)), rebate);
     let acc : *mut i64 = offset_mut((*b).fee_acc, (*a).lane as i64);
     // Signed and checked too (W-11): an accumulator that cannot hold the fee is a fault.
     if fee > 9223372036854775807u64 || rebate > 9223372036854775807u64 { (*b).fault = 1u64; }
@@ -417,13 +421,14 @@ fn match_on_entry(b : *mut Book, t : i64, idx : u64) -> void {
     let mut lvl = 0u64;
     let mut lq = 0u64;
     let mut tn = 0u64;                       // the taker's notional in this step
+    let mut tcr = 0u64;                      // and its quote credit before the fee
     while open(b, t) > 0u64 {
       let m = maker_after(b, side, tick, -1i64);
       if m < 0i64 { break; }
       let mo = ord(b, m);
       if (*mo).acct == ta && (*o).stp != 0u64 {
         if (*o).stp == 2u64 { stp_remove_maker(b, m); continue; }
-        charge(b, ta, tn, (*acct(b, ta)).taker);
+        charge(b, ta, tcr, tn, (*acct(b, ta)).taker);
         flush(b, t, idx, lvl, lq);
         if (*o).stp == 3u64 { stp_remove_maker(b, m); }
         stp_end(b, t, idx, (*mo).handle, traded);
@@ -432,15 +437,17 @@ fn match_on_entry(b : *mut Book, t : i64, idx : u64) -> void {
       let q = min(open(b, t), open(b, m));
       let f = (*mo).tick;
       if f != lvl { flush(b, t, idx, lvl, lq); lvl = f; lq = 0u64; }
-      tn = add(b, tn, settle(b, t, q, f));
-      let mn = settle(b, m, q, f);
-      charge(b, (*mo).acct, mn, (*acct(b, (*mo).acct)).maker);
+      let n = mul(b, q, px(b, f));
+      tn = add(b, tn, n);
+      tcr = add(b, tcr, settle(b, t, q, f));
+      let mcr = settle(b, m, q, f);
+      charge(b, (*mo).acct, mcr, n, (*acct(b, (*mo).acct)).maker);
       emit(b, (*mo).session, R_FILL, 255u64, 0u64, (*mo).handle, f, q);
       if open(b, m) == 0u64 { end(b, m, END_FILLED); }
       lq = lq + q;
       traded = true;
     }
-    charge(b, ta, tn, (*acct(b, ta)).taker);
+    charge(b, ta, tcr, tn, (*acct(b, ta)).taker);
     flush(b, t, idx, lvl, lq);
     if open(b, t) == 0u64 { end(b, t, END_FILLED); return; }
     if (*o).tif == 1u64 || (*o).tif == 2u64 {
@@ -731,8 +738,8 @@ fn allocate(b : *mut Book, side : u64, p : u64, v : u64) -> void {
     let q = min(left, open(b, i));
     let o = ord(b, i);
     unsafe {
-      let n = settle(b, i, q, p);
-      charge(b, (*o).acct, n, (*acct(b, (*o).acct)).auction);
+      let cr = settle(b, i, q, p);
+      charge(b, (*o).acct, cr, mul(b, q, px(b, p)), (*acct(b, (*o).acct)).auction);
       emit(b, (*o).session, R_FILL, 255u64, 2u64, (*o).handle, p, q);
     }
     if open(b, i) == 0u64 { end(b, i, END_FILLED); }
