@@ -59,7 +59,7 @@ fn frames_decode_and_headers_chain() {
         tenure: 0,
         sender: 0,
     };
-    let mut w = SeqWriter::new(layout, ident, ts(), SEED).unwrap();
+    let mut w = SeqWriter::new(layout, ident, ts(), SEED, 1472).unwrap();
     let mut frames = Vec::new();
     // Block 0: two packets on lane 2 (same session, second pkt_seq predicted), one on lane 0,
     // an Improve; then an Advance record on lane 2 after a step that filled it.
@@ -179,5 +179,79 @@ fn two_substreams_are_refused() {
         tenure: 0,
         sender: 0,
     };
-    assert!(SeqWriter::new(Layout::new(4, 2, 0).unwrap(), ident, ts(), SEED).is_err());
+    assert!(SeqWriter::new(Layout::new(4, 2, 0).unwrap(), ident, ts(), SEED, 1472).is_err());
+}
+
+/// 49 lanes, every lane's first packet in one burst with its own session, then a step that
+/// moves every lane's cut: every frame stays within 1472 bytes (07 over a 1514-byte Ethernet
+/// frame), the stream still decodes, and framed positions follow what was returned.
+#[test]
+fn frames_stay_within_the_limit() {
+    const MAX: usize = 1472;
+    let n = 49u8;
+    let ts = TenureStart {
+        lanes: vec![
+            LaneBase {
+                next_lane_seq: LaneSeq(1),
+                rx_ts: Nanos(u64::MAX / 2),
+                fills_applied: StepId(0),
+            };
+            usize::from(n)
+        ],
+        prev_cut: vec![LaneSeq(0); usize::from(n)],
+        ..ts()
+    };
+    let layout = Layout::new(n, 1, 0).unwrap();
+    let ident = Ident {
+        book: BookId(2),
+        epoch: Epoch(3),
+        tenure: 0,
+        sender: 0,
+    };
+    let mut w = SeqWriter::new(layout, ident, ts, SEED, MAX).unwrap();
+    let mut frames = Vec::new();
+    for l in 0..n {
+        for k in 0..4u64 {
+            let mut p = pkt(l, 0x1000 + u32::from(l), 1 + k as u32, 1 + 10 * k, 10);
+            p.rx_ts = Nanos(u64::MAX / 4 + k);
+            p.pkt_seq = 0x7000_0000 + k as u32; // never predicted: SEQ_EXC on every record
+            frames.extend(w.packet(p, Some(Hash([l; 32]))).unwrap());
+        }
+    }
+    assert!(
+        w.framed_lane_seq(LaneId(0)).is_some(),
+        "a full frame was flushed"
+    );
+    let cut: Vec<LaneSeq> = (0..n).map(|_| LaneSeq(u64::from(u32::MAX))).collect();
+    frames.extend(
+        w.step(StepId(1), StepKind::Idle, None, Vec::new(), &cut)
+            .unwrap(),
+    );
+    assert_eq!(w.framed_step(), StepId(0), "the step is not framed yet");
+    let (f, _) = w.close_block().unwrap();
+    frames.extend(f);
+    assert_eq!(w.framed_step(), StepId(1));
+    assert_eq!(w.framed_lane_seq(LaneId(48)), Some(LaneSeq(31)));
+    assert!(frames.len() > 3);
+    let mut dec = StreamDecoder::new(layout, 0).unwrap();
+    for f in &frames {
+        assert!(f.len() <= MAX, "frame of {} bytes", f.len());
+        dec.decode(f).unwrap();
+    }
+}
+
+#[test]
+fn a_step_too_long_for_any_frame_is_refused() {
+    let ident = Ident {
+        book: BookId(2),
+        epoch: Epoch(3),
+        tenure: 0,
+        sender: 0,
+    };
+    let mut w = SeqWriter::new(Layout::new(3, 1, 0).unwrap(), ident, ts(), SEED, 1472).unwrap();
+    let cut = [LaneSeq(0); 3];
+    assert!(
+        w.step(StepId(1), StepKind::Control, None, vec![0; 1500], &cut)
+            .is_err()
+    );
 }

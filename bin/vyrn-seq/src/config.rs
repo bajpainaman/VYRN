@@ -63,7 +63,7 @@ pub struct Nic {
     pub port_base: u16,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cores {
     /// Pin threads to `engine` and `stream`. Refused today: `vyrn-nic::sys` has no affinity call.
@@ -78,6 +78,18 @@ pub struct Cores {
 
 fn d_seal() -> String {
     "count".into()
+}
+
+/// An omitted `[cores]` table means the same as an empty one.
+impl Default for Cores {
+    fn default() -> Self {
+        Self {
+            pin: false,
+            engine: None,
+            stream: None,
+            seal: d_seal(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

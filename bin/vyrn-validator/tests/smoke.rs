@@ -102,7 +102,7 @@ fn block(seed: [u8; 32]) -> Vec<Vec<u8>> {
         tenure: 0,
         sender: 0,
     };
-    let mut w = SeqWriter::new(Layout::new(2, 1, 0).unwrap(), ident, ts, seed).unwrap();
+    let mut w = SeqWriter::new(Layout::new(2, 1, 0).unwrap(), ident, ts, seed, 1472).unwrap();
     let body = b"one request packet";
     let p = PacketRecord {
         lane: LaneId(0),
@@ -164,7 +164,7 @@ fn one_block_is_valid() {
         .map(Result::unwrap)
         .find(|l| l.starts_with("STATS"))
         .unwrap();
-    assert_eq!(stats, "STATS frames=4 blocks=1 faults=0");
+    assert_eq!(stats, "STATS frames=5 blocks=1 faults=0");
     assert!(child.wait().unwrap().success());
 }
 

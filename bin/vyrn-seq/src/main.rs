@@ -74,7 +74,7 @@ use vyrn_cut::Hw;
 use vyrn_engine::alloc::SealingAlloc;
 use vyrn_engine::{Engine, Rec, Shared, Sink};
 use vyrn_epoch::{Boundary, EpochNotice, Notifier};
-use vyrn_lane::{ArenaConfig, Lane, PathTable, RespPkt, RxIn, SessionSpec};
+use vyrn_lane::{ArenaConfig, Gate, Lane, PathTable, RespPkt, RxIn, SessionSpec};
 use vyrn_log::stream::has_src;
 use vyrn_log::{Ident, LaneBase, Layout, SeqWriter, TenureStart};
 use vyrn_nic::frame::{self, Endpoint, FrameHdr};
@@ -99,6 +99,8 @@ pub const NA: usize = 16;
 pub const MAX_LANES: usize = vyrn_bbo::MAX_LANES;
 /// Records in flight between the engine and stream threads.
 const CHANNEL: usize = 8192;
+/// Messages the stream thread takes before it drains responses and checks the block timer.
+const BATCH: usize = 1024;
 /// Records per response packet (01 §6.3).
 const MAX_RECS: usize = vyrn_wire::MAX_RECS_PER_PKT as usize;
 /// Recent packets whose full hash the stream thread may still ask for.
@@ -121,7 +123,7 @@ struct Cli {
 enum Out {
     Pkt(PacketRecord, Option<Hash>),
     Step(StepEntry, u8, [CutDelta; MAX_LANES]),
-    Resp(Endpoint, RespPkt),
+    Resp(LaneId, Endpoint, RespPkt),
     /// A fill TX packet (05 §8.10 rules 1 and 2), its records cut to one response's worth.
     Tx(Endpoint, TxEntry, u8, [Record; MAX_RECS]),
     /// A TX packet this release cannot send (see `EngineSink::tx`).
@@ -332,7 +334,15 @@ fn writer(cfg: &Config, n: usize, seed: [u8; 32]) -> Result<SeqWriter, String> {
         ],
         prev_cut: vec![LaneSeq(0); n],
     };
-    SeqWriter::new(layout, ident, ts, seed).map_err(|e| e.to_string())
+    // Each log frame is one UDP payload of a fast-path frame.
+    SeqWriter::new(layout, ident, ts, seed, frame::MAX_PAYLOAD).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+fn writer_for_test() -> SeqWriter {
+    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/dev.toml");
+    let c = Config::load(std::path::Path::new(p)).unwrap_or_else(|e| panic!("{e}"));
+    writer(&c, 2, [0x42; 32]).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// What the engine thread builds, taken from the config before the thread starts.
@@ -488,10 +498,10 @@ impl Sink for EngineSink {
             }
         }
     }
-    fn lane_resp(&mut self, _lane: LaneId, p: &RespPkt) {
+    fn lane_resp(&mut self, lane: LaneId, p: &RespPkt) {
         if let Some((_, ep)) = self.peers.iter().find(|(s, _)| *s == p.session) {
             let ep = *ep;
-            self.send(Out::Resp(ep, *p));
+            self.send(Out::Resp(lane, ep, *p));
         }
     }
     /// Only packets with a `resp_seq` are sent: maker packets take theirs from the lane's
@@ -691,7 +701,7 @@ struct StreamCore<T: TxRing> {
     epoch16: u16,
     cut: Vec<LaneSeq>,
     stats: Arc<Stats>,
-    pending: Vec<(Endpoint, RespPkt)>,
+    pending: Vec<(LaneId, Endpoint, RespPkt)>,
     pending_tx: Vec<(Endpoint, TxEntry, u8, [Record; MAX_RECS])>,
 }
 
@@ -715,7 +725,8 @@ impl<T: TxRing> StreamCore<T> {
                     return Err("engine thread stopped".into());
                 }
             };
-            for o in first.into_iter().chain(rx.try_iter()) {
+            // A bounded batch, so responses and block closure run under sustained input.
+            for o in first.into_iter().chain(rx.try_iter()).take(BATCH) {
                 open_steps |= matches!(o, Out::Step(..));
                 self.take(o)?;
             }
@@ -749,8 +760,8 @@ impl<T: TxRing> StreamCore<T> {
                 // and Uncross (07 §3.8), so those steps are framed with an empty one.
                 self.writer.step(e.step, kind, src, Vec::new(), &self.cut)
             }
-            Out::Resp(ep, p) => {
-                self.pending.push((ep, p));
+            Out::Resp(l, ep, p) => {
+                self.pending.push((l, ep, p));
                 return Ok(());
             }
             Out::Tx(ep, h, n, rs) => {
@@ -770,17 +781,28 @@ impl<T: TxRing> StreamCore<T> {
         self.ship(&frames)
     }
 
-    /// Flushes the writer, then sends the responses its frames cover (`INV-FRAME-FIRST`).
+    /// Flushes the writer, ships its frames, then sends the responses whose gate those frames
+    /// opened (`INV-FRAME-FIRST`, 05 §8.10). A response whose packet or step has not reached
+    /// this thread yet stays pending, in order.
     fn drain(&mut self) -> Result<(), String> {
         let frames = self.writer.flush().map_err(|e| e.to_string())?;
         self.ship(&frames)?;
-        for (ep, p) in core::mem::take(&mut self.pending) {
+        for (l, ep, p) in core::mem::take(&mut self.pending) {
+            if !gate_open(&self.writer, l, p.gate) {
+                self.pending.push((l, ep, p));
+                continue;
+            }
             let hdr = RespHeader::new(p.session, p.resp_seq, self.epoch16, p.echo_pkt, false);
             if self.respond(ep, hdr, p.records())? {
                 self.stats.responses.fetch_add(1, Ordering::Relaxed);
             }
         }
         for (ep, h, n, rs) in core::mem::take(&mut self.pending_tx) {
+            // A TX packet goes out after its step is framed (05 §8.10 rules 1 and 2).
+            if self.writer.framed_step().0 < h.step.0 {
+                self.pending_tx.push((ep, h, n, rs));
+                continue;
+            }
             let hdr = RespHeader::new(h.session, h.resp_seq, self.epoch16, h.pkt_seq, false);
             if self.respond(ep, hdr, rs.get(..usize::from(n)).unwrap_or(&[]))? {
                 self.stats.fills.fetch_add(1, Ordering::Relaxed);
@@ -825,6 +847,15 @@ impl<T: TxRing> StreamCore<T> {
     }
 }
 
+/// Whether frames already returned by `w` cover what `gate` waits for on `lane`.
+fn gate_open(w: &SeqWriter, lane: LaneId, gate: Gate) -> bool {
+    match gate {
+        Gate::None => true,
+        Gate::Packet(s) => w.framed_lane_seq(lane).is_some_and(|f| f.0 >= s.0),
+        Gate::Step(s) => w.framed_step().0 >= s.0,
+    }
+}
+
 fn send<T: TxRing>(tx: &mut T, src: Ipv4Addr, dst: Endpoint, payload: &[u8]) -> Result<(), String> {
     let hdr = FrameHdr {
         src: Endpoint {
@@ -856,5 +887,60 @@ mod tests {
         let c = super::Config::load(std::path::Path::new(p)).unwrap();
         assert_eq!((c.engine.dedicated, c.dev_session.len()), (2, 1));
         assert!(super::EnginePlan::from(&c).unwrap().notifier.is_some());
+    }
+
+    /// Without `[cores]` the box takes the table's defaults (seal = count), as with an empty one.
+    #[test]
+    fn omitted_cores_table_uses_defaults() {
+        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/dev.toml");
+        let text = std::fs::read_to_string(p).unwrap();
+        let start = text.find("[cores]").unwrap();
+        let end = start + text[start..].find("[replication]").unwrap();
+        let dir = std::env::temp_dir().join(format!("vyrn-seq-cores-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("seq.toml");
+        std::fs::write(&f, format!("{}{}", &text[..start], &text[end..])).unwrap();
+        let c = super::Config::load(&f).unwrap();
+        assert_eq!(c.cores.seal, "count");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A response gated on a packet or step opens only once a returned frame carries it.
+    #[test]
+    fn gates_follow_framed_positions() {
+        use vyrn_types::{LaneId, LaneSeq, Nanos, PacketRecord, PktHash, SessionId, StepId};
+        let mut w = super::writer_for_test();
+        let gp = super::Gate::Packet(LaneSeq(1));
+        assert!(super::gate_open(&w, LaneId(0), super::Gate::None));
+        assert!(!super::gate_open(&w, LaneId(0), gp), "nothing pushed");
+        let p = PacketRecord {
+            lane: LaneId(0),
+            count: 1,
+            flags: 0,
+            session: SessionId(0x0010_0001),
+            pkt_seq: 1,
+            rx_ts: Nanos(1),
+            pkt_hash: PktHash(5),
+            first_lane_seq: LaneSeq(1),
+            fills_applied: StepId(0),
+        };
+        w.packet(p, Some(vyrn_types::Hash([1; 32]))).unwrap();
+        assert!(
+            !super::gate_open(&w, LaneId(0), gp),
+            "pushed but not framed"
+        );
+        w.flush().unwrap();
+        assert!(super::gate_open(&w, LaneId(0), gp));
+        assert!(!super::gate_open(&w, LaneId(1), gp), "another lane");
+        assert!(!super::gate_open(
+            &w,
+            LaneId(0),
+            super::Gate::Packet(LaneSeq(2))
+        ));
+        assert!(!super::gate_open(
+            &w,
+            LaneId(0),
+            super::Gate::Step(StepId(1))
+        ));
     }
 }
