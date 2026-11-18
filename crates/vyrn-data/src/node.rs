@@ -4,12 +4,15 @@
 //!
 //! The node is single-threaded: its owner calls [`DataNode::poll`] in its loop with the time.
 
+use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
+
 use vyrn_log::BlockStore;
 use vyrn_nic::frame::{self as nic_frame, Endpoint, FrameHdr, MAX_FRAME_BYTES};
 use vyrn_types::{BookId, Height, MAX_MSGS_PER_PKT, MSG_BYTES, Nanos, PKT_HDR_BYTES, TAG_BYTES};
 use vyrn_wire::{RX_BURST, RxPkt, RxRing, TxRing};
 
-use crate::frame::{DataHdr, Fetch, FrameBuf, Kind, key_seq};
+use crate::frame::{DataHdr, Fetch, FrameBuf, FrameErr, Kind, key_seq};
 use crate::ingest::{DataHome, Event, HomeConfig, Reject};
 
 #[derive(Clone, Debug)]
@@ -33,6 +36,14 @@ pub struct NodeConfig {
     pub log_scan: u64,
     /// Events kept until drained; more are counted in `events_dropped`.
     pub max_events: usize,
+    /// `K_fetch` per requester address (crate docs, § Fetch). Empty: open mode, plain 32-byte
+    /// fetches from anyone, under one shared rate limit (DEV and tests). Otherwise only these
+    /// sources are served, and only with the 40-byte authenticated form.
+    pub fetch_keys: BTreeMap<Ipv4Addr, [u8; 16]>,
+    /// Fetches per second each source may send, refilled continuously.
+    pub fetch_rate: u64,
+    /// The most fetches a source may send at once after being idle.
+    pub fetch_burst: u64,
 }
 
 impl NodeConfig {
@@ -49,6 +60,9 @@ impl NodeConfig {
             max_range: 256,
             log_scan: 64,
             max_events: 1024,
+            fetch_keys: BTreeMap::new(),
+            fetch_rate: 20_000,
+            fetch_burst: 256,
         }
     }
 }
@@ -73,6 +87,10 @@ pub struct Counters {
     pub tx_full: u64,
     pub events_dropped: u64,
     pub fetch_bad: u64,
+    /// A fetch from a source with no `K_fetch`, or whose tag does not verify.
+    pub fetch_unauth: u64,
+    /// A fetch over its source's rate limit.
+    pub fetch_limited: u64,
     pub fetch_ring_hit: u64,
     pub fetch_log_hit: u64,
     pub fetch_miss: u64,
@@ -154,6 +172,38 @@ fn pkt_key(p: &[u8]) -> (u32, u32, BookId, u16) {
     (u(0, 4), u(4, 4), BookId(u(12, 2) as u16), u(10, 2) as u16)
 }
 
+/// A token bucket in token-nanoseconds: one fetch costs `1e9`, and `rate` tokens/s refill
+/// `rate` per elapsed ns. Integer only.
+#[derive(Clone, Copy, Debug)]
+struct Bucket {
+    level: u64,
+    at: Nanos,
+}
+
+const TOKEN: u64 = 1_000_000_000;
+
+impl Bucket {
+    fn full(burst: u64) -> Self {
+        Self {
+            level: burst.saturating_mul(TOKEN),
+            at: Nanos(0),
+        }
+    }
+
+    fn take(&mut self, now: Nanos, rate: u64, burst: u64) -> bool {
+        let dt = now.0.saturating_sub(self.at.0);
+        self.at = Nanos(self.at.0.max(now.0));
+        let cap = burst.saturating_mul(TOKEN);
+        self.level = self.level.saturating_add(dt.saturating_mul(rate)).min(cap);
+        if self.level >= TOKEN {
+            self.level -= TOKEN;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub struct DataNode<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> {
     cfg: NodeConfig,
     home: DataHome,
@@ -167,6 +217,10 @@ pub struct DataNode<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> {
     resp: FrameBuf,
     events: Vec<Event>,
     counters: Counters,
+    /// One bucket per keyed source, made at construction, so a flood of new addresses grows
+    /// nothing; open mode shares `open_bucket`.
+    buckets: BTreeMap<Ipv4Addr, Bucket>,
+    open_bucket: Bucket,
 }
 
 impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
@@ -193,6 +247,12 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
                 hist_next: 0,
             })
             .collect();
+        let buckets = cfg
+            .fetch_keys
+            .keys()
+            .map(|&ip| (ip, Bucket::full(cfg.fetch_burst)))
+            .collect();
+        let open_bucket = Bucket::full(cfg.fetch_burst);
         Self {
             home: DataHome::new(cfg.home.clone()),
             events: Vec::with_capacity(cfg.max_events),
@@ -205,6 +265,8 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
             wire: Box::new([0; MAX_FRAME_BYTES]),
             resp: FrameBuf::default(),
             counters: Counters::default(),
+            buckets,
+            open_bucket,
         }
     }
 
@@ -234,7 +296,7 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
     pub fn poll(&mut self, now: Nanos) -> usize {
         self.tx.reap();
         let mut work = self.poll_ingest(now);
-        work = work.saturating_add(self.poll_fetch());
+        work = work.saturating_add(self.poll_fetch(now));
         self.timers(now);
         work
     }
@@ -304,16 +366,44 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
         n
     }
 
-    fn poll_fetch(&mut self) -> usize {
+    fn poll_fetch(&mut self, now: Nanos) -> usize {
         let mut burst = [RxPkt::empty(); RX_BURST];
         let n = self.fetch.poll(&mut burst);
         for p in burst.iter().take(n) {
-            let parsed = nic_frame::parse(self.fetch.bytes(p))
-                .ok()
-                .and_then(|f| Fetch::decode(f.payload).ok().map(|q| (f.hdr.src, q)));
-            match parsed {
-                None => bump(&mut self.counters.fetch_bad),
-                Some((to, q)) => self.serve(to, q),
+            let Ok(f) = nic_frame::parse(self.fetch.bytes(p)) else {
+                bump(&mut self.counters.fetch_bad);
+                continue;
+            };
+            let src = f.hdr.src;
+            // Authenticate and decode, then charge the source: a forged, unkeyed or malformed
+            // fetch costs one SipHash at most and never a token of an honest source's bucket.
+            let q = if self.cfg.fetch_keys.is_empty() {
+                Fetch::decode(f.payload)
+            } else if let Some(key) = self.cfg.fetch_keys.get(&src.ip) {
+                Fetch::open(f.payload, key)
+            } else {
+                Err(FrameErr::Tag)
+            };
+            let q = match q {
+                Ok(q) => q,
+                Err(FrameErr::Tag) => {
+                    bump(&mut self.counters.fetch_unauth);
+                    continue;
+                }
+                Err(_) => {
+                    bump(&mut self.counters.fetch_bad);
+                    continue;
+                }
+            };
+            let (rate, cap) = (self.cfg.fetch_rate, self.cfg.fetch_burst);
+            let b = match self.buckets.get_mut(&src.ip) {
+                Some(b) => b,
+                None => &mut self.open_bucket,
+            };
+            if b.take(now, rate, cap) {
+                self.serve(src, q);
+            } else {
+                bump(&mut self.counters.fetch_limited);
             }
         }
         self.fetch.release(n);

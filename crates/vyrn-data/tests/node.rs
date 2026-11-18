@@ -60,6 +60,10 @@ struct Rig {
 }
 
 fn rig(store: MemStore) -> Rig {
+    rig_with(store, |_| {})
+}
+
+fn rig_with(store: MemStore, tweak: impl FnOnce(&mut NodeConfig)) -> Rig {
     let mut ports = vec![];
     for i in 0..6u8 {
         ports.push(PortConfig {
@@ -92,13 +96,9 @@ fn rig(store: MemStore) -> Rig {
         ring_slots: 64,
         index_key: [0x42; 16],
     };
-    let node = DataNode::new(
-        NodeConfig::new(home, 1, me_ingest, dests),
-        ingest,
-        fetch,
-        tx,
-        store,
-    );
+    let mut cfg = NodeConfig::new(home, 1, me_ingest, dests);
+    tweak(&mut cfg);
+    let node = DataNode::new(cfg, ingest, fetch, tx, store);
     Rig {
         nic,
         node,
@@ -493,4 +493,48 @@ fn a_resend_with_new_flags_and_epoch_is_a_forwarded_variant() {
     let mut want = vec![&a[..], &resend[..]];
     want.sort();
     assert_eq!(v, want);
+}
+
+/// A keyed node serves only sealed fetches from keyed sources, and each source within its own
+/// rate: a forged tag, a plain fetch and a stranger are refused before any bucket is charged.
+#[test]
+fn authenticated_fetches_and_the_per_source_rate_limit() {
+    const KF: [u8; 16] = [0x33; 16];
+    let stranger = ep(8, 4000);
+    let mut r = rig_with(MemStore::default(), |c| {
+        c.fetch_keys = BTreeMap::from([(ep(9, 4000).ip, KF)]);
+        (c.fetch_rate, c.fetch_burst) = (1_000, 2);
+    });
+    let mut c = client_rx(&mut r);
+    let q = Fetch::Key {
+        session: SessionId(5),
+        pkt_seq: 1,
+    };
+    let inject = |r: &Rig, from: Endpoint, b: &[u8], ts: u64| {
+        let f = wire(from, r.me_fetch, b);
+        assert!(r.nic.inject(addr(r.me_fetch), &f, Nanos(ts)));
+    };
+    let mut forged = q.seal(&KF);
+    forged[39] ^= 1;
+    inject(&r, r.client, &forged, 0);
+    inject(&r, r.client, &q.encode(), 0);
+    inject(&r, stranger, &q.seal(&KF), 0);
+    // Burst 2: two pass, the third is limited.
+    for _ in 0..3 {
+        inject(&r, r.client, &q.seal(&KF), 0);
+    }
+    r.node.poll(Nanos(0));
+    let k = *r.node.counters();
+    assert_eq!(
+        (k.fetch_unauth, k.fetch_bad, k.fetch_limited, k.fetch_miss),
+        (2, 1, 1, 2)
+    );
+    assert_eq!(drain_rx(&mut c).len(), 2);
+    // 1,000/s: one token back after 1 ms, not before.
+    inject(&r, r.client, &q.seal(&KF), 0);
+    r.node.poll(Nanos(999_999));
+    inject(&r, r.client, &q.seal(&KF), 0);
+    r.node.poll(Nanos(1_000_000));
+    let k = *r.node.counters();
+    assert_eq!((k.fetch_limited, k.fetch_miss), (2, 3));
 }

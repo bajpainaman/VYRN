@@ -1052,6 +1052,15 @@ fetch, with these sources in order:
 3. the sequencer's control core (core 51): `SeqDataReq`, served from lane packet retention
    (`REP_SEQ_PKT_RETAIN_MS` = 50 ms, owned by 05) at ≤ `REP_SEQ_DATA_MAX_PPS` = 50k pkts/s
 
+**Fetch request bytes (reading, `vyrn-data`).** `DataFetch` is a 32-byte request (`magic`
+0x4650 "PF", version 1, kind 1 KEY `{session, pkt_seq}`, 2 RANGE `{dst, from, to}`, 3 BLOCK
+`{height}`; layout and vectors in `crates/vyrn-data` docs and `tests/golden/vyrn_data_vectors`).
+A data box with fetch keys accepts only the 40-byte authenticated form: those 32 bytes, then
+`tag` u64 LE = SipHash-2-4(`K_fetch`, bytes 0..32), with one `K_fetch` per requester address
+(operator-provisioned; 09 owns key schedules). It rate-limits each requester with a token bucket
+(03 §1: "rate-limit by source address") and drops forged, unkeyed and over-rate fetches before
+any work. Replies are not tagged (next paragraph).
+
 Every fetched packet is checked like a pushed one. Source 3 is the only source of the bytes the
 sequencer actually matched, so it settles every conflict (§5.6).
 

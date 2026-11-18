@@ -94,6 +94,18 @@
 //!   `FETCH_RESP` frames with `data_seq = height`; one empty frame if the block has none or is
 //!   not stored. The block is read through `BlockStore::read`, which checks `order_root`.
 //!
+//! **Authentication and rate (*reading*, recorded in 07 §5.5).** A box configured with
+//! `K_fetch` keys ([`NodeConfig::fetch_keys`], one 16-byte key per requester address) serves only
+//! the 40-byte form: the 32 bytes above, then `tag` u64 = SipHash-2-4(`K_fetch`, bytes 0..32).
+//! A fetch from an unkeyed address, a plain fetch, or a bad tag is dropped and counted
+//! (`fetch_unauth`). Each keyed address has a token bucket (`fetch_rate` per second, burst
+//! `fetch_burst`, one token per fetch), made at construction; a fetch over it is dropped and
+//! counted (`fetch_limited`). Forged and malformed fetches are refused before a bucket is
+//! charged, so they cannot spend an honest source's rate. A box with no keys is in open mode
+//! (DEV, tests): plain fetches from anyone, under one shared bucket. Replies are not tagged:
+//! a replica checks every fetched packet against `pkt_hash` (07 §5.4), and RANGE resends go to
+//! the frame's original destination, so a reply cannot be steered or trusted blindly.
+//!
 //! A malformed or out-of-range fetch is dropped and counted (`fetch_bad`).
 //!
 //! # Hot path

@@ -9,6 +9,9 @@ pub const FETCH_MAGIC: u16 = 0x4650;
 pub const VERSION: u8 = 1;
 pub const HDR_BYTES: usize = 24;
 pub const FETCH_BYTES: usize = 32;
+/// An authenticated fetch: the 32 bytes, then `tag` u64 = SipHash-2-4 under the requester's
+/// `K_fetch` of bytes 0..32 (crate docs, § Fetch).
+pub const FETCH_AUTH_BYTES: usize = FETCH_BYTES + 8;
 /// The largest data frame: one UDP payload of a 1514-byte fast-path frame.
 pub const MAX_FRAME: usize = MAX_PAYLOAD;
 
@@ -53,6 +56,8 @@ pub enum FrameErr {
     Count,
     #[error("a heartbeat carries packets")]
     HbBody,
+    #[error("an authenticated fetch whose tag does not verify")]
+    Tag,
 }
 
 fn u16_at(b: &[u8], at: usize) -> u16 {
@@ -326,6 +331,32 @@ impl Fetch {
             return Err(FrameErr::Reserved);
         }
         Ok(f)
+    }
+}
+
+impl Fetch {
+    /// The 40-byte authenticated form under `key` (`K_fetch` of the requester).
+    pub fn seal(&self, key: &[u8; 16]) -> [u8; FETCH_AUTH_BYTES] {
+        let body = self.encode();
+        let mut b = [0u8; FETCH_AUTH_BYTES];
+        let (head, tag) = b.split_at_mut(FETCH_BYTES);
+        head.copy_from_slice(&body);
+        tag.copy_from_slice(&vyrn_crypto::siphash24(key, &body).0.to_le_bytes());
+        b
+    }
+
+    /// Decodes a 40-byte authenticated fetch: the tag first, in constant time, then the 32
+    /// bytes as [`Fetch::decode`] does.
+    pub fn open(b: &[u8], key: &[u8; 16]) -> Result<Self, FrameErr> {
+        if b.len() != FETCH_AUTH_BYTES {
+            return Err(FrameErr::Short);
+        }
+        let (body, tag) = b.split_at(FETCH_BYTES);
+        let tag = vyrn_types::Tag(u64_at(tag, 0));
+        if !vyrn_crypto::siphash::verify(key, body, tag) {
+            return Err(FrameErr::Tag);
+        }
+        Self::decode(body)
     }
 }
 
