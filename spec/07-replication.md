@@ -242,7 +242,7 @@ fn decode_pkt(l: LaneId, d: &mut LaneDec, r: &mut Reader) -> Rec {   // Rec::Pkt
         if h != 0 || !is_pool_lane(l) { fail(REP_E_COUNT) }
         return Rec::Take(AcctTake { account: AccountId(r.leb_u32()), ver: r.leb_u64(), lane: l });
     }
-    if slot as usize == REP_SLOT_ROUTE {                         // 05 §10: a lane-rejected route
+    if slot as usize == REP_SLOT_ROUTE {                         // 05 §10: a classified op's route
         let (first, n) = d.last_pkt;
         let back = h & 0x0F;
         if h & 0x70 != 0 || back >= n { fail(REP_E_COUNT) }
@@ -294,17 +294,20 @@ defines any.
   on a dedicated lane is `REP_E_COUNT`. Size ~7 B. A take happens only when an account changes pool core,
   ≤ 3M/s at peak, ~0.2 B per record over the whole book (budget, §3.13).
 - **`RouteRecord { lane, lane_seq, cross }`** (01 §6.6, 05 §10). A lane logs one for each `New`
-  or new-priority `Replace` that it classified `Cross` or `Improve` (05 §6.5) and then rejected
-  itself, for example `POST_ONLY_WOULD_CROSS` or a cross bucket (10 M8). No `StepRecord` names
-  such an op, and risk charged it by its route, so replay must route it the same way. Wire form:
+  or new-priority `Replace` that it classifies `Cross` or `Improve` (05 §6.5), whether it then
+  forwards the op or rejects it itself (for example `POST_ONLY_WOULD_CROSS` or a cross bucket,
+  10 M8). Risk charged the op by its route, so replay must give pass 1 the same route, and the
+  record travels with its packet: the step that names a forwarded op may fall in a later block
+  than the packet, so a replica that waited for it could not replay the packet. Wire form:
   `h` = `back` in bits 0–3, bits 4–6 0, bit 7 `CROSS` (`cross`); `slot` = `REP_SLOT_ROUTE`;
   nothing else. `lane_seq` = `last − back`, where `last` = `first_lane_seq + count − 1` of the
   lane's last non-Advance PacketRecord (`LaneDec.last_pkt`); `back ≥ count`, or a reserved bit,
   is `REP_E_COUNT`. It follows its packet's PacketRecord in the `LaneRun`, after or between that
   packet's `MID` Advance records, and before the lane's next PacketRecord or non-`MID` Advance
   record; it need not come right after the PacketRecord. It takes no `LaneSeq`, `rx_ts`, hash or
-  payload. A forwarded op never has one: its route is `StepRecord.flags.CROSS` (§3.8). Size 3 B;
-  it exists only on rejects, ~0 B per record at full load (budget, §3.13).
+  payload. A forwarded op's `StepRecord.flags.CROSS` (§3.8) repeats its route; `replay_step`
+  checks that the two agree. Size 3 B per classified op, 0 B for a `Join`; ≤ 30M/s at peak
+  (budget, §3.13).
 - **Pooled slots.** On a pooled lane `slot` indexes the pool's shared session table, and
   `slot_next_pkt_seq` is kept per pool, so consecutive packets of a session may sit on different
   pool lanes. A packet framed out of `pkt_seq` order across pool lanes takes `SEQ_EXC`.
@@ -499,6 +502,7 @@ pair of replication ports on one leaf, one per substream (06 §2.3); the table s
 |---|---|---|---|
 | PacketRecord O-part | 100M/s | 6.0 | 600 |
 | `AcctTake` (pooled lanes) | ≤ 3M/s | 7 | 20 |
+| `RouteRecord` (one per op classified `Cross` or `Improve`) | ≤ 30M/s | 3 | 90 |
 | LaneRun headers | 12M frames × ~5 lanes | 2 | 120 |
 | StepRecord home part, with gap | 30M/s | 4 | 120 |
 | Cut-only records, fixed part | ≤ 10M/s | 2 | 20 |
@@ -509,11 +513,11 @@ pair of replication ports on one leaf, one per substream (06 §2.3); the table s
 | HASH frame overhead (9000 B frames) | ~0.1M/s | 90 | 9 |
 | HEADER, BlockMark, HEARTBEAT, SessionBind | ~25k/s | ≤ 220 | < 1 |
 | HEADER_PQ (scheme 1 only, 01 §14.20) | 1k/s per book | ~2,540 | 2.5 |
-| **Total per path** | | | **3,310 MB/s ≈ 26.5 Gbps** (3,313 under scheme 1) |
+| **Total per path** | | | **3,400 MB/s ≈ 27.2 Gbps** (3,403 under scheme 1) |
 
-Record payload (O + H + steps) is 2.24 GB/s ≈ 17.9 Gbps. Frame overhead is the rest, and it falls
+Record payload (O + H + steps) is 2.33 GB/s ≈ 18.6 Gbps. Frame overhead is the rest, and it falls
 when flushes coalesce under load (§4.5). On the sequencer each path is two 100GbE ports at ≤ 14%
-each; at a replica each path is one port at ≤ 27%, carrying both substreams. Replicas send
+each; at a replica each path is one port at ≤ 28%, carrying both substreams. Replicas send
 the sequencer ≤ 1 Mbps of acks and NACKs.
 
 Other links at peak (budget):
@@ -1417,13 +1421,12 @@ into one sequence by this rule, so the Rust and Vx clients run the same schedule
 2. Before step `s`, every lane in increasing lane id replays, in O-order, each of its remaining
    records with `f(r) < s`. Then step `s` is replayed.
 3. After the block's last step, every lane in increasing lane id replays its remaining records
-   with `f(r)` at most the last step, in O-order, and stops at the first record that is not
-   settled. A record is *not settled* when `f(r)` is greater than the last step, or when it is a
-   packet (not `SHED`) with an op above the block's last cut that no step of the block names as
-   its source: a step of a later block may still name that op, so the lane cannot classify it
-   yet. That record and every later record of its lane **carry** into the next block, where they
-   come before the next block's records. A record carried past a cut that covers one of its ops
-   is `REP_E_ORDER`.
+   with `f(r)` at most the last step, in O-order, and stops at the first record with `f(r)`
+   greater than the last step. That record and every later record of its lane, with their route
+   records, **carry** into the next block, where they come before the next block's records. A
+   packet's routes are its route records (§3.6), which travel with it, so no record waits for a
+   later block's steps. A record carried past a cut that covers one of its ops is
+   `REP_E_ORDER`.
 
 `REP_MERGE` respects both dependencies above: a lane reads a step's fill events only after the
 step, and a step's cut covers only ops that its lane applied before the step was published, so
@@ -1438,7 +1441,7 @@ record with `REP_E_ORDER` until 05 defines a split lane call.
 
 **Fields replay derives.** 07's `StepRecord` carries the kind, the source with its `CROSS`
 route bit (§3.8), the cut and the kind payload; the lane's route records (§3.6) carry the route
-of each op it classified and rejected itself. Everything else in 05's `StepEntry` is an output of the replayed step, not an input:
+of each op it classified, forwarded or rejected. Everything else in 05's `StepEntry` is an output of the replayed step, not an input:
 `n_tx`, `n_fills`, `fill_lanes`, the half-cut publication ids `pub_a`/`pub_b`, and the `CONT`
 flag. The replay BBO core knows whether a continuation is pending, and when it is, the next step
 must be that continuation (05 §8.5, §8.6). The `Rescan` band is the kind payload (§3.8):

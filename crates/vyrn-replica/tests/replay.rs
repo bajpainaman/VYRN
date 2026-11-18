@@ -171,7 +171,7 @@ fn tenure() -> TenureStart {
 }
 
 /// Frames the live journal with `SeqWriter`, closing a block after each record index in
-/// `cuts` and after the last record.
+/// `cuts` (or after the routes that follow it) and after the last record.
 fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
     let ident = Ident {
         book: BOOK,
@@ -183,6 +183,7 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
     let mut w = SeqWriter::new(layout, ident, tenure(), SEED, 9000).unwrap();
     let mut out = Vec::new();
     let mut cut = vec![LaneSeq(0); N];
+    let mut pending = false;
     for (i, r) in j.recs.iter().enumerate() {
         match r {
             OwnedRec::Packet(p) => {
@@ -193,7 +194,7 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
                 });
                 out.extend(w.packet(*p, full).unwrap());
             }
-            OwnedRec::Route(_) => panic!("SeqWriter frames no RouteRecord yet"),
+            OwnedRec::Route(t) => out.extend(w.route(*t).unwrap()),
             OwnedRec::Step(e, d) => {
                 for x in &d[..usize::from(e.n_delta)] {
                     cut[usize::from(x.lane.0)] = x.seq;
@@ -216,7 +217,12 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
                 );
             }
         }
-        if cuts.contains(&i) || i + 1 == j.recs.len() {
+        // A packet's routes stay in its block (07 §3.6), as vyrn-seq frames them: a cut right
+        // after a packet moves past its routes.
+        let route_next = matches!(j.recs.get(i + 1), Some(OwnedRec::Route(_)));
+        pending |= cuts.contains(&i);
+        if (pending && !route_next) || i + 1 == j.recs.len() {
+            pending = false;
             out.extend(w.close_block().unwrap().0);
         }
     }

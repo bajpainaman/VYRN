@@ -12,15 +12,12 @@
 //! - a packet record (with the `MID` Advance records the lane wrote while processing it): the
 //!   packet, fetched from [`Payloads`], through `vyrn_lane::Lane::replay_packet` with a late
 //!   clock iff `SHED`, its `MID` records as `Mid` boundaries at `(f, C_f[l])` (05 §6.2, §10 row
-//!   3), and its ops' routes taken from the later `StepRecord`s that name them (their
-//!   `STEP_CROSS` bit, §10 row 7) and from its `Route` records (ops the lane rejected itself).
+//!   3), and its ops' routes taken from its `Route` records (one per op the lane classified,
+//!   forwarded or rejected, 07 §3.6; §10 row 7).
 //!   A `Route` record is part of its packet's lane call and is compared like the packet's.
 
 use vyrn_bbo::admit::{FixedClock, NeverLate};
-use vyrn_bbo::{
-    Cut, CutDelta, Diverge, MAX_LANES, Record, ReplayStep, STEP_CONT, STEP_CROSS, StepEntry,
-    TxEntry,
-};
+use vyrn_bbo::{Cut, CutDelta, Diverge, MAX_LANES, Record, ReplayStep, StepEntry, TxEntry};
 use vyrn_cut::LaneCutEntry;
 use vyrn_cut::Visibility;
 use vyrn_lane::{Mid, RespPkt, RxIn};
@@ -238,42 +235,27 @@ const MAX_MIDS: usize = 20;
 /// Forwarded ops one packet can hold.
 const MAX_ROUTES: usize = 10;
 
-/// The routes of packet `pk`'s classified ops (05 §10 row 7, 07 §3.6): each op a later step
-/// names as its source, with that step's `CROSS` bit, and each op of `rejected` (the packet's
-/// route records: ops the lane classified and then rejected itself). Every other op is `Join`.
-/// A lane's sources come in `LaneSeq` order (its `FwdRing` is FIFO), so the scan of `srcs`
-/// stops at the first later one.
+/// The routes of packet `pk`'s classified ops (05 §10 row 7, 07 §3.6): one route record per op
+/// the lane classified `Cross` or `Improve`, forwarded or rejected by the lane itself. Every
+/// other op is `Join`.
 fn routes_of(
-    srcs: impl Iterator<Item = (LaneId, LaneSeq, bool)>,
-    rejected: impl Iterator<Item = RouteRecord>,
+    recs: impl Iterator<Item = RouteRecord>,
     pk: &PacketRecord,
     out: &mut [(LaneSeq, Route); MAX_ROUTES],
 ) -> usize {
-    let lo = pk.first_lane_seq.0;
-    let hi = lo.saturating_add(u64::from(pk.count));
-    let route = |cross: bool| if cross { Route::Cross } else { Route::Improve };
     let mut n = 0usize;
-    let mut put = |seq: LaneSeq, r: Route, n: &mut usize| {
-        if out.iter().take(*n).any(|(s, _)| *s == seq) {
-            return;
-        }
-        if let Some(d) = out.get_mut(*n) {
-            *d = (seq, r);
-            *n = n.saturating_add(1);
-        }
-    };
-    for x in rejected.filter(|x| in_packet(pk, x)) {
-        put(x.lane_seq, route(x.cross), &mut n);
-    }
-    for (lane, seq, cross) in srcs {
-        if lane != pk.lane {
+    for x in recs.filter(|x| in_packet(pk, x)) {
+        if out.iter().take(n).any(|(s, _)| *s == x.lane_seq) {
             continue;
         }
-        if seq.0 >= hi {
-            break;
-        }
-        if seq.0 >= lo {
-            put(seq, route(cross), &mut n);
+        let route = if x.cross {
+            Route::Cross
+        } else {
+            Route::Improve
+        };
+        if let Some(d) = out.get_mut(n) {
+            *d = (x.lane_seq, route);
+            n = n.saturating_add(1);
         }
     }
     n
@@ -286,25 +268,6 @@ fn in_packet(pk: &PacketRecord, x: &RouteRecord) -> bool {
         && !is_advance(pk)
         && lo <= x.lane_seq.0
         && x.lane_seq.0 < lo.saturating_add(u64::from(pk.count))
-}
-
-/// `routes_of` sources over journal records (`CONT` steps name an op already routed).
-fn journal_sources(recs: &[OwnedRec]) -> impl Iterator<Item = (LaneId, LaneSeq, bool)> + '_ {
-    recs.iter().filter_map(|r| match r {
-        OwnedRec::Step(e, _) if e.src_lane_seq.0 != 0 && e.flags & STEP_CONT == 0 => {
-            Some((e.src_lane, e.src_lane_seq, e.flags & STEP_CROSS != 0))
-        }
-        _ => None,
-    })
-}
-
-/// `routes_of` sources over 07 steps. A `CONT` step repeats its source, which the dedup drops.
-fn wire_sources<'a>(
-    steps: &'a [WireStep<'a>],
-) -> impl Iterator<Item = (LaneId, LaneSeq, bool)> + 'a {
-    steps
-        .iter()
-        .filter_map(|w| w.src.map(|(l, q)| (l, q, w.cross)))
 }
 
 fn is_advance(p: &PacketRecord) -> bool {
@@ -451,46 +414,6 @@ fn next_call(recs: Recs<'_>, lane: LaneId, from: usize) -> Option<(usize, Result
     Some((i, Ok(c)))
 }
 
-/// A packet whose ops are not all decided by this block (07 §7.1 item 3): one of them is above
-/// the block's last cut, so a step of a later block may still name it as a source. It is
-/// carried unless a step left in this block names one of its ops, which must be replayed now.
-///
-/// `n_ops` bounds the packet's ops that a step can name: its messages other than Heartbeat and
-/// ResendReq, which take no `LaneSeq` (05 §3.1), so a packet's `count` overstates them. (After a
-/// header reject they do take one, but then no op is forwarded.)
-fn undecided(c: &Call, n_ops: u64, final_cut: LaneSeq, later: &[WireStep<'_>]) -> bool {
-    let r = &c.rec;
-    if is_advance(r) || n_ops == 0 || r.flags & PacketFlags::SHED != 0 {
-        return false;
-    }
-    let lo = r.first_lane_seq.0;
-    let hi = lo.saturating_add(n_ops);
-    let named = later
-        .iter()
-        .filter_map(|w| w.src)
-        .any(|(l, q)| l == r.lane && lo <= q.0 && q.0 < hi);
-    hi.saturating_sub(1) > final_cut.0 && !named
-}
-
-/// The messages of a request that take a `LaneSeq` when its header is accepted: all but
-/// Heartbeat and ResendReq, as `Lane::packet` assigns them. 0 if the request does not parse.
-fn routable_ops(bytes: &[u8]) -> u64 {
-    let Ok(req) = vyrn_wire::Request::parse(bytes) else {
-        return 0;
-    };
-    let n = req
-        .raw_msgs()
-        .iter()
-        .filter(|m| {
-            !matches!(
-                vyrn_wire::Msg::decode(m),
-                Ok(vyrn_wire::Msg::Heartbeat) | Ok(vyrn_wire::Msg::ResendReq { .. })
-            )
-        })
-        .count();
-    u64::try_from(n).unwrap_or(u64::MAX)
-}
-
 impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
     /// The lane records [`Engine::replay_wire`] carried to the next block, in input order.
     pub fn carried(&self) -> &[PacketRecord] {
@@ -531,8 +454,8 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
     /// no packet of the inputs holds is [`Why::BadRecord`] at [`WireAt::End`].
     ///
     /// Blocks are replayed by calling this once per block, in height order, on the same engine.
-    /// A lane record that is not settled by the block (not yet due, or a packet with an op above
-    /// the block's last cut that no step of the block names) is carried into the next call
+    /// A lane record not yet due at the block's last step is carried, with its route records,
+    /// into the next call
     /// ([`Engine::carried`]), ahead of that call's `lanes` (07 §7.1 `REP_MERGE` item 3). A response
     /// log spans blocks, so the caller checks [`Responses::finished`] after its last block.
     pub fn replay_wire<P: Payloads, S: Sink, R: Responses>(
@@ -594,33 +517,14 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 why: Why::BadRecord,
             });
         }
-        // The block's last cut decides which ops are settled in this block (item 3).
-        let mut final_cut = self.cut;
-        if let Some(w) = steps.last() {
-            for (d, c) in final_cut.iter_mut().zip(w.cut) {
-                *d = *c;
-            }
-        }
-        // cur[l]: index of lane l's next record; held[l]: lane l carries from cur[l] on.
+        // cur[l]: index of lane l's next record.
         let mut cur = [0usize; MAX_LANES];
-        let mut held = [false; MAX_LANES];
         let (lo, hi) = self.tick_range().ok_or(WireDiverged {
             at: WireAt::End,
             why: Why::BadStep,
         })?;
-        for (k, w) in steps.iter().enumerate() {
-            self.wire_lanes(
-                lanes,
-                steps.get(k..).unwrap_or(&[]),
-                w.step,
-                &final_cut,
-                &mut cur,
-                &mut held,
-                payloads,
-                log,
-                sink,
-                buf,
-            )?;
+        for w in steps {
+            self.wire_lanes(lanes, w.step, &mut cur, payloads, log, sink, buf)?;
             let at = |why| WireDiverged {
                 at: WireAt::Step(w.step),
                 why,
@@ -679,17 +583,14 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             .map_or(self.bbo.next_step().0.saturating_sub(1), |w| w.step.0);
         self.wire_lanes(
             lanes,
-            &[],
             StepId(last.saturating_add(1)),
-            &final_cut,
             &mut cur,
-            &mut held,
             payloads,
             log,
             sink,
             buf,
         )?;
-        // Item 3: what is left (not yet due, or undecided) carries to the next block, per lane in
+        // Item 3: what is left (not yet due) carries to the next block, per lane in
         // O-order.
         for i in 0..lanes.len() {
             let Some(r) = lanes.get(i) else { continue };
@@ -736,25 +637,18 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
     }
 
     /// `REP_MERGE` item 2: every lane, in lane id order, replays its records due before step `s`.
-    /// `later` is the steps from `s` on, for the forwarded-op routes.
     #[allow(clippy::too_many_arguments)]
     fn wire_lanes<P: Payloads, S: Sink, R: Responses>(
         &mut self,
         lanes: Recs<'_>,
-        later: &[WireStep<'_>],
         s: StepId,
-        final_cut: &Cut,
         cur: &mut [usize; MAX_LANES],
-        held: &mut [bool; MAX_LANES],
         payloads: &P,
         log: &mut R,
         sink: &mut S,
         buf: &mut Vec<PacketRecord>,
     ) -> Result<(), WireDiverged> {
         for l in 0..self.lanes.len() {
-            if held.get(l).copied().unwrap_or(true) {
-                continue;
-            }
             let lane = crate::engine::lane_id(l);
             loop {
                 let from = cur.get(l).copied().unwrap_or(0);
@@ -781,16 +675,6 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 if c.f >= s {
                     break;
                 }
-                let n_ops = payloads
-                    .get(&c.rec)
-                    .map_or(u64::from(c.rec.count), routable_ops);
-                let cut_l = final_cut.get(l).copied().unwrap_or(LaneSeq(0));
-                if undecided(&c, n_ops, cut_l, later) {
-                    if let Some(h) = held.get_mut(l) {
-                        *h = true;
-                    }
-                    break;
-                }
                 let at = |why| WireDiverged {
                     at: WireAt::Lane(i),
                     why,
@@ -808,16 +692,8 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     in_packet(&c.rec, x) && next_first.is_none_or(|f| x.lane_seq.0 < f)
                 };
                 let rejected = lanes.routes().filter(|x| owns(x));
-                self.lane_call(
-                    l,
-                    &c.rec,
-                    mids,
-                    wire_sources(later),
-                    rejected,
-                    payloads,
-                    &mut tee,
-                )
-                .map_err(at)?;
+                self.lane_call(l, &c.rec, mids, rejected, payloads, &mut tee)
+                    .map_err(at)?;
                 if tee.bad_resp {
                     return Err(at(Why::Response));
                 }
@@ -869,16 +745,14 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
 
     /// One replayed lane call: a non-`MID` Advance record is the lane's boundary at its logged
     /// `(f, C_f[l])`; a packet goes
-    /// through `Lane::replay_packet` with `mids` as its boundaries and the routes that `srcs`
-    /// (later steps) and `rejected` (its route records) give.
-    #[allow(clippy::too_many_arguments)]
+    /// through `Lane::replay_packet` with `mids` as its boundaries and the routes its route
+    /// records `routes` give.
     fn lane_call<P: Payloads, S: Sink>(
         &mut self,
         l: usize,
         rec: &PacketRecord,
         mids: &[PacketRecord],
-        srcs: impl Iterator<Item = (LaneId, LaneSeq, bool)>,
-        rejected: impl Iterator<Item = RouteRecord>,
+        routes_in: impl Iterator<Item = RouteRecord>,
         payloads: &P,
         sink: &mut S,
     ) -> Result<(), Why> {
@@ -911,7 +785,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             };
         }
         let mut routes = [(LaneSeq(0), Route::Join); MAX_ROUTES];
-        let n_route = routes_of(srcs, rejected, rec, &mut routes);
+        let n_route = routes_of(routes_in, rec, &mut routes);
         let bytes = payloads.get(rec).ok_or(Why::NoPayload)?;
         let rx = RxIn {
             bytes,
@@ -1011,16 +885,8 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                         OwnedRec::Route(q) => Some(*q),
                         _ => None,
                     });
-                    self.lane_call(
-                        l,
-                        pk,
-                        mids,
-                        journal_sources(run),
-                        rejected,
-                        payloads,
-                        &mut tee,
-                    )
-                    .map_err(at)?;
+                    self.lane_call(l, pk, mids, rejected, payloads, &mut tee)
+                        .map_err(at)?;
                     if tee.bad_resp {
                         return Err(at(Why::Response));
                     }

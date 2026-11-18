@@ -5,7 +5,8 @@
 //!
 //! **Input**, in the engine's output order (05 §6.2): [`SeqWriter::packet`] for each
 //! `PacketRecord` (Advance records included) with the full BLAKE3 hash of every non-Advance
-//! packet, and [`SeqWriter::step`] for each step with its absolute cut after the step.
+//! packet, [`SeqWriter::route`] for each `RouteRecord` after its packet, and [`SeqWriter::step`]
+//! for each step with its absolute cut after the step.
 //!
 //! **Output.** [`SeqWriter::flush`] frames everything pushed since the last flush: frame 1 is an
 //! ORDER frame holding only `TenureStart`; then ORDER frames with the pending sections (a
@@ -37,7 +38,7 @@
 //! closed, [`StreamEncoder::encode`]); the sequencer fail-stops on it.
 
 use vyrn_types::{BlockHeader, Hash, LaneId, LaneSeq, PacketFlags, PacketRecord, PktHash};
-use vyrn_types::{SessionId, StepId, StepKind};
+use vyrn_types::{RouteRecord, SessionId, StepId, StepKind};
 
 use crate::block::sign_header;
 use crate::frame::FRAME_HEADER_BYTES;
@@ -205,6 +206,23 @@ impl SeqWriter {
             Some(Section::LaneRun { lane: l, recs }) if *l == p.lane => recs.push(rec),
             _ => self.sections.push(Section::LaneRun {
                 lane: p.lane,
+                recs: vec![rec],
+            }),
+        }
+        Ok(out)
+    }
+
+    /// One `RouteRecord` (07 §3.6): pushed after the `PacketRecord` holding its op, with no
+    /// later non-Advance packet of its lane in between, as the lane logs it.
+    pub fn route(&mut self, t: RouteRecord) -> Result<Frames, RepErr> {
+        let new_run =
+            !matches!(self.sections.last(), Some(Section::LaneRun { lane: l, .. }) if *l == t.lane);
+        let out = self.reserve(if new_run { 3 + RUN } else { 3 })?;
+        let rec = LaneRec::Route(t);
+        match self.sections.last_mut() {
+            Some(Section::LaneRun { lane: l, recs }) if *l == t.lane => recs.push(rec),
+            _ => self.sections.push(Section::LaneRun {
+                lane: t.lane,
                 recs: vec![rec],
             }),
         }

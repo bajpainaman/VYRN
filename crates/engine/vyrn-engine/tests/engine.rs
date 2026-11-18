@@ -392,7 +392,6 @@ fn replay_from_07_carries_unsettled_records_across_blocks() {
             OwnedRec::Step(..) => before.push((n, nr)),
         }
     }
-    let mut carried_any = false;
     for k in 1..steps.len() {
         let (n, nr) = before[k];
         let b1 = (&lanes[..n], &routes[..nr], &steps[..k]);
@@ -421,10 +420,7 @@ fn replay_from_07_carries_unsettled_records_across_blocks() {
         };
         assert!(st(&rep.recs) == st(&one.recs), "split at step {k}: steps");
         assert!(rep.tx == one.tx, "split at step {k}: fill TX");
-        let (_, _, c) = replay_blocks(&[b1], &store, None);
-        carried_any |= c > 0;
     }
-    assert!(carried_any, "some split must carry a record");
 }
 
 #[test]
@@ -485,7 +481,9 @@ fn replay_routes_a_locally_rejected_cross_from_its_route_record() {
         lane_seq: LaneSeq(q),
         cross: true,
     };
-    assert_eq!(routes, [route(2), route(4)]);
+    // G12: every classified op has a route record; the two post-only crosses are the rejects.
+    let cross: Vec<_> = routes.iter().filter(|x| x.cross).copied().collect();
+    assert_eq!(cross, [route(2), route(4)]);
     // Journal replay reproduces it, route record included.
     let (r, rep) = replay(&j.recs, &store);
     assert_eq!(r, Ok(()));
@@ -493,7 +491,7 @@ fn replay_routes_a_locally_rejected_cross_from_its_route_record() {
     let no_route: Vec<_> = j
         .recs
         .iter()
-        .filter(|r| !matches!(r, OwnedRec::Route(_)))
+        .filter(|r| !matches!(r, OwnedRec::Route(x) if x.cross))
         .copied()
         .collect();
     // Without it the op replays as a Join: the lane accepts it, so its responses differ.
@@ -522,17 +520,20 @@ fn replay_routes_a_locally_rejected_cross_from_its_route_record() {
     let (r, _) = replay_wire(&lanes, &[], &steps, &store, Some(&j));
     assert!(r.is_err(), "{r:?}");
     // A missing, repeated or conflicting route record is refused.
+    let without = |q| {
+        wr.iter()
+            .filter(|x| **x != route(q))
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let with = |x| wr.iter().copied().chain([x]).collect::<Vec<_>>();
     for bad in [
-        vec![route(2)],
-        vec![route(2), route(4), route(4)],
-        vec![
-            route(2),
-            route(4),
-            vyrn_types::RouteRecord {
-                cross: false,
-                ..route(4)
-            },
-        ],
+        without(4),
+        with(route(4)),
+        with(vyrn_types::RouteRecord {
+            cross: false,
+            ..route(4)
+        }),
     ] {
         let (r, _) = replay_wire(&lanes, &bad, &steps, &store, Some(&j));
         assert!(r.is_err(), "{bad:?}: {r:?}");
@@ -653,6 +654,63 @@ fn replay_from_07_does_not_count_session_only_messages_as_ops() {
     let (r, _, carried) = replay_blocks(&[(&lanes, &routes, &steps)], &store, Some(&j));
     assert_eq!(r, Ok(()));
     assert_eq!(carried, 0);
+}
+
+#[test]
+fn replay_from_07_routes_a_packet_whose_sources_span_two_blocks() {
+    // G12 (07 §3.6): asks 97 and 98 rest on lane 1, then one lane-0 packet sends Buy 97 and
+    // Buy 98. Both are forwarded Cross, and two steps name them. A block that ends between
+    // those steps must not replay the packet with only the first op's route known. With a
+    // RouteRecord for every classified op, every split reproduces the one-block replay.
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let s = vec![
+        Act::Pkt {
+            l: 1,
+            a: 1,
+            rx_ts: 1_000,
+            now: 1_000,
+            msgs: vec![new(Sell, Day, 97, 1, 11), new(Sell, Day, 98, 1, 12)],
+        },
+        Act::Run,
+        Act::Pkt {
+            l: 0,
+            a: 1,
+            rx_ts: 2_000,
+            now: 2_000,
+            msgs: vec![new(Buy, Day, 97, 1, 21), new(Buy, Day, 98, 1, 22)],
+        },
+        Act::Run,
+    ];
+    let (j, store, _, _) = live(&s);
+    let (lanes, routes, steps) = to_wire(&j.recs);
+    // Two steps name ops of the same lane-0 packet.
+    let srcs: Vec<_> = steps
+        .iter()
+        .filter_map(|w| w.2)
+        .filter(|(l, _)| l.0 == 0)
+        .collect();
+    assert!(srcs.len() >= 2, "{srcs:?}");
+    let (r, one) = replay_wire(&lanes, &routes, &steps, &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    let mut before = Vec::new();
+    let (mut n, mut nr) = (0, 0);
+    for x in &j.recs {
+        match x {
+            OwnedRec::Packet(_) => n += 1,
+            OwnedRec::Route(_) => nr += 1,
+            OwnedRec::Step(..) => before.push((n, nr)),
+        }
+    }
+    for k in 1..steps.len() {
+        let (n, nr) = before[k];
+        let b1 = (&lanes[..n], &routes[..nr], &steps[..k]);
+        let b2 = (&lanes[n..], &routes[nr..], &steps[k..]);
+        let (r, rep, left) = replay_blocks(&[b1, b2], &store, Some(&j));
+        assert_eq!(r, Ok(()), "split at step {k}");
+        assert_eq!(left, 0, "split at step {k}");
+        assert!(rep.tx == one.tx, "split at step {k}: fill TX");
+    }
 }
 
 #[test]

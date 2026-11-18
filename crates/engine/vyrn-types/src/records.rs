@@ -46,10 +46,10 @@ impl StepFlags {
     pub const CROSS: u8 = 1 << 1;
 }
 
-/// The route a lane classified a `New` or new-priority `Replace` with (05 §6.5) when it then
-/// rejected the op itself, so no `StepRecord` names it (01 §6.6). Replay forces that route, so
-/// risk charges and rejects as live did (10 M8). A forwarded op has none: its step's
-/// `StepFlags::CROSS` carries the route.
+/// The route a lane classified a `New` or new-priority `Replace` with (05 §6.5), logged for
+/// every such op, forwarded or rejected by the lane itself (01 §6.6, 07 §3.6). Replay forces
+/// that route, so risk charges and rejects as live did (10 M8); a forwarded op's step also
+/// carries it as `StepFlags::CROSS`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RouteRecord {
     pub lane: LaneId,

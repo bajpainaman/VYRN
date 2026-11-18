@@ -486,7 +486,7 @@ fn mid_run(mids: impl Fn(vyrn_cut::LaneCutEntry) -> Vec<Mid>) -> (StepId, Vec<Pa
         x.lanes[0].fills_applied() < cross,
         "lane 0 has not applied the cross"
     );
-    let n = x.log[0].len();
+    let n = packets(&x, 0).len();
     let m = [
         new(day(Side::Sell), 110, 1, 2),
         new(day(Side::Sell), 111, 1, 3),
@@ -1028,8 +1028,13 @@ fn a_locally_rejected_cross_logs_its_route_and_replays_with_it() {
         (routes, x.records(0, 2))
     };
     let live = run(None);
+    // G12: every classified op logs its route (the resting ask too); this one is the reject's.
     assert_eq!(
-        live.0,
+        live.0
+            .iter()
+            .filter(|r| r.lane_seq == LaneSeq(2))
+            .copied()
+            .collect::<Vec<_>>(),
         [vyrn_types::RouteRecord {
             lane: vyrn_types::LaneId(0),
             lane_seq: LaneSeq(2),

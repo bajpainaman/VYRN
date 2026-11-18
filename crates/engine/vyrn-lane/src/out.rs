@@ -64,8 +64,8 @@ impl RespPkt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogRec {
     Packet(PacketRecord),
-    /// After its op's `PacketRecord`: the op was classified Cross or Improve, then rejected
-    /// by the lane (01 §6.6, 07 §3.6).
+    /// The route of an op the lane classified Cross or Improve, forwarded or rejected by the
+    /// lane itself (01 §6.6, 07 §3.6).
     Route(RouteRecord),
 }
 
