@@ -290,7 +290,7 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
             return Some(e);
         }
         // Cheap: a range right after a known tip.
-        let mut hit = tips.iter().find_map(|t| self.find(*t, digest).0);
+        let mut hit = tips.iter().find_map(|t| self.find(*t, digest));
         // Deep: any range above the lowest known tip.
         if hit.is_none()
             && let Some(low) = tips.iter().min_by_key(|t| t.height)
@@ -337,16 +337,14 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
         Some(e)
     }
 
-    /// The candidate after `parent` whose digest is `payload`, with whether the run is complete.
-    fn find(&self, parent: Tip, payload: &Digest) -> (Option<(Proposal, Tip)>, bool) {
+    /// The candidate after `parent` whose digest is `payload`.
+    fn find(&self, parent: Tip, payload: &Digest) -> Option<(Proposal, Tip)> {
         let max = usize::try_from(MAX_HDRS_PER_PROPOSAL).unwrap_or(16);
         let run = chain_after(&self.source, self.epoch, &self.seq_key, parent, max);
-        let full = run.len() >= max;
-        let hit = run.iter().find_map(|last| {
+        run.iter().find_map(|last| {
             let p = proposal_for(&self.source, self.epoch, parent, last);
             (Digest(p.digest().0) == *payload).then(|| (p, tip_at(&p, last)))
-        });
-        (hit, full)
+        })
     }
 }
 
@@ -434,24 +432,21 @@ where
                         Verdict::Invalid => break false,
                         Verdict::Pending => {}
                     }
-                } else if let Some(parent) = parent {
-                    match app.find(parent, &payload) {
-                        (Some((p, tip)), _) => {
-                            match app
-                                .source
-                                .check_body(app.epoch, p.first_height, p.last_height)
-                            {
-                                Verdict::Valid => {
-                                    app.accept(view, payload, Entry::headers(p, tip));
-                                    break true;
-                                }
-                                Verdict::Invalid => break false,
-                                Verdict::Pending => {}
-                            }
+                } else if let Some(parent) = parent
+                    // No match, even from a full run, is no contradiction: the payload may be a
+                    // seal this voter's source does not hold yet (07 §9.4).
+                    && let Some((p, tip)) = app.find(parent, &payload)
+                {
+                    match app
+                        .source
+                        .check_body(app.epoch, p.first_height, p.last_height)
+                    {
+                        Verdict::Valid => {
+                            app.accept(view, payload, Entry::headers(p, tip));
+                            break true;
                         }
-                        // Even a full run that matches nothing proves no contradiction: the
-                        // payload may be a seal this voter's source does not hold yet (07 §9.4).
-                        (None, _) => {}
+                        Verdict::Invalid => break false,
+                        Verdict::Pending => {}
                     }
                 }
                 if clock.current() >= deadline {
