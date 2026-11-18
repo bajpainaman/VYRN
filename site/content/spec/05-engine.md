@@ -1411,7 +1411,8 @@ fn late(l: &Lane, rx_ts: Nanos, cls: Class, at: Point) -> bool {
 
   `11` checks each entry against B3's measured maxima before a configuration is accepted.
 - **At dequeue**, a late packet costs ~20 ns: session lookup, bound-address check, one
-  `Reject { BUSY }` per message in one response packet with `client_tag` 0, no MAC verification
+  `Reject { BUSY }` per message in one response packet with detail = the session's `expected` (≥ 1;
+  a BBO-core `BUSY` has 0, 04 §3.5) and `client_tag` 0, no MAC verification
   and no message read. It does not advance `pkt_seq` (the client resends) and cannot change book
   state; its record is `PacketRecord { flags: SHED }` with its real `pkt_hash` (§3.1). Its bytes
   are never needed: replay rebuilds the responses from the record, and `data_root` leaves it out

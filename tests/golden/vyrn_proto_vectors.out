@@ -105,11 +105,11 @@ V16 req A: New buy IOC 2 @ 100000 (arrives in overload) (48 B)
   020: fd 45 e4 3b dc 2a da 03 00 00 00 00 00 00 00 00
   tag_seq=0x03da2adc3be445fd  tag_com=0x0000000000000000
 
-V17 resp A: out-of-stream Reject BUSY (lane shed), index 0xFF, detail = expected 6 (40 B)
-  000: 07 30 10 00 00 00 00 00 01 00 e8 03 06 00 00 00
-  010: 83 ff 18 00 06 00 00 00 00 00 00 00 00 00 00 00
-  020: 70 0e fd 35 ea 4e de dc
-  tag=0xdcde4eea35fd0e70
+V17 resp A: lane shed of V16, in-stream Reject BUSY at index 0, detail = expected 6, client_tag 0 (40 B)
+  000: 07 30 10 00 07 00 00 00 01 00 e8 03 06 00 00 00
+  010: 83 00 18 00 06 00 00 00 00 00 00 00 00 00 00 00
+  020: 5e 98 88 b7 00 13 39 2a
+  tag=0x2a391300b788985e
 
 V18 req A: resend of V16, same pkt_seq and content, bit0 = 1 (48 B)
   000: 07 30 10 00 06 00 00 00 01 01 e8 03 01 00 00 00
@@ -125,12 +125,27 @@ V19 redir A: DataRedirect data[0] down -> data[1], resend_from 5, tag under K_se
 V20 admin A: DataTierStatus push, epoch 1000, seq 1, data[0] down (18 B)
   000: 0e 00 00 00 03 80 e8 03 00 00 01 00 00 00 01 00
   010: 00 00
+
+V21 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload) (64 B)
+  000: 07 30 10 00 07 00 00 00 02 00 e8 03 01 00 00 00
+  010: 01 01 00 00 a5 86 01 00 01 00 00 00 99 99 99 99
+  020: 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  030: fc 00 f4 62 6c 63 16 ae 00 00 00 00 00 00 00 00
+  tag_seq=0xae16636c62f400fc  tag_com=0x0000000000000000
+
+V22 resp A: lane shed of V21, BUSY run: one Reject BUSY per message, detail = expected 7 (56 B)
+  000: 07 30 10 00 09 00 00 00 02 00 e8 03 07 00 00 00
+  010: 83 00 18 00 07 00 00 00 00 00 00 00 00 00 00 00
+  020: 83 01 18 00 07 00 00 00 00 00 00 00 00 00 00 00
+  030: 08 45 f0 6d 45 7b 90 10
+  tag=0x10907b456df04508
 check OK: V1 verifies with K_SEQ
 check OK: V1 fails with K_OUT
 check OK: V1 with one tag bit flipped fails (bound source: close session)
 check OK: V10 tag_com = SipHash(K_COM, bytes 0..32)
 check OK: V13 tag differs from V2 tag
-check OK: V17 is out of stream (resp_seq 0), reason BUSY 24, echo_pkt 6
+check OK: V17 is in stream (resp_seq 7), echo_pkt 6, Reject BUSY 24 at index 0, detail 6 >= 1, tag 0
 check OK: V18 has V16's logical content (D3) and verifies
 check OK: V19 tag = SipHash(K_SEQ, bytes 0..16), not K_OUT
 check OK: V20 is a 0x8003 admin frame, len 14, and V19's data[to] is not down in it
+check OK: V22 answers every message of V21 (count 2, Heartbeat included) with BUSY, detail 7, tag 0

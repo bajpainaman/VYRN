@@ -53,7 +53,7 @@ msg 3 0x00103007 0 rx=8 seq=8 : cancel_all 0x77777777
 => 0x00103007 vector V15 2
 
 # V16 at the BBO core in a Shed step: Reject BUSY and nothing else (05 §2.3). (V17 is the
-# lane's out-of-stream form of the same decision and is not an oracle record.)
+# lane-shed form of the same decision, client_tag 0, and is not an oracle record.)
 shed 3 0x00103007 0 step=3 : new buy ioc 100000 2 0x88888888
 => 0x00103007 reject 0 BUSY 0 0x88888888
 

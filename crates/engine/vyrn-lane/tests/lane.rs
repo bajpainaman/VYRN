@@ -459,8 +459,8 @@ fn deadline_admission_at_the_threshold() {
         vec![Record::Reject {
             index: 0,
             reason: RejectReason::Busy,
-            detail: 0,
-            client_tag: 0 // 04 §3.5, 05 §18 Q17: from the record alone, not the message's tag 9
+            detail: 1,     // 04 §3.5: the session's `expected`; a BBO shed has 0
+            client_tag: 0  // 04 §3.5, 05 §18 Q17: from the record alone, not the message's tag 9
         }]
     );
     let p = packets(&x, 0);

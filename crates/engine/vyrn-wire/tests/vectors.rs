@@ -1,5 +1,5 @@
 //! The 04 §11 protocol conformance vectors. `tests/golden/vyrn_proto_vectors.out` is the output of
-//! `python3 -I vyrn_proto_vectors.py`; this test builds the same 18 packets with `vyrn-wire`
+//! `python3 -I vyrn_proto_vectors.py`; this test builds the same 20 packets with `vyrn-wire`
 //! (V19 is a data-tier `DataRedirect`, 04 §7.6, which `vyrn-data` tests; V20 is an admin
 //! frame, 04 §4.4),
 //! compares them byte for byte, parses each back, and repeats the script's checks.
@@ -25,7 +25,7 @@ const E: u32 = 1000;
 const E16: u16 = 0x03e8;
 const BOOK: BookId = BookId(1);
 
-/// Vector name ("V1" … "V18") → bytes, from the script's hex dump; V19 and V20 are not `vyrn-wire` packets.
+/// Vector name ("V1" … "V22") → bytes, from the script's hex dump; V19 and V20 are not `vyrn-wire` packets.
 fn golden() -> BTreeMap<String, Vec<u8>> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -57,7 +57,7 @@ fn golden() -> BTreeMap<String, Vec<u8>> {
     for (name, len) in &lens {
         assert_eq!(out[name].len(), *len, "{name} length in the dump");
     }
-    assert_eq!(out.len(), 20);
+    assert_eq!(out.len(), 22);
     out.remove("V19");
     out.remove("V20");
     out
@@ -128,6 +128,14 @@ fn built() -> Vec<(&'static str, Pkt)> {
         handle: a1,
         tick: Tick(100_000),
         client_tag: 0x1111_1111,
+    };
+    // A lane-shed BUSY (04 §3.5): in stream, at the message's index, detail = the session's
+    // `expected` (≥ 1; a BBO shed has 0), client_tag 0.
+    let busy = |index, expected| Record::Reject {
+        index,
+        reason: RejectReason::Busy,
+        detail: expected,
+        client_tag: 0,
     };
     let ioc_buy = Msg::New {
         flags: of(Side::Buy, Tif::Ioc, false, Stp::None),
@@ -368,22 +376,27 @@ fn built() -> Vec<(&'static str, Pkt)> {
             ),
         ),
         ("V16", r(vec![ioc_buy], a, 6, None, false)),
+        ("V17", p(vec![busy(0, 6)], a, 7, 6, false)),
+        ("V18", r(vec![ioc_buy], a, 6, None, true)),
         (
-            "V17",
-            p(
-                vec![Record::Reject {
-                    index: 0xFF,
-                    reason: RejectReason::Busy,
-                    detail: 6,
-                    client_tag: 0,
-                }],
+            "V21",
+            r(
+                vec![
+                    Msg::New {
+                        flags: of(Side::Sell, Tif::Day, false, Stp::None),
+                        tick: Tick(100_005),
+                        qty: Qty(1),
+                        client_tag: 0x9999_9999,
+                    },
+                    Msg::Heartbeat,
+                ],
                 a,
-                0,
-                6,
+                7,
+                None,
                 false,
             ),
         ),
-        ("V18", r(vec![ioc_buy], a, 6, None, true)),
+        ("V22", p(vec![busy(0, 7), busy(1, 7)], a, 9, 7, false)),
     ]
 }
 
@@ -445,9 +458,23 @@ fn the_scripts_checks_hold() {
     assert_eq!(v2.header().resp_seq, v13.header().resp_seq);
     assert_ne!(v2.tag(), v13.tag());
 
+    // A lane BUSY is in stream: it takes the next resp_seq (7 after V15's 6) and echoes the
+    // shed pkt_seq; V22 runs one BUSY per message of V21, its Heartbeat included.
     let v17 = Response::parse(&g["V17"]).unwrap();
-    assert!(v17.is_out_of_stream());
-    assert_eq!(v17.header().echo_pkt.get(), 6);
+    assert!(!v17.is_out_of_stream());
+    assert_eq!(
+        (v17.header().resp_seq.get(), v17.header().echo_pkt.get()),
+        (7, 6)
+    );
+    let v22 = Response::parse(&g["V22"]).unwrap();
+    assert_eq!(
+        (v22.header().resp_seq.get(), v22.header().echo_pkt.get()),
+        (9, 7)
+    );
+    assert_eq!(
+        v22.records().collect::<Result<Vec<_>, _>>().unwrap().len(),
+        usize::from(Request::parse(&g["V21"]).unwrap().header().count)
+    );
 
     let (v16, v18) = (
         Request::parse(&g["V16"]).unwrap(),
