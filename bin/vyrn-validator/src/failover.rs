@@ -303,14 +303,22 @@ impl Failover {
     pub fn step(&mut self, now: u64) -> Step {
         let mut newly = Vec::new();
         for (i, v) in self.votes.iter().enumerate() {
-            if v.len() >= self.quorum && !self.effective.get(i).copied().unwrap_or(true) {
+            // *Reading:* the last live box never goes down. With none left the mark moves no
+            // session anywhere, and it would leave every session homed on a dead box later with
+            // no backup: under load a live backup silent for `REP_DATA_SILENCE_MS` was marked
+            // down for the run.
+            let live_left = self.effective.iter().filter(|e| !**e).count();
+            if v.len() >= self.quorum
+                && !self.effective.get(i).copied().unwrap_or(true)
+                && live_left > 1
+            {
                 newly.push((u8::try_from(i).unwrap_or(u8::MAX), v.len()));
+                if let Some(e) = self.effective.get_mut(i) {
+                    *e = true;
+                }
             }
         }
         for &(d, _) in &newly {
-            if let Some(e) = self.effective.get_mut(usize::from(d)) {
-                *e = true;
-            }
             self.counts.effective = self.counts.effective.saturating_add(1);
             if d == self.home {
                 let live: Vec<bool> = self.effective.iter().map(|e| !e).collect();
@@ -494,7 +502,7 @@ mod tests {
         assert_eq!(f.silent(&[0], 0).len(), 1);
         assert!(f.silent(&[0], 1).is_empty(), "gossip waits a period");
         // Codex r4612686942: gossip goes on after the box is effective, for peers short of Q.
-        let mut g = Failover::new(1, 0, 1, 0, 1);
+        let mut g = Failover::new(2, 0, 1, 0, 1);
         assert_eq!(g.silent(&[0], 0).len(), 1);
         assert_eq!(g.step(0).0, vec![(0, 1)]);
         assert_eq!(
@@ -531,6 +539,13 @@ mod tests {
         assert_eq!(newly, vec![(2, 3)]);
         assert!(due.is_empty());
         assert_eq!(f.counts.down_bad, 1);
+        // Box 1, the last live one, has Q votes and stays live: down, it would leave the
+        // sessions no home.
+        for v in 0..3 {
+            f.heard(dd(1, v));
+        }
+        assert_eq!(f.step(6 + GOSSIP_EVERY_NS).0, vec![]);
+        assert!(f.live(1));
     }
 
     /// Codex r4612686917: a DataDown counts only as the voter whose key, IP and peer entry match.

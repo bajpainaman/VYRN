@@ -600,7 +600,11 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
             if let Some(k) = &ks {
                 down_auth.set_keys(k.serve.clone(), &k.peers);
             }
-            let peer = fetch::PeerServer::new(&peer_addrs, ks.map(|k| serve_keys(&k.serve)));
+            let mut peer =
+                fetch::PeerServer::new(&peer_addrs, ks.as_ref().map(|k| serve_keys(&k.serve)));
+            if let Some(k) = &ks {
+                peer.set_plain(&k.peers);
+            }
             if let Some((kr, _)) = ring {
                 let (tx, rx) = std::sync::mpsc::channel();
                 rekey = Some(rx);
@@ -1037,6 +1041,7 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 self.sources.set_keys(&ks.boxes, &ks.peers, ks.seq);
                 self.down_auth.set_keys(ks.serve.clone(), &ks.peers);
                 self.peer.set_keys(serve_keys(&ks.serve));
+                self.peer.set_plain(&ks.peers);
                 self.keys = ks.boxes;
                 if let Some(f) = self.failover.as_mut() {
                     f.epoch = e;
