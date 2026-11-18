@@ -577,6 +577,17 @@ order-entry path:
 
 - Mutual TLS. Each account has a client certificate from the exchange's CA. TLS 1.2 and earlier
   are refused.
+- **Post-quantum binding (from `E_pq`, 01 §14.20 H).** TLS authenticates both sides with Ed25519
+  only, which a quantum attacker can forge. So before any other frame, each side sends `PqBind`
+  (type 0x0002 client → `vyrn-admin`, 0x8003 `vyrn-admin` → client). Its body is a scheme-1 hybrid
+  signature (2,484 B) over `derive_key("vyrn v1 admin bind", exporter ‖ [side])`, where
+  `exporter` is the connection's TLS exporter value for label `"EXPORTER-vyrn-admin-bind"`, empty
+  context, 32 bytes (RFC 8446 §7.5), and `side` is 0 for the client and 1 for `vyrn-admin`. The
+  client's hybrid key is in a non-critical extension of its client certificate. `vyrn-admin`'s
+  key is in the CA bundle that clients pin. Until both binds verify, `vyrn-admin` processes no
+  `OpenSessionReq` and sends no keys. The binding ties the post-quantum signature to this TLS
+  session, so a forged Ed25519 certificate alone gets no keys. Cost: one hybrid signature and one
+  verification per connection, ≤ 2 ms of a ≤ 50 ms open.
 - The channel stays open for the life of the session. `vyrn-admin` pushes status and key bundles
   on it. If it drops, the client reconnects. The UDP session is not affected.
 - `vyrn-admin` implements the admin messages (`11-build.md`). This chapter fixes their fields,
