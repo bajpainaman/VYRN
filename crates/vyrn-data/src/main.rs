@@ -37,7 +37,10 @@
 //! copy_conflict session=<s> pkt_seq=<q>` (the transport to the sequencer's control core is a
 //! follow-up), written by their own thread from a bounded queue so stdout never blocks the poll
 //! loop (a full queue drops and counts the line), and at exit `STATS stored=<n> data_frames=<n>
-//! heartbeats=<n> duplicate=<n> fetch_unauth=<n> fetch_limited=<n> events_unprinted=<n>`.
+//! heartbeats=<n> duplicate=<n> fetch_unauth=<n> fetch_limited=<n> bad_mac=<n> events_dropped=<n>
+//! events_unprinted=<n>`. A stop waits up to 1 s for queued events to print and counts the rest
+//! in `events_unprinted`, so `EVENT` lines + `events_unprinted` + `events_dropped` = `bad_mac` +
+//! `conflicts`.
 //!
 //! **Metrics.** Every [`vyrn_data::Counters`] field as `vyrn_data_<field>_total`, and
 //! `vyrn_data_events_unprinted_total` (events dropped by the stdout queue), labels `role`,
@@ -53,7 +56,7 @@ use std::net::{SocketAddrV4, TcpListener};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -154,9 +157,34 @@ fn serve_metrics(listener: TcpListener, reg: Registry) {
 
 /// Events waiting for the output thread; more are dropped and counted (`events_unprinted`).
 const EVENT_QUEUE: usize = 4096;
+/// How long a stop waits for the output thread to print what is queued.
+const DRAIN: Duration = Duration::from_secs(1);
 
-fn print_events(rx: &std::sync::mpsc::Receiver<Event>) {
+/// Set in [`Drain::claimed`] by a stop: from then on the output thread prints nothing.
+const CLOSED: u64 = 1 << 63;
+
+/// The output thread's progress, shared with the stop.
+#[derive(Default)]
+struct Drain {
+    /// Events the output thread has taken to print, with [`CLOSED`] set once the stop has
+    /// counted what is left. Claiming and closing are one atomic word, so an event is either
+    /// claimed (printed, or the one line being written when the process exits) or abandoned,
+    /// never both.
+    claimed: AtomicU64,
+    /// Events fully written.
+    printed: AtomicU64,
+}
+
+fn print_events(rx: &std::sync::mpsc::Receiver<Event>, d: &Drain) {
     while let Ok(e) = rx.recv() {
+        let claim = d
+            .claimed
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                (v & CLOSED == 0).then_some(v.wrapping_add(1))
+            });
+        if claim.is_err() {
+            return;
+        }
         let mut out = std::io::stdout().lock();
         let _ = match e {
             Event::BadMac { session, pkt_seq } => {
@@ -171,6 +199,8 @@ fn print_events(rx: &std::sync::mpsc::Receiver<Event>) {
             ),
         };
         let _ = out.flush();
+        drop(out);
+        d.printed.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -281,11 +311,25 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
     // Events go to stdout from their own thread through a bounded queue, so a slow or stalled
     // reader of stdout (or a bad-MAC flood) never blocks ingest.
     let (events, events_rx) = std::sync::mpsc::sync_channel::<Event>(EVENT_QUEUE);
-    let mut unprinted = 0u64;
-    std::thread::Builder::new()
-        .name("vyrn-data/events".into())
-        .spawn(move || print_events(&events_rx))
-        .map_err(|e| e.to_string())?;
+    let (mut unprinted, mut queued) = (0u64, 0u64);
+    let drain = Arc::new(Drain::default());
+    {
+        let drain = Arc::clone(&drain);
+        std::thread::Builder::new()
+            .name("vyrn-data/events".into())
+            .spawn(move || print_events(&events_rx, &drain))
+            .map_err(|e| e.to_string())?;
+    }
+    let mut hand_over = |node_events: std::vec::Drain<'_, Event>, unprinted: &mut u64| {
+        for e in node_events {
+            if events.try_send(e).is_ok() {
+                queued = queued.wrapping_add(1);
+            } else {
+                *unprinted = unprinted.wrapping_add(1);
+                unprinted_metric.inc();
+            }
+        }
+    };
     println!("READY vyrn-data ingest={in_addr} fetch={fetch_addr} metrics={maddr}");
     let _ = std::io::stdout().flush();
     let t0 = Instant::now();
@@ -294,12 +338,7 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
     while !stop.load(Ordering::Acquire) {
         let work = node.poll(now(t0));
         // Never block the poll loop on stdout: a full queue drops and counts the line.
-        for e in node.drain_events() {
-            if events.try_send(e).is_err() {
-                unprinted = unprinted.wrapping_add(1);
-                unprinted_metric.inc();
-            }
-        }
+        hand_over(node.drain_events(), &mut unprinted);
         if published.elapsed() >= Duration::from_millis(100) {
             exported.publish(node.counters());
             published = Instant::now();
@@ -309,18 +348,34 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
         }
     }
     node.flush(now(t0));
+    hand_over(node.drain_events(), &mut unprinted);
+    drop(hand_over);
+    // Give the output thread `DRAIN` to print what is queued, then close it: whatever it has not
+    // claimed by then is counted and never printed, so every event is either an EVENT line or in
+    // `events_unprinted` (at most one line, the one being written as the process exits, may be
+    // cut short).
+    let deadline = Instant::now() + DRAIN;
+    while drain.printed.load(Ordering::Acquire) < queued && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let claimed = drain.claimed.fetch_or(CLOSED, Ordering::AcqRel) & !CLOSED;
+    let abandoned = queued.saturating_sub(claimed);
+    unprinted = unprinted.wrapping_add(abandoned);
+    unprinted_metric.inc_by(abandoned);
     let c = *node.counters();
     exported.publish(&c);
     // A closed stdout (the supervisor went away) is not a reason to fail the stop.
     let _ = writeln!(
         std::io::stdout(),
-        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} events_unprinted={unprinted}",
+        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} bad_mac={} events_dropped={} events_unprinted={unprinted}",
         c.stored,
         c.data_frames,
         c.heartbeats,
         c.duplicate,
         c.fetch_unauth,
-        c.fetch_limited
+        c.fetch_limited,
+        c.bad_mac,
+        c.events_dropped
     );
     Ok(())
 }
