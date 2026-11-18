@@ -36,6 +36,7 @@
 //! Closing balances come from the shell ([`Balances`]).
 
 mod record;
+pub mod ring;
 pub mod server;
 pub mod wire;
 

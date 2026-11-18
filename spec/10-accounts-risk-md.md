@@ -1787,6 +1787,47 @@ Login (client → server, 128 B)
    whose epoch leaves the replay window before it caught up gets `REJECT(5)` and is closed; it
    rebuilds from the statement (§10).
 
+### 8.6 The observer's output ring
+
+`vyrn-dropcopy` is a separate process that reads the replica's output ring (03 §4.5). The ring
+carries the replay events of `SinkStream`'s tap (§7.9), the same sink that feeds `vyrn-md`.
+`vyrn-dropcopy` applies them to its own `DropCopy`, so its records are the ones an in-process tap
+makes, byte for byte. That equality is tested against `RustReplay` at every split
+(`crates/vyrn-md/tests/dropcopy.rs`).
+
+1. **Transport.** The ring is a file under `/dev/shm`. The writer (`RingTap`, the tap of the
+   observer's `SinkStream`) uses `pwrite`; the reader (`RingReader`) uses `pread`. 11 §3.2
+   closes the `unsafe` list, so neither side maps it; tmpfs makes the page cache the shared
+   memory. The writer never waits for a reader, so a reader crash or stall cannot stop replay
+   or voting. \[Guessing\]
+2. **Layout.** All fields little-endian. Header (64 bytes): magic `VYRNDCR1`, `cap` (u64),
+   `head` (u64, bytes ever written), `!head`. Data byte `i` is at `64 + i % cap`. A frame is a
+   `len: u32` and then `len` bytes: a kind byte and its fixed fields. The kinds are:
+   - 1 lane op (lane, LaneSeq, session, pkt_seq, resp_seq, message, response record);
+   - 2 step (StepId, `StepKind` code, flags, source op, then `n: u16` TX entries, each with its
+     record);
+   - 3 `final_block`;
+   - 4 `alloc`;
+   - 5 `settled`;
+   - 6 `revert_after`;
+   - 7 route;
+   - 8 epoch begin;
+   - 9 epoch end, with each account's closing balances.
+
+   A message and a source op are a presence byte followed by zeroes when absent. \[Guessing\]
+3. **Publication.** The writer buffers lane ops. A step, a shell input, or a buffer over
+   `cap / 4` publishes the buffer: the data, then `head` and `!head` in one `pwrite`.
+   `cap` defaults to 64 MiB. \[Guessing\]
+4. **Reading.** A header where `head ≠ !(!head)` is torn, and the reader reads it again. If
+   `tail` is more than `cap` behind `head`, before or after the copy, the reader stops with
+   `Lagged`. A reader starts at offset 0, so a ring that has already wrapped is `Lagged` too.
+   A lagged or failed `vyrn-dropcopy` exits; its positions are rebuilt from the final log
+   (03 §7). Its sessions keep the gap rules of §8.5 item 4. \[Guessing\]
+5. **Shell inputs.** The observer's shell writes the inputs that no replay output carries:
+   finality (`INV-QUORUM`), allocations, settlement, reverts and routes (§8.4 items 9–12), and
+   each epoch's begin and end. They go into the ring in the order the shell calls them, so
+   both processes apply them in the same order. \[Likely\]
+
 ## 9. Surveillance
 
 Surveillance runs on observer replicas and archive boxes, from the finalized log. It never runs on

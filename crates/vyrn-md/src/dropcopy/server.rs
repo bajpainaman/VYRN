@@ -302,8 +302,8 @@ impl Session {
 
 impl DcStore {
     /// A store from `store <epoch> <account> <master 0|1> <seq> <hex>` lines (other lines are
-    /// skipped), in epoch order: the input of `vyrn-dropcopy --records` until the observer's
-    /// output ring feeds a [`DropCopy`](super::DropCopy) directly.
+    /// skipped), in epoch order: the input of `vyrn-dropcopy --records` (`--ring` feeds a
+    /// [`DropCopy`](super::DropCopy) from the observer's output ring instead, 10 §8.6).
     pub fn load_text(text: &str) -> Result<Self, String> {
         let mut s = Self::new();
         for (n, line) in text.lines().enumerate() {
