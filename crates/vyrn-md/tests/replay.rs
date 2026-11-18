@@ -295,6 +295,8 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
                 out.extend(w.packet(*p, full).unwrap());
             }
             OwnedRec::Route(t) => out.extend(w.route(*t).unwrap()),
+            // No pooled session in this script, so no `AcctTake` (05 §6.9).
+            OwnedRec::Take(_) => unreachable!("no pooled session"),
             OwnedRec::Step(e, d) => {
                 for x in &d[..usize::from(e.n_delta)] {
                     cut[usize::from(x.lane.0)] = x.seq;

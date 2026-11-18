@@ -70,7 +70,7 @@ fn script() -> Vec<Act> {
 fn packets(recs: &[OwnedRec]) -> impl Iterator<Item = &vyrn_types::PacketRecord> {
     recs.iter().filter_map(|r| match r {
         OwnedRec::Packet(p) => Some(p),
-        OwnedRec::Step(..) | OwnedRec::Route(_) => None,
+        OwnedRec::Step(..) | OwnedRec::Route(_) | OwnedRec::Take(_) => None,
     })
 }
 
@@ -94,7 +94,7 @@ fn logical(recs: &[OwnedRec]) -> Vec<OwnedRec> {
 fn steps(recs: &[OwnedRec]) -> impl Iterator<Item = &vyrn_bbo::StepEntry> {
     recs.iter().filter_map(|r| match r {
         OwnedRec::Step(e, _) => Some(e),
-        OwnedRec::Packet(_) | OwnedRec::Route(_) => None,
+        OwnedRec::Packet(_) | OwnedRec::Route(_) | OwnedRec::Take(_) => None,
     })
 }
 
@@ -429,6 +429,7 @@ fn replay_from_07_carries_unsettled_records_across_blocks() {
         match x {
             OwnedRec::Packet(_) => n += 1,
             OwnedRec::Route(_) => nr += 1,
+            OwnedRec::Take(_) => {}
             OwnedRec::Step(..) => before.push((n, nr)),
         }
     }
@@ -758,6 +759,7 @@ fn replay_from_07_routes_a_packet_whose_sources_span_two_blocks() {
         match x {
             OwnedRec::Packet(_) => n += 1,
             OwnedRec::Route(_) => nr += 1,
+            OwnedRec::Take(_) => {}
             OwnedRec::Step(..) => before.push((n, nr)),
         }
     }

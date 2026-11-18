@@ -75,8 +75,12 @@
 //!   plays every pool core, so nothing else can write the account in between. Boundary work
 //!   (B1 fills, B2 settlement) on a pooled account takes no token and logs no `AcctTake`,
 //!   because the lane does not report which accounts a boundary touched. The account's ledger
-//!   and sessions stay lane-local (`vyrn-lane` has no shared `PoolAcct`). Replay does not yet
-//!   check `AcctTake` records, and [`OwnedRec`] cannot hold one.
+//!   and sessions stay lane-local (`vyrn-lane` has no shared `PoolAcct`). [`Engine::replay`]
+//!   checks `AcctTake` records ([`OwnedRec::Take`]): each is part of the lane call of the record
+//!   it covers, and must be reproduced right before that packet's group (its own route
+//!   records and the packet, in emitted order) with the same `ver`. Otherwise replay fails
+//!   with [`Why::Mismatch`] at the take, including when a route record of another packet, on
+//!   any lane, sits between them. [`Engine::replay_wire`] does not take them yet.
 //! - Control steps carry their kind, not their command, in the order stream. A replayer
 //!   queues the commands through [`Engine::command`] before [`Engine::replay`].
 //! - On a delayed backend (`Sim`), a step's lines may become visible after `Bbo::poll`

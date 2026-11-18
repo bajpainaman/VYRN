@@ -14,7 +14,7 @@ use harness::*;
 use vyrn_bbo::admit::{FixedClock, NeverLate};
 use vyrn_bbo::{Bbo, ControlCmd, OrderFlags, Phase, Record, Side, Stp, Tif, TxEntry};
 use vyrn_cut::{Hw, PoolTok};
-use vyrn_engine::{Engine, Fault, NoResponses, OwnedRec, Rec, Shared, Sink};
+use vyrn_engine::{Diverged, Engine, Fault, NoResponses, OwnedRec, Rec, Shared, Sink, Why};
 use vyrn_lane::{RespPkt, RxIn};
 use vyrn_risk::AcctSlot;
 use vyrn_types::{AccountId, AcctTake, Epoch, LaneId, MAX_REQ_PAYLOAD, Nanos, Qty, StepKind, Tick};
@@ -39,6 +39,7 @@ impl Sink for Takes {
     }
     fn take(&mut self, t: &AcctTake) {
         self.takes.push((self.j.recs.len(), *t));
+        self.j.take(t);
     }
 }
 
@@ -146,7 +147,12 @@ fn a_pooled_session_logs_one_take_before_each_of_its_records() {
         vec![(1, POOLED, 1, 1), (2, POOLED, 2, 1), (1, POOLED, 3, 2)]
     );
     for (at, t) in &s.takes {
-        let OwnedRec::Packet(p) = s.j.recs[*at] else {
+        assert_eq!(
+            s.j.recs[*at],
+            OwnedRec::Take(*t),
+            "the journal holds the take"
+        );
+        let OwnedRec::Packet(p) = s.j.recs[*at + 1] else {
             panic!("take {t:?} is not followed by a packet record");
         };
         assert_eq!(
@@ -166,6 +172,141 @@ fn a_pooled_session_logs_one_take_before_each_of_its_records() {
         Ok(())
     );
     assert_eq!(rs.takes, s.takes);
+
+    // F4a: each `AcctTake` is part of its record's lane call and must be reproduced in place
+    // (05 §6.9, 01 §14.17.4). A changed `ver`, a dropped take, or a take moved after its record
+    // diverges at the take's index.
+    let (first, _) = s.takes[0];
+    let replay = |recs: &[OwnedRec]| {
+        let rtok = PoolTok::new();
+        let mut rsh = box_shared();
+        let mut r = pooled_engine(&mut rsh, &rtok, true);
+        r.replay(recs, &store, &mut NoResponses, &mut Journal::default())
+    };
+    let mismatch = |index| {
+        Err(Diverged {
+            index,
+            why: Why::Mismatch,
+        })
+    };
+    let mut bad_ver = s.j.recs.clone();
+    if let OwnedRec::Take(t) = &mut bad_ver[first] {
+        t.ver += 1;
+    }
+    assert_eq!(replay(&bad_ver), mismatch(first));
+    let mut dropped = s.j.recs.clone();
+    dropped.remove(first);
+    assert_eq!(replay(&dropped), mismatch(first));
+    let mut moved = s.j.recs.clone();
+    moved.swap(first, first + 1);
+    assert_eq!(replay(&moved), mismatch(first));
+}
+
+#[test]
+fn a_take_must_sit_right_before_its_record_not_before_its_route() {
+    // A pooled IOC that crosses the resting ask is forwarded with a route record (07 §3.6),
+    // logged as `[Take, Packet, Route]`. Moving the route between the take and its packet
+    // record keeps every record and each kind's order, but breaks "right before the record it
+    // covers" (05 §6.9), so replay diverges at the take (#135 review).
+    let tok = PoolTok::new();
+    let mut sh = box_shared();
+    let mut e = pooled_engine(&mut sh, &tok, true);
+    let mut s = Takes::default();
+    let store = feed(
+        &mut e,
+        &[
+            (0, 1, order(Side::Sell, Tif::Day, Stp::None, 200, 1, 1)),
+            (1, 1, order(Side::Buy, Tif::Ioc, Stp::None, 200, 1, 2)),
+        ],
+        &mut s,
+    );
+    let recs = &s.j.recs;
+    let at = (0..recs.len() - 2)
+        .find(|&i| {
+            matches!(
+                (&recs[i], &recs[i + 1], &recs[i + 2]),
+                (OwnedRec::Take(_), OwnedRec::Packet(_), OwnedRec::Route(_))
+            )
+        })
+        .expect("the pooled IOC logs [Take, Packet, Route]");
+    let replay = |recs: &[OwnedRec]| {
+        let rtok = PoolTok::new();
+        let mut rsh = box_shared();
+        let mut r = pooled_engine(&mut rsh, &rtok, true);
+        r.replay(recs, &store, &mut NoResponses, &mut Journal::default())
+    };
+    assert_eq!(replay(recs), Ok(()));
+    let mut moved = recs.clone();
+    moved.swap(at + 1, at + 2);
+    assert_eq!(
+        replay(&moved),
+        Err(Diverged {
+            index: at,
+            why: Why::Mismatch
+        })
+    );
+}
+
+#[test]
+fn a_foreign_route_between_a_take_and_its_packet_diverges_at_the_take() {
+    // Coordinator ruling on #135: a take sits right before its packet's group (the packet's
+    // own route records and the packet). A route record of another packet between them is
+    // `Why::Mismatch` at the take's index, whether that route is from the same lane or not.
+    let tok = PoolTok::new();
+    let mut sh = box_shared();
+    let mut e = pooled_engine(&mut sh, &tok, true);
+    let mut s = Takes::default();
+    let store = feed(
+        &mut e,
+        &[
+            (0, 1, order(Side::Sell, Tif::Day, Stp::None, 200, 2, 1)),
+            (1, 1, order(Side::Buy, Tif::Ioc, Stp::None, 200, 1, 2)),
+            (1, 1, order(Side::Buy, Tif::Ioc, Stp::None, 200, 1, 3)),
+        ],
+        &mut s,
+    );
+    let recs = &s.j.recs;
+    let groups: Vec<usize> = (0..recs.len() - 2)
+        .filter(|&i| {
+            matches!(
+                (&recs[i], &recs[i + 1], &recs[i + 2]),
+                (OwnedRec::Take(_), OwnedRec::Packet(_), OwnedRec::Route(_))
+            )
+        })
+        .collect();
+    assert_eq!(
+        groups.len(),
+        2,
+        "each pooled IOC logs [Take, Packet, Route]"
+    );
+    let (first, second) = (groups[0], groups[1]);
+    let OwnedRec::Route(foreign) = recs[first + 2] else {
+        unreachable!()
+    };
+    let replay = |recs: &[OwnedRec]| {
+        let rtok = PoolTok::new();
+        let mut rsh = box_shared();
+        let mut r = pooled_engine(&mut rsh, &rtok, true);
+        r.replay(recs, &store, &mut NoResponses, &mut Journal::default())
+    };
+    assert_eq!(replay(recs), Ok(()));
+    let other_lane = vyrn_types::RouteRecord {
+        lane: LaneId(2),
+        ..foreign
+    };
+    for r in [foreign, other_lane] {
+        let mut bad = recs.clone();
+        bad.insert(second + 1, OwnedRec::Route(r));
+        assert_eq!(
+            replay(&bad),
+            Err(Diverged {
+                index: second,
+                why: Why::Mismatch
+            }),
+            "foreign route on lane {}",
+            r.lane.0
+        );
+    }
 }
 
 #[test]
@@ -273,7 +414,7 @@ fn an_auction_runs_through_control_steps_and_replays() {
         .iter()
         .filter_map(|r| match r {
             OwnedRec::Step(s, _) => StepKind::from_code(s.kind),
-            OwnedRec::Packet(_) | OwnedRec::Route(_) => None,
+            OwnedRec::Packet(_) | OwnedRec::Route(_) | OwnedRec::Take(_) => None,
         })
         .filter(|k| matches!(k, StepKind::Control | StepKind::Uncross))
         .collect();

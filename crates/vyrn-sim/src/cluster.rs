@@ -881,8 +881,8 @@ pub fn run(seed: u64, schedule: &Schedule) -> Report {
                             .collect(),
                     });
                 }
-                // A route record (07 §3.6) is checked by replay (INV-DET), not here.
-                OwnedRec::Route(_) => {}
+                // Route records (07 §3.6) and `AcctTake`s are checked by replay (INV-DET).
+                OwnedRec::Route(_) | OwnedRec::Take(_) => {}
             }
         }
         seen_rec = out.recs.len();
@@ -951,6 +951,7 @@ pub fn run(seed: u64, schedule: &Schedule) -> Report {
                         }
                         OwnedRec::Step(s, _) => s.n_fills = s.n_fills.wrapping_add(1),
                         OwnedRec::Route(x) => x.cross = !x.cross,
+                        OwnedRec::Take(t) => t.ver = t.ver.wrapping_add(1),
                     }
                 }
             }
