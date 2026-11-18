@@ -1406,11 +1406,29 @@ Anyone submits an `Evidence` item. Its handling is automatic:
    Each check is deterministic.
 2. Evidence older than `CHN_EVIDENCE_EPOCHS` (42 epochs, 14 days) is rejected. Duplicate evidence
    (the same fault by the same operator) is a no-op.
-2a. **Classical evidence after the switch (01 §14.20 SG7).** From the first chain block of `E_pq`,
-   evidence whose signatures are all scheme 0 (Ed25519 votes, `seq_sig`s, handoff and commit
-   votes of epochs < `E_pq`) slashes or jails only if it, or `EvidenceCommit { hash }` of its
-   encoding, is in a chain block final before `E_pq` began. Otherwise it is verified with the
-   scheme-0 rules, recorded, and changes no bond and no jail. Why: after the switch a quantum
+2a. **Classical evidence after the switch (01 §14.20 SG7).** Evidence is *classical* when **any**
+   signature it relies on is scheme 0: an offending signature in the table below, or a
+   certificate or record that the check uses (a `NodeCert`, a handoff or finalization
+   certificate). An authentic hybrid signature elsewhere in the item does not change that: a
+   genuine hybrid-signed `NodeCert` that certifies a scheme-0 vote key leaves a forged scheme-0
+   vote forgeable. From the first chain block of `E_pq`, classical evidence slashes or jails only
+   if it, or `EvidenceCommit { hash }` of its encoding, is in a chain block final before `E_pq`
+   began. Otherwise it is verified with the scheme-0 rules, recorded, and changes no bond and no
+   jail. `BadPost`'s secp256k1 signature is not a `SigScheme`; PQ-5 covers it (below).
+
+   | Evidence | Offending signatures (the misconduct itself) | Signatures it relies on besides |
+   |---|---|---|
+   | `SeqEquivocation` | `a.seq_sig`, `b.seq_sig` | — |
+   | `DoubleVote` | `a.sig`, `b.sig` | — |
+   | `FenceViolation` | `h.seq_sig` | the `HandoffCert` |
+   | `HandoffWithheld` | the four `HandoffTimeout` signatures | — |
+   | `CrossHomeVote` | `v.sig` | `cert.sig` (the `NodeCert`) |
+   | `DoubleCommit` | `a.sig`, `b.sig` | — |
+   | `Censorship` | the `seq_sig` of every book header in `(lastb(C), h]` | the finalization certificate of `C` |
+   | `WrongExclusion` | the finalization certificate of the block | — (the disclosure is a hash preimage) |
+   | `BadPost` | `sig` (secp256k1, outside SG7) | — |
+
+   Why: after the switch a quantum
    attacker can forge scheme-0 signatures for the old epochs at will, and two forged `DoubleVote`s
    would jail two operators and stop finality (4 of 5 needed) without touching a hybrid key. The
    cost: a fault committed in the last moments of `E_pq − 1` and not committed on chain before the
