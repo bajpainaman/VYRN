@@ -52,6 +52,13 @@
 //!   `FINAL height=<h> view= from=` (#121) are parsed by `height=` only. The committee is a DEV
 //!   roster: vote seeds `[i + 1; 32]`, genesis `[0; 32]`, the run's `seq_key` as primary and a
 //!   dummy standby, repl and CTRL ports picked below the ephemeral range, `delta_ms = 500`.
+//! - R7. `--keyed` (needs `--data --finality`): the box serves only fetches sealed under
+//!   `K_fetch` (07 §5.5, 08 §9.6), from the DEV roster: validator 0's X25519 key is
+//!   `XCHG_SEED`'s, the box's `BOX_XCHG`'s. The other voters and the `vyrn-seq` entries get
+//!   all-zero (low-order) keys, so they get no key: on one host every requester shares
+//!   127.0.0.1, and the box refuses two keyed requesters on one IPv4. A relay drops every
+//!   `LOSS_EVERY`-th datagram the box sends validator 0, so its RANGE and KEY fetches must be
+//!   served (`STATS` `fetch_ring_hit + fetch_log_hit + fetch_resent > 0`) for it to keep up.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -84,7 +91,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddrV4, UdpSocket};
+use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
@@ -111,6 +118,11 @@ use vyrn_wire::{ReqHeader, Request, Response, encode_request};
 
 const WORKLOAD: &str = include_str!("../wl-smoke.toml");
 const SEQ_SEED: [u8; 32] = [0x42; 32];
+/// `--keyed` (R7): validator 0's X25519 secret and the box's.
+const XCHG_SEED: [u8; 32] = [0x5a; 32];
+const BOX_XCHG: [u8; 32] = [0x6b; 32];
+/// `--keyed` (R7): the relay to validator 0 drops every this-many-th datagram.
+const LOSS_EVERY: u64 = 25;
 const LANES: usize = 2;
 const NA: usize = 16;
 const BOOK: u16 = 7;
@@ -164,6 +176,10 @@ struct Cli {
     /// needs --data). The spec's bound is 1000; CI sets a larger one with --strict-hashlag (R5).
     #[arg(long, value_name = "US")]
     dev_hashlag_us: Option<u64>,
+    /// Key the vyrn-data node from the roster and drop some of validator 0's data frames, so
+    /// its sealed fetches must be served (R7; needs --data and --finality).
+    #[arg(long)]
+    keyed: bool,
 }
 
 fn main() -> ExitCode {
@@ -450,6 +466,34 @@ fn tap(sock: UdpSocket, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<Vec<Ve
     })
 }
 
+/// `--keyed` (R7): a UDP relay to `127.0.0.1:port` that drops every `LOSS_EVERY`-th datagram,
+/// until `stop`. Returns its address and, on join, how many it dropped.
+fn relay(
+    port: u16,
+    stop: Arc<AtomicBool>,
+) -> Result<(SocketAddr, std::thread::JoinHandle<u64>), String> {
+    let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    sock.set_read_timeout(Some(Duration::from_millis(50)))
+        .map_err(|e| e.to_string())?;
+    let addr = sock.local_addr().map_err(|e| e.to_string())?;
+    let h = std::thread::spawn(move || {
+        let (mut n, mut dropped) = (0u64, 0u64);
+        let mut buf = [0u8; 65536];
+        while !stop.load(Ordering::Acquire) {
+            if let Ok(k) = sock.recv(&mut buf) {
+                n += 1;
+                if n.is_multiple_of(LOSS_EVERY) {
+                    dropped += 1;
+                } else {
+                    let _ = sock.send_to(buf.get(..k).unwrap_or_default(), ("127.0.0.1", port));
+                }
+            }
+        }
+        dropped
+    });
+    Ok((addr, h))
+}
+
 /// The responses the client received, until `stop`, unchecked.
 fn client(sock: UdpSocket, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<Vec<Vec<u8>>> {
     std::thread::spawn(move || {
@@ -687,6 +731,7 @@ fn validator_config(
     sessions: &[Sess],
     cons: Option<&Cons>,
     hashlag_us: Option<u64>,
+    keyed: bool,
 ) -> Result<PathBuf, String> {
     let key = hex(&vyrn_crypto::ed25519::public_key(&SEQ_SEED));
     let data_port = data.map_or(0, |(_, p)| p);
@@ -725,8 +770,13 @@ vote = "{vote}"
     );
     if let Some((fetch, _)) = data {
         s.push_str(&format!(
-            "\n[data]\nboxes = [\"{fetch}\"]\nme = {}\n\n[replay]\ntick_min = {TICK_MIN}\ntick_max = {TICK_MAX}\nwin_center = {WIN_CENTER}\nslot_cap = {SLOT_CAP}\n",
-            i + 1
+            "\n[data]\nboxes = [\"{fetch}\"]\nme = {}\n{}\n[replay]\ntick_min = {TICK_MIN}\ntick_max = {TICK_MAX}\nwin_center = {WIN_CENTER}\nslot_cap = {SLOT_CAP}\n",
+            i + 1,
+            if keyed {
+                "xchg = \"env:VYRN_E2E_XCHG\"\n"
+            } else {
+                ""
+            }
         ));
         if let Some(us) = hashlag_us {
             s.push_str(&format!("hashlag_us = {us}\n"));
@@ -757,7 +807,13 @@ vote = "{vote}"
 
 /// The vyrn-data DEV config: destination 0 the tap's data socket, then the validators', and
 /// every session's `K_seq`.
-fn data_config(dir: &Path, dests: &[String], sessions: &[Sess]) -> Result<PathBuf, String> {
+/// With `keyed` (R7) also `[roster]`: the box derives every requester's `K_fetch` from it.
+fn data_config(
+    dir: &Path,
+    dests: &[String],
+    sessions: &[Sess],
+    keyed: Option<&Cons>,
+) -> Result<PathBuf, String> {
     let dests = dests
         .iter()
         .map(|d| format!("\"{d}\""))
@@ -794,6 +850,15 @@ listen = "127.0.0.1:0"
             hex(&x.k_seq)
         ));
     }
+    if let Some(c) = keyed {
+        s.push_str(&format!(
+            "\n[roster]\nfile = \"{}\"\nroster_hash = \"{}\"\ngenesis_hash = \"{}\"\nepoch = 0\nbox = 0\nxchg_secret = \"hex:{}\"\n",
+            c.roster.display(),
+            c.roster_hash,
+            hex(&[0; 32]),
+            hex(&BOX_XCHG)
+        ));
+    }
     let p = dir.join("data.toml");
     std::fs::write(&p, s).map_err(|e| e.to_string())?;
     Ok(p)
@@ -809,6 +874,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
         return Err(
             "--dev-hashlag-us needs --data: hashlag_us sits in the validators' [replay]".into(),
         );
+    }
+    if cli.keyed && !(cli.data && cli.finality) {
+        return Err("--keyed needs --data and --finality: K_fetch comes from the roster".into());
     }
     let wait = Duration::from_secs(cli.wait_s);
     let bin_dir = match &cli.bin_dir {
@@ -846,19 +914,29 @@ fn run(cli: &Cli) -> Result<bool, String> {
         Vec::new()
     };
     let cons = if cli.finality {
-        Some(Cons::new(&dir, &picked)?)
+        Some(Cons::new(&dir, &picked, cli.keyed)?)
     } else {
         None
     };
     // --data: a vyrn-data node takes copy 2 from the client and fans DATA frames out to the
     // tap's data socket and every validator's data port (07 §5.1, §5.2). It starts first, so
     // the validators' configs can name its fetch address; their data ports are picked here.
+    let mut relay_h = None;
     let data_node = if cli.data {
         let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
         sock.set_read_timeout(timeout).map_err(|e| e.to_string())?;
         let mut dests = vec![sock.local_addr().map_err(|e| e.to_string())?.to_string()];
         dests.extend(val_data.iter().map(|p| format!("127.0.0.1:{p}")));
-        let cfg = data_config(&dir, &dests, &sessions)?;
+        // --keyed (R7): validator 0's frames go through the lossy relay.
+        if cli.keyed
+            && let (Some(d), Some(&p)) = (dests.get_mut(1), val_data.first())
+        {
+            let (addr, h) = relay(p, Arc::clone(&stop_tap))?;
+            *d = addr.to_string();
+            relay_h = Some(h);
+        }
+        let keyed = cons.as_ref().filter(|_| cli.keyed);
+        let cfg = data_config(&dir, &dests, &sessions, keyed)?;
         let mut c = command(&bin_dir.join("vyrn-data"), cli.seq_cpus.as_deref());
         c.arg("--config").arg(cfg).arg("--stop-on-stdin-eof");
         let i = nodes.spawn("vyrn-data", &mut c, &tx)?;
@@ -895,8 +973,16 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 .as_ref()
                 .zip(val_data.get(i))
                 .map(|((_, _, fetch, _), port)| (*fetch, *port));
-            let cfg =
-                validator_config(&dir, i, data, &sessions, cons.as_ref(), cli.dev_hashlag_us)?;
+            let keyed = cli.keyed && i == 0;
+            let cfg = validator_config(
+                &dir,
+                i,
+                data,
+                &sessions,
+                cons.as_ref(),
+                cli.dev_hashlag_us,
+                keyed,
+            )?;
             let mut c = command(
                 &bin_dir.join("vyrn-validator"),
                 cli.validator_cpus.as_deref(),
@@ -904,7 +990,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
             c.arg("--config")
                 .arg(cfg)
                 .arg("--stop-on-stdin-eof")
-                .env("VYRN_E2E_VOTE_SEED", hex(&vote_seed(i)));
+                .env("VYRN_E2E_VOTE_SEED", hex(&vote_seed(i)))
+                .env("VYRN_E2E_XCHG", hex(&XCHG_SEED));
             nodes.spawn(&format!("validator-{i}"), &mut c, &tx)
         })
         .collect::<Result<_, String>>()?;
@@ -1061,6 +1148,10 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let frames = tap_h.join().map_err(|_| "tap thread")?;
     let data_frames = match data_h {
         Some(h) => Some(h.join().map_err(|_| "data tap thread")?),
+        None => None,
+    };
+    let relay_dropped = match relay_h {
+        Some(h) => Some(h.join().map_err(|_| "relay thread")?),
         None => None,
     };
     // The tap's join: DATA frames through DataFeed with --data, else copy 2 in process (R3).
@@ -1469,6 +1560,18 @@ fn run(cli: &Cli) -> Result<bool, String> {
             if let Some(e) = events.first() {
                 errs.push(format!("{} EVENT lines, first {e}", events.len()));
             }
+            // R7: validator 0 lost frames, and only sealed fetches are served.
+            if let Some(dropped) = relay_dropped {
+                let served: u64 = ["fetch_ring_hit", "fetch_log_hit", "fetch_resent"]
+                    .iter()
+                    .filter_map(|k| field(&st, k)?.parse::<u64>().ok())
+                    .sum();
+                if dropped == 0 || served == 0 {
+                    errs.push(format!(
+                        "--keyed: the relay dropped {dropped} frames and the box served {served} sealed fetches; both must be > 0"
+                    ));
+                }
+            }
             if !feed_errs.is_empty() {
                 errs.push(format!("feed: {}", feed_errs.join(", ")));
             }
@@ -1525,10 +1628,11 @@ struct Cons {
 
 impl Cons {
     /// `ports`: `n` TCP repl ports, then the box's CTRL port (`data_ports`).
-    fn new(dir: &Path, ports: &[u16]) -> Result<Self, String> {
+    /// `keyed` (R7): validator 0 and data box 0 get real X25519 keys, every other entry none.
+    fn new(dir: &Path, ports: &[u16], keyed: bool) -> Result<Self, String> {
         let (repl, ctrl) = ports.split_at(ports.len().saturating_sub(1));
         let n = repl.len();
-        use vyrn_epoch::{Addr, Domain, Home, Roster, SeqEntry, Voter};
+        use vyrn_epoch::{Addr, DataBox, Domain, Home, Roster, SeqEntry, Voter};
         let addr = |port: u16| {
             let mut ip = [0u8; 16];
             ip[10] = 0xff;
@@ -1545,7 +1649,11 @@ impl Cons {
                 facility: u8::try_from(i + 1).map_err(|e| e.to_string())?,
                 node_key: k.clone(),
                 vote_key: k,
-                xchg_key: vec![0x55; 32],
+                xchg_key: match (keyed, i) {
+                    (true, 0) => vyrn_crypto::x25519::public_key(&XCHG_SEED).to_vec(),
+                    (true, _) => vec![0; 32],
+                    (false, _) => vec![0x55; 32],
+                },
                 data_addr: addr(0),
                 repl_addr: addr(*repl.get(i).ok_or("repl port")?),
             });
@@ -1557,7 +1665,7 @@ impl Cons {
                 facility: f,
                 node_key: k.to_vec(),
                 seq_key: k.to_vec(),
-                xchg_key: vec![0x66; 32],
+                xchg_key: vec![if keyed { 0 } else { 0x66 }; 32],
                 client_addr: addr(0),
                 repl_addr: addr(0),
             })
@@ -1566,7 +1674,15 @@ impl Cons {
             voters,
             seq,
             recovery: 0,
-            data: Vec::new(),
+            data: if keyed {
+                vec![DataBox {
+                    facility: 1,
+                    addr: addr(0),
+                    xchg_key: vyrn_crypto::x25519::public_key(&BOX_XCHG).to_vec(),
+                }]
+            } else {
+                Vec::new()
+            },
         };
         let r = Roster {
             sig_scheme: 0,

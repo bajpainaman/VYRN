@@ -1094,7 +1094,7 @@ fetch, with these sources in order:
 A data box with fetch keys accepts only the 40-byte authenticated form: those 32 bytes, then
 `tag` u64 LE = SipHash-2-4(`K_fetch`, bytes 0..32), with one `K_fetch(e, i, d)` per requester,
 derived per epoch from the roster's X25519 keys (08 §9.6) and keyed by the requester's `repl_addr`
-IPv4. It rate-limits each requester with a token bucket
+IPv4, so a requester sends its fetches from that address (*reading*). It rate-limits each requester with a token bucket
 (03 §1: "rate-limit by source address") and drops forged, unkeyed and over-rate fetches before
 any work. Replies are not tagged (next paragraph).
 

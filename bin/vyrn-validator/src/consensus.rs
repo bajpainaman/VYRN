@@ -168,6 +168,10 @@ pub struct Plan {
     pub storage: PathBuf,
     /// `storage` is this run's temporary directory, removed at exit; a configured one is kept.
     pub temp_storage: bool,
+    /// The roster and the facts that select from it, for `K_fetch` ([`Plan::fetch_key`]).
+    roster: vyrn_epoch::Roster,
+    domain: Domain,
+    home: HomeCode,
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], String> {
@@ -302,7 +306,19 @@ impl Plan {
             timeouts,
             storage,
             temp_storage: s.storage.is_none(),
+            roster,
+            domain,
+            home,
         })
+    }
+
+    /// `K_fetch(e, me, d)` (08 §9.6) this voter seals its fetches to data box `d` of its home
+    /// with, from its X25519 `secret`. `None` if the roster has no box `d` or its key is
+    /// unusable.
+    pub fn fetch_key(&self, d: u8, secret: &[u8; 32]) -> Option<[u8; 16]> {
+        let i = u8::try_from(self.me).ok()?;
+        self.roster
+            .requester_fetch_key(&self.domain, self.epoch, self.home, i, d, secret)
     }
 
     pub fn repl_addr(&self) -> SocketAddr {
