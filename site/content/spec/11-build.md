@@ -1159,8 +1159,15 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
 - *Threads.* `VxReplay` creates the `n + 1` threads (W-04) but does not pin them yet: pinning
   comes with the core map (§10.1), and tests run unpinned. W-03 calls libc `sched_yield`, not
   `vyrn_vx_spin`, because vxc cannot declare a host symbol (W-18 in `vx/FRICTION.md`).
-- *CI.* CI does not run `vx/build.sh`, so the Vx tests skip there as the oracle's do;
-  `VYRN_REQUIRE_VX=1` makes a missing `libvyrn_vx_client` a failure.
+- *CI.* The `vx` job runs `vx/build.sh`, then `tests/replay.rs`, `oracle_scenarios` and
+  `vx_golden` with `VYRN_REQUIRE_VX=1`, so a missing `libvyrn_vx_client` fails them. The other
+  jobs build no Vx, so their Vx halves skip. vxc embeds its source and target directories and
+  links the distro's LLVM/MLIR 22 statically, so the job runs in `debian:trixie` with
+  `HOME=/home/user`, the host kind `vxc_blake3.x86_64-linux` was pinned on. It builds vxc with
+  `.agents/setup`'s own `llvm_for_vx` and `vxc_build` (`.github/scripts/vxc.sh`) and caches the
+  binary by `vx/TOOLCHAIN` and `rust-toolchain.toml`. `vx/build.sh` checks its hash either way.
+  A cold run takes about 7.5 min (vxc 4.2 min), within S1's 15. On aarch64 there is no pin, so
+  the job is x86-64 only.
 
 **Race testing.** The Vx client's own cross-core protocol is tested with `--sanitize=thread` and
 with `VX_TASK_SEED` sweeps in CI (§9.2). The interleavings of the shell-to-client rings are
