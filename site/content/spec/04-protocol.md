@@ -560,6 +560,17 @@ When a session enters `CLOSED`, the lane emits a final in-stream record: `Reject
 detail = the offending `pkt_seq` (cause `BAD_MAC`), or `Reject SESSION_CLOSED` with detail = the
 close cause (every other cause). Both have index 0xFF.
 
+*Readings (`vyrn-lane`):*
+- The lane holds no `OPENING` slot. The control path installs a session on the lane only once it
+  is `ACTIVE`, so `OPENING` and `FREE` look the same to the lane: the session is not there, and V2
+  drops the packet with no answer.
+- The close cause is set once, on entering `CLOSED`. A packet that fails V6 after the session is
+  already `CLOSED` is dropped with no answer (it is unauthenticated, and the final record is
+  already sent), so V7 keeps answering with the first cause.
+- A control-path close (every cause except `BAD_MAC`) answers no request, so its final record
+  goes in a packet with `echo_pkt` = 0 (R-ECHO, §7.2). The `BAD_MAC` record echoes the offending
+  `pkt_seq`.
+
 | Close cause (`PROTO_D_*`) | Value | Trigger |
 |---|---|---|
 | `LOGOUT` | 1 | the client's `Logout`, at the end of `DRAINING` |

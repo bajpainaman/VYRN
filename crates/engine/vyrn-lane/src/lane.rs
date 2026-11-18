@@ -860,6 +860,12 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         }
         // V6.
         if !req.verify_seq(&s.k_seq) {
+            // *Reading (04 §4.3 sets the cause on entering CLOSED):* a session already closed
+            // keeps its first cause and has had its final record, so a bad tag is dropped with
+            // no answer: an unauthenticated packet gets nothing back (Codex on #207).
+            if s.state == SessState::Closed {
+                return Rx::Dropped;
+            }
             // 04 §4.3: the final record of a BAD_MAC close has detail = the offending pkt_seq.
             self.close(si, PROTO_D_BAD_MAC, RejectReason::BadMac, pkt_seq, pkt_seq);
             return Rx::Closed;
