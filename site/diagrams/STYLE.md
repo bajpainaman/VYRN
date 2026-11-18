@@ -60,3 +60,16 @@ cd /Users/namanbajpai/plankbook/.claude/skills/excalidraw-diagram/references && 
 
 Then open the PNG with your image-reading tool and fix overlaps, clipped text, stray arrows and lopsided
 spacing, then render again. Two or three passes is normal. A diagram you never looked at is not done.
+
+## When a spec edit adds or moves an ASCII block
+
+The `site-diagrams` CI job fails when `site/content/spec` or `diagrams/inventory.json` is stale. Regenerate
+both from the repository root and commit the result:
+
+```bash
+(cd site && node scripts/sync-spec.mjs && node scripts/diagram-inventory.mjs)
+```
+
+If a block before an existing figure moved, that figure's `asciiIndex` in `diagrams/manifest/*.json` is now
+wrong. Set it to the block's new index in `inventory.json` and keep `file` unchanged. Check the new block is
+the one the figure's `alt` describes, then run `(cd site && pnpm exec vitest run lib/diagrams.test.ts)`.
