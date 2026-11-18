@@ -20,7 +20,7 @@
 //! | `[keys] seq` | the `seq_key` handle (Ed25519 seed) |
 //! | `[epoch_boundary] next, t_ns, to_home, seq_index` | optional: per-lane `EpochNotice` triggers (08 §2.4) |
 //! | `[[dev_session]] lane, slot, account, k_seq, k_out, quote, base` | DEV only: sessions opened at start |
-//! | `[repair] port, slots = 65536, max_pps = 50000, session_pps = 2000` | optional: `SeqDataReq` (07 §5.5 source 3) on its own thread; see `repair.rs` |
+//! | `[repair] port, slots = 65536, max_pps = 50000, session_pps = 2000, xchg` | optional: `SeqDataReq` (07 §5.5 source 3) on its own thread; with `xchg` (needs `[consensus]`) only fetches sealed under `K_fetch` are served; see `repair.rs` |
 //! | `[consensus] ctrl, roster, roster_hash, genesis_hash, seq_order` | optional: the finality listener (`finality.rs`) on `REP_UDP_CTRL`; committee from the roster file (08 §9.6), checked against `roster_hash` |
 //!
 //! **Start sequence** (11 §10.1), each step fail-stops with exit code 2 and one line on stderr:
@@ -256,7 +256,33 @@ where
             .tx_ring(PortId(0), TxClass::Control)
             .map_err(|e| e.to_string())?;
         let replicas = cfg.replication.order.iter().map(|a| *a.ip()).collect();
-        let server = repair::Server::new(r.slots, replicas, r.max_pps, r.session_pps);
+        let mut server = repair::Server::new(r.slots, replicas, r.max_pps, r.session_pps);
+        if let Some(h) = &r.xchg {
+            let c = cfg.consensus.as_ref().ok_or(
+                "config repair.xchg needs [consensus]: K_fetch is derived from the roster",
+            )?;
+            let mode = vyrn_types::Mode::Base;
+            let bytes = finality::roster_bytes(&c.roster)?;
+            let domain = vyrn_epoch::Domain {
+                genesis_hash: vyrn_types::Hash(config::hex::<32>(&c.genesis_hash)?),
+                mode,
+            };
+            if vyrn_epoch::Roster::hash_bytes(&domain, &bytes).0
+                != config::hex::<32>(&c.roster_hash)?
+            {
+                return Err("config consensus.roster does not hash to roster_hash".into());
+            }
+            let roster =
+                vyrn_epoch::Roster::decode(mode, &bytes).map_err(|e| format!("roster: {e}"))?;
+            let home = home_code(&cfg.home).ok_or("config home is not TYO, LDN or NYC")?;
+            server.set_keys(repair::fetch_keys(
+                &roster,
+                &domain,
+                Epoch(cfg.epoch),
+                home,
+                &config::resolve::<32>(h)?,
+            )?);
+        }
         repair_q = Some((server, rrx, rtx));
     }
     let (retain_tx, retain_rx) = match retain_ring.as_mut().and_then(|r| r.split()) {

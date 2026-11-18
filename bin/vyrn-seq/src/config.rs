@@ -55,6 +55,10 @@ pub struct Repair {
     /// `DAV_SESSION_REPAIR_PPS`.
     #[serde(default = "d_session_pps")]
     pub session_pps: u64,
+    /// This box's X25519 secret (`env:NAME`), the private half of its roster `xchg_key`: with
+    /// it only fetches sealed under `K_fetch` are served (`repair.rs`). Needs `[consensus]`.
+    #[serde(default)]
+    pub xchg: Option<String>,
 }
 
 fn d_slots() -> usize {

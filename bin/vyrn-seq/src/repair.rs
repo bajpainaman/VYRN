@@ -15,6 +15,11 @@
 //! `[replication] order`, a frame that is not a fast-path frame, a fetch that does not decode, and
 //! a RANGE or BLOCK fetch (only data boxes serve those).
 //!
+//! **Sealed** (07 §5.5, 08 §9.6, *reading*): with [`Server::set_keys`] the box serves only the
+//! 40-byte form under the requester's `K_fetch(e, i, SEQ_TARGET + j)`, keyed by its source IPv4,
+//! like a keyed data box; `j` is this box's place in `home.seq`. A plain or wrongly tagged
+//! fetch counts in `repair_bad`.
+//!
 //! **Rate** (07 §5.5, 13 §2, DAV-2): each answer takes one token per packet it carries, and a miss
 //! takes one, from a box bucket of `REP_SEQ_DATA_MAX_PPS` = 50k/s. Each packet also takes one
 //! token from its session's bucket of `DAV_SESSION_REPAIR_PPS` = 2,000/s. Each bucket holds 10 ms
@@ -77,6 +82,44 @@ fn cap(rate: u64) -> u64 {
     BURST_NS.saturating_mul(rate).max(most.saturating_mul(SEC))
 }
 
+/// `K_fetch(e, i, SEQ_TARGET + j)` of every requester of `home`, by its `repl_addr` IPv4, for
+/// the `vyrn-seq` box `j` whose X25519 secret is `secret` (08 §9.6). An error if `secret` is no
+/// seq box's key, or no requester gets a key (an empty map would mean plain fetches).
+pub fn fetch_keys(
+    roster: &vyrn_epoch::Roster,
+    domain: &vyrn_epoch::Domain,
+    epoch: vyrn_types::Epoch,
+    home: vyrn_types::HomeCode,
+    secret: &[u8; 32],
+) -> Result<BTreeMap<Ipv4Addr, [u8; 16]>, String> {
+    let n = u8::try_from(roster.home(home).seq.len()).unwrap_or(0);
+    let keys = (0..n)
+        .find_map(|j| {
+            roster.box_fetch_keys(
+                vyrn_epoch::FETCH_CONTEXT,
+                domain,
+                epoch,
+                home,
+                vyrn_epoch::SEQ_TARGET + j,
+                secret,
+            )
+        })
+        .ok_or("repair.xchg is not the X25519 key of a vyrn-seq box of home")?;
+    let mut out = BTreeMap::new();
+    for (i, addr, k) in keys {
+        let ip = addr
+            .ipv4()
+            .ok_or(format!("roster: requester {i} has no IPv4 repl_addr"))?;
+        if out.insert(ip, k).is_some() {
+            return Err(format!("roster: two requesters share {ip}"));
+        }
+    }
+    if out.is_empty() {
+        return Err("roster: no requester has a usable K_fetch".into());
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RepairStats {
     pub served: u64,
@@ -89,6 +132,8 @@ pub struct RepairStats {
 pub struct Server {
     retain: Retain,
     replicas: Vec<Ipv4Addr>,
+    /// `K_fetch` per requester address; empty: plain 32-byte fetches (DEV).
+    keys: BTreeMap<Ipv4Addr, [u8; 16]>,
     box_pps: u64,
     session_pps: u64,
     total: Bucket,
@@ -102,6 +147,7 @@ impl Server {
         Self {
             retain: Retain::new(slots),
             replicas,
+            keys: BTreeMap::new(),
             box_pps,
             session_pps,
             total: Bucket::full(box_pps, 0),
@@ -111,14 +157,24 @@ impl Server {
         }
     }
 
+    /// Serve only fetches sealed under these keys, by source address.
+    pub fn set_keys(&mut self, keys: BTreeMap<Ipv4Addr, [u8; 16]>) {
+        self.keys = keys;
+    }
+
     pub fn put(&mut self, k: Kept) {
         self.retain.put(k);
     }
 
     /// Answers one request from `from` at `now_ns`: the `FETCH_RESP` payload, or `None`.
     pub fn serve(&mut self, from: Ipv4Addr, req: &[u8], now_ns: u64) -> Option<&[u8]> {
-        let key = match Fetch::decode(req) {
-            Ok(Fetch::Key { session, pkt_seq }) if self.replicas.contains(&from) => {
+        let q = if self.keys.is_empty() {
+            Fetch::decode(req).ok()
+        } else {
+            self.keys.get(&from).and_then(|k| Fetch::open(req, k).ok())
+        };
+        let key = match q {
+            Some(Fetch::Key { session, pkt_seq }) if self.replicas.contains(&from) => {
                 (session, pkt_seq)
             }
             _ => {
@@ -262,6 +318,33 @@ mod tests {
             pkt_seq,
         }
         .encode()
+    }
+
+    #[test]
+    fn a_keyed_box_serves_only_sealed_fetches_under_the_sources_key() {
+        let mut s = Server::new(64, vec![R], 50_000, 2_000);
+        let k = [0x42; 16];
+        s.set_keys(BTreeMap::from([(R, k)]));
+        s.put(kept(5, 1, 0xA));
+        let q = Fetch::Key {
+            session: SessionId(5),
+            pkt_seq: 1,
+        };
+        assert!(s.serve(R, &q.encode(), 0).is_none());
+        assert!(
+            s.serve(R, &vyrn_data::frame::seal_fetch(&[0x43; 16], &q), 0)
+                .is_none()
+        );
+        let other = Ipv4Addr::new(10, 0, 0, 3);
+        assert!(
+            s.serve(other, &vyrn_data::frame::seal_fetch(&k, &q), 0)
+                .is_none()
+        );
+        let reply = s
+            .serve(R, &vyrn_data::frame::seal_fetch(&k, &q), 0)
+            .unwrap();
+        assert_eq!(decode(reply).unwrap().n_pkts, 1);
+        assert_eq!((s.stats.served, s.stats.bad), (1, 3));
     }
 
     #[test]

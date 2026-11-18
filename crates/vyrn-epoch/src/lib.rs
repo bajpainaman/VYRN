@@ -89,7 +89,7 @@ pub use roles::{
 };
 pub use roster::{
     Addr, DataBox, FETCH_CONTEXT, HOMES, Home, ROSTER_CONTEXT, ROSTER_VERSION, Roster, RosterErr,
-    SeqEntry, Voter, fetch_key, key_len, xchg_len,
+    SEQ_TARGET, SeqEntry, VOTER_TARGET, Voter, fetch_key, key_len, xchg_len,
 };
 pub use schedule::{
     Boundary, EpoConfig, ScheduleErr, ScheduleRecord, Timetable, default_home, slot_start,

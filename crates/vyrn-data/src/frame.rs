@@ -360,6 +360,12 @@ impl Fetch {
     }
 }
 
+/// The 40-byte authenticated form of `fetch` under `key`, the requester's `K_fetch` (07 §5.5):
+/// what every requester sends to a keyed data box or `vyrn-seq` box.
+pub fn seal_fetch(key: &[u8; 16], fetch: &Fetch) -> [u8; FETCH_AUTH_BYTES] {
+    fetch.seal(key)
+}
+
 /// `data_seq` of the `FETCH_RESP` that answers a KEY fetch.
 pub const fn key_seq(session: SessionId, pkt_seq: u32) -> u64 {
     ((session.0 as u64) << 32) | pkt_seq as u64

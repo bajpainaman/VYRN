@@ -226,7 +226,7 @@ fn listen(
 }
 
 /// Roster bytes from a file: hex text if it is all hex digits (whitespace ignored), else raw.
-fn roster_bytes(path: &std::path::Path) -> Result<Vec<u8>, String> {
+pub fn roster_bytes(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let text: Vec<u8> = raw
         .iter()

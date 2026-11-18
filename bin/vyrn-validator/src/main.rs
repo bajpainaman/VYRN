@@ -18,7 +18,7 @@
 //! | `[cores] order` | REF core of the order core (07 §7.2 core 3); reported, not pinned |
 //! | `[membership] seq_keys = ["<hex>"]` | `REP_Membership`'s `seq_key` per sequencer index (07 §13.1); public keys, so they may sit in the file |
 //! | `[keys] vote, node` | vote key handle; `node` (the p2p identity) defaults to `vote`. Only `env:NAME` (seed hex) resolves, and only with `[consensus]` |
-//! | `[nic] data_port`, `[data] boxes = ["ip:port"], me, max_range` | optional: the data RX queue (07 §5.4); `boxes[i]` is data box `src = i`, `me` this replica's index in their destination lists. Without `[data]` vote-rule item 3 is not checked (DEV) |
+//! | `[nic] data_port`, `[data] boxes = ["ip:port"], me, max_range, xchg` | optional: the data RX queue (07 §5.4); `boxes[i]` is data box `src = i`, `me` this replica's index in their  destination lists; with `xchg` (needs `[consensus]`) every fetch to `boxes[d]` is sealed under `K_fetch(e, me, d)` (08 §9.6). Without `[data]` vote-rule item 3 is not checked (DEV) |
 //! | `dev = false` | `true` marks a DEV validator: only then may `[replay] hashlag_us` differ from 1000 |
 //! | `[replay] tick_min, tick_max, win_center, slot_cap, hashlag_us, [[replay.session]] lane, slot, account, k_seq, quote, base` | optional, needs `[data]`: replay of every block that passes item 3 on `vyrn-engine` (`replay.rs`), built from the sequencer's `[engine]` and `[[dev_session]]` (no state snapshot encoding yet). `hashlag_us` (DEV only, default 1000 = the spec's 1 ms, 07 §3.7) is the `REP_E_HASHLAG` bound, for unpinned DEV hosts |
 //! | `[consensus] roster, roster_hash, genesis_hash, home, seq_order, observers, delta_ms, storage` | optional: the Simplex voter (`consensus.rs`); committee and peers from the roster file (08 §9.6), checked against `roster_hash`; `membership.seq_keys[0]` must be the roster's primary `seq_key` |
@@ -120,6 +120,12 @@ struct Data {
     /// The largest RANGE fetch a data box accepts, in frames.
     #[serde(default = "d_range")]
     max_range: u64,
+    /// This voter's X25519 secret (`env:NAME`), the private half of its roster `xchg_key`:
+    /// with it every fetch to `boxes[d]` is sealed under `K_fetch(e, me, d)` (07 §5.5, 08
+    /// §9.6). Needs `[consensus]`. Without it fetches go unsealed, which only an open-mode
+    /// (DEV) box serves.
+    #[serde(default)]
+    xchg: Option<String>,
 }
 
 fn d_range() -> u64 {
@@ -326,6 +332,27 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                 })
                 .map_err(|e| e.to_string())?;
             let n = u8::try_from(d.boxes.len()).map_err(|_| "config data.boxes: too many")?;
+            let keys = match (&d.xchg, &plan) {
+                (None, _) => Vec::new(),
+                (Some(_), None) => {
+                    return Err(
+                        "config data.xchg needs [consensus]: K_fetch is derived from the roster"
+                            .into(),
+                    );
+                }
+                (Some(h), Some(p)) => {
+                    let secret = consensus::resolve(h)?;
+                    (0..n)
+                        .map(|b| {
+                            p.fetch_key(b, &secret).ok_or_else(|| {
+                                format!("config data.xchg: no K_fetch for box {b} (08 §9.6)")
+                            })
+                        })
+                        .collect::<Result<_, String>>()?
+                }
+            };
+            // A box keys a requester by its repl_addr's IPv4 (08 §9.6), so fetches leave from
+            // [nic] ip: the reading is that it is this voter's repl_addr IP.
             let repair = UdpSocket::bind(SocketAddrV4::new(ip, 0)).map_err(|e| e.to_string())?;
             repair.set_nonblocking(true).map_err(|e| e.to_string())?;
             println!("DATA rx={}", drx.local_addr());
@@ -338,6 +365,7 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                 rx: drx,
                 repair,
                 boxes: d.boxes.clone(),
+                keys,
                 max_range: d.max_range,
                 fetches: VecDeque::new(),
                 missing: None,
@@ -438,10 +466,12 @@ struct DataRx<const N: usize, R> {
     /// an ephemeral socket nothing polls. RANGE answers come to `rx` as data frames.
     repair: UdpSocket,
     boxes: Vec<std::net::SocketAddrV4>,
+    /// `K_fetch` per box, by index (`[data] xchg`); empty: fetches go unsealed (DEV).
+    keys: Vec<[u8; 16]>,
     max_range: u64,
     /// Gaps not fully fetched yet, with the box to ask: at most `FETCH_BURST` RANGE fetches go
     /// out per poll and a gap's `from` moves past them. One entry per gap, however long.
-    fetches: VecDeque<(SocketAddrV4, Gap)>,
+    fetches: VecDeque<(u8, Gap)>,
     /// The payload the front pending block waits for, and when it was last fetched by key.
     missing: Option<(SessionId, u32, u64)>,
 }
@@ -498,8 +528,8 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             }
         }
         for g in gaps {
-            if let Some(to) = self.boxes.get(usize::from(g.src)) {
-                self.fetches.push_back((*to, g));
+            if self.boxes.get(usize::from(g.src)).is_some() {
+                self.fetches.push_back((g.src, g));
             }
         }
         let mut budget = FETCH_BURST;
@@ -516,7 +546,7 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                     }
                 }
                 // UDP: a lost fetch is retried by key while its payload stays missing.
-                let _ = self.repair.send_to(&Fetch::encode(&q), *to);
+                send(&self.repair, &self.boxes, &self.keys, &q, usize::from(*to));
             }
             if done {
                 self.fetches.pop_front();
@@ -579,11 +609,22 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
     /// A KEY fetch to every configured box: the validator has no session-to-data-home map yet
     /// (DEV reading, PR body), and a box that lacks the packet does not answer.
     fn fetch_key(&mut self, session: SessionId, pkt_seq: u32) {
-        let q = Fetch::encode(&Fetch::Key { session, pkt_seq });
-        for to in &self.boxes {
-            let _ = self.repair.send_to(&q, to);
+        let q = Fetch::Key { session, pkt_seq };
+        for d in 0..self.boxes.len() {
+            send(&self.repair, &self.boxes, &self.keys, &q, d);
         }
     }
+}
+
+/// Sends `q` to box `d`: the 40-byte form under its `K_fetch` when keyed, else the 32 bytes.
+fn send(repair: &UdpSocket, boxes: &[SocketAddrV4], keys: &[[u8; 16]], q: &Fetch, d: usize) {
+    let Some(to) = boxes.get(d) else {
+        return;
+    };
+    let _ = match keys.get(d) {
+        Some(k) => repair.send_to(&vyrn_data::frame::seal_fetch(k, q), to),
+        None => repair.send_to(&q.encode(), to),
+    };
 }
 
 /// Sets the flag when dropped.

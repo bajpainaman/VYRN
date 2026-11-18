@@ -259,6 +259,7 @@ fn roster() -> String {
         if scheme == 0 {
             let keys = r
                 .box_fetch_keys(
+                    crate::FETCH_CONTEXT,
                     &domain,
                     Epoch(8),
                     HomeCode::Ldn,

@@ -39,7 +39,8 @@
 //! follow-up), written by their own thread from a bounded queue so stdout never blocks the poll
 //! loop (a full queue drops and counts the line), and at exit `STATS stored=<n> data_frames=<n>
 //! heartbeats=<n> duplicate=<n> fetch_unauth=<n> fetch_limited=<n> bad_mac=<n> events_dropped=<n>
-//! events_unprinted=<n>`. A stop waits up to 1 s for queued events to print and counts the rest
+//! events_unprinted=<n> fetch_ring_hit=<n> fetch_log_hit=<n> fetch_miss=<n> fetch_resent=<n>`.
+//! A stop waits up to 1 s for queued events to print and counts the rest
 //! in `events_unprinted`, so `EVENT` lines + `events_unprinted` + `events_dropped` = `bad_mac` +
 //! `conflicts`.
 //!
@@ -272,6 +273,7 @@ fn fetch_keys(cfg: &Config) -> Result<BTreeMap<Ipv4Addr, [u8; 16]>, String> {
     let secret = cfg.resolve::<32>(&r.xchg_secret)?;
     let keys = roster
         .box_fetch_keys(
+            vyrn_epoch::FETCH_CONTEXT,
             &domain,
             vyrn_types::Epoch(r.epoch),
             home,
@@ -454,7 +456,7 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
     // A closed stdout (the supervisor went away) is not a reason to fail the stop.
     let _ = writeln!(
         std::io::stdout(),
-        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} bad_mac={} events_dropped={} events_unprinted={unprinted}",
+        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} bad_mac={} events_dropped={} events_unprinted={unprinted} fetch_ring_hit={} fetch_log_hit={} fetch_miss={} fetch_resent={}",
         c.stored,
         c.data_frames,
         c.heartbeats,
@@ -462,7 +464,11 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
         c.fetch_unauth,
         c.fetch_limited,
         c.bad_mac,
-        c.events_dropped
+        c.events_dropped,
+        c.fetch_ring_hit,
+        c.fetch_log_hit,
+        c.fetch_miss,
+        c.fetch_resent
     );
     Ok(())
 }
