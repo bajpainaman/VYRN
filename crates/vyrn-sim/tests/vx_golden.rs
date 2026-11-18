@@ -199,8 +199,7 @@ fn vx_lib() -> Option<std::path::PathBuf> {
 /// Seed 6f with faults `drop 31` (tests/seeds.toml, #199) as a 07 log: replay's `lowver` is an
 /// input there. With the logged LOWVER mask ignored, the band reset publishes other bounds and
 /// snapshot versions than live, and a later packet names a version replay never published
-/// (`NoSnapshot`). The log has in-packet dependencies (gap item 5), so until they are in the Vx
-/// client's subset it must either match `RustReplay` or stop with UNSUPPORTED, never differ.
+/// (`NoSnapshot`). The log also has in-packet Join and Cancel dependencies (05 §3.7).
 #[test]
 fn the_vx_client_replays_sim_seed_6f() {
     const N: usize = 3;
@@ -227,12 +226,9 @@ fn the_vx_client_replays_sim_seed_6f() {
         .collect();
     let Some(lib) = vx_lib() else { return };
     let mut vx = VxReplay::new(&lib, &vx_config(&report.config), data(&store)).unwrap();
-    let got = blocks
+    let got: Vec<Hash> = blocks
         .iter()
-        .map(|b| vx.replay_block(b).map(|o| o.output_hash))
-        .collect::<Result<Vec<_>, _>>();
-    match got {
-        Ok(got) => assert_eq!(got, want),
-        Err(e) => assert!(format!("{e:?}").contains("(unsupported)"), "{e:?}"),
-    }
+        .map(|b| vx.replay_block(b).unwrap().output_hash)
+        .collect();
+    assert_eq!(got, want);
 }

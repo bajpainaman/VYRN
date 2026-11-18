@@ -168,6 +168,7 @@ const OUT_AUCTION : u64 = 3;
 const RESTED_DONE : u64 = 0;
 const RESTED_IN_FLIGHT : u64 = 1;
 const ROLE_TAKER : u64 = 0;
+const ROLE_DEPS : u64 = 1;
 const ROLE_MAKER : u64 = 2;
 
 // Fill events (BBO -> lane).
@@ -178,6 +179,8 @@ const EV_REJECT : u64 = 4;
 const EV_PHASE : u64 = 5;
 const EV_BAND : u64 = 6;
 const EV_UNCROSS : u64 = 7;
+// A dependency's outcome (05 §3.7): liq is its kind, cause 0 or a reject reason.
+const EV_DEP : u64 = 8;
 
 // Op log kinds.
 const OP_NOP : u64 = 0;
@@ -187,6 +190,10 @@ const OP_CANCEL : u64 = 3;
 const OP_REDUCE : u64 = 4;
 // CancelAll (04 §6.6): every order of session sess_id on the lane ends (05 §4.7).
 const OP_KILLALL : u64 = 5;
+// An in-packet dependency of a later forwarded op (05 §3.7): the BBO applies it with that op.
+const OP_DEP : u64 = 6;
+const DK_JOIN : u64 = 1;   // DEP_JOIN
+const DK_CANCEL : u64 = 2; // DEP_CANCEL
 
 // Lane op kinds (pass 1 -> pass 2) and pending settles (05 §7.6).
 const OK_REJECT : u64 = 0;
@@ -273,6 +280,9 @@ struct LOp {
   resp_seq : u64, pkt_seq : u64, snap_ver : u64,
   // The version the lane held when it applied this op (Lane::applied_ver, 07 §3.8 LOWVER).
   aver : u64,
+  // OP_DEP: DK_JOIN or DK_CANCEL. OP_FWD: bit b set when the op at LaneSeq seq - b is a
+  // dependency (ops per packet < 64).
+  dk : u64, dmask : u64,
 }
 
 struct Ev { step : u64, kind : u64, liq : u64, cause : u64, vslot : u64, handle : u64, tick : u64, qty : u64 }
@@ -281,6 +291,8 @@ struct Ev { step : u64, kind : u64, liq : u64, cause : u64, vslot : u64, handle 
 struct BOrd {
   state : u64, side : u64, tick : u64, total : u64, filled : u64, killed : u64,
   ts : u64, seq : u64, acct : u64, sess_id : u64, tag : u64, flags : u64, vslot : u64,
+  // A Join dependency rested in step dstep as dependency dg - 1 (vyrn-bbo PendEnt.dep).
+  dstep : u64, dg : u64,
 }
 
 struct Lane {
@@ -332,6 +344,8 @@ struct Bbo {
   rc_has : u64, rc_l : u64, rc_q : u64, rc_lo : u64, rc_hi : u64,
   // Set while that taker sweeps: makers are seen at its key (05 §5.2 visible_at), not the cut.
   kv : u64,
+  // The step's deps packet (NONE without one) and each TX record's dependency index.
+  dh : i64, tgrp : *mut u64,
 }
 
 struct Ctx {
@@ -1531,22 +1545,41 @@ fn forward(c : *mut Ctx, l : i64, m : *mut i8, op : *mut Op, cross : bool) -> vo
     }
     if bar != 0u64 { pass2_through(c, l, bar); }
     if (*ln).err != 0u64 { return; }
-    // Earlier unapplied local Joins and Cancels in range would be dependencies, which are not in
-    // the supported subset.
+    // Dependencies (05 §3.7, vyrn-lane forward): earlier unapplied, not explicit Joins and
+    // Cancels of another order in range. Each becomes explicit and goes to the BBO with j as an
+    // OP_DEP entry at its own LaneSeq.
+    let mut dmask = 0u64;
     for i in 0i64..((*ln).n_ops - 1i64) {
       let o = opk(ln, i);
       if (*o).applied != 0u64 || (*o).explicit != 0u64 || (*o).has_side == 0u64 { continue; }
       if (*o).root == (*op).root { continue; }
       let opp_side = (*o).side != js;
       let in_rng = opp_side && ((js == 0u64 && (*o).tick <= jt) || (js == 1u64 && (*o).tick >= jt));
-      if in_rng && ((*o).k == OK_JOIN || (*o).k == OK_CANCEL) {
-        fail_lane(ln, E_UNSUPPORTED);
-        return;
+      if !in_rng || ((*o).k != OK_JOIN && (*o).k != OK_CANCEL) { continue; }
+      (*o).explicit = 1u64;
+      dmask = dmask | (1u64 << ((*op).seq - (*o).seq));
+      let rp = root(ln, (*o).root);
+      let d = put_op(c, l, (*o).seq, OP_DEP);
+      (*d).root = (*o).root; (*d).ix = (*o).ix; (*d).tag = (*rp).tag; (*d).ts = (*ln).cur_ts;
+      if (*o).k == OK_JOIN {
+        let sp = slot(ln, (*o).v);
+        (*sp).explicit = 1u64;
+        (*d).dk = DK_JOIN; (*d).vslot = (*o).v; (*d).side = (*sp).side; (*d).tick = (*sp).tick;
+        (*d).total = (*sp).total; (*d).flags = (*sp).flags; (*d).ts = (*sp).ts;
+        (*d).sess_id = (*sess(ln, (*sp).sess)).id; (*d).acct = (*acct(ln, (*rp).acct)).ix;
+      } else {
+        let leg = (*slot(ln, (*o).v)).leg;
+        let hp = slot(ln, leg);
+        (*d).dk = DK_CANCEL; (*d).vslot = leg; (*d).side = (*hp).side; (*d).tick = (*hp).tick;
+        (*d).flags = (*hp).flags;
+        // An explicit cancel can be shed (contract rule R): the order is not ended locally.
+        (*rp).local_end = 0u64;
       }
     }
+    if (*ln).err != 0u64 { return; }
     let s = sess(ln, (*ln).cur_sess);
     let rs = (*s).next_resp;
-    (*s).next_resp = (rs + 1u64) & U32_MAX;
+    (*s).next_resp = (rs + (if dmask != 0u64 { 2u64 } else { 1u64 })) & U32_MAX;
     let e = put_op(c, l, (*op).seq, OP_FWD);
     let v = (*op).v;
     let sp = slot(ln, v);
@@ -1555,7 +1588,7 @@ fn forward(c : *mut Ctx, l : i64, m : *mut i8, op : *mut Op, cross : bool) -> vo
     (*e).sess_id = (*s).id; (*e).acct = (*acct(ln, (*s).acct)).ix; (*e).tag = rd32(m, 12i64);
     (*e).snap_ver = (*ln).snap_ver;
     (*e).ix = (*op).ix; (*e).cross = if cross { 1u64 } else { 0u64 };
-    (*e).resp_seq = rs; (*e).pkt_seq = (*ln).cur_pkt;
+    (*e).resp_seq = rs; (*e).pkt_seq = (*ln).cur_pkt; (*e).dmask = dmask;
     // The forwarded queue, in LaneSeq order.
     loop {
       let t = sld(c, 2i64 * l + 1i64, Y_FWD_TAIL);
@@ -1729,6 +1762,24 @@ fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
     let leg = (*sp).leg;
     let rp = root(ln, (*sp).root);
     let k = (*ev).kind;
+    if k == EV_DEP {
+      // vyrn-lane on_dep: a rested Join needs nothing here; a refused one ends its order. A
+      // Cancel that took effect ends its order; TOO_LATE, BUSY or AUCTION_PHASE change nothing.
+      let c0 = (*ev).cause;
+      if (*ev).liq == DK_JOIN {
+        if c0 == 0u64 { return; }
+        if c0 == BUSY { shed_leg(c, ln, leg); } else { release(c, ln, leg); }
+      } else if c0 == 0u64 && (*ev).qty > 0u64 {
+        (*slot(ln, (*rp).cur)).tomb = 1u64;
+        release(c, ln, leg);
+      } else {
+        return;
+      }
+      (*slot(ln, leg)).dead = 1u64;
+      (*rp).ended = 1u64;
+      (*rp).end_detail = D_CANCELED;
+      return;
+    }
     if k == EV_FILL {
       let taker = (*ev).liq == LIQ_TAKER;
       if taker {
@@ -2303,6 +2354,32 @@ fn tx_push(c : *mut Ctx, i : i64, lo : u64, hi : u64) -> void {
   wr8(p, 21i64, n + 1u64);
 }
 
+// The deps packet's push (vyrn-bbo TxOut::push): record r of dependency g goes after every
+// record of dependency g or lower, so the packet stays in dependency index order (05 §8.9).
+fn tx_push_g(c : *mut Ctx, i : i64, g : u64, lo : u64, hi : u64) -> void {
+  let p = tx_slot(c, i);
+  let n = rd8(p, 21i64) as i64;
+  if n >= (MAX_RECS as i64) { unsafe { (*(*c).bbo).err = E_FAULT; } return; }
+  unsafe {
+    let gp : *mut u64 = offset_mut((*(*c).bbo).tgrp, i * (MAX_RECS as i64));
+    let mut at = n;
+    for k in 0i64..n {
+      if *offset_mut(gp, k) > g { at = k; break; }
+    }
+    let mut k = n;
+    while k > at {
+      wr64(p, 23i64 + 16i64 * k, rd64(p, 7i64 + 16i64 * k));
+      wr64(p, 31i64 + 16i64 * k, rd64(p, 15i64 + 16i64 * k));
+      *offset_mut(gp, k) = *offset_mut(gp, k - 1i64);
+      k = k - 1i64;
+    }
+    wr64(p, 23i64 + 16i64 * at, lo);
+    wr64(p, 31i64 + 16i64 * at, hi);
+    *offset_mut(gp, at) = g;
+  }
+  wr8(p, 21i64, (n as u64) + 1u64);
+}
+
 fn event(c : *mut Ctx, l : u64, kind : u64, liq : u64, cause : u64, vslot : u64, h : u64,
          tick : u64, qty : u64) -> void {
   unsafe {
@@ -2574,6 +2651,7 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
       if (*b).err != 0u64 { return; }
     }
     (*b).n_tx = 0i64;
+    (*b).dh = NONE;
     (*b).n_fills = 0u64;
     // While an uncross is open only its chunks and Idle steps run (Bbo::decide).
     let unc = (*b).has_unc != 0u64;
@@ -2986,8 +3064,10 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
     let r = (*e).root;
     let h = handle(r);
     let tif = ((*e).flags >> 1u64) & 3u64;
+    let rs1 = if (*e).dmask != 0u64 { ((*e).resp_seq + 1u64) & U32_MAX } else { (*e).resp_seq };
     if kind == K_SHED {
-      let i = tx_open(c, s, (*e).sess_id, (*e).resp_seq, (*e).pkt_seq, l, ROLE_TAKER);
+      if (*e).dmask != 0u64 { apply_deps(c, s, l, q, e, true); }
+      let i = tx_open(c, s, (*e).sess_id, rs1, (*e).pkt_seq, l, ROLE_TAKER);
       event(c, l, EV_REJECT, LIQ_TAKER, BUSY, (*e).vslot, h, (*e).tick, (*e).total);
       tx_push(c, i, rec_lo(R_REJECT, (*e).ix, BUSY, 0u64), rec_hi(0u64, (*e).tag));
       return;
@@ -3000,7 +3080,12 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
       (*o).seq = q; (*o).acct = (*e).acct; (*o).sess_id = (*e).sess_id; (*o).tag = (*e).tag;
       (*o).flags = (*e).flags; (*o).vslot = (*e).vslot; (*o).state = 2u64;
     }
-    let rs = if cont { 0u64 } else { (*e).resp_seq };
+    // 05 §8.5 apply_deps: the dependencies, in index order, before the source.
+    if !cont && (*e).dmask != 0u64 {
+      apply_deps(c, s, l, q, e, false);
+      if (*b).err != 0u64 { return; }
+    }
+    let rs = if cont { 0u64 } else { rs1 };
     let src = tx_open(c, s, (*e).sess_id, rs, (*e).pkt_seq, l, ROLE_TAKER);
     let opp = 1u64 - (*e).side;
     let mut ended = false;
@@ -3061,6 +3146,83 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
     (*b).cont_seq = q;
     let got = if cont || (*b).n_fills > 0u64 { K_CROSS } else { K_IMPROVE };
     if got != kind { fail_bbo(c, E_KIND); } else { }
+  }
+}
+
+// 05 §8.5 apply_deps, §3.7 (4), as Bbo::apply_deps: forwarded op q's dependencies in index
+// order, each recorded in the deps packet (resp_seq of the source; the source takes the next).
+// `shed`: every one gets Reject BUSY and nothing is applied (Bbo::exec_shed).
+fn apply_deps(c : *mut Ctx, s : u64, l : u64, q : u64, e : *mut LOp, shed : bool) -> void {
+  unsafe {
+    let b = (*c).bbo;
+    let li = l as i64;
+    let dh = tx_open(c, s, (*e).sess_id, (*e).resp_seq, (*e).pkt_seq, l, ROLE_DEPS);
+    if dh == NONE { return; }
+    (*b).dh = dh;
+    let ph = (*b).phase;
+    let mut g = 0u64;
+    let mut back = 63u64;
+    while back > 0u64 {
+      if (((*e).dmask >> back) & 1u64) != 0u64 {
+        let dq = q - back;
+        let d = lop(c, li, dq);
+        if (*d).seq != dq || (*d).kind != OP_DEP { fail_bbo(c, E_FAULT); return; }
+        let r = (*d).root;
+        let h = handle(r);
+        let dk = (*d).dk;
+        // Spec follow-up F2: FwdDep has no message index; Rust takes the source's minus back.
+        let ix = sat_sub((*e).ix, back);
+        if shed {
+          let dqty = if dk == DK_JOIN { (*d).total } else { 0u64 };
+          event(c, l, EV_DEP, dk, BUSY, (*d).vslot, h, (*d).tick, dqty);
+          tx_push_g(c, dh, g, rec_lo(R_REJECT, ix, BUSY, 0u64), rec_hi(0u64, 0u64));
+        } else if ph == PH_FROZEN || (ph == PH_HALTED && dk == DK_JOIN) {
+          let why = if ph == PH_FROZEN { AUCTION_PHASE } else { BOOK_HALTED };
+          event(c, l, EV_DEP, dk, why, (*d).vslot, h, (*d).tick, 0u64);
+          tx_push_g(c, dh, g, rec_lo(R_REJECT, ix, why, 0u64), rec_hi(0u64, (*d).tag));
+        } else if dk == DK_JOIN {
+          let o = bord(c, l, r);
+          let op : *mut i8 = o;
+          clear(op, sizeof<BOrd>());
+          (*o).side = (*d).side; (*o).tick = (*d).tick; (*o).total = (*d).total; (*o).ts = (*d).ts;
+          (*o).seq = dq; (*o).acct = (*d).acct; (*o).sess_id = (*d).sess_id; (*o).tag = (*d).tag;
+          (*o).flags = (*d).flags; (*o).vslot = (*d).vslot;
+          // It enters like a New (Bbo::join_dep): a Join that crosses at the source's cut would
+          // match before the source and end the step, which the client does not replay.
+          if ph == PH_CONT {
+            let opp = 1u64 - (*d).side;
+            let from = if opp == 0u64 { (*b).bb } else { (*b).ba };
+            let empty = if opp == 0u64 { NO_BID } else { NO_ASK };
+            let lvl = if from == empty { 0u64 } else { level_from(c, opp, from) };
+            let crosses = lvl != 0u64 && (if opp == 1u64 { lvl <= (*d).tick } else { lvl >= (*d).tick });
+            if crosses { fail_bbo(c, E_UNSUPPORTED); return; }
+          } else { }
+          book_add(c, l, r);
+          rest_bound(c, (*d).side, (*d).tick);
+          (*o).dstep = s;
+          (*o).dg = g + 1u64;
+          event(c, l, EV_DEP, DK_JOIN, 0u64, (*d).vslot, h, (*d).tick, (*d).total);
+          tx_push_g(c, dh, g, rec_lo(R_ACK, ix, 0u64, h), rec_hi((*d).tick, (*d).tag));
+        } else {
+          let o = bord(c, l, r);
+          // Not in the book yet: its Join is applied but past the cut (unreplayed).
+          if (*o).state == 0u64 { fail_bbo(c, E_UNSUPPORTED); return; }
+          let open = if (*o).state == 3u64 { 0u64 } else { bopen(c, l, r) };
+          (*o).killed = 1u64;
+          book_drop(c, l, r);
+          if open == 0u64 {
+            event(c, l, EV_DEP, DK_CANCEL, TOO_LATE, (*d).vslot, h, (*d).tick, 0u64);
+            tx_push_g(c, dh, g, rec_lo(R_REJECT, ix, TOO_LATE, 0u64), rec_hi(0u64, (*d).tag));
+          } else {
+            event(c, l, EV_DEP, DK_CANCEL, 0u64, (*d).vslot, h, (*d).tick, open);
+            tx_push_g(c, dh, g, rec_lo(R_CXL, ix, 0u64, h), rec_hi(open, (*d).tag));
+          }
+        }
+        if (*b).err != 0u64 { return; }
+        g = g + 1u64;
+      } else { }
+      back = back - 1u64;
+    }
   }
 }
 
@@ -3184,8 +3346,16 @@ fn sweep(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, kb : bool, from : u64) 
         let mh = handle(mr);
         event(c, ml, EV_FILL, LIQ_MAKER, 0u64, (*mo).vslot, mh, lvl, q);
         (*b).n_fills = (*b).n_fills + 1u64;
-        let mi2 = tx_open(c, (*b).next, (*mo).sess_id, 0u64, 0u64, ml, ROLE_MAKER);
-        tx_push(c, mi2, rec_lo(R_FILL, INDEX_NONE, LIQ_MAKER, mh), rec_hi(lvl, q));
+        // A Join dependency rested in this step takes its maker record in the deps packet
+        // while it has room (vyrn-bbo maker_record, spec follow-up F8).
+        let dh = (*b).dh;
+        if (*mo).dg != 0u64 && (*mo).dstep == (*b).next && dh != NONE
+           && rd8(tx_slot(c, dh), 21i64) < MAX_RECS {
+          tx_push_g(c, dh, (*mo).dg - 1u64, rec_lo(R_FILL, INDEX_NONE, LIQ_MAKER, mh), rec_hi(lvl, q));
+        } else {
+          let mi2 = tx_open(c, (*b).next, (*mo).sess_id, 0u64, 0u64, ml, ROLE_MAKER);
+          tx_push(c, mi2, rec_lo(R_FILL, INDEX_NONE, LIQ_MAKER, mh), rec_hi(lvl, q));
+        }
         if bopen(c, ml, mr) == 0u64 { book_drop(c, ml, mr); }
         let o = bord(c, l, r);
         (*o).filled = (*o).filled + q;
@@ -3444,7 +3614,8 @@ pub fn pbv_new(cfg : *const i8, accts : *const i8, n_accts : u32, sp : *const i8
     (*b).book_l = zalloc(8i64 * n * (slot_cap as i64));
     (*b).book_r = zalloc(8i64 * n * (slot_cap as i64));
     (*b).tx = zalloc(TX_BYTES * MAX_TX);
-    if is_null_mut((*b).ords) || is_null_mut((*b).book_l) || is_null_mut((*b).tx) { return nul; }
+    (*b).tgrp = zalloc(8i64 * MAX_TX * (MAX_RECS as i64));
+    if is_null_mut((*b).ords) || is_null_mut((*b).book_l) || is_null_mut((*b).tx) || is_null_mut((*b).tgrp) { return nul; }
     (*c).pool = rd64(cfg, 48i64);
     (*c).pa_id = zalloc(8i64 * ((n_sess as i64) + 1i64));
     let pd : *mut AtomicU64 = zalloc(8i64 * ((n_sess as i64) + 1i64));
@@ -3504,6 +3675,7 @@ pub fn pbv_free(c : *mut Ctx) -> void {
     let q5 : *mut i8 = (*b).book_l; free(q5);
     let q6 : *mut i8 = (*b).book_r; free(q6);
     free((*b).tx);
+    let q7 : *mut i8 = (*b).tgrp; free(q7);
     let v0 : *mut i8 = (*b).vh_ver; free(v0);
     let v1 : *mut i8 = (*b).vh_b; free(v1);
     let v2 : *mut i8 = (*b).vh_a; free(v2);
