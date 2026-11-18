@@ -353,16 +353,21 @@ impl Membership {
     /// The [`Membership`] of `cfg.epoch` from the roster bytes `cfg` names (08 §9.6): checks
     /// `roster_hash`, decodes, checks `sig_scheme`, `epoch_from` and `seq_order`, then takes
     /// `home(e)`'s voters in index order and `seq_order`'s boxes, spares after them in roster
-    /// order. Returns the decoded roster too, for addresses and the bridge set.
+    /// order. CHAIN needs the node's `bridge` signer table, which the roster's set must match
+    /// (R7); BASE ignores it. Returns the decoded roster too, for addresses and the bridge set.
     pub fn from_roster(
         cfg: &EpoConfig,
         bytes: &[u8],
         domain: &Domain,
+        bridge: Option<&BridgeSignerTable>,
     ) -> Result<(Self, Roster), RosterErr> {
         if Roster::hash_bytes(domain, bytes) != cfg.roster_hash {
             return Err(RosterErr::Hash);
         }
         let roster = Roster::decode(domain.mode, bytes)?;
+        if domain.mode == Mode::Chain {
+            roster.check_bridge(bridge.ok_or(RosterErr::Bridge)?)?;
+        }
         if roster.sig_scheme != cfg.sig_scheme {
             return Err(RosterErr::Scheme {
                 got: roster.sig_scheme,
@@ -468,8 +473,10 @@ mod tests {
             let domain = testkit::domain(mode);
             let roster = testkit::roster(mode, 0);
             let cfg = testkit::config(&domain, &roster);
-            let (next, decoded) = Membership::from_roster(&cfg, &roster.encode(), &domain)
-                .unwrap_or_else(|e| panic!("{e}"));
+            let table = testkit::bridge_table(&roster);
+            let (next, decoded) =
+                Membership::from_roster(&cfg, &roster.encode(), &domain, table.as_ref())
+                    .unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(decoded, roster);
             let want = testkit::next(mode);
             for i in 0..u8::try_from(mode.n()).unwrap_or(0) {
@@ -489,18 +496,27 @@ mod tests {
     }
 
     #[test]
-    fn the_bridge_set_must_be_the_tables() {
+    fn a_chain_membership_needs_the_tables_bridge_set() {
+        let domain = testkit::domain(Mode::Chain);
         let roster = testkit::roster(Mode::Chain, 0);
-        let mut set = roster.bridge.unwrap_or_else(|| panic!("chain roster"));
-        set.rotation_no = 0;
-        let table = BridgeSignerTable::genesis(set).unwrap_or_else(|e| panic!("{e}"));
-        // The fixture names rotation 2, which this table never activated.
-        assert_eq!(roster.check_bridge(&table), Err(RosterErr::Bridge));
-        let mut at_zero = roster.clone();
-        at_zero.bridge = Some(set);
-        assert_eq!(at_zero.check_bridge(&table), Ok(()));
-        set.bridge_keys[4] = [0xEE; 20];
-        at_zero.bridge = Some(set);
-        assert_eq!(at_zero.check_bridge(&table), Err(RosterErr::Bridge));
+        let cfg = testkit::config(&domain, &roster);
+        let bytes = roster.encode();
+        let from = |t: Option<&BridgeSignerTable>| {
+            Membership::from_roster(&cfg, &bytes, &domain, t).map(|_| ())
+        };
+        let table = testkit::bridge_table(&roster);
+        assert_eq!(from(table.as_ref()), Ok(()));
+        // No table, or a table whose rotation 0 has other keys: no membership.
+        assert_eq!(from(None), Err(RosterErr::Bridge));
+        let mut other = roster.bridge.unwrap_or_else(|| panic!("chain roster"));
+        other.bridge_keys[4] = [0xEE; 20];
+        let other = BridgeSignerTable::genesis(other).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(from(Some(&other)), Err(RosterErr::Bridge));
+        // A rotation the table never activated.
+        let mut later = roster.clone();
+        if let Some(set) = later.bridge.as_mut() {
+            set.rotation_no = 1;
+        }
+        assert_eq!(later.check_bridge(&other), Err(RosterErr::Bridge));
     }
 }

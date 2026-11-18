@@ -232,7 +232,7 @@ pub fn roster(mode: Mode, scheme: u8) -> crate::Roster {
         bridge: match mode {
             Mode::Base => None,
             Mode::Chain => Some(crate::BridgeSigners {
-                rotation_no: 2,
+                rotation_no: 0,
                 bridge_keys: core::array::from_fn(|i| [0xB0 + i as u8; 20]),
                 guardian_keys: core::array::from_fn(|i| [0xB8 + i as u8; 20]),
             }),
@@ -272,4 +272,11 @@ pub fn gxk_seed(h: u8, i: u8) -> [u8; 32] {
     s[0] = h;
     s[1] = i;
     s
+}
+
+/// CHAIN: the signer table whose genesis set is `roster`'s bridge set; BASE: none.
+pub fn bridge_table(roster: &crate::Roster) -> Option<crate::BridgeSignerTable> {
+    roster
+        .bridge
+        .map(|set| crate::BridgeSignerTable::genesis(set).unwrap_or_else(|e| panic!("{e}")))
 }

@@ -234,7 +234,8 @@ fn roster() -> String {
          # Fixture: testkit::roster. LDN voter i has vote seed [0x41+i; 32] and GXK seed [2, i, 0xC7 x 30];\n\
          # LDN vyrn-seq box j has seq seed [0x90+j; 32] and XK seed [0x98+j; 32].\n\
          # EpoConfig(8) is LDN with seq_order [n, n+1].\n\
-         # verdict is Membership::from_roster. A reject_ case edits the fixture as its name says;\n\
+         # verdict is Membership::from_roster; CHAIN passes a signer table whose rotation 0 is the\n\
+         # roster's bridge set. A reject_ case edits the fixture as its name says;\n\
          # its roster_hash is the hash of the edited bytes unless the case edits the hash itself.\n\n",
     );
     for (mode, scheme) in [(Mode::Base, 0u8), (Mode::Chain, 0), (Mode::Chain, 1)] {
@@ -252,7 +253,8 @@ fn roster() -> String {
             let _ = writeln!(s, "roster = {}", hex(&bytes));
         }
         let _ = writeln!(s, "roster_hash = {}", hex(&cfg.roster_hash.0));
-        let got = Membership::from_roster(&cfg, &bytes, &domain);
+        let table = testkit::bridge_table(&r);
+        let got = Membership::from_roster(&cfg, &bytes, &domain, table.as_ref());
         let _ = writeln!(
             s,
             "verdict = {}",
@@ -343,7 +345,7 @@ fn roster() -> String {
         let _ = writeln!(s, "roster_hash = {}", hex(&cfg.roster_hash.0));
         let _ = writeln!(s, "seq_order = {} {}", cfg.seq_order[0], cfg.seq_order[1]);
         let _ = writeln!(s, "sig_scheme = {}", cfg.sig_scheme);
-        let got = Membership::from_roster(&cfg, &bytes, &domain).map(|_| ());
+        let got = Membership::from_roster(&cfg, &bytes, &domain, None).map(|_| ());
         let _ = writeln!(s, "verdict = {}\n", roster_verdict(got));
     }
     s
