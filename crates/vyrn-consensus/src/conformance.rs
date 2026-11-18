@@ -45,6 +45,7 @@ fn verdict(r: Result<(), CertErr>) -> &'static str {
         Err(CertErr::Epoch) => "epoch",
         Err(CertErr::Proposal(_)) => "proposal",
         Err(CertErr::Length) => "length",
+        Err(CertErr::Seal) => "seal",
     }
 }
 
@@ -91,6 +92,7 @@ fn generate() -> String {
             parent_view: view - 1,
             proposal,
             sigs: Vec::new(),
+            seal: None,
         };
         let msg = c.message();
         c.sigs = signers

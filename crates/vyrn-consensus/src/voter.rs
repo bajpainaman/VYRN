@@ -370,6 +370,8 @@ impl<E: Clock + Spawner, S: BlockSource> Finalized<E, S> {
             parent_view: f.proposal.parent.get(),
             proposal,
             sigs,
+            // This voter never proposes or verifies a seal yet (07 §9.4 follow-up).
+            seal: None,
         })
     }
 }
@@ -396,6 +398,7 @@ impl<E: Clock + Spawner, S: BlockSource> Finalized<E, S> {
             proposal,
             index: self.committee.voter_of(self.me)?,
             sig: sig.try_into().ok()?,
+            seal: None,
         })
     }
 }
