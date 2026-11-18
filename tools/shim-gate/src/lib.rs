@@ -7,7 +7,9 @@
 //! - **Rule:** the non-blank, non-comment lines of `shim.c` plus `shim.h` must not exceed
 //!   [`MAX_LINES`] (300). A line counts when any character on it lies outside a comment and is not
 //!   whitespace. `//` and `/* .. */` comments are recognised; comment markers inside string and
-//!   character literals are not comments. Preprocessor lines count like any other code line.
+//!   character literals are not comments. A line ending in `\` splices onto the next (C11
+//!   translation phase 2), so a string literal or `//` comment continues there. Preprocessor
+//!   lines count like any other code line.
 //! - **Ordering:** `shim.h` is counted first, then `shim.c` (the header is what `vyrn-nic` binds).
 //!   The violation names the file and line of the first code line past the limit, so a reviewer
 //!   lands on the line that broke it.
@@ -53,6 +55,7 @@ pub fn code_lines(src: &str) -> Result<Vec<usize>, usize> {
         Code,
         Block(usize),
         Str(char),
+        Line,
     }
     let mut st = St::Code;
     let mut out = Vec::new();
@@ -62,6 +65,7 @@ pub fn code_lines(src: &str) -> Result<Vec<usize>, usize> {
         let mut chars = line.chars().peekable();
         while let Some(c) = chars.next() {
             match st {
+                St::Line => {}
                 St::Block(_) => {
                     if c == '*' && chars.peek() == Some(&'/') {
                         chars.next();
@@ -77,7 +81,10 @@ pub fn code_lines(src: &str) -> Result<Vec<usize>, usize> {
                     }
                 }
                 St::Code => match c {
-                    '/' if chars.peek() == Some(&'/') => break,
+                    '/' if chars.peek() == Some(&'/') => {
+                        chars.next();
+                        st = St::Line;
+                    }
                     '/' if chars.peek() == Some(&'*') => {
                         chars.next();
                         st = St::Block(n);
@@ -91,8 +98,9 @@ pub fn code_lines(src: &str) -> Result<Vec<usize>, usize> {
                 },
             }
         }
-        // A string literal does not continue past the end of a line in C11 without `\`.
-        if let St::Str(_) = st {
+        // Translation phase 2: a line that ends in `\\` splices onto the next, so a string literal
+        // or a `//` comment continues there. Otherwise both end with the line.
+        if matches!(st, St::Str(_) | St::Line) && !line.ends_with('\\') {
             st = St::Code;
         }
         if code {

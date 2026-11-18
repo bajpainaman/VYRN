@@ -18,7 +18,10 @@
 //! - **Baseline directory:** `runner.toml` with `schema = 1`, `runner` and `mad_ppm` (the runner's
 //!   median absolute deviation from qualification, in parts per million), and `main/*.toml`,
 //!   results files of past `main` runs. Files sort by name, oldest first; name them
-//!   `<commit time as SOURCE_DATE_EPOCH>-<short sha>.toml`.
+//!   `<commit time as SOURCE_DATE_EPOCH>-<short sha>.toml`. A baseline run whose `runner` is not
+//!   `runner.toml`'s is reported and left out of every median.
+//! - **Completeness:** the results must carry every `(id, stat)` of the newest usable baseline
+//!   run, so a benchmark that stopped emitting numbers cannot skip the gate.
 //! - **Rule (§9.3):** for each `(id, stat)` of the results, the baseline is the median of that
 //!   metric's values in the last [`HISTORY`] files that contain it (for an even count, the floor
 //!   of the mean of the two middle values). The metric regresses when it is worse than the
@@ -47,6 +50,9 @@
 //! | `missing-stat` | an `id` has `mean` without `p99` or `p99` without `mean` (§9.3 compares both) |
 //! | `duplicate-metric` | one `(id, stat)` appears twice |
 //! | `runner-mismatch` | the results come from another runner than the baseline's |
+//! | `no-metrics` | the results file has no `[[metric]]` (an empty run proves nothing) |
+//! | `missing-metric` | an `(id, stat)` of the newest baseline run is absent from the results |
+//! | `baseline-runner-mismatch` | a baseline run names another runner; its values are not used |
 //!
 //! Conformance vectors: `tools/perf-gate/fixtures/*/`.
 #![forbid(unsafe_code)]
@@ -202,6 +208,51 @@ pub fn check(
                 results.runner, runner.runner
             ),
         });
+    }
+    if results.metric.is_empty() {
+        out.push(Violation {
+            line: 1,
+            rule: "no-metrics",
+            message: "the results file has no [[metric]] table".into(),
+        });
+    }
+    let history: Vec<&Results> = history
+        .iter()
+        .filter(|h| {
+            let ok = h.runner == runner.runner;
+            if !ok {
+                out.push(Violation {
+                    line: 1,
+                    rule: "baseline-runner-mismatch",
+                    message: format!(
+                        "baseline run {} is from `{}`, not `{}`; left out",
+                        h.commit.as_deref().unwrap_or("(no commit)"),
+                        h.runner,
+                        runner.runner
+                    ),
+                });
+            }
+            ok
+        })
+        .collect();
+    if let Some(newest) = history.last() {
+        for m in &newest.metric {
+            if !results
+                .metric
+                .iter()
+                .any(|x| x.id == m.id && x.stat == m.stat)
+            {
+                out.push(Violation {
+                    line: 1,
+                    rule: "missing-metric",
+                    message: format!(
+                        "{}:{} is in the newest baseline run but not here",
+                        m.id,
+                        m.stat.name()
+                    ),
+                });
+            }
+        }
     }
     let tol = tolerance_ppm(runner.mad_ppm);
     let mut seen: BTreeMap<(&str, Stat), usize> = BTreeMap::new();
