@@ -1338,10 +1338,11 @@ seq_keys = ["{key}"]
             .collect::<Vec<_>>()
             .join(", ");
         s.push_str(&format!(
-            "\n[consensus]\nroster = \"{}\"\nroster_hash = \"{}\"\ngenesis_hash = \"{}\"\nhome = \"LDN\"\nobservers = [{observers}]\ndelta_ms = 500\n",
+            "\n[consensus]\nroster = \"{}\"\nroster_hash = \"{}\"\ngenesis_hash = \"{}\"\nhome = \"LDN\"\nobservers = [{observers}]\ndelta_ms = 500\nstorage = \"{}\"\n",
             c.roster.display(),
             c.roster_hash,
             hex(&[0; 32]),
+            dir.join(format!("journal-{i}")).display(),
         ));
     }
     if let Some(rp) = repair {
@@ -1668,9 +1669,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 &bin_dir.join("vyrn-validator"),
                 cli.validator_cpus.as_deref(),
             );
+            // A first start: the journal in the run's directory is empty (`--fresh`).
             c.arg("--config")
                 .arg(cfg)
                 .arg("--stop-on-stdin-eof")
+                .arg("--fresh")
                 .env("VYRN_E2E_VOTE_SEED", hex(&vote_seed(i)))
                 .env("VYRN_E2E_XCHG", hex(&XCHG_SEED));
             nodes.spawn(&format!("validator-{i}"), &mut c, &tx)

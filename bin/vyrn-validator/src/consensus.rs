@@ -59,9 +59,19 @@ pub struct Section {
     /// `REP_DELTA_MS` (07 §6.3); DEV runs on a loaded host may raise it. Default 1.
     #[serde(default = "d_delta")]
     pub delta_ms: u64,
-    /// Where the voter's Simplex journal lives. Default: a temporary directory.
+    /// Where the voter's Simplex journal lives; required for a voter, kept across restarts.
+    /// *Reading* (restart safety): no default. A temporary journal is lost on restart, and a
+    /// voter that restarts without its own votes can sign one that conflicts with them in the
+    /// view it died in (a nullify and a finalize, or two proposals as leader). An observer, which
+    /// does not vote, needs none.
     #[serde(default)]
     pub storage: Option<PathBuf>,
+    /// `--fresh`: the operator's one-shot acknowledgement that this voter starts with an empty
+    /// journal for the epoch; without it, an empty journal refuses to start ([`Plan::new`]). Not a
+    /// config key (a TOML `fresh` is an unknown field): a persistent value would disarm the guard
+    /// for every later wipe.
+    #[serde(skip)]
+    pub fresh: bool,
 }
 
 fn d_delta() -> u64 {
@@ -157,6 +167,14 @@ impl BlockSource for Source {
     }
 }
 
+/// No blob in the journal's partition holds a byte (or the partition does not exist).
+fn journal_empty(part: &std::path::Path) -> bool {
+    std::fs::read_dir(part).map_or(true, |d| {
+        !d.flatten()
+            .any(|e| e.metadata().is_ok_and(|m| m.is_file() && m.len() > 0))
+    })
+}
+
 /// What the voter thread needs, resolved from the config before any thread starts.
 pub struct Plan {
     pub committee: Committee,
@@ -169,8 +187,6 @@ pub struct Plan {
     pub observers: Vec<SocketAddr>,
     pub timeouts: Timeouts,
     pub storage: PathBuf,
-    /// `storage` is this run's temporary directory, removed at exit; a configured one is kept.
-    pub temp_storage: bool,
     /// The roster and the facts that select from it, for `K_fetch` ([`Plan::keyring`]).
     roster: vyrn_epoch::Roster,
     domain: Domain,
@@ -369,9 +385,29 @@ impl Plan {
             retry: d * 3,
             skip: d * 4,
         };
-        let storage = s.storage.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("vyrn-validator-{}-{me}", std::process::id()))
-        });
+        let storage = s
+            .storage
+            .clone()
+            .ok_or("[consensus] storage is required for a voter: its Simplex journal must survive a restart")?;
+        // *Reading* (07 §9 names no check): an empty journal for this epoch is a new voter or a
+        // wiped disk, and a wiped disk can sign against its own lost votes. It starts only with
+        // the operator's `fresh` acknowledgement, which is theirs to give: valid while the
+        // committee has not finalized past genesis in this epoch, or as a known risk.
+        let index = membership
+            .committee()
+            .index_of(&own)
+            .ok_or("keys.vote is not in the committee")?;
+        let part = storage.join(vyrn_consensus::voter::partition(epoch, index));
+        if journal_empty(&part) {
+            if !s.fresh {
+                return Err(format!(
+                    "the Simplex journal {} is empty: a voter that lost its votes can equivocate; start with --fresh only if the committee has not finalized past genesis in epoch {}, or knowingly",
+                    part.display(),
+                    epoch.0
+                ));
+            }
+            println!("FRESH_JOURNAL epoch={} voter={index}", epoch.0);
+        }
         Ok(Self {
             committee: membership.committee().clone(),
             peers,
@@ -383,7 +419,6 @@ impl Plan {
             observers: s.observers.clone(),
             timeouts,
             storage,
-            temp_storage: s.storage.is_none(),
             roster,
             domain,
             home,
@@ -469,8 +504,7 @@ pub fn run(plan: Plan, source: Source, stop: &AtomicBool) -> Result<(), String> 
     };
     let ctrl = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     let cfg = commonware_runtime::tokio::Config::new().with_storage_directory(&plan.storage);
-    let storage = plan.temp_storage.then(|| plan.storage.clone());
-    let r = commonware_runtime::tokio::Runner::new(cfg).start(|ctx| async move {
+    commonware_runtime::tokio::Runner::new(cfg).start(|ctx| async move {
         let n = net::start(
             ctx.child("net"),
             plan.node_seed,
@@ -523,9 +557,5 @@ pub fn run(plan: Plan, source: Source, stop: &AtomicBool) -> Result<(), String> 
         }
         engine.abort();
         Ok::<(), String>(())
-    });
-    if let Some(dir) = storage {
-        let _ = std::fs::remove_dir_all(dir);
-    }
-    r
+    })
 }

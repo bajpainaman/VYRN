@@ -117,6 +117,8 @@ impl Box_ {
             .arg("--config")
             .arg(cfg)
             .arg("--stop-on-stdin-eof")
+            // Each test's journals start empty (07 §6.3 Journal).
+            .arg("--fresh")
             .env(env.0, env.1)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
