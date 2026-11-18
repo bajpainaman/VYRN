@@ -1759,7 +1759,7 @@ links break it counts as the one fault f.
 | One fault: a nullified view | | +2.80 | `t_l` 2 ms + 1 hop; under scheme 1 the next leader's signature is done when the view nullifies (L1′) |
 | **Total, one fault (leader)** | | **9.79** (9.76 scheme 1) | ≤ `FINALITY_MAX_MS` = 10, margin 0.21 (0.24 scheme 1). Under scheme 1 a lost `RangeFix` (+0.75 → 7.71) is a smaller one fault |
 | One fault: a data-box stall | | **pending ruling** | §5.7: 3.80 on top of the data lag gives 10.79 (10.76 scheme 1), over the bound; 01 §14.20 PQ-13 |
-| Reserve, outside the sums: one frame repair | 0.00 | 0.39 | cross-metro, ≤ 0.60 (§4.10); it runs in parallel with the data lag, and `verify` waits for the later, so the pair costs ≤ 0.71. Nothing above spends it: the leader-fault case is 9.76 + 0.39 of reserve under scheme 1 |
+| Reserve, outside the sums: one frame repair | 0.00 | 0.39 | cross-metro, ≤ 0.60 (§4.10); it runs in parallel with the data lag, and `verify` waits for the later, so the pair costs ≤ 0.71. Nothing above spends it: under scheme 1 the leader-fault case is 9.76 by the sums and 9.71 in the model, + 0.39 of reserve |
 | Sequencer fault | | ≤ 9.0 | the seal finalizes the tail ≤ 7.85 ms after the last frame (§9.7) |
 
 The next-proposal row and the one-fault totals come from a scratch discrete-event model of the
