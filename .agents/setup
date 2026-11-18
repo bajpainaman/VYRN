@@ -148,12 +148,24 @@ vxc_build() {
     echo "vx checkout does not match $VX_TAG ($VX_TAG_OBJECT -> $VX_COMMIT)" >&2
     return 1
   fi
+  local pin
+  pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
   (
     cd "$VX_SRC"
     [[ -f config.local ]] || LLVM_VERSION="$VX_LLVM" ./setup.sh >/dev/null
     # shellcheck disable=SC1091
     source config.local
-    cargo build --release --locked --quiet
+    # VX-WORKAROUND W-10 (issue to file): no vxc release binary, so the pin is a local build.
+    # Reproducible vxc: one toolchain name (the pin, not `stable` or the
+    # rustup default), and the registry and toolchain paths remapped. rust-src turns std's
+    # /rustc/<commit> paths into sysroot paths, so the last rule (the last match wins) maps them
+    # back. The target dir stays $VX_SRC/target: build.rs embeds it.
+    local sysroot commit
+    sysroot="$(rustup run "$pin" rustc --print sysroot)"
+    commit="$(rustup run "$pin" rustc -vV | sed -n 's/^commit-hash: //p')"
+    RUSTUP_TOOLCHAIN="$pin" CARGO_TARGET_DIR="$VX_SRC/target" \
+      RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}/registry/src=/cargo/registry/src --remap-path-prefix=$sysroot=/rustc/sysroot --remap-path-prefix=$sysroot/lib/rustlib/src/rust=/rustc/$commit" \
+      cargo build --release --locked --quiet
   )
   ln -sfn "$VX_SRC/target/release/vxc" "$LOCAL_BIN/vxc"
 }
@@ -166,12 +178,17 @@ cargo_tools() {
   # deny/vet/fuzz/show-asm are named by 11 (L54, L58, L102, L613); nextest is a faster runner for
   # the unit tier; cyclonedx writes the release SBOM (11 L316); vx/build.sh checks the vxc pin
   # with b3sum.
-  local tools=() tool
-  for tool in cargo-deny cargo-vet cargo-fuzz cargo-show-asm:cargo-asm cargo-nextest cargo-cyclonedx b3sum; do
-    command -v "${tool#*:}" >/dev/null || tools+=("${tool%%:*}")
+  # One binstall call per tool, b3sum first, so a tool binstall cannot install (cargo-show-asm
+  # builds from source) cannot leave vx/build.sh without b3sum. --force: a tool whose binary is
+  # gone but which cargo's install metadata still lists is otherwise "already installed".
+  local failed=() tool
+  for tool in b3sum cargo-deny cargo-vet cargo-fuzz cargo-show-asm:cargo-asm cargo-nextest cargo-cyclonedx; do
+    command -v "${tool#*:}" >/dev/null && continue
+    cargo binstall --no-confirm --disable-telemetry --force "${tool%%:*}" || failed+=("${tool%%:*}")
   done
-  if ((${#tools[@]})); then
-    cargo binstall --no-confirm --disable-telemetry "${tools[@]}"
+  if ((${#failed[@]})); then
+    echo "cargo binstall failed for: ${failed[*]}" >&2
+    return 1
   fi
 }
 
