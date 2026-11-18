@@ -3,7 +3,8 @@
 //! # Contract
 //!
 //! **Invocation.** `e2e-smoke [--bin-dir DIR] [--validators K] [--packets P] [--rate R]
-//! [--seed S] [--wait-s T] [--finality] [--data]`. `DIR` holds `vyrn-seq` and `vyrn-validator`
+//! [--seed S] [--wait-s T] [--seq-cpus L] [--validator-cpus L] [--strict-hashlag] [--finality]
+//! [--data]`. `DIR` holds `vyrn-seq` and `vyrn-validator`
 //! (default: this binary's directory). Exit 0 when every enabled check passes, 1 when one fails,
 //! 2 when the run could not start. Every wait has a deadline of `T` seconds (default 30): the
 //! harness never blocks on a child, a socket or a pipe without one, and kills every child it
@@ -49,7 +50,9 @@
 //!   unpinned DEV machine one preemption between an ORDER frame and its HASH frame trips it, so
 //!   by default a validator that stops at it is a `WARN`: its blocks before the fault must still
 //!   be the box's, and at least one validator must cover every height. Any other fault fails.
-//!   `--strict-hashlag` fails it as well.
+//!   `--strict-hashlag` fails it as well. `--seq-cpus` and `--validator-cpus` (taskset masks)
+//!   keep the box's two polling threads off the validators' cores. Without them all validators
+//!   can stop at one height when the box is preempted between an ORDER frame and its HASH frame.
 //!
 //! **Known gap.** `vyrn-risk` (`check.rs`, the post-only check) rejects a post-only `New` that
 //! crosses the lane's snapshot in the lane, with the snapshot's opposite tick as the detail.
@@ -127,6 +130,13 @@ struct Cli {
     /// Require finality lines from every validator (R4).
     #[arg(long)]
     finality: bool,
+    /// CPU list for vyrn-seq (taskset -c), so the box's threads do not share cores with the
+    /// validators' polling threads (R5).
+    #[arg(long)]
+    seq_cpus: Option<String>,
+    /// CPU list for every vyrn-validator (taskset -c).
+    #[arg(long)]
+    validator_cpus: Option<String>,
     /// Fail a validator's REP_E_HASHLAG too (pinned rigs); by default it is a WARN (R5).
     #[arg(long)]
     strict_hashlag: bool,
@@ -342,6 +352,18 @@ fn blocks(n: &Node) -> Vec<((u64, u64, u64), &str)> {
             Some(((g("height")?, g("first_step")?, g("last_step")?), b))
         })
         .collect()
+}
+
+/// `bin`, under `taskset -c cpus` when a CPU list is given.
+fn command(bin: &Path, cpus: Option<&str>) -> Command {
+    match cpus {
+        Some(c) => {
+            let mut cmd = Command::new("taskset");
+            cmd.arg("-c").arg(c).arg(bin);
+            cmd
+        }
+        None => Command::new(bin),
+    }
 }
 
 // ----- the replay tap -----
@@ -651,7 +673,10 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let vals: Vec<usize> = (0..cli.validators)
         .map(|i| {
             let cfg = validator_config(&dir, i)?;
-            let mut c = Command::new(bin_dir.join("vyrn-validator"));
+            let mut c = command(
+                &bin_dir.join("vyrn-validator"),
+                cli.validator_cpus.as_deref(),
+            );
             c.arg("--config").arg(cfg).arg("--stop-on-stdin-eof");
             nodes.spawn(&format!("validator-{i}"), &mut c, &tx)
         })
@@ -692,7 +717,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let cl_recv = cl_sock.try_clone().map_err(|e| e.to_string())?;
 
     let cfg = seq_config(&dir, &order, &sessions)?;
-    let mut c = Command::new(bin_dir.join("vyrn-seq"));
+    let mut c = command(&bin_dir.join("vyrn-seq"), cli.seq_cpus.as_deref());
     c.arg("--config")
         .arg(cfg)
         .arg("--stop-on-stdin-eof")
