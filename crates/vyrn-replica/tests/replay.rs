@@ -123,10 +123,36 @@ fn live07_on(script: &[Act], pool: bool) -> (Journal, Store) {
     let (_, mut sh) = new_box();
     let tok = vyrn_cut::PoolTok::new();
     let mut e = pooled_engine(&mut sh, &tok, pool);
+    live07_with(&mut e, script, &[], &|| {})
+}
+
+/// [`live07`] over `vyrn_cut::Sim` with publications delayed by up to `max_delay` ns. Virtual
+/// time moves past every delay before each act except those in `hold`, and before each round of
+/// a `Run`, so a held act sees only what was visible before the act ahead of it.
+fn live07_sim(script: &[Act], hold: &[usize], seed: u64, max_delay: u64) -> (Journal, Store) {
+    let sim = vyrn_cut::Sim::new(seed, max_delay);
+    let bbo = vyrn_bbo::Bbo::new(bbo_cfg());
+    let mut sh = vyrn_engine::Shared::new(&sim, N, arena_cfg(), &bbo.initial_snapshot()).unwrap();
+    let mut e = engine_on(&sim, bbo, &mut sh);
+    let advance = || sim.advance_to(sim.virtual_ns() + max_delay + 1);
+    live07_with(&mut e, script, hold, &advance)
+}
+
+/// Drives `script` on `e`, calling `advance` before each act not in `hold` and before each
+/// round of a `Run`.
+fn live07_with<V: vyrn_cut::Visibility>(
+    e: &mut vyrn_engine::Engine<'_, V, NA>,
+    script: &[Act],
+    hold: &[usize],
+    advance: &dyn Fn(),
+) -> (Journal, Store) {
     let mut j = Journal::default();
     let mut store = Store::default();
     let mut pkt = [[0u32; NA]; N];
-    for act in script {
+    for (i, act) in script.iter().enumerate() {
+        if !hold.contains(&i) {
+            advance();
+        }
         match act {
             Act::Pkt {
                 l,
@@ -164,7 +190,13 @@ fn live07_on(script: &[Act], pool: bool) -> (Journal, Store) {
             Act::Poll => {
                 e.poll_lanes(&mut j).unwrap();
             }
-            Act::Run => assert!(e.run(&NeverLate, &mut j, 64).unwrap(), "no quiescence"),
+            Act::Run => {
+                let quiet = (0..64).any(|_| {
+                    advance();
+                    e.run(&NeverLate, &mut j, 1).unwrap()
+                });
+                assert!(quiet, "no quiescence");
+            }
             Act::Cmd(c) => {
                 assert!(e.command(c), "control ring full");
                 j.cmds.push(*c);
@@ -319,15 +351,21 @@ fn blocks_of(script: &[Act], cuts: &[usize]) -> (Journal, Store, Vec<BlockInputs
 /// [`blocks_of`], with lanes 1 and 2 pooled when `pool` is set.
 fn blocks_on(script: &[Act], cuts: &[usize], pool: bool) -> (Journal, Store, Vec<BlockInputs<N>>) {
     let (live_j, store) = live07_on(script, pool);
+    let blocks = blocks_from(&live_j, &store, cuts, pool);
+    (live_j, store, blocks)
+}
+
+/// The 07 blocks of a live run, framed as [`blocks_on`] frames them.
+fn blocks_from(live_j: &Journal, store: &Store, cuts: &[usize], pool: bool) -> Vec<BlockInputs<N>> {
     let key = vyrn_crypto::ed25519::public_key(&SEED);
     let layout = Layout::new(N as u8, 1, if pool { POOL_MASK } else { 0 }).unwrap();
     let mut core = OrderCore::<N, _>::new(layout, View(key)).unwrap();
-    for f in frames_on(layout, &live_j, &store, cuts) {
+    for f in frames_on(layout, live_j, store, cuts) {
         core.on_frame(&f, 0).unwrap();
     }
     let blocks: Vec<_> = std::iter::from_fn(|| core.take_ready()).collect();
     assert_eq!(blocks.len(), cuts.len() + 1);
-    (live_j, store, blocks)
+    blocks
 }
 
 /// Replays `blocks` on a fresh engine with the live run's response log. Returns the replay's
@@ -1113,8 +1151,17 @@ fn the_vx_client_halts_on_a_forwarded_queue_overflow() {
 /// The Vx client and `RustReplay` produce the live run's bytes and the same output hash in one
 /// block, and the same output hashes with the blocks split after each record index in `splits`.
 fn assert_vx_matches(script: &[Act], splits: impl IntoIterator<Item = usize>) {
+    assert_vx_matches_live(&|| live07(script), splits);
+}
+
+/// [`assert_vx_matches`] on the live run `live` gives.
+fn assert_vx_matches_live(
+    live: &dyn Fn() -> (Journal, Store),
+    splits: impl IntoIterator<Item = usize>,
+) {
     let Some(lib) = vx_lib() else { return };
-    let (live_j, store, blocks) = blocks_of(script, &[]);
+    let (live_j, store) = live();
+    let blocks = blocks_from(&live_j, &store, &[], false);
     let (_, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
     let vx = vx_replay(&store, &blocks, &lib).unwrap();
     let (lanes, tx) = live_bytes(&live_j);
@@ -1124,7 +1171,7 @@ fn assert_vx_matches(script: &[Act], splits: impl IntoIterator<Item = usize>) {
     assert_eq!(vx[0].1, tx, "fill TX packets");
     assert_eq!(vec![vx[0].2], rust_hashes);
     for at in splits {
-        let (live_j, store, blocks) = blocks_of(script, &[at]);
+        let blocks = blocks_from(&live_j, &store, &[at], false);
         let (_, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
         let vx =
             vx_replay(&store, &blocks, &lib).unwrap_or_else(|e| panic!("split after {at}: {e}"));
@@ -1451,6 +1498,129 @@ fn the_vx_client_replays_an_uncross_and_a_seal() {
         let (j, _) = live07(&auction_script(extra));
         assert_vx_matches(&auction_script(extra), 0..j.recs.len() - 1);
     }
+}
+
+/// 05 §8.8 item 6 with a Reduce admitted after the freeze cut C\* but before its lane applies
+/// the uncross (the shape of vyrn-lane's
+/// `a_reduce_admitted_after_the_freeze_does_not_keep_the_auction_reservation`). The auction-only
+/// sell of 10 at 110 on lane 0 does not fill (Q = 1 at 105 on lane 1). The reduce moves it to a
+/// version with `ins_seq` > C\*, but it was visible at C\* through the older one, so it is Out
+/// AUCTION for 10, and the reduce is TOO_LATE. A second auction then fills the lane-1 sell at 110,
+/// not the ended order.
+fn auction_reduce_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::{AuctionOnly, Day};
+    use vyrn_bbo::{ControlCmd, Phase};
+    let phase = |phase, lo, hi| {
+        Act::Cmd(ControlCmd::Phase {
+            phase,
+            lo: vyrn_types::Tick(lo),
+            hi: vyrn_types::Tick(hi),
+        })
+    };
+    let p = |l, a, t: u64, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs,
+    };
+    let unc = |q| {
+        Act::Cmd(ControlCmd::Uncross {
+            price: vyrn_types::Tick(105),
+            qty: q,
+        })
+    };
+    let reduce = vyrn_wire::Msg::Reduce {
+        handle: Handle::new(1, 1).unwrap(),
+        by: vyrn_types::Qty(4),
+        client_tag: 6,
+    };
+    vec![
+        phase(Phase::Auction, 0, 0),
+        Act::Run,
+        p(
+            1,
+            1,
+            1_000,
+            vec![new(Sell, Day, 104, 1, 1), new(Buy, Day, 106, 1, 2)],
+        ),
+        p(0, 1, 2_000, vec![new(Sell, AuctionOnly, 110, 10, 4)]),
+        Act::Run,
+        Act::Poll,
+        phase(Phase::Frozen, 1, TICK_MAX),
+        // Acts 7 to 10. The BBO freezes; lane 0 has not seen it when the reduce arrives, and the
+        // uncross runs before the reduce is visible to the BBO ([`REDUCE_HOLD`]).
+        Act::Step(None),
+        p(0, 1, 3_000, vec![reduce]),
+        unc(1),
+        Act::Step(None),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        phase(Phase::Auction, 0, 0),
+        Act::Run,
+        p(1, 2, 4_000, vec![new(Sell, Day, 110, 1, 7)]),
+        p(2, 1, 4_100, vec![new(Buy, Day, 110, 1, 8)]),
+        Act::Run,
+        Act::Poll,
+        phase(Phase::Frozen, 1, TICK_MAX),
+        Act::Run,
+        Act::Cmd(ControlCmd::Uncross {
+            price: vyrn_types::Tick(110),
+            qty: 1,
+        }),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        Act::Cmd(ControlCmd::Seal),
+        Act::Run,
+    ]
+}
+
+/// The acts of [`auction_reduce_script`] that see only what was visible before the freeze step.
+const REDUCE_HOLD: [usize; 3] = [8, 9, 10];
+
+/// [`auction_reduce_script`] live over `vyrn_cut::Sim`, with [`REDUCE_HOLD`].
+fn auction_reduce_live() -> (Journal, Store) {
+    live07_sim(&auction_reduce_script(), &REDUCE_HOLD, 7, 1_000_000)
+}
+
+#[test]
+fn the_vx_client_ends_an_auction_only_order_reduced_after_the_freeze() {
+    let (live_j, store) = auction_reduce_live();
+    let blocks = blocks_from(&live_j, &store, &[], false);
+    let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let recs = |lane: u8| -> Vec<vyrn_bbo::Record> {
+        live_j
+            .resp
+            .iter()
+            .filter(|(l, _)| l.0 == lane)
+            .flat_map(|(_, p)| p.records().iter().copied())
+            .filter(|r| !matches!(r, vyrn_bbo::Record::Ack { .. }))
+            .collect()
+    };
+    let lane0 = recs(0);
+    assert!(
+        matches!(
+            lane0.as_slice(),
+            [
+                vyrn_bbo::Record::Out { cause: vyrn_bbo::OUT_AUCTION, qty, client_tag: 4, .. },
+                vyrn_bbo::Record::Reject { reason, detail: 3, client_tag: 6, .. },
+            ] if qty.0 == 10 && *reason == vyrn_types::RejectReason::TooLate
+        ),
+        "{lane0:?}"
+    );
+    // The second auction fills the lane-1 sell at 110, not the ended order on lane 0.
+    let fills = |lane| {
+        recs(lane)
+            .iter()
+            .filter(|r| matches!(r, vyrn_bbo::Record::Fill { tick, .. } if tick.0 == 110))
+            .count()
+    };
+    assert_eq!((fills(0), fills(1), fills(2)), (0, 1, 1));
+    assert_vx_matches_live(&auction_reduce_live, 0..live_j.recs.len() - 1);
 }
 
 /// A Rescan whose exact bounds change a later decision (found by a search over small

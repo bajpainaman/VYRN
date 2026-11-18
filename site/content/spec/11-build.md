@@ -1076,11 +1076,16 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   sell would otherwise fill first. Mutation check: dropping the end or `adead` fails the test.
   Running the end before the pending ops ≤ C\* still passes, because no script yet has such an
   op pending at the uncross.
-  **[Reading]** The test is the order's current version, as in `vyrn-lane`: a Reduce admitted
-  after C\* but before the uncross boundary makes a version with `ins_seq` > C\*, and both skip
-  the order, so it keeps its reservation and the Reduce is acknowledged. 05 §8.8 item 6 ends the
-  version visible at C\*. This is a known engine divergence, and the client follows `vyrn-lane`
-  until the engine changes.
+  An order a Reduce moved past C\\* after the freeze is still ended: the lane takes the version
+  in effect at C\\* (`version_at`, through each version's predecessor), outs that version's open
+  quantity, releases and kills every leg from the current version back to it, and holds the
+  `Out` under that version, so the Reduce then settles `TOO_LATE` (05 §8.10 rule 4.1), as
+  `vyrn-lane` does since #202. `tests/replay.rs` drives that script live over `vyrn_cut::Sim`,
+  so the lane admits the Reduce before it sees the freeze and the BBO runs the uncross before it
+  sees the Reduce. A client that tests the current version fails it. Holding the `Out` under the
+  current version, or releasing only its leg, still passes: the `Out` flushes at the uncross
+  boundary, before the Reduce settles, and a Reduce keeps its predecessor's leg. Replace (3b)
+  makes the second one observable.
 - *Gap list (the plan).* What `RustReplay` replays and the Vx client does not yet
   (1, Uncross and Seal, and 2, Rescan batch takers that trade, are done). The order is 5, then 3,
   then 4: dependencies first, since without them the client fully replays only 3 of the first
