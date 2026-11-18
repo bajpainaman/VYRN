@@ -153,8 +153,12 @@ NodeCert {
 }
 ```
 
-A `NodeCert` with `scheme` = 1 must have `valid_from ≤ E_pq − CHN_KEY_LEAD_EPOCHS` to serve in
-`E_pq` (01 §14.20 SG4). A scheme-0 `NodeCert` is not in force for any epoch ≥ `E_pq`.
+**Scheme of the cert in force.** For epoch e, the cert in force is the newest one with
+`valid_from ≤ e` **and** `scheme = EpoConfig(e).sig_scheme`. A hybrid `NodeCert` for the switch
+has `valid_from = E_pq` and is included in a chain block of an epoch ≤ `E_pq −
+CHN_KEY_LEAD_EPOCHS` (the lead rule below, 01 §14.20 SG4). So the hybrid keys never sign in an
+epoch that still requires scheme 0, and the scheme-0 cert stays in force up to `E_pq − 1`. A
+scheme-0 `NodeCert` is not in force for any epoch ≥ `E_pq`, and a hybrid one for none before it.
 
 A `NodeCert` takes effect only when a chain block includes it, and only from `valid_from`, which
 must be at least `CHN_KEY_LEAD_EPOCHS` (4) after the including block's epoch. The lead time exists
@@ -706,8 +710,8 @@ delay bound of the model (01 §14.0 fact 3):
 | `tag_com` of the last payload, exclusion list | 0.05 | 20 ns per packet, incremental; keys precomputed (§5.4) |
 | Hops 2–4: proposal, notarize, finalize → `Q_CHAIN` at every voter and at the sequencer | 2.45 | |
 | Vote signature checks | 0.10 | 0.15 under scheme 1 (hybrid, 01 §14.20): the ML-DSA parts run in parallel with the batched Ed25519 parts |
-| **No fault** | **5.31** | was 4.85 with F1 data homes; 5.36 under scheme 1 |
-| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault; 8.16 under scheme 1 (margin 0.84 ms to the gate) |
+| **No fault** | **5.31** | was 4.85 with F1 data homes; 6.11 under scheme 1 (+0.05 checks, +0.75 one notarize re-sign) |
+| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault; under scheme 1, 8.91 with a missed notarize prediction (07 §6.5a), against the 10.00 ms gate of `FIN_GATE_BLOCKS` = 9 (01 §14.20 D), margin 1.09 ms |
 | or a data box redirect (07 §5.7, 3 ms in place of 0.71) | **7.60** | |
 | or the sequencer is the fault | 07 failover; its seal must be final ≤ 9 ms after the last frame | |
 
@@ -1285,18 +1289,27 @@ side checks them.
    the current owner key, are available from `E_pq`. Wallets that support ML-DSA move first; an
    EVM wallet keeps its `Secp256k1` key until it can.
 2. **Classical cutoff.** Governance sets `CHN_PQ_OWNER_CUTOFF` (an epoch, unset by default) with the
-   72 h timelock. From that epoch a classical `OwnerKey` signs only `SetOwnerKey`, `Withdraw` to the
-   `exit_address` in force at the cutoff, and `CancelWithdraw`; `SetExitAddress` and new sessions
-   need a hybrid key. The exit address is frozen, so a quantum attacker who recovers the key can
-   only send the funds where the owner already said.
+   72 h timelock. At that epoch every account whose `OwnerKey` is still classical gets a permanent
+   flag `exit_frozen` and keeps the `exit_address` in force at the cutoff. The flag is account
+   state and survives every later `SetOwnerKey`: a frozen account never accepts `SetExitAddress`,
+   and all its withdrawals go to the frozen address, whoever holds the owner key. A classical key
+   may still sign `SetOwnerKey` (so the owner can trade again under a hybrid key), `Withdraw` and
+   `CancelWithdraw`. A quantum attacker who recovers the classical key and installs its own hybrid
+   key can therefore trade the account but can send funds only where the owner already said. An
+   owner who loses access to the frozen address recovers through governance, out of band. Accounts
+   that move to a hybrid key before the cutoff are not frozen.
 3. **A second bridge.** The contract is immutable (§6.1), so the post-quantum bridge is a new
    contract that governance adds and users opt into. Its signature check is a pluggable verifier
    address fixed at deployment: a precompile when Ethereum offers one, or a proof that VYRN's
    hybrid `CommitCert` verifies. Bridge keys `BK′` are then hybrid. Its design is out of scope.
-4. **`PqAlarm`.** A governance action (tightening, so it acts at once, §2.10). On `PqAlarm` the
-   validators stop signing posts for the old bridge except posts that only release withdrawals to
-   recorded exit addresses, and every guardian calls `pause()` on new deposits. The old bridge then
-   holds a shrinking balance that its 10% cap protects.
+4. **`PqAlarm`.** A governance action (tightening, so it acts at once, §2.10). The immutable
+   contract has no deposit-only switch, and `pause()` (§6.6) also blocks proposals and claims, so
+   `PqAlarm` does not pause it. Instead: the validators sign only posts whose withdrawals all go to
+   recorded exit addresses (frozen ones included); the SDK, wallet integrations and the public RPC
+   refuse to build deposits to the old bridge and point to the new one; and deposits that still
+   arrive are credited as usual, so no funds are stranded. Guardians keep `pause()` for an attack in
+   progress, as today. The old bridge then holds a shrinking balance that its 10% cap protects.
+   [Likely: deposits stop by tooling, not by the contract]
 5. **Disclosure.** The service contract states: "Funds in the L1 bridge and accounts with classical
    owner keys are not protected against a quantum attacker. VYRN's ordering, finality and history
    are." 01 §14.20 open question PQ-5 asks the owner when to deploy step 3 and raise step 4.

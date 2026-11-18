@@ -443,7 +443,7 @@ Core 1 reads lanes 0–24 and core 6 reads lanes 25–48. Each writes its own ha
 
 ### 14.9 Chain gate and forced inclusion
 
-- `FIN_GATE_BLOCKS` = 8. In both modes, the sequencer never runs more than 8 blocks ahead of finality. If finality lags more than that, the book halts rather than issue fills that cannot be final within 10 ms.
+- `FIN_GATE_BLOCKS` = 8 (9 from `E_pq`, §14.20 D). In both modes, the sequencer never runs more than 8 blocks ahead of finality. If finality lags more than that, the book halts rather than issue fills that cannot be final within 10 ms.
 - A forced packet, under an honest sequencer, is positioned at the first block boundary after the block that includes it is notarized. It is final ≤ 10 ms after it is sent, like any order. `FIN_GATE_BLOCKS` = 8 is only the deadline after which validators treat its absence as censorship (evidence plus failover, §14.0 fact 3).
 - Orders through the normal path are final ≤ `FINALITY_MAX_MS` = 10 ms.
 
@@ -808,16 +808,22 @@ or to fund an audit first.
   replication path rises by about 2.5 MB/s of HEADER_PQ frames (1,000/s × ~2.54 KB with framing), 0.08% of 3,310 MB/s (07 §3.13).
 - **Per-block budgets.** The ML-DSA part of `seq_sig` travels in its own frame and is checked in
   parallel with the data lag, so it adds nothing to the maximum (07 §6.6). Votes are signed
-  speculatively, in parallel with the hops that precede them (07 §6.5a), so they add nothing to
-  the maximum either. The remaining cost is vote checking: 0.10 → 0.15 ms (max, budget). Finality:
-  typical 2.59 → 2.69 ms, max with no fault 5.65 → 5.70 ms, max with one fault 8.65 → 8.70 ms
-  (reserve 1.30 ms), and the finality gate's spare in BASE 0.35 → 0.30 ms (07 §6.8). CHAIN's worst
-  case moves from 8.11 to 8.16 ms (09 §4.8). [Likely: budgets built from the measured figures; the
+  speculatively, in parallel with the hops that precede them (07 §6.5a). Finalize and nullify
+  never miss, and the leader never misses, but a voter can mispredict the notarize range in the
+  fault-free case and re-sign: ≤ 0.75 ms on the notarize hop. Vote checking costs 0.10 → 0.15 ms
+  (max, budget). Finality: typical 2.59 → 2.69 ms, max with no fault 5.65 → 6.45 ms, max with one
+  fault 8.65 → 9.45 ms (reserve 0.55 ms to `FINALITY_MAX_MS`). CHAIN's worst case moves from 8.11
+  to 8.91 ms from block start (09 §4.8). [Likely: budgets built from the measured figures; the
   speculative signing depends on open question PQ-3]
+- **The finality gate.** Block h is final ≤ 8.45 ms after it closes (BASE), past the 8 closed
+  blocks that `FIN_GATE_BLOCKS` = 8 allows. So `FIN_GATE_BLOCKS` = **9** from `E_pq` in both modes
+  (BASE spare 0.55 ms, CHAIN 1.09 ms; 07 §6.8, 09 §4.6). The cost: outside the fault model, ≤ 1 ms
+  more of fills are released unfinal before the halt. The 1 µs answer and the 10 ms finality
+  maximum are unchanged. PQ-8 would bring both budgets back down by removing the miss. [Likely]
 - **If speculative signing is not possible**, the leader's notarize and each voter's notarize
   are signed after `verify`, at ≤ 0.75 ms each, and the one-fault maximum becomes ~10.2 ms, above
   `FINALITY_MAX_MS` = 10. Scheme 1 must then not activate until votes run with `PQ_HEDGE` ≥ 4 on
-  voters too, and BASE also needs `FIN_GATE_BLOCKS` = 9. [Likely]
+  voters too. [Likely]
 
 **E. The switch.** Rules SG1–SG6 follow 04 §12's VR4: the set of accepted schemes changes only at
 an epoch boundary.
@@ -827,7 +833,7 @@ an epoch boundary.
 | SG1 | `EpoConfig(e).sig_scheme` (08 §2.3) fixes the scheme of every live signature made for epoch e: votes, `seq_sig`, `HandoffSig`, root and commit votes. A verifier takes the scheme from the epoch the message names, never from the message. |
 | SG2 | A scheme-0 signature is accepted only on a message of an epoch e < `E_pq`, the first epoch with `sig_scheme` ≥ 1. Old signatures stay valid as history; a new one under the old scheme is rejected, so a forged Ed25519 vote for a current epoch is worthless. |
 | SG3 | `sig_scheme` never decreases. A broken ML-DSA is covered by the Ed25519 half, so no rollback is needed; a downgrade would hand a quantum attacker every later epoch. |
-| SG4 | Hybrid keys are registered at least `CHN_KEY_LEAD_EPOCHS` (4) before `E_pq` (CHAIN: `NodeCert` with `scheme` = 1, 09 §2.3; BASE: `REP_Membership`, 07 §13). The roster of `EpoConfig(E_pq)` then holds only hybrid keys, and `HandoffCert(E_pq − 1)`, the last certificate signed with scheme 0, certifies them. |
+| SG4 | Hybrid keys are included at least `CHN_KEY_LEAD_EPOCHS` (4) before `E_pq` and become active at `E_pq` (CHAIN: `NodeCert` with `scheme` = 1 and `valid_from = E_pq`, 09 §2.3; BASE: `REP_Membership` with `epoch_from = E_pq`, 07 §13). A key of one scheme is never in force in an epoch of another. The roster of `EpoConfig(E_pq)` then holds only hybrid keys, and `HandoffCert(E_pq − 1)`, the last certificate signed with scheme 0, certifies them. |
 | SG5 | CHAIN activates `E_pq` by an `Upgrade` with the 72 h timelock and both clients ready (09 §14.2); BASE by an admin record. Both client kinds verify both schemes before any switch is scheduled (U5, 08 §9.4). |
 | SG6 | `pq_anchor` = the hash of `HandoffRecord(E_pq − 1)` goes into every release manifest from the switch on, signed by the hybrid release keys (11 §9.5). A light client or a node syncing from genesis accepts only a history through that record. A quantum attacker who forges an older Ed25519 history cannot also forge the anchor. |
 
@@ -839,11 +845,12 @@ an epoch boundary.
   5-of-5 at once, so every defense of 09 §6.4–6.6 falls and the whole balance of the contract is
   exposed. VYRN cannot fix this inside an immutable contract. It states the exposure and adds a
   migration hook: a second bridge with a pluggable verifier, deposits moved by users, and a
-  `PqAlarm` that stops new deposits to the old bridge (09 §6.8). [Certain for the dependency on
+  `PqAlarm` under which tooling stops new deposits to the old bridge and posts go only to recorded
+  exit addresses; the contract itself is not paused (09 §6.8). [Certain for the dependency on
   `ecrecover`; Guessing on when Ethereum offers a post-quantum precompile]
 - **EVM wallet sessions.** An account whose `OwnerKey` is secp256k1 is as safe as that key.
   Hook: a hybrid `OwnerKey` variant and a `SetOwnerKey` item; after a governance cutoff epoch,
-  classical owner keys can only withdraw to their own exit address (09 §6.8).
+  classical owner keys are frozen to their exit address for good, even after a later key change (09 §6.8).
 - **Key agreement.** X25519 for `K_seq`, `K_out`, `K_com` transport and the p2p handshake is also
   quantum-breakable, and an attacker who recovers a validator's static `XK` derives every
   session's MAC keys. This section covers signatures only. Open question PQ-6 asks for a hybrid
@@ -860,3 +867,4 @@ an epoch boundary.
 | PQ-5 | The L1 bridge: when does governance deploy the post-quantum bridge and raise `PqAlarm`, and is a 10% daily cap on the old bridge acceptable until then? | at the first Ethereum post-quantum verifier VYRN can afford (09 §6.8) | owner, 09 |
 | PQ-6 | Make key agreement hybrid (X25519 + ML-KEM-768) for session keys and the p2p handshake? | not in this change | owner, 04, 09 |
 | PQ-7 | Release keys on hardware tokens (11 §9.5): which token holds an ML-DSA-65 key? | an HSM with ML-DSA support for the ML-DSA half, the current tokens for the Ed25519 half | owner, 11 |
+| PQ-8 | Remove the voter's notarize misprediction (07 §6.5a): fix the proposal range by a rule every voter can compute before the proposal arrives (for example, every header closed at least `REP_HOP_MAX_MS` before the view started). That brings the maxima back to 5.70 / 8.70 ms and `FIN_GATE_BLOCKS` back to 8, but it delays each header's proposal by up to one hop. | budget the miss; `FIN_GATE_BLOCKS` = 9 from `E_pq` | owner, 07 |

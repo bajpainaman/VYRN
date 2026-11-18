@@ -1192,15 +1192,23 @@ signs before it knows it will send:
   the proposal the leader must make under the rule of §6.3 (every contiguous header after the
   parent, up to 16) and signs that notarize on its two PQ cores,
   in parallel with `verify`. It sends the vote only if the leader's proposal matches and `verify`
-  returns true; otherwise it drops it and signs the actual proposal. The leader signs its own
-  proposal the same way. The voter's PQ cores are replica cores 0 and 63 (§7.2).
+  returns true; otherwise it drops it and signs the actual proposal. The voter's PQ cores are
+  replica cores 0 and 63 (§7.2).
+- **The leader never misses.** It signs the range it holds when its own `verify` completes and
+  then proposes exactly that range, so its notarize is ready when it proposes.
+- **A voter can miss in the fault-free case.** §6.3 lets the leader take every header it holds
+  when its `verify` completes, and frame arrival and the data join differ across facilities, so a
+  voter may predict a range one header shorter or longer. A miss costs one signature after the
+  proposal arrives, ≤ `PQ_SIGN_MAX_US` = 0.75 ms at `PQ_HEDGE` = 2. §6.6 budgets one miss per
+  block on the notarize hop; finalize and nullify never miss, because their content is fixed when
+  signing starts. Open question PQ-8 (01 §14.20) asks for a range rule that removes the miss.
 - **Finalize.** A voter starts the finalize signature when it sends its notarize, in parallel with
   hop 3. It sends it only if Simplex would (a notarization seen and no nullify sent).
 - **Nullify** is signed when its timer starts, `t_l` before it can be sent.
 - **Safety.** Signing is not voting: an unsent signature is never stored, logged or sent, and is
   zeroed after the view. The persisted high-water mark of 09 §2.5 is written before **sending**,
   as today. A crash between signing and sending leaks nothing. [Certain: the one-vote rule counts
-  sent votes] The extra cost is at most one wasted signature per view when the prediction misses.
+  sent votes] The extra CPU is at most one wasted signature per view when the prediction misses.
 - **Dependency.** This needs Simplex to let the application produce a vote's signature
   asynchronously. Open question PQ-3 (01 §14.20) asks whether `commonware-consensus` allows it.
 
@@ -1228,12 +1236,12 @@ links break it counts as the one fault f.
 | One frame repair | 0.00 | 0.39 | cross-metro, ≤ 0.60 (§4.10); it runs in parallel with the data lag, and `verify` waits for the later, so the pair costs ≤ 0.71 and this row is 0.39 of reserve |
 | `verify` completion | 0.02 | 0.10 | §6.4 |
 | Hop 2: leader's notarize (the proposal) | 0.50 | 0.80 | |
-| Hop 3: notarize votes; certify; send finalize | 0.51 | 0.85 | |
+| Hop 3: notarize votes; certify; send finalize | 0.51 | 0.85 (1.60 scheme 1) | scheme 1: +0.75 for one voter's missed notarize prediction, re-signed after the proposal arrives (§6.5a); the budget assumes the miss hits a vote the quorum needs |
 | Hop 4: finalize votes → Q at each voter | 0.50 | 0.80 | |
-| Vote signature checks | 0.03 (0.08 scheme 1) | 0.10 (0.15 scheme 1) | scheme 1: Ed25519 parts batched on core 4, ML-DSA parts at 35 µs each on a PQ core, in parallel; speculative signing adds nothing to the maximum (§6.5a) |
-| **Total, no fault** | **2.59** (2.69 scheme 1) | **5.65** (5.70 scheme 1) | |
+| Vote signature checks | 0.03 (0.08 scheme 1) | 0.10 (0.15 scheme 1) | scheme 1: Ed25519 parts batched on core 4, ML-DSA parts at 35 µs each on a PQ core, in parallel |
+| **Total, no fault** | **2.59** (2.69 scheme 1) | **5.65** (6.45 scheme 1) | |
 | One fault (f = 1) | | +3.00 | the larger of a nullified view (`t_l` 2 ms + 1 hop ≈ 2.8) and a data-box stall (§5.7, 3.0) |
-| **Total, one fault** | | **8.65** (8.70 scheme 1) | ≤ `FINALITY_MAX_MS` = 10; reserve 1.35 (1.30 scheme 1) |
+| **Total, one fault** | | **8.65** (9.45 scheme 1) | ≤ `FINALITY_MAX_MS` = 10; reserve 1.35 (0.55 scheme 1) |
 | Sequencer fault | | ≤ 9.0 | the seal finalizes the tail ≤ 7.85 ms after the last frame (§9.7) |
 
 A fill at the end of its block sees ~3.1 ms typical, which is DESIGN §5's "~3 ms". In a single
@@ -1277,8 +1285,10 @@ block `h + 9` opens only when block `h` is final. 09 §4.6 (`INV-CHN-TXGATE`) us
 - **Resume.** `Control(Resume)` at `lag ≤ REP_GATE_RESUME_BLOCKS` = 4; after > 1000 ms, via a
   reopening auction (08).
 - **It never trips within f = 1.** Block `h` is final at every voter and at the sequencer ≤ 7.65 ms
-  after it closes (§6.6, signature checks included; 7.70 ms under scheme 1). `h + 8` closes 8 ms
-  after `h` closes, so ≤ 8 closed blocks are open (0.35 ms spare; 0.30 ms under scheme 1). In CHAIN the bound is 7.11 ms after close (09 §4.8).
+  after it closes (§6.6, signature checks included). `h + 8` closes 8 ms after `h` closes, so ≤ 8
+  closed blocks are open (0.35 ms spare). Under scheme 1 the bound is 8.45 ms after close, with a
+  missed notarize prediction (§6.5a), so `FIN_GATE_BLOCKS` is 9 from `E_pq` (01 §14.20 D): `h + 9`
+  closes 9 ms after `h`, 0.55 ms spare. In CHAIN the bound is 7.11 ms after close (09 §4.8).
 - **What it bounds.** Outside the fault model (no Q, a slow metro), at most ~9 ms of fills are
   released unfinal before the halt, none reverted; they finalize when Q returns. Draft 0.1's
   100 ms halt (a 10 ms escape) is removed.
@@ -2093,7 +2103,7 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | B-REP-4 | Each stream core's load at the peak mix | ≤ 0.50 |
 | B-REP-5 | Sliced Ed25519 sign on core 4: CPU per signature, longest slice | ≤ 12 µs, ≤ 50 ns |
 | B-PQ-1 | Scheme 1 on `REF`: ML-DSA-44 sign with `PQ_HEDGE` = 4 on cores 52–55 and = 2 on a voter, 10⁹ signatures; verify per signature | max ≤ `PQ_SIGN_MAX_US` (400, 750 µs); verify ≤ `PQ_VERIFY_US` |
-| B-PQ-2 | Scheme 1 finality: B-REP-1 with hybrid keys and speculative signing (§6.5a); the frame gate (B-REP-13) and stream-core load (B-REP-4) re-run | max ≤ 5.70 ms no fault, ≤ 8.70 ms one fault; B-REP-13 and B-REP-4 pass values unchanged |
+| B-PQ-2 | Scheme 1 finality: B-REP-1 with hybrid keys and speculative signing (§6.5a); the frame gate (B-REP-13) and stream-core load (B-REP-4) re-run | max ≤ 6.45 ms no fault, ≤ 9.45 ms one fault, with prediction misses counted; B-REP-13 and B-REP-4 pass values unchanged |
 | B-PQ-3 | The switch at `E_pq` in `vyrn-sim`: scheme-0 votes and headers for epoch ≥ `E_pq` injected, history before it replayed | every injected signature rejected; replay from genesis bit for bit (01 §14.20 SG1–SG6) |
 | B-REP-6 | Sequencer core 50 BLAKE3 load | ≤ 0.60 |
 | B-REP-7 | Replay speed at peak and at average load | ≥ 1.5×, ≥ 10× |
