@@ -1324,6 +1324,13 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                                 {
                                     continue;
                                 }
+                                // A stuck key here is repaired too, so stranded sessions'
+                                // REDIRECTs leave in one batch (Codex r4619550283).
+                                if self.sources.stuck(p.session, p.pkt_seq)
+                                    && let Some(fo) = self.failover.as_mut()
+                                {
+                                    fo.repair(p.session, p.pkt_seq, now);
+                                }
                                 let to = self.sources.due(p.session, p.pkt_seq, now);
                                 sent = sent.saturating_add(usize::from(!to.is_empty()));
                                 fetch::send_key(&self.repair, p.session, p.pkt_seq, &to);
