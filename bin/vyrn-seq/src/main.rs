@@ -256,12 +256,11 @@ where
                         pending: Vec::new(),
                         pending_tx: Vec::new(),
                     };
+                    // Ends the engine's wait on a full ring, and the engine loop, however this
+                    // thread exits: a return, an error, or a panic that unwinds.
+                    let _done = Done([stream_done, &stop]);
                     let mut rx = rx;
-                    let r = s.run(&mut rx, engine_done, block);
-                    // Ends the engine's wait on a full ring, and the engine loop on an error.
-                    stream_done.store(true, Ordering::Release);
-                    stop.store(true, Ordering::Release);
-                    r
+                    s.run(&mut rx, engine_done, block)
                 })
                 .map_err(|e| e.to_string())?
         };
@@ -334,6 +333,17 @@ where
         let s = s.map_err(|_| "stream thread panicked")?;
         e.and(s)
     })
+}
+
+/// Sets its flags when dropped, so a thread publishes its exit even when it unwinds.
+struct Done<'a>([&'a AtomicBool; 2]);
+
+impl Drop for Done<'_> {
+    fn drop(&mut self) {
+        for f in self.0 {
+            f.store(true, Ordering::Release);
+        }
+    }
 }
 
 /// The `LAYOUT` and `READY` lines.

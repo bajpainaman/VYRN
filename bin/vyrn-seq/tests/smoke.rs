@@ -270,58 +270,59 @@ fn one_order_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Back-pressure with a sealed engine thread (`seal = "abort"`): the test stops reading stdout,
-/// so the stream thread blocks printing `BLOCK` lines while orders keep arriving. The handoff
-/// fills and the engine waits for room; once stdout is read again the box drains, closes its
-/// blocks and exits 0. An allocation on the engine thread aborts the process instead.
-#[test]
-fn sealed_engine_survives_a_full_handoff() {
-    let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let (mut child, out, lane0, dir) = start(&replica, "abort", 1, "full");
+/// Stalls the stream thread and fills the handoff behind it. The caller has stopped reading
+/// stdout. Buy, then sell, 1 at one tick: each pair rests and fills, so every packet makes a step
+/// and every block_ms closes a block. Lockstep (one response per packet, so no packet is lost)
+/// until a response stops coming: stdout's pipe is full and the stream thread is blocked on a
+/// `BLOCK` line. Then 2 packets of four orders a millisecond for 4 s: slow enough that a debug
+/// or arm engine keeps the sequence, and enough that, with only about two entries a packet once
+/// the session's TX window is full, the handoff's 8192 entries fill well before the end.
+fn stall_and_fill(lane0: SocketAddrV4) {
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let mut buf = [0u8; vyrn_types::MAX_REQ_PAYLOAD];
-    // Buy, then sell, 1 at one tick: each pair rests and fills, so every packet makes a step
-    // and every block_ms closes a block. Lockstep (one response per packet, so no packet is
-    // lost) until a response stops coming: stdout's pipe is full and the stream thread blocked.
     client
         .set_read_timeout(Some(Duration::from_millis(300)))
         .unwrap();
+    let mut buf = [0u8; vyrn_types::MAX_REQ_PAYLOAD];
     let mut rbuf = [0u8; 2048];
+    let (b, s) = (vyrn_bbo::Side::Buy, vyrn_bbo::Side::Sell);
     let mut seq = 1u32;
-    let side = |s: u32| {
-        if s % 2 == 1 {
-            vyrn_bbo::Side::Buy
-        } else {
-            vyrn_bbo::Side::Sell
-        }
-    };
     let t0 = Instant::now();
     loop {
         assert!(
             t0.elapsed() < Duration::from_secs(60),
             "stream never stalled"
         );
-        let n = order(seq, side(seq), 1, seq, &mut buf);
+        let side = if seq % 2 == 1 { b } else { s };
+        let n = order(seq, side, 1, seq, &mut buf);
         client.send_to(&buf[..n], lane0).unwrap();
         seq += 1;
         if client.recv(&mut rbuf).is_err() {
             break;
         }
     }
-    // The stream is stalled: these fill the handoff behind it, four orders (four steps) a packet.
-    let (b, s) = (vyrn_bbo::Side::Buy, vyrn_bbo::Side::Sell);
-    for _ in 0..1000 {
-        for _ in 0..4 {
+    for _ in 0..4000 {
+        for _ in 0..2 {
             let n = orders(seq, &[b, s, b, s], 1, seq, &mut buf);
             client.send_to(&buf[..n], lane0).unwrap();
             seq += 1;
         }
-        // About 4 packets a millisecond (`thread::sleep` is disallowed).
+        // `thread::sleep` is disallowed.
         let t = Instant::now();
         while t.elapsed() < Duration::from_millis(1) {
             std::thread::yield_now();
         }
     }
+}
+
+/// Back-pressure with a sealed engine thread (`seal = "abort"`): the stream thread blocks
+/// printing `BLOCK` lines while orders keep arriving, the handoff fills and the engine waits for
+/// room; once stdout is read again the box drains, closes its blocks and exits 0. An allocation
+/// on the engine thread aborts the process instead.
+#[test]
+fn sealed_engine_survives_a_full_handoff() {
+    let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut child, out, lane0, dir) = start(&replica, "abort", 1, "full");
+    stall_and_fill(lane0);
     let (stats, ok) = stop(&mut child, out);
     assert!(ok, "exit status: {stats}");
     assert!(stats.contains("seal_violations=0"), "{stats}");
@@ -334,6 +335,32 @@ fn sealed_engine_survives_a_full_handoff() {
         field("handoff_full=") > 0,
         "the handoff never filled: {stats}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stream thread that panics still releases the engine waiting on a full handoff: with the
+/// handoff full, closing stdout makes the stream thread's blocked `BLOCK` line panic, and once
+/// stdin closes the box exits instead of waiting forever.
+#[test]
+fn stream_panic_stops_the_box() {
+    let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut child, out, lane0, dir) = start(&replica, "abort", 1, "panic");
+    stall_and_fill(lane0);
+    drop(out);
+    drop(child.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("the box did not exit");
+        }
+        std::thread::yield_now();
+    };
+    // The stream thread's panic is the box's failure (and STATS cannot print).
+    assert!(!status.success(), "{status}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
