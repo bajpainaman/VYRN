@@ -139,11 +139,19 @@ pub struct RxCore<R: RxRing, F: RxRing> {
     fetch: F,
     gate: Gate,
     counters: Counters,
+    fetches: usize,
 }
 
 impl<R: RxRing, F: RxRing> RxCore<R, F> {
     pub fn counters(&self) -> &Counters {
         &self.counters
+    }
+
+    /// Fetch datagrams the last [`RxCore::poll`] took. A core loop yields after a turn with
+    /// fetch work, so a fetch flood cannot keep this thread on a CPU the sender needs for its
+    /// `DATA_HB` cadence (07 §5.3); ingest-only turns keep spinning.
+    pub fn fetches(&self) -> usize {
+        self.fetches
     }
 
     /// See [`DataNode::set_fetch_keys`](crate::DataNode::set_fetch_keys).
@@ -215,6 +223,7 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
         }
         self.ingest.release(n);
         let m = self.fetch.poll(&mut burst);
+        self.fetches = m;
         for p in burst.iter().take(m) {
             let Ok(f) = nic_frame::parse(self.fetch.bytes(p)) else {
                 bump(&mut self.counters.fetch_bad);
@@ -283,11 +292,17 @@ pub struct ShardCore<T: TxRing> {
     resp: Responder,
     events: Vec<Event>,
     counters: Counters,
+    fetches: usize,
 }
 
 impl<T: TxRing> ShardCore<T> {
     pub fn counters(&self) -> &Counters {
         &self.counters
+    }
+
+    /// Fetches and redirects the last [`ShardCore::poll`] served; see [`RxCore::fetches`].
+    pub fn fetches(&self) -> usize {
+        self.fetches
     }
 
     pub fn home(&self) -> &DataHome {
@@ -308,6 +323,7 @@ impl<T: TxRing> ShardCore<T> {
     ) -> usize {
         self.tx.reap();
         let mut n = 0;
+        self.fetches = 0;
         while n < RX_BURST {
             let Some(e) = rx.pop(&Hw) else { break };
             n += 1;
@@ -342,6 +358,7 @@ impl<T: TxRing> ShardCore<T> {
                     }
                 }
                 ToShard::Fetch { to, q } => {
+                    self.fetches += 1;
                     let (tx, c, cfg) = (&mut self.tx, &mut self.counters, &self.cfg);
                     match q {
                         Fetch::Key { session, pkt_seq } => {
@@ -360,6 +377,7 @@ impl<T: TxRing> ShardCore<T> {
                     session,
                     resend_from,
                 } => {
+                    self.fetches += 1;
                     let h = &self.home;
                     let (Some(dst), Some(key)) = (h.source(session), h.key(session)) else {
                         bump(&mut self.counters.redirect_unknown);
@@ -448,6 +466,7 @@ pub fn split<R: RxRing, F: RxRing, T: TxRing>(
         fetch,
         gate: Gate::new(cfg),
         counters: Counters::default(),
+        fetches: 0,
     };
     let shards = shard_tx
         .into_iter()
@@ -459,6 +478,7 @@ pub fn split<R: RxRing, F: RxRing, T: TxRing>(
             tx,
             resp: Responder::default(),
             counters: Counters::default(),
+            fetches: 0,
         })
         .collect();
     let sender = SenderCore {
