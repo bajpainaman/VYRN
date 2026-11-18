@@ -40,7 +40,7 @@ pub struct BridgeSigners {
 }
 
 impl BridgeSigners {
-    fn well_formed(&self) -> bool {
+    pub(crate) fn well_formed(&self) -> bool {
         let ok = |keys: &[EvmAddress; BRIDGE_SIGNERS]| {
             keys.iter()
                 .enumerate()
@@ -66,6 +66,8 @@ pub enum BridgeErr {
 pub struct BridgeSignerTable {
     active: Epoch,
     sets: BTreeMap<u64, BridgeSigners>,
+    /// The epoch each activated set was scheduled for (genesis: 0).
+    from: BTreeMap<u64, Epoch>,
     /// Approved sets by the epoch they activate at, at most one per rotation number.
     pending: BTreeMap<u64, (Epoch, BridgeSigners)>,
 }
@@ -85,6 +87,7 @@ impl BridgeSignerTable {
         Ok(Self {
             active: Epoch(0),
             sets: BTreeMap::from([(0, set)]),
+            from: BTreeMap::from([(0, Epoch(0))]),
             pending: BTreeMap::new(),
         })
     }
@@ -92,6 +95,25 @@ impl BridgeSignerTable {
     /// The set with rotation number `rotation_no`, once its epoch has activated.
     pub fn get(&self, rotation_no: u64) -> Option<&BridgeSigners> {
         self.sets.get(&rotation_no)
+    }
+
+    /// The set with rotation number `rotation_no` that is in force at `epoch` or will be once
+    /// `epoch` activates: an activated set, or one scheduled to activate at or before `epoch`.
+    /// The next epoch's roster is checked before its boundary (08 §2.6), when its set is pending.
+    /// Either way the set must be scheduled for `epoch` or earlier, so the answer does not depend
+    /// on how far this table has activated.
+    pub fn for_epoch(&self, rotation_no: u64, epoch: Epoch) -> Option<&BridgeSigners> {
+        let activated = self
+            .from
+            .get(&rotation_no)
+            .filter(|from| **from <= epoch)
+            .and_then(|_| self.sets.get(&rotation_no));
+        activated.or_else(|| {
+            self.pending
+                .get(&rotation_no)
+                .filter(|(from, _)| *from <= epoch)
+                .map(|(_, set)| set)
+        })
     }
 
     /// The newest active set.
@@ -145,7 +167,8 @@ impl BridgeSignerTable {
             if entry.get().0 > self.active {
                 break;
             }
-            let (_, set) = entry.remove();
+            let (from, set) = entry.remove();
+            self.from.insert(set.rotation_no, from);
             self.sets.insert(set.rotation_no, set);
         }
     }

@@ -117,7 +117,9 @@ starts with a domain-separation context (§17.3).
      ├──► NodeCert(i, TYO) ─┬─ node key      NK  (Ed25519)  p2p identity, TagFault, attestations
      ├──► NodeCert(i, LDN)  ├─ vote key      VK  (Ed25519)  consensus votes, commit votes
      └──► NodeCert(i, NYC)  ├─ seq key       SK  (Ed25519)  seq_sig on book blocks
-                            └─ exchange key  XK  (X25519; + ML-KEM-768 from E_pq)   K_seq derivation, committee-key transport
+                            ├─ exchange key  XK  (X25519; + ML-KEM-768 from E_pq)   K_seq derivation (sequencer box)
+                            └─ G-key exchange key GXK (X25519; + ML-KEM-768 from E_pq)
+                                                            committee-key transport (validator box)
   bridge key BK_i   (secp256k1, HSM)    signs L1 posts and signer rotations
   guardian key GK_i (secp256k1, online) pauses the bridge, vetoes an L1 post
 ```
@@ -126,6 +128,7 @@ starts with a domain-separation context (§17.3).
 |---|---|---|---|
 | `OIK_i` | Ed25519; hybrid Ed25519 + ML-DSA-65 (scheme 2) before `E_pq` (01 §14.20) | Air-gapped Linux machine or COTS HSM | Governance (§2.10), timelocked |
 | `NK`, `VK`, `SK`, `XK` | Ed25519 / X25519; `NK`, `VK`, `SK` hybrid Ed25519 + ML-DSA-44 (scheme 1) from `E_pq`; `XK` a hybrid X25519 + ML-KEM-768 `KexKey` from `E_pq` (01 §14.20 G) | The node's boxes, in memory, loaded from an encrypted file at start | New `NodeCert`; active from the node's next active epoch |
+| `GXK` | as `XK` (`KexKey`, 01 §3) | The validator box only, never the sequencer box (`INV-CHN-SPLIT`) | New `NodeCert`, with the other node keys |
 | `BK_i` | secp256k1 | COTS HSM on the commit box | L1 signer rotation (§6.7) |
 | `GK_i` | secp256k1 | Online watcher process on the commit box | L1 signer rotation |
 
@@ -148,6 +151,7 @@ NodeCert {
     vote_key:     PubKey,
     seq_key:      PubKey,
     xchg_key:     KexKey,       // 32 B (scheme 0) or 1,216 B (scheme 1): X25519 ‖ ML-KEM-768 (01 §3)
+    gx_key:       KexKey,       // GXK (§2.4): the validator box's G-key exchange key, ≠ xchg_key
     client_kind:  u8,           // 0 Rust, 1 Vx
     sig:          Sig,          // by OIK_op, in OIK's scheme, over ctx "vyrn      v1 nodecert" ‖ fields
 }
@@ -177,14 +181,16 @@ committee key per possible sequencer.
 - For each epoch e and each operator s, `G(e, s)` is an X25519 key pair. Its private half is held
   by the nodes `(i, home(e))` for every i ≠ s, and by no one else.
 - Dealer: the lowest `OpIdx` in `committee(e) \ {s}`. It generates `G(e, s)`, encrypts the private
-  half to each other member under `X25519(dealer XK, member XK)` with BLAKE3 `derive_key`
-  (`"vyrn v1 gkey wrap"`), and submits `CommitteeKey` to the chain.
+  half to each other member under `X25519(dealer GXK, member GXK)` with BLAKE3 `derive_key`
+  (`"vyrn v1 gkey wrap"`), and submits `CommitteeKey` to the chain. `GXK` is the `NodeCert`'s
+  `gx_key`, held by the validator box only. The sequencer box holds `XK` for `K_seq` and no `GXK`,
+  so it cannot unwrap any `G(e, ·)` (`INV-CHN-SPLIT`).
 - Each member decrypts, checks that the scalar multiplied by the base point equals the published
   public key, and signs a confirmation. The record takes effect with 3 confirmations, so one absent
   member does not block it.
 - **From `E_pq`** (01 §14.20 G, KG1), for every e ≥ `E_pq`: `G(e, s)` is a hybrid pair, an X25519
   key plus an ML-KEM-768 key generated from a 64-byte seed, and `pub_key` is their `KexKey`. The
-  dealer also encapsulates to the ML-KEM part of each member's exchange key and puts the 1,088 B
+  dealer also encapsulates to the ML-KEM part of each member's `GXK` and puts the 1,088 B
   ciphertext `ct` beside the wrap. The wrap key's material is the X25519 secret ‖ the ML-KEM secret
   ‖ BLAKE3(`ct`). The wrapped private half is the X25519 scalar and the ML-KEM seed (96 B, 112 B
   with the tag). The seed is `(d, z)` (FIPS 203): the public key depends on `d` only, and `z` is the
@@ -1289,7 +1295,8 @@ keys are stolen, the thief can try to rotate to its own keys, and the 72 h windo
 veto and pause. Guardian keys rotate by the same flow.
 
 **Owner.** The signer table (rotation number → `SignerSet`) is a key table, owned by `vyrn-epoch`
-with the other per-epoch keys (08 §9.5). A set that governance approves activates at the first epoch
+with the other per-epoch keys (08 §9.5). The set in force for epoch e is the one the roster of
+`EpoConfig(e)` names (08 §9.6). A set that governance approves activates at the first epoch
 boundary after approval, and every activated set stays readable by rotation number, because posts
 accepted under it stay claimable (step 4). `vyrn-chain` reads it through `Epochs::bridge_signers`.
 
@@ -1684,9 +1691,12 @@ trusts no RPC server. Every RPC answer comes with a proof.
 ### 10.2 The validator-set history
 
 ```
-EpochKeys(e) = { epoch: e, home: home(e), vote_keys: [[u8; 32]; 5],   // VK(i, home(e))
-                 seq_keys: [[u8; 32]; 5],                              // SK(i, home(e))
+EpochKeys(e) = { epoch: e, home: home(e),
+                 sig_scheme: SigScheme,                                // EpoConfig(e).sig_scheme
+                 vote_keys: [PubKey; 5],                               // VK(i, home(e))
+                 seq_keys: [PubKey; 5],                                // SK(i, home(e))
                  jailed: u8 bitmap, seq_op: OpIdx }
+// Each PubKey is the length of sig_scheme (01 §3: 32 or 1,344 B); keys_hash commits to the scheme.
 keys_hash(e) = BLAKE3(derive_key("vyrn      v1 epochkeys", encode(EpochKeys(e))))
 ```
 
@@ -1707,7 +1717,11 @@ fn follow_keys(genesis: &GenesisRecord, rpc: &impl Rpc, target: Epoch) -> EpochK
 }
 ```
 
-That is 3 handoffs per day, about 1,100 per year, each 4 Ed25519 verifications: well under a second
+`EpochKeys(e)` is the CHAIN view of the roster of `EpoConfig(e)` (08 §9.6) at `home(e)`. A
+verifier takes the key length and scheme from `sig_scheme` (01 §14.20 SG1).
+
+That is 3 handoffs per day, about 1,100 per year, each 4 Ed25519 verifications (4 hybrid ones from
+`E_pq`): well under a second
 of CPU for a year of history (budget). A failover inside an epoch changes the sequencer, not the
 vote keys, and `EpochKeys` lists the seq keys of all 5 operators, so failovers need no extra record.
 
@@ -2126,7 +2140,7 @@ qty`, where `qty` is the reversed quantity of the original fill.
 
 | Name | Statement |
 |---|---|
-| `INV-CHN-SPLIT` | An operator's consensus and commit votes are cast by its validator box, which runs its client kind, never by its sequencer box. No sequencer box, live or standby, holds a `G` private half (01 §14.4). |
+| `INV-CHN-SPLIT` | An operator's consensus and commit votes are cast by its validator box, which runs its client kind, never by its sequencer box. No sequencer box, live or standby, holds a `G` private half or a `GXK` private key (01 §14.4). |
 | `INV-CHN-ONEVOTE` | Per `(epoch, view)`, an operator signs at most one `Notarize`, at most one `Finalize`, and never a `Finalize` and a `Nullify`. |
 | `INV-CHN-KEYSPLIT` | No operator other than s can compute `K_seq(e, s)`; s cannot compute `K_com(e, s, ·)` before its disclosure. |
 | `INV-CHN-TXGATE` | The sequencer never runs more than D = 8 closed blocks ahead of finality: it applies no op of book block h until it holds a finalization that covers book block h − D − 1, and halts until then (01 §14.9, 07 §6.8). |

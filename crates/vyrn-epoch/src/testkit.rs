@@ -160,3 +160,123 @@ impl LocalView for Local {
         (s == self.step).then_some(self.root).flatten()
     }
 }
+
+/// A roster whose LDN home holds [`next`]'s voters (in BASE, sequencer boxes at roster indices
+/// n and n + 1 with [`next`]'s keys). Other homes and NK use distinct seeds; `scheme` 1 pads each
+/// Ed25519 key with a fake ML-DSA-44 part of 1,312 bytes `0xC0 + i` and each X25519 key with a
+/// fake ML-KEM-768 part of 1,184 bytes `0xE0 + i`.
+pub fn roster(mode: Mode, scheme: u8) -> crate::Roster {
+    use crate::{Addr, DataBox, Home, Roster, SeqEntry, Voter};
+    let key = |seed: [u8; 32], i: u8| {
+        let mut k = pk(seed).to_vec();
+        if scheme == 1 {
+            k.extend_from_slice(&[0xC0 + i; 1_312]);
+        }
+        k
+    };
+    // Scheme 1: X25519 ‖ a fake ML-KEM-768 part of 1,184 bytes `0xE0 + i`.
+    let kex = |seed: [u8; 32], i: u8| {
+        let mut k = pk(seed).to_vec();
+        if scheme == 1 {
+            k.extend_from_slice(&[0xE0 + i; 1_184]);
+        }
+        k
+    };
+    let addr = |h: u8, i: u8, port: u16| Addr {
+        ip: [0x20, 0x01, 0x0d, 0xb8, h, i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        port,
+    };
+    let home = |h: u8, voter_seed: fn(u8) -> [u8; 32], seq_base: u8| {
+        let n = n(mode);
+        let n_seq = n_seq(mode);
+        Home {
+            voters: (0..n)
+                .map(|i| Voter {
+                    // R1 Rust, R2 Vx, R3 Rust, ...: 07 §2.1, 09 §2.1 (3 Rust + 2 Vx).
+                    client: i % 2,
+                    facility: i + 1,
+                    node_key: key([0x10 + 0x08 * h + i; 32], i),
+                    vote_key: key(voter_seed(i), i),
+                    xchg_key: kex(gxk_seed(h, i), i),
+                    data_addr: addr(h, i, 7_000),
+                    repl_addr: addr(h, i, 7_001),
+                })
+                .collect(),
+            seq: (0..n_seq)
+                .map(|j| SeqEntry {
+                    facility: j + 1,
+                    node_key: key([0xD0 + 0x08 * h + j; 32], j),
+                    seq_key: key([seq_base + j; 32], j),
+                    xchg_key: kex([seq_base + 8 + j; 32], j),
+                    client_addr: addr(h, 0x40 + j, 9_000),
+                    repl_addr: addr(h, 0x40 + j, 9_001),
+                })
+                .collect(),
+            recovery: 0,
+            data: (0..n)
+                .map(|i| DataBox {
+                    facility: i + 1,
+                    addr: addr(h, 0x80 + i, 8_000),
+                })
+                .collect(),
+        }
+    };
+    Roster {
+        sig_scheme: scheme,
+        epoch_from: Epoch(6),
+        homes: [
+            home(1, seed, 0x80),
+            home(2, next_seed, 0x90),
+            home(3, |i| [0x61 + i; 32], 0xA0),
+        ],
+        bridge: match mode {
+            Mode::Base => None,
+            Mode::Chain => Some(crate::BridgeSigners {
+                rotation_no: 0,
+                bridge_keys: core::array::from_fn(|i| [0xB0 + i as u8; 20]),
+                guardian_keys: core::array::from_fn(|i| [0xB8 + i as u8; 20]),
+            }),
+        },
+    }
+}
+
+/// `vyrn-seq` boxes per home in [`roster`]: 2 in BASE, one per operator in CHAIN.
+pub fn n_seq(mode: Mode) -> u8 {
+    match mode {
+        Mode::Base => 2,
+        Mode::Chain => n(mode),
+    }
+}
+
+/// `EpoConfig(8)` for LDN naming `roster`, primary and standby at roster indices n and n + 1.
+pub fn config(domain: &Domain, roster: &crate::Roster) -> crate::EpoConfig {
+    let n = n(domain.mode);
+    crate::EpoConfig {
+        epoch: Epoch(8),
+        home: HomeCode::Ldn,
+        t_start: Nanos(0),
+        roster_hash: roster.hash(domain),
+        seq_order: [n, n + 1],
+        lane_map_hash: Hash([2; 32]),
+        n_lanes: [49, 49, 11],
+        version: VERSION,
+        endpoint_hash: Hash([3; 32]),
+        flags: 0,
+        sig_scheme: roster.sig_scheme,
+    }
+}
+
+/// The GXK seed of voter i of home h (1 TYO, 2 LDN, 3 NYC): `[h, i, 0xC7, 0xC7, …]`.
+pub fn gxk_seed(h: u8, i: u8) -> [u8; 32] {
+    let mut s = [0xC7; 32];
+    s[0] = h;
+    s[1] = i;
+    s
+}
+
+/// CHAIN: the signer table whose genesis set is `roster`'s bridge set; BASE: none.
+pub fn bridge_table(roster: &crate::Roster) -> Option<crate::BridgeSignerTable> {
+    roster
+        .bridge
+        .map(|set| crate::BridgeSignerTable::genesis(set).unwrap_or_else(|e| panic!("{e}")))
+}
