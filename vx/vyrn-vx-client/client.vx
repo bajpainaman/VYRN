@@ -17,8 +17,7 @@
 //
 // Every C struct and ring slot is read and written by byte offset (as in the oracle), so the ABI
 // never depends on how vxc lays out a struct. Anything outside the supported subset of v1 stops
-// with PBV_E_UNSUPPORTED rather than guess: Replace, STP that would trigger and in-packet
-// dependencies (pbv.h lists the subset).
+// with PBV_E_UNSUPPORTED rather than guess (11 §5.3 lists the gaps).
 
 import core::ptr;
 import core::num;
@@ -112,6 +111,7 @@ const FOK_UNFILLABLE : u64 = 11;
 const UNKNOWN_HANDLE : u64 = 12;
 const TOO_LATE : u64 = 13;
 const BOOK_HALTED : u64 = 14;
+const STP : u64 = 16;
 const AUCTION_PHASE : u64 = 19;
 const ACCOUNT_KILLED : u64 = 21;
 const BAD_BOOK : u64 = 23;
@@ -166,6 +166,7 @@ const LIQ_AUCTION : u64 = 2;
 const UNCROSS_CHUNK : u64 = 6;    // ENG_UNCROSS_CHUNK
 const OUT_IOC_REST : u64 = 1;
 const OUT_AUCTION : u64 = 3;
+const OUT_STP : u64 = 2;
 const OUT_FINISHED : u64 = 0;
 // A Replace dependency whose new total is filled already (vyrn-bbo DEP_ENDED).
 const DEP_ENDED : u64 = 32768;
@@ -345,6 +346,8 @@ struct Bbo {
   has_cont : u64, cont_lane : u64, cont_seq : u64,
   ords : *mut BOrd, book_l : *mut i64, book_r : *mut i64, n_book : i64,
   tx : *mut i8, n_tx : i64, n_fills : u64,
+  // STP ends (a maker or the taker): events that make a Join dependency's step work (join_dep).
+  n_stp : u64,
   // Rust's Bbo bounds and snapshot history (05 §8.6): (B, A), the version, the last published
   // pair, per-version (id, B, A) and each lane's lowest snapshot version.
   bb : u64, ba : u64, ver : u64, lp_b : u64, lp_a : u64,
@@ -1979,7 +1982,9 @@ fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
       if pp != 0u64 { release(c, ln, (*slot(ln, pp)).leg); } else { }
     } else { }
     end_replaced(c, ln, v);
-    let d = if k == EV_OUT && cz != OUT_FINISHED { D_OUT } else { D_CANCELED };
+    // Reject STP (04 §6.8) ends an order that was in the matching step, as an Out does.
+    let stp = k == EV_REJECT && cz == STP;
+    let d = if (k == EV_OUT && cz != OUT_FINISHED) || stp { D_OUT } else { D_CANCELED };
     (*rp).ended = 1u64;
     (*rp).end_detail = d;
   }
@@ -3224,7 +3229,7 @@ fn rescan_run(c : *mut Ctx, cont : bool) -> void {
         book_drop(c, l, r);
         end_taker(c, l, e, NONE, EV_REJECT, POST_ONLY_WOULD_CROSS, true, at);
       } else {
-        res = sweep(c, l, e, NONE, true, from);
+        res = sweep(c, l, e, NONE, true, from, false);
         (*b).kv = 0u64;
         if (*b).err != 0u64 { return; }
         if bopen(c, l, r) == 0u64 { book_drop(c, l, r); }
@@ -3489,7 +3494,7 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
     }
     let mut capped = false;
     if !ended {
-      let res = sweep(c, l, e, src, false, 0u64);
+      let res = sweep(c, l, e, src, false, 0u64, first);
       if (*b).err != 0u64 { return; }
       if res == 1u64 {
         capped = true;
@@ -3546,7 +3551,7 @@ fn apply_deps(c : *mut Ctx, s : u64, l : u64, q : u64, e : *mut LOp, shed : bool
         (*b).cg = g;
         if mid && g == from {
           // The CONT step of a capped Join dependency's sweep (Bbo::join_dep, resume).
-          let w = join_sweep(c, s, l, d, g);
+          let w = join_sweep(c, s, l, d, g, true);
           if w != 0u64 { return dep_stop(c, g, w); }
         } else if shed {
           let dqty = if dk == DK_JOIN { (*d).total } else { 0u64 };
@@ -3594,7 +3599,7 @@ fn apply_deps(c : *mut Ctx, s : u64, l : u64, q : u64, e : *mut LOp, shed : bool
             if (*b).err != 0u64 { return false; }
             return dep_stop(c, g, 1u64);
           }
-          let w = if lvl != 0u64 { join_sweep(c, s, l, d, g) } else { join_rest(c, s, l, d, g) };
+          let w = if lvl != 0u64 { join_sweep(c, s, l, d, g, false) } else { join_rest(c, s, l, d, g) };
           if w != 0u64 { return dep_stop(c, g, w); }
         } else {
           let o = bord(c, l, r);
@@ -3635,15 +3640,17 @@ fn dep_stop(c : *mut Ctx, g : u64, w : u64) -> bool {
 
 // A crossing Join dependency's capped sweep, then join_rest (Bbo::join_dep): 2 = capped, 1 =
 // it traded (the step ends), 0 = nothing happened.
-fn join_sweep(c : *mut Ctx, s : u64, l : u64, d : *mut LOp, g : u64) -> u64 {
+fn join_sweep(c : *mut Ctx, s : u64, l : u64, d : *mut LOp, g : u64, resume : bool) -> u64 {
   unsafe {
     let b = (*c).bbo;
     let n0 = (*b).n_fills;
-    let res = sweep(c, l, d, (*b).dh, false, 0u64);
+    let k0 = (*b).n_stp;
+    let res = sweep(c, l, d, (*b).dh, false, 0u64, !resume);
     if (*b).err != 0u64 { return 0u64; }
     if res == 1u64 { return 2u64; }
     let _ = join_rest(c, s, l, d, g);
-    return if (*b).n_fills != n0 { 1u64 } else { 0u64 };
+    // Bbo::join_dep: any event of the sweep (a fill or an STP end) ends the step.
+    return if (*b).n_fills != n0 || (*b).n_stp != k0 { 1u64 } else { 0u64 };
   }
 }
 
@@ -3735,10 +3742,15 @@ fn end_taker(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, kind : u64, code : 
   }
 }
 
-// STP between the taker and maker m: unsupported when it would act (pbv.h subset).
+// The taker's STP mode (OrderFlags::stp): 0 none, 1 cancel newest, 2 cancel oldest, 3 both.
+fn stp_mode(e : *mut LOp) -> u64 {
+  unsafe { return ((*e).flags >> 4u64) & 3u64; }
+}
+
+// STP acts between the taker and maker m (Bbo::same_acct, with an STP mode).
 fn stp_hit(c : *mut Ctx, l : u64, e : *mut LOp, ml : u64, mr : u64) -> bool {
   unsafe {
-    if (((*e).flags >> 4u64) & 3u64) == 0u64 { return false; }
+    if stp_mode(e) == 0u64 { return false; }
     // Same account on the same lane, or on two pooled lanes (pool-wide index, 05 §6.9).
     let pooled = ((*c).pool >> ml) & ((*c).pool >> l) & 1u64;
     return (ml == l || pooled != 0u64) && (*bord(c, ml, mr)).acct == (*e).acct;
@@ -3775,43 +3787,70 @@ fn match_before(c : *mut Ctx, i : i64, j : i64) -> bool {
   }
 }
 
-// 05 §8.5 dry_run_fillable, as Bbo::fillable: makers in matching order until the taker's open
-// quantity is covered. A same-account maker reached before that would trigger STP, which v1
-// does not replay (UNSUPPORTED); one reached only after is never visited.
+// 05 §8.5 dry_run_fillable, as Bbo::fillable: makers in matching order. A same-account maker
+// is skipped under cancel-oldest; under the other modes the sum stops at the first one. The
+// caller only compares the sum with the open quantity, so it is not capped there.
 fn fillable(c : *mut Ctx, l : u64, e : *mut LOp) -> u64 {
   unsafe {
-    let need = bopen(c, l, (*e).root);
     let b = (*c).bbo;
+    let mode = stp_mode(e);
+    let mut stop = NONE;
+    if mode == 1u64 || mode == 3u64 {
+      for i in 0i64..(*b).n_book {
+        if !fill_cand(c, e, i) { continue; }
+        let ml = (*offset_mut((*b).book_l, i)) as u64;
+        let mr = (*offset_mut((*b).book_r, i)) as u64;
+        if stp_hit(c, l, e, ml, mr) && (stop == NONE || match_before(c, i, stop)) { stop = i; } else { }
+      }
+    } else { }
     let mut sum = 0u64;
     for i in 0i64..(*b).n_book {
       if !fill_cand(c, e, i) { continue; }
       let ml = (*offset_mut((*b).book_l, i)) as u64;
       let mr = (*offset_mut((*b).book_r, i)) as u64;
-      if stp_hit(c, l, e, ml, mr) {
-        let mut before = 0u64;
-        for j in 0i64..(*b).n_book {
-          if j != i && fill_cand(c, e, j) && match_before(c, j, i) {
-            before = before + bopen(c, (*offset_mut((*b).book_l, j)) as u64,
-                                    (*offset_mut((*b).book_r, j)) as u64);
-          }
-        }
-        if before < need { fail_bbo(c, E_UNSUPPORTED); return 0u64; }
-        continue;
-      }
+      if stp_hit(c, l, e, ml, mr) { continue; }
+      if stop != NONE && !match_before(c, i, stop) { continue; }
       sum = sum + bopen(c, ml, mr);
     }
     return sum;
   }
 }
 
-// The capped sweep (D14): one level, or ENG_STEP_FILLS fills, per step. 1 = capped, 0 = open.
-// A batch taker (kb) searches from `from` at its key (bvis) and has no TX record.
-fn sweep(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, kb : bool, from : u64) -> u64 {
+// Bbo::kill_maker: STP ends resting order (ml, mr), Out STP for its open quantity; its record
+// is routed as a maker fill's is (maker_record).
+fn kill_maker(c : *mut Ctx, ml : u64, mr : u64) -> void {
+  unsafe {
+    let b = (*c).bbo;
+    let mo = bord(c, ml, mr);
+    let open = bopen(c, ml, mr);
+    let mh = handle(mr);
+    (*mo).killed = 1u64;
+    (*mo).state = 3u64;
+    (*b).n_stp = (*b).n_stp + 1u64;
+    event(c, ml, EV_OUT, LIQ_MAKER, OUT_STP, (*mo).vslot, mh, (*mo).tick, open);
+    let lo = rec_lo(R_OUT, INDEX_NONE, OUT_STP, mh);
+    let hi = rec_hi(open, (*mo).tag);
+    let dh = (*b).dh;
+    if (*mo).dg != 0u64 && (*mo).dstep == (*b).next && dh != NONE && rd8(tx_slot(c, dh), 21i64) < MAX_RECS {
+      tx_push_g(c, dh, (*mo).dg - 1u64, lo, hi);
+    } else {
+      let mi2 = tx_open(c, (*b).next, (*mo).sess_id, 0u64, 0u64, ml, ROLE_MAKER);
+      tx_push(c, mi2, lo, hi);
+    }
+    book_drop(c, ml, mr);
+  }
+}
+
+// The capped sweep (D14): one level, or ENG_STEP_FILLS fills, per step. 1 = capped, 0 = open,
+// 2 = STP ended the taker. A batch taker (kb) searches from `from` at its key (bvis) and has no
+// TX record. `first`: the op's first step (Taker::first), so STP can tell "no fill yet".
+fn sweep(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, kb : bool, from : u64, first : bool) -> u64 {
   unsafe {
     let b = (*c).bbo;
     let r = (*e).root;
     let side = 1u64 - (*e).side;
     let h = handle(r);
+    let open0 = bopen(c, l, r);
     let mut levels = 0u64;
     let mut work = 0u64;
     loop {
@@ -3827,7 +3866,28 @@ fn sweep(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, kb : bool, from : u64) 
         if mi == NONE { break; }
         let ml = (*offset_mut((*b).book_l, mi)) as u64;
         let mr = (*offset_mut((*b).book_r, mi)) as u64;
-        if stp_hit(c, l, e, ml, mr) { fail_bbo(c, E_UNSUPPORTED); return 0u64; }
+        if stp_hit(c, l, e, ml, mr) {
+          // Bbo::sweep's STP (05 §2.4, 04 §6.8).
+          let mode = stp_mode(e);
+          if mode == 2u64 {
+            kill_maker(c, ml, mr);
+            work = work + 1u64;
+            continue;
+          }
+          if mode == 3u64 { kill_maker(c, ml, mr); } else { }
+          if level_qty > 0u64 {
+            event(c, l, EV_FILL, LIQ_TAKER, 0u64, (*e).vslot, h, lvl, level_qty);
+            if !kb { tx_push(c, src, rec_lo(R_FILL, (*e).ix, LIQ_TAKER, h), rec_hi(lvl, level_qty)); }
+          } else { }
+          (*b).n_stp = (*b).n_stp + 1u64;
+          // Reject STP (the resting handle) before any fill of the aggressor, Out STP after one.
+          if first && bopen(c, l, r) == open0 {
+            end_taker(c, l, e, src, EV_REJECT, STP, true, handle(mr));
+          } else {
+            end_taker(c, l, e, src, EV_OUT, OUT_STP, false, 0u64);
+          }
+          return 2u64;
+        }
         let mo = bord(c, ml, mr);
         let q = min(open, bopen(c, ml, mr));
         (*mo).filled = (*mo).filled + q;

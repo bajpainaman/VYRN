@@ -3053,3 +3053,130 @@ fn the_vx_client_accepts_a_replace_of_an_order_that_left_auction_only() {
     assert_eq!(fills_at(&j, 0, 112), 1, "{:?}", lane_recs(&j, 0));
     assert_vx_matches(&script, 0..j.recs.len() - 1);
 }
+
+/// A New with STP mode `stp` (04 §6.8).
+fn stp_new(
+    side: Side,
+    tif: Tif,
+    tick: u32,
+    qty: u32,
+    tag: u32,
+    stp: vyrn_bbo::Stp,
+) -> vyrn_wire::Msg {
+    vyrn_wire::Msg::New {
+        flags: vyrn_wire::OrderFlags::from_byte(vyrn_bbo::OrderFlags::new(side, tif, false, stp).0)
+            .unwrap(),
+        tick: vyrn_types::Tick(tick),
+        qty: vyrn_types::Qty(qty),
+        client_tag: tag,
+    }
+}
+
+/// STP that triggers (05 §2.4, 04 §6.8, gap item 4). Lane 0's account 1 rests a sell of 2 at
+/// 105, account 2 a sell at 106. Account 1 then crosses its own sell: cancel-newest is
+/// `Reject STP` with the resting handle and the maker stays; a FOK cancel-both finds nothing
+/// fillable before its own maker (`FOK_UNFILLABLE`); a FOK cancel-oldest skips it in the dry
+/// run, then the sweep ends it (`Out STP`) and fills the sell at 106. Lane 1 and lane 0's
+/// account 1 rest sells at 104; account 1's cancel-both buy of 3 fills lane 1's, then ends its
+/// own maker and goes `Out STP` for its open 2, since it has filled.
+fn stp_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::{Day, Fok};
+    use vyrn_bbo::Stp;
+    let p = |l, a, t: u64, m| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs: vec![m],
+    };
+    let settle = [Act::Run, Act::Poll, Act::Run];
+    let mut s = vec![
+        p(0, 1, 1_000, new(Sell, Day, 105, 2, 1)),
+        p(0, 2, 1_100, new(Sell, Day, 106, 1, 2)),
+    ];
+    for (t, m) in [
+        (2_000, stp_new(Buy, Day, 106, 1, 3, Stp::CancelNewest)),
+        (2_500, stp_new(Buy, Fok, 106, 1, 4, Stp::CancelBoth)),
+        (3_000, stp_new(Buy, Fok, 106, 1, 5, Stp::CancelOldest)),
+    ] {
+        s.extend(settle.clone());
+        s.push(p(0, 1, t, m));
+    }
+    s.extend(settle.clone());
+    s.push(p(1, 1, 4_000, new(Sell, Day, 104, 1, 6)));
+    s.push(p(0, 1, 4_100, new(Sell, Day, 104, 1, 7)));
+    s.extend(settle.clone());
+    s.push(p(
+        0,
+        1,
+        5_000,
+        stp_new(Buy, Day, 104, 3, 8, Stp::CancelBoth),
+    ));
+    s.extend(settle.clone());
+    // The order `Reject STP` ended is ended by the exchange: TOO_LATE with detail OUT.
+    s.push(p(0, 1, 6_000, cancel(Handle::new(3, 1).unwrap(), 9)));
+    s.extend(settle);
+    s
+}
+
+#[test]
+fn the_vx_client_replays_stp_that_triggers() {
+    use vyrn_bbo::Record as R;
+    use vyrn_types::RejectReason as RR;
+    let script = stp_script();
+    let (live_j, store, blocks) = blocks_of(&script, &[]);
+    let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let all: Vec<_> = live_j
+        .resp
+        .iter()
+        .flat_map(|(_, p)| p.records().iter().copied())
+        .chain(live_j.tx.iter().flat_map(|(_, r)| r.iter().copied()))
+        .collect();
+    let h1 = Handle::new(1, 1).unwrap();
+    let has = |f: &dyn Fn(&R) -> bool| all.iter().any(f);
+    assert!(
+        has(
+            &|r| matches!(r, R::Reject { reason: RR::Stp, client_tag: 3, detail, .. } if *detail == h1.0)
+        ),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(
+            r,
+            R::Reject {
+                reason: RR::FokUnfillable,
+                client_tag: 4,
+                ..
+            }
+        )),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(r, R::Out { cause: 2, handle, qty, .. } if *handle == h1 && qty.0 == 2)),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(r, R::Fill { tick, qty, .. } if tick.0 == 106 && qty.0 == 1)),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(r, R::Out { cause: 2, client_tag: 8, qty, .. } if qty.0 == 2)),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(
+            r,
+            R::Reject {
+                reason: RR::TooLate,
+                client_tag: 9,
+                detail: 3,
+                ..
+            }
+        )),
+        "{all:?}"
+    );
+    let (j, _) = live07(&script);
+    assert_vx_matches(&script, 0..j.recs.len() - 1);
+}

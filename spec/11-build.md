@@ -1062,6 +1062,22 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   order filled to its predecessor's total already has `fin` set before the Replace, and skipping the predecessor-leg release or the true-up changes only
   risk reservations, which the harness's limits (`max_open` 1,000, credit 2^40 and 2^60) never
   reach.
+- *STP that triggers (4, 05 §2.4, 04 §6.8).* A sweep that reaches a maker of the taker's
+  account (same `acct_ix` on the lane, or on two pooled lanes) acts as `Bbo::sweep` does:
+  cancel-oldest ends the maker (`Out STP`, routed like a maker fill's record) and goes on;
+  cancel-both ends the maker and the taker; cancel-newest ends the taker. The taker gets
+  `Reject STP` with the resting handle on its op's first step before any fill, else `Out STP`
+  after its level's taker fill record. The lane ends the order with detail `OUT` for either, as
+  `vyrn-lane` does. The FOK dry run (`Bbo::fillable`) skips a cancel-oldest maker and stops at
+  any other. A Join dependency whose sweep only ended by STP still ends the step (`join_dep`).
+  `tests/replay.rs` (`the_vx_client_replays_stp_that_triggers`) covers each mode, the FOK dry
+  run, `Reject` versus `Out`, and a later Cancel of the ended order. Mutation check: no trigger,
+  and each wrong mode (cancel-oldest or cancel-both as cancel-newest, cancel-newest as
+  cancel-both), fail it, as do always-`Reject`, always-`Out`, either wrong dry run, a missing
+  level record and the lane's detail. Four survive, recorded as #211 did: cancel-oldest's maker
+  end not counting as step work and STP-only Join steps (no script reaches `ENG_STEP_FILLS` or
+  STP in a dependency), the `first` test (no script has STP in a `CONT` step), and the
+  deps-packet route of an STP maker record (no rested dependency is an STP maker in its step).
 - *In-packet dependencies (5).* The lane's `forward` builds the list as `vyrn-lane` does: every
   earlier unapplied, not explicit Join or Cancel of another order in range of the forwarded op
   becomes explicit, and the op's `resp_seq` advances by 2. Each one is an `OP_DEP` op-log entry
@@ -1100,8 +1116,8 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   when they are made exact from `(max(B, band_hi), min(A, band_lo))`. Maker fills have TX
   packets as in a forwarded sweep. The taker's own Fill, Out and Reject records are the
   lane's (05 §8.10 rule 4): the lane holds them until the version settles, and holds the
-  taker's Ack while it is in flight (rule B), as `vyrn-lane` does. STP that would act in a batch
-  sweep is still `PBV_E_UNSUPPORTED` (item 4). **[Reading, 2]** A Cancel or Reduce in a Rescan
+  taker's Ack while it is in flight (rule B), as `vyrn-lane` does. STP in a batch sweep acts as
+  in a forwarded one (item 4). **[Reading, 2]** A Cancel or Reduce in a Rescan
   cut that orders after the taker's key stops with `PBV_E_UNSUPPORTED`. The Vx book has
   already applied it, but at the key it is not visible. Live never logs such a cut:
   `Bbo::clamp_after_key` cuts below the first op after the key. For the same reason, on a live
@@ -1145,13 +1161,11 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   settles. Releasing only its leg fails the Replace (3b) freeze test, since a Replace has its
   own leg.
 - *Gap list (the plan).* What `RustReplay` replays and the Vx client does not yet
-  (1, Uncross and Seal, 2, Rescan batch takers that trade, 3, Replace and CancelAll, and 5 and 5b, in-packet dependencies
+  (1, Uncross and Seal, 2, Rescan batch takers that trade, 3, Replace and CancelAll, 4, STP that triggers, and 5 and 5b, in-packet dependencies
   with crossing Join dependencies, are done). The client fully replays all of the first 149
   sim-swarm seeds, each under its generated fault schedule (3 before 5, 142 after it);
   `vx_golden.rs`'s `the_vx_client_replays_the_swarm_seeds` requires that, with no
   `PBV_E_UNSUPPORTED` allowance, and runs in the CI `vx` job.
-  4. STP that triggers (currently `PBV_E_UNSUPPORTED` in a forwarded or batch sweep and the FOK
-     dry run).
   6. `engine.client` wiring in `vyrn-validator` (nothing constructs `VxReplay` today).
   7. Then a write-up of what a Vx default (`engine.client = vx`) needs; the default stays `rust`.
 - *Pooled lanes (`AcctTake`, 05 §6.9, 07 §7.1).* `pbv_config` byte 48 is the pool mask,
