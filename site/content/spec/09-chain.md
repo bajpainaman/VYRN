@@ -1963,7 +1963,7 @@ the same property that `CLIENT_SPLIT_CHAIN` gives finality.
 ### 14.3 The version handshake
 
 Every p2p connection starts with the transport handshake, hybrid X25519 + ML-KEM-768 from `E_pq`
-(01 §14.20 G, PQ-12), and then:
+(`HybridSake`, 01 §14.20 G, H), and then:
 
 ```
 Hello { chain_id: u32, genesis_hash: Hash, op: OpIdx, home: HomeCode, client_kind: u8,
