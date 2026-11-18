@@ -308,7 +308,17 @@ nothing to the book. The book at S is the book after the last cross.
   frame, it sends `EpoForceSeal{e, last_height_held}` and starts 07's failover in **seal mode**:
   the replicas finalize the longest order prefix they hold, as in an ordinary failover, but they
   promote no standby. S is the last step of that prefix. Q `EpoForceSeal` signatures are the
-  attestation that 09 slashes as a withheld handoff.
+  attestation that 09 slashes as a withheld handoff. One `EpoForceSeal` is sent per book, signed
+  with the member's vote key `VK(i, home(e))`:
+
+  ```
+  body (14 bytes, little-endian)          msg = derive_key("vyrn      v1 force seal",
+  off size field                                          genesis_hash ‖ mode ‖ body)
+    0   2  book             BookId        sig = Ed25519_sign(VK(i, home(e)), msg)
+    2   4  epoch            e             on the wire: body ‖ index u8 ‖ sig [64]
+    6   8  last_height_held highest block height the member holds
+   14      end
+  ```
 - **Failover guard.** A failover of the sequencer that starts before `T − EPO_SEAL_GUARD_MS`
   promotes the old home's standby, which trades until T and seals. One that starts later runs in
   seal mode. `EPO_SEAL_GUARD_MS` = `FAILOVER_TARGET_MS` (20 ms): a promotion that cannot finish
@@ -557,9 +567,13 @@ streaming, so the end of an epoch needs no bulk transfer.
   before the certificate arrives (§6.1).
 - **Pull.** After the certificate arrives, a node that misses a block or a payload sends
   `EpoTailReq{heights | pkt_hashes}` to the old home and the third home at the same time. The first
-  `EpoTailResp` wins. For TYO → LDN the third home (NYC) answers first: a request at T + 110 ms gets
-  its answer at ≈ T + 180 ms from NYC (35 ms each way, NYC got the data at T + 80) and at ≈ T + 330
-  ms from TYO.
+  `EpoTailResp` that verifies wins: a block must carry its finality certificate and a payload must
+  match its `PktHash`, so a bad answer from one home never blocks a good one from the other.
+  `EpoTailReq` is unsigned (the answers authenticate themselves), little-endian:
+  `book u16 ‖ epoch u32 ‖ req_id u32 ‖ kind u8 (1 heights, 2 pkt_hashes) ‖ count u16 ‖ count × u64`,
+  with 1 ≤ count ≤ `EPO_TAIL_REQ_MAX` (1,024); `EpoTailResp` echoes `req_id`. For TYO → LDN the
+  third home (NYC) answers first: a request at T + 110 ms gets its answer at ≈ T + 180 ms from NYC
+  (35 ms each way, NYC got the data at T + 80) and at ≈ T + 330 ms from TYO.
 - Follow lag at T adds to the window one for one; `EpoReady` caps it at `EPO_READY_LAG_MS` (1 ms,
   §2.6), which `EPO_WINDOW_SLACK_MS` covers. A pull is needed only when both paths lost the same
   data, which is two faults (§10.6).
@@ -710,7 +724,7 @@ protocol goes below it.
 | Message | 1 µs answer in the window (§7.11) | At U | After the lane is live |
 |---|---|---|---|
 | `New`, Day | queued `Ack` with `wref` | joins the auction; any rest rests | normal |
-| `New`, IOC | queued `Ack` | joins; the rest is `Out` cause auction | normal |
+| `New`, IOC | `Reject AUCTION_PHASE` (04 §6.9) | — | normal |
 | `New`, FOK | `Reject AUCTION_PHASE` | — | normal |
 | `New`, auction-only | queued `Ack` | joins; the rest is `Out` cause auction | `Reject AUCTION_PHASE` |
 | `New`, post-only | `Reject AUCTION_PHASE` (04 §6.9; a `Replace` to post-only too) | — | normal |
@@ -1006,8 +1020,8 @@ with the last trade before the halt as the reference.
    lane is **live** and fills each packet on arrival. Catch-up takes at most `EPO_CATCHUP_US`
    (0.75 ms at peak, §6.1). W ends when the last lane is live.
 4. **Final records.** The final records of window messages drain at low priority. Each lane builds,
-   per session in `(pkt_seq, index)` order: `Fill`, then `Ack` for a resting rest, `Out` for an IOC
-   or auction-only rest, `Reject` and `CancelAck` as recorded. Uncross fills go first, and leave
+   per session in `(pkt_seq, index)` order: `Fill`, then `Ack` for a resting rest, `Out` for an
+   auction-only rest, `Reject` and `CancelAck` as recorded. Uncross fills go first, and leave
    within `BLD_UNCROSS_US_MAX` (§7.8). Continuous responses always go before the drain. A lane
    posts a drain packet only when its port's TX load is below `EPO_DRAIN_LOAD_CAP` (0.80). At peak
    (~110M records, ~1.9 GB) the drain takes ≤ `EPO_DRAIN_MS` (150 ms) in the ~50% of port capacity
@@ -1026,7 +1040,8 @@ with the last trade before the halt as the reference.
 The window costs fills only (§6.3). Every packet that reaches a new-home lane gets its first
 response within `LAT_MAX_NS`, like any other packet (01 §14.0, E10).
 
-**The queued `Ack`** (Requests to 01, item 8) is `Ack` (0x81) with bytes 2–3 = `EPO_ACK_QUEUED`,
+**The queued `Ack`** (Requests to 01, item 8) is `Ack` (0x81) with bytes 2–3 = `EPO_ACK_QUEUED`
+(= 1, little-endian u16: bit 0 set, every other bit 0),
 `handle` = the `wref` (`New`, `Replace`) or the target handle (`Cancel`, `Reduce`), `tick` = the
 message's tick or 0, and the `client_tag`. It states: this message is in the log of e+1 at
 (lane, `LaneSeq`), and it is resolved at U. It does not state that a `New` passed risk: balances
@@ -1059,6 +1074,7 @@ window as everywhere, and pooled and dedicated lanes run the same collect path (
 |---|---|---|
 | late by deadline admission; collect buffer full | 01 §14.1 | `Reject BUSY` per message (detail 1 = full), logged as shed |
 | `New` FOK | it needs the book now | `Reject AUCTION_PHASE` |
+| `New` IOC | 04 §6.9: IOC is not accepted in any auction phase, so every auction (the opening one and a reopening after a halt, §7.9) answers it the same way | `Reject AUCTION_PHASE`, detail `PROTO_PHASE_AUCTION` (2) |
 | `rx_ts < T` | it belongs to epoch e | out-of-stream `Reject EPOCH_MISMATCH` (§11.2) |
 | old session of an account that moves lane | it closes at S (§9.2) | out-of-stream `Reject SESSION_CLOSED`, detail `EPO_D_LANE_MOVED` |
 | `New` or `Replace` after `EpoHalt` (§10.3) | the book is halted | `Reject BOOK_HALTED` in the window stream |
@@ -1251,7 +1267,7 @@ path heals, activation proceeds with a longer window and the same uncross rule.
 
 Decision: **no automatic resumption at the old home.** A node of `R_e` cannot tell a dead new home
 from a partitioned live one, and a live one activates as soon as it holds the certificate. After
-`EPO_REASSIGN_MIN_S` (60 s), operators may reassign epoch e+1 with
+`EPO_REASSIGN_MIN_S` (60 s) after T, operators may reassign epoch e+1 with
 `EpoReassign{e+1, home, win_head}`:
 
 1. Each signing operator first fences its own node in the new home through its out-of-band
@@ -1263,6 +1279,17 @@ from a partitioned live one, and a live one activates as soon as it holds the ce
 3. Q signatures make it valid. The target home fetches the window chain to `win_head` and its
    payloads from the fenced nodes' log stores, then activates e+1 from cert(e, S), the
    reassignment and those window blocks.
+
+```
+EpoReassign body (43 bytes, little-endian)   msg = derive_key("vyrn      v1 reassign",
+off size field                                              genesis_hash ‖ mode ‖ body)
+  0   2  book      BookId                    sig = Ed25519_sign(operator key, msg)
+  2   4  epoch     e+1                       valid with Q distinct operator indices, ascending,
+  6   1  home      HomeCode of the target     each (index u8, sig [64])
+  7   4  wheight   win_head height (0: no final window block)
+ 11  32  win_hash  win_head block hash (zero when wheight = 0)
+ 43      end
+```
 
 A fill of e+1 at the new home needs Q armed members, and a reassignment needs Q operators whose
 members are not armed. Two quorums share an honest operator (§5.3), so exactly one of them can
@@ -1457,7 +1484,8 @@ Constants (all budgets). The timeouts and periods are in §4.9.
 | `EPO_SKEW_ALARM_NS` | 1,000 | clock offset between homes that raises an alarm |
 | `EPO_COLLECT_NS` | 10 | lane cost per collected message |
 | `EPO_REPLAY_SLICE_NS` | 40 | longest replay or Apply slice between two RX polls of a lane |
-| `EPO_ACK_QUEUED` | bit 0 of `Ack` bytes 2–3 | the queued `Ack` of a window message |
+| `EPO_ACK_QUEUED` | 1 (bit 0 of `Ack` bytes 2–3, u16 LE) | the queued `Ack` of a window message |
+| `EPO_TAIL_REQ_MAX` | 1,024 | items per `EpoTailReq` |
 | `EPO_APPLY_NS` | 3 | lane cost per applied window message |
 | `EPO_COLLECT_MAX_MSGS` | 6,000,000 | collect buffer per lane; beyond it, `BUSY` |
 | `EPO_HIST_HALF` | 4,096 | band half-width in ticks |
