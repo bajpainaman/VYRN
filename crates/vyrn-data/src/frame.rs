@@ -58,6 +58,8 @@ pub enum FrameErr {
     HbBody,
     #[error("an authenticated fetch whose tag does not verify")]
     Tag,
+    #[error("a REDIRECT whose down or to is not below 8, or both are the same position")]
+    Position,
 }
 
 fn u16_at(b: &[u8], at: usize) -> u16 {
@@ -253,10 +255,31 @@ pub fn decode(b: &[u8]) -> Result<DataFrame<'_>, FrameErr> {
 /// A fetch request (crate docs, § Fetch).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fetch {
-    Key { session: SessionId, pkt_seq: u32 },
-    Range { dst: u8, from: u64, to: u64 },
-    Block { height: Height },
+    Key {
+        session: SessionId,
+        pkt_seq: u32,
+    },
+    Range {
+        dst: u8,
+        from: u64,
+        to: u64,
+    },
+    Block {
+        height: Height,
+    },
+    /// *Reading* (07 §5.7 step 3, wire): a replica's `resend_from` for one session homed on
+    /// the down box, which this box turns into the session's `DataRedirect{down → to,
+    /// resend_from}` (04 §7.6). `down` and `to` are `KeyBundle.data` positions, as there.
+    Redirect {
+        session: SessionId,
+        resend_from: u32,
+        down: u8,
+        to: u8,
+    },
 }
+
+/// The most entries a session's `KeyBundle.data` list has (04 §7.6 DR1: `down`, `to` < 8).
+pub const MAX_DATA_POS: u8 = 8;
 
 impl Fetch {
     pub fn encode(&self) -> [u8; FETCH_BYTES] {
@@ -278,6 +301,18 @@ impl Fetch {
             Self::Block { height } => {
                 b[3] = 3;
                 b[8..16].copy_from_slice(&height.0.to_le_bytes());
+            }
+            Self::Redirect {
+                session,
+                resend_from,
+                down,
+                to,
+            } => {
+                b[3] = 4;
+                b[8..12].copy_from_slice(&session.0.to_le_bytes());
+                b[12..16].copy_from_slice(&resend_from.to_le_bytes());
+                b[16] = down;
+                b[17] = to;
             }
         }
         b
@@ -325,6 +360,27 @@ impl Fetch {
                 },
                 16..32,
             ),
+            Some(4) => {
+                let (down, to) = (
+                    b.get(16).copied().unwrap_or(0),
+                    b.get(17).copied().unwrap_or(0),
+                );
+                if !zero(18..32) {
+                    return Err(FrameErr::Reserved);
+                }
+                if down >= MAX_DATA_POS || to >= MAX_DATA_POS || down == to {
+                    return Err(FrameErr::Position);
+                }
+                (
+                    Self::Redirect {
+                        session: SessionId(u32_at(b, 8)),
+                        resend_from: u32_at(b, 12),
+                        down,
+                        to,
+                    },
+                    32..32,
+                )
+            }
             _ => return Err(FrameErr::Kind),
         };
         if !zero(unused) {

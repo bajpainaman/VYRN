@@ -359,6 +359,12 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
                 to: last,
             } => self.fanout.resend(dst, from, last, tx, c, cfg),
             Fetch::Block { height } => self.resp.block(to, height, &self.store, tx, c, cfg),
+            Fetch::Redirect {
+                session,
+                resend_from,
+                down,
+                to,
+            } => self.redirect(down, to, &[(session, resend_from)]),
         }
     }
 

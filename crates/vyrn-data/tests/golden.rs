@@ -108,6 +108,15 @@ fn fetches_match_the_published_vectors() {
                         },
                         &f[4],
                     ),
+                    "redirect" => (
+                        Fetch::Redirect {
+                            session: SessionId(n(3) as u32),
+                            resend_from: n(4) as u32,
+                            down: n(5) as u8,
+                            to: n(6) as u8,
+                        },
+                        &f[7],
+                    ),
                     k => panic!("fetch kind {k}"),
                 };
                 let want = unhex(hex);
@@ -123,7 +132,7 @@ fn fetches_match_the_published_vectors() {
             _ => {}
         }
     }
-    assert_eq!((ok, err), (3, 9));
+    assert_eq!((ok, err), (4, 12));
 }
 
 #[test]
@@ -167,7 +176,7 @@ fn authenticated_fetches_match_the_published_vectors() {
             _ => {}
         }
     }
-    assert_eq!((ok, err), (3, 4));
+    assert_eq!((ok, err), (4, 4));
 }
 
 #[test]

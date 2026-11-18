@@ -569,6 +569,35 @@ fn redirects_go_to_the_sessions_address_and_replays_do_not_move_it() {
     );
     let k = *r.node.counters();
     assert_eq!((k.redirects, k.redirect_unknown), (1, 1));
+
+    // The same redirect from a replica's REDIRECT fetch (07 §5.7 step 3, reading): sent to the
+    // client's address under the session's key; one for an unknown session is only counted.
+    r.fetch(Fetch::Redirect {
+        session: SessionId(5),
+        resend_from: 4,
+        down: 0,
+        to: 2,
+    });
+    r.fetch(Fetch::Redirect {
+        session: SessionId(6),
+        resend_from: 1,
+        down: 0,
+        to: 2,
+    });
+    r.node.poll(Nanos(1));
+    let got = drain_rx(&mut c);
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        Redirect::open(&got[0], &K).unwrap(),
+        Redirect {
+            down: 0,
+            to: 2,
+            session: SessionId(5),
+            resend_from: 4
+        }
+    );
+    let k = *r.node.counters();
+    assert_eq!((k.redirects, k.redirect_unknown), (2, 2));
 }
 
 /// 08 §4.6: from T the home also takes epoch e + 1 under its own keys. `epoch16` picks the key

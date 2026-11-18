@@ -11,6 +11,7 @@ Line formats (space-separated; '-' for an empty list):
   fetch_ok  <name> key <session> <pkt_seq> <hex>
   fetch_ok  <name> range <dst> <from> <to> <hex>
   fetch_ok  <name> block <height> <hex>
+  fetch_ok  <name> redirect <session> <resend_from> <down> <to> <hex>
   fetch_err <name> <hex> <reason>
   fetch_auth <name> <key hex> <32-byte fetch hex> <40-byte sealed hex>
   fetch_auth_err <name> <key hex> <hex> <reason>
@@ -56,6 +57,10 @@ def rng(dst, frm, to):
 
 def block(h):
     return fetch(3, struct.pack("<Q", h) + bytes(16))
+
+
+def resend(session, frm, down, to, tail=bytes(14)):
+    return fetch(4, struct.pack("<IIBB", session, frm, down, to) + tail)
 
 
 M64 = (1 << 64) - 1
@@ -157,6 +162,7 @@ def main():
     print(f"fetch_ok key key 305419896 7 {hx(key(0x12345678, 7))}")
     print(f"fetch_ok range range 2 10 20 {hx(rng(2, 10, 20))}")
     print(f"fetch_ok block block 1099511627776 {hx(block(1 << 40))}")
+    print(f"fetch_ok redirect redirect 4294967295 5 0 7 {hx(resend(0xFFFFFFFF, 5, 0, 7))}")
     bad = [
         ("short", key(1, 1)[:31], "Short"),
         ("long", key(1, 1) + b"\x00", "Short"),
@@ -167,12 +173,15 @@ def main():
         ("key_tail", fetch(1, struct.pack("<II", 1, 1) + bytes(15) + b"\x01"), "Reserved"),
         ("range_pad", fetch(2, bytes([1, 1]) + bytes(6) + struct.pack("<QQ", 1, 2)), "Reserved"),
         ("block_tail", fetch(3, struct.pack("<Q", 1) + b"\x01" + bytes(15)), "Reserved"),
+        ("redirect_tail", resend(1, 1, 0, 1, tail=bytes(13) + b"\x01"), "Reserved"),
+        ("redirect_same", resend(1, 1, 2, 2), "Position"),
+        ("redirect_to_8", resend(1, 1, 0, 8), "Position"),
     ]
     for name, b, why in bad:
         print(f"fetch_err {name} {hx(b)} {why}")
     kf = bytes(range(0x40, 0x50))
     for name, b in [("key", key(0x12345678, 7)), ("range", rng(2, 10, 20)),
-                    ("block", block(1 << 40))]:
+                    ("block", block(1 << 40)), ("redirect", resend(9, 4, 1, 2))]:
         print(f"fetch_auth {name} {hx(kf)} {hx(b)} {hx(seal(b, kf))}")
     good = seal(key(1, 1), kf)
     for name, b, why in [
