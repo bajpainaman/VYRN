@@ -1003,6 +1003,17 @@ of the packet (`session`); a packet too short to carry them is a parse failure. 
 per shard: `data_seq` stays per box and destination (§5.4), so shards that share a destination
 serialize their frames through one sender.
 
+**Cores of a sharded box (reading, `vyrn-data::shards`).** A box with `n` shards runs `n + 2`
+cores joined by SPSC rings. The RX core reads both RX queues, steers each packet to its shard, and
+runs the fetch gate (`K_fetch` and the per-source rate limit of §5.5) once for the box, so a
+source's limit is the box's, not a shard's. One sender core owns every destination: each
+destination's open frame, its `data_seq` and its RANGE history, so each destination has exactly one
+sender. An admitted KEY fetch goes to shard_of(`session`), the only shard whose ring can hold the
+packet, which answers from that ring or the log on its own TX queue. A BLOCK fetch goes to shard
+`height mod n`, and a RANGE fetch goes to the sender. A full ring between cores drops the packet or
+fetch and counts it (`hop_full`), as a full NIC RX queue would; a replica repairs a lost packet with
+a KEY fetch. Splitting destinations over several sender cores is not specified.
+
 1. **Parse.** A packet is valid if `count ∈ 1..=10`, `len = 32 + 16·count`, `reserved = 0`, and
    `book` is a book this home serves. Anything else is dropped and counted.
 2. **MAC.** In BASE, the data box holds `K_seq` (the operator holds all keys) and checks `tag_seq`.

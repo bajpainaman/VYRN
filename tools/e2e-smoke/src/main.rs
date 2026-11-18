@@ -64,6 +64,10 @@
 //!   gives its `[repair]` `xchg`: with the box still up, `seq-repair` sends a plain and a sealed
 //!   (`K_fetch(0, 0, SEQ_TARGET)`, validator 0's) KEY fetch of the last packets sent; only the sealed
 //!   one may be answered, with the packet's exact bytes (07 §5.5 source 3, 08 §9.6).
+//! - R10. `--data-shards N` runs the box on `N` ingest shards (`[shards] n`, 07 §5.2 RSS by
+//!   session): `STATS` must report `shards=N` and `hop_full=0`, with every other `data` check
+//!   unchanged, so the sharded fan-out keeps one `data_seq` per destination (the feed reports no
+//!   gap) and fetches reach the owning shard.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -205,6 +209,9 @@ struct Cli {
     /// --data and --finality).
     #[arg(long)]
     dropcopy: bool,
+    /// The vyrn-data node's ingest shards (`[shards] n`, R10; needs --data).
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    data_shards: usize,
 }
 
 fn main() -> ExitCode {
@@ -936,6 +943,7 @@ fn data_config(
     dests: &[String],
     sessions: &[Sess],
     keyed: Option<&Cons>,
+    shards: usize,
 ) -> Result<PathBuf, String> {
     let dests = dests
         .iter()
@@ -964,6 +972,9 @@ slots = 65536
 
 [metrics]
 listen = "127.0.0.1:0"
+
+[shards]
+n = {shards}
 "#
     );
     for x in sessions {
@@ -1005,6 +1016,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
         return Err(
             "--dropcopy needs --data and --finality: the observer replays and finalizes".into(),
         );
+    }
+    if cli.data_shards == 0 || (cli.data_shards > 1 && !cli.data) {
+        return Err("--data-shards needs --data and N >= 1".into());
     }
     let wait = Duration::from_secs(cli.wait_s);
     let bin_dir = match &cli.bin_dir {
@@ -1086,7 +1100,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
         // The observer is the last destination (its `[data] me`).
         dests.extend(dc_ports.first().map(|p| format!("127.0.0.1:{p}")));
         let keyed = cons.as_ref().filter(|_| cli.keyed);
-        let cfg = data_config(&dir, &dests, &sessions, keyed)?;
+        let cfg = data_config(&dir, &dests, &sessions, keyed, cli.data_shards)?;
         let mut c = command(&bin_dir.join("vyrn-data"), cli.seq_cpus.as_deref());
         c.arg("--config").arg(cfg).arg("--stop-on-stdin-eof");
         let i = nodes.spawn("vyrn-data", &mut c, &tx)?;
@@ -1834,6 +1848,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
             if let Some(e) = events.first() {
                 errs.push(format!("{} EVENT lines, first {e}", events.len()));
+            }
+            // R10: the box ran on the asked shards and no hop ring overflowed.
+            let shards = cli.data_shards.to_string();
+            if field(&st, "shards") != Some(shards.as_str()) || field(&st, "hop_full") != Some("0") {
+                errs.push(format!("--data-shards {shards}: STATS shards/hop_full wrong: {st}"));
             }
             // R7: validator 0 lost frames, and only sealed fetches are served.
             if let Some(dropped) = relay_dropped {

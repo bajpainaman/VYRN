@@ -132,6 +132,8 @@ pub mod ingest;
 pub mod node;
 pub mod redirect;
 pub mod ring;
+mod serve;
+pub mod shards;
 pub mod spread;
 
 pub use ingest::{DataHome, Event, HomeConfig, Ingested, Mode, Packet, Reject};

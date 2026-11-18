@@ -138,13 +138,37 @@ fn scrape(addr: &str) -> String {
 
 #[test]
 fn serves_a_replica_exports_metrics_and_stops() {
-    let dir = std::env::temp_dir().join(format!("vyrn-data-bin-{}", std::process::id()));
+    serves(None);
+}
+
+/// The same box on two ingest shards, every core pinned to a CPU the test may use: the KEY
+/// fetch reaches the shard that owns session 5, and `STATS` sums the cores.
+#[test]
+fn serves_on_two_pinned_shards() {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let cpu = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .and_then(|l| l.trim().split([',', '-']).next().map(str::to_owned))
+        .unwrap_or_else(|| "0".into());
+    serves(Some(format!(
+        "[shards]\nn = 2\ncpus = [{cpu}, {cpu}, {cpu}, {cpu}]\n"
+    )));
+}
+
+fn serves(shards: Option<String>) {
+    let tag = if shards.is_some() { "sharded" } else { "one" };
+    let dir = std::env::temp_dir().join(format!("vyrn-data-bin-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
     replica
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let cfg = config(&dir, replica.local_addr().unwrap(), false, true);
+    if let Some(extra) = &shards {
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        std::fs::write(&cfg, format!("{text}\n{extra}")).unwrap();
+    }
     let mut child = cmd(&cfg)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -250,6 +274,9 @@ fn serves_a_replica_exports_metrics_and_stops() {
     assert_eq!(field(&stats, "data_frames="), "1", "{stats}");
     assert_eq!(field(&stats, "events_unprinted="), "0", "{stats}");
     assert_eq!(field(&stats, "fetch_unauth="), "2", "{stats}");
+    assert_eq!(field(&stats, "fetch_ring_hit="), "4", "{stats}");
+    let n = if shards.is_some() { "2" } else { "1" };
+    assert_eq!(field(&stats, "shards="), n, "{stats}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
