@@ -2191,7 +2191,15 @@ sequencer. The standby sends a TailReport too, but its Silence never counts towa
 *Readings* (`vyrn-validator` `depose.rs`, `vyrn-seq`):
 - **Heartbeats** (**semantics**, DEV): `vyrn-seq` sends a HEARTBEAT frame only after
   `[replication] heartbeat_us` with no frame sent, so a busy stream sends none. Unset, it sends
-  none at all, and a voter with `[failover]` then suspects an idle sequencer.
+  none at all, and a voter with `[failover]` then suspects an idle sequencer. An idle stream
+  closes an empty block every 16,384 heartbeats (0.8 s at 50 µs), because a TailReport covers
+  at most 2^20 frames after `BlockMark(H_i)` and heartbeats alone would outgrow it.
+- **Arrival** (**semantics**): the silence clock restarts on every frame of the tenure that
+  arrives, including one that waits behind a gap for repair, not only on frames delivered in
+  order.
+- **"Within `REP_SUSPECT_ABORT_MS`"** (**semantics**): a peer's `Silence` counts toward Q while
+  its newest copy is younger than the abort window. A frozen voter repeats its own, so it stays
+  counted, and an aborted one ages out. A signed report of another tenure is refused.
 - **Freeze** (**semantics**): a frozen voter stops polling its ORDER queues, so the socket
   buffers what still arrives, and it runs no `REP_E_HASHLAG` deadline. An abort resumes both.
   Frames buffered past the bound then trip `REP_E_HASHLAG`, as the 5 ms abort window against a
@@ -2214,6 +2222,10 @@ newest frames. The leader therefore waits for every voter's and the standby's re
 longer than `T* + REP_TAIL_WAIT_MS`, where `T*` is the newest `t_last_rx` in the reports it holds
 and `REP_TAIL_WAIT_MS` = 4.05 ms (fence 1.15 + detection 2.0 + one hop 0.8 + 0.1). It starts
 fetching what it lacks at the Q-th report, in parallel. After a crash all reports arrive together.
+
+*Reading* (`vyrn-validator`, **semantics**): a voter deposed by the others' `Silence` before it
+suspected sends its TailReport too, from the frames it holds at deposition, and it computes the
+prefix only once its own report is among those it holds.
 
 ### 9.3 Tail reports and the prefix rule
 

@@ -587,6 +587,8 @@ pub fn run(
                 plan.committee.clone(),
                 plan.seq_order.clone(),
                 plan.epoch,
+                // Reading: this release runs tenure 0 only (promotion is a later change).
+                0,
                 me,
                 s.abort_us,
             )

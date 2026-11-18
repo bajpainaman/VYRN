@@ -419,6 +419,7 @@ where
                         rtx_out: Vec::new(),
                         heartbeat,
                         last_ship: Instant::now(),
+                        heartbeats: 0,
                         t0: Instant::now(),
                         src: ip,
                         k_out,
@@ -1161,6 +1162,10 @@ fn ingest(
     r.map(|_| ())
 }
 
+/// Heartbeats an idle stream sends before it closes an empty block (*reading*, 07 §9.1, §9.3):
+/// 0.8 s at 07's 50 µs, far below a TailReport's 2^20-frame cap.
+const IDLE_BLOCK_HEARTBEATS: u32 = 16_384;
+
 /// The stream core: frames, blocks, and the responses those frames release.
 struct StreamCore<T: TxRing> {
     writer: SeqWriter,
@@ -1181,6 +1186,8 @@ struct StreamCore<T: TxRing> {
     /// `[replication] heartbeat_us`, and when a frame last left.
     heartbeat: Option<Duration>,
     last_ship: Instant,
+    /// Heartbeats since the last block closed (Codex r4618501052).
+    heartbeats: u32,
     t0: Instant,
     src: Ipv4Addr,
     k_out: Vec<(SessionId, [u8; 16])>,
@@ -1246,7 +1253,16 @@ impl<T: TxRing> StreamCore<T> {
                     .heartbeat(Nanos(now))
                     .map_err(|e| e.to_string())?
                 {
-                    Some(f) => self.ship(&[f])?,
+                    Some(f) => {
+                        self.ship(&[f])?;
+                        self.heartbeats = self.heartbeats.saturating_add(1);
+                        // A TailReport covers the frames after the last BlockMark, at most
+                        // MAX_TAIL_FRAMES (2^20) of them: an idle stream closes an empty
+                        // block every IDLE_BLOCK_HEARTBEATS, so heartbeats never outgrow it.
+                        if !open && self.heartbeats >= IDLE_BLOCK_HEARTBEATS {
+                            self.close_block()?;
+                        }
+                    }
                     // Frame 1 (the TenureStart) has not left yet.
                     None => self.last_ship = Instant::now(),
                 }
@@ -1271,6 +1287,7 @@ impl<T: TxRing> StreamCore<T> {
     }
 
     fn close_block(&mut self) -> Result<(), String> {
+        self.heartbeats = 0;
         let (frames, h) = self.writer.close_block().map_err(|e| e.to_string())?;
         self.ship(&frames)?;
         self.stats.blocks.fetch_add(1, Ordering::Relaxed);

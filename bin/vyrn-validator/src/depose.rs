@@ -36,7 +36,7 @@ use std::time::Instant;
 use serde::Deserialize;
 use vyrn_consensus::silence::{Deposition, Reason};
 use vyrn_consensus::tail::{next_seq, prefix, seal_header, tail_deadline};
-use vyrn_consensus::{Committee, Prefix, Reporter, Seal, SealExt, Silence, Tail, TailReport};
+use vyrn_consensus::{Committee, Prefix, Seal, SealExt, Silence, Tail, TailReport};
 use vyrn_log::LaneRec;
 use vyrn_log::block::{data_root, order_root};
 use vyrn_replica::{DataJoin, TailState, full_hash};
@@ -78,6 +78,8 @@ struct St {
     phase: Phase,
     /// This voter's report, from the order thread, until the consensus thread signs it.
     own: Option<TailReport>,
+    /// The order thread had no report to give (no block ready yet).
+    own_none: bool,
     decided: Option<(Prefix, u8)>,
 }
 
@@ -94,12 +96,23 @@ impl Shared {
         self.st().phase
     }
 
-    /// The order thread suspects: freeze, with its report.
+    /// The order thread suspects: freeze, with its report. Already deposed by the others in
+    /// the meantime, the report still goes in: the prefix waits for it.
     pub fn freeze(&self, report: TailReport) {
         let mut s = self.st();
         if s.phase == Phase::Live {
             s.phase = Phase::Frozen;
-            s.own = Some(report);
+        }
+        s.own = Some(report);
+    }
+
+    /// Deposed by the others' `Silence` before this voter suspected (Codex r4618501027): its
+    /// tail still goes into the prefix, which waits for it (07 §9.2). `None`: no block ready.
+    pub fn publish(&self, report: Option<TailReport>) {
+        let mut s = self.st();
+        match report {
+            Some(r) => s.own = Some(r),
+            None => s.own_none = true,
         }
     }
 
@@ -117,6 +130,8 @@ pub struct OrderSide {
     pub me: u8,
     /// It left `Live` and has not come back (an abort resets the silence clock).
     pub was_frozen: bool,
+    /// Its TailReport went to the consensus thread in this failover.
+    pub reported: bool,
     pub sealed: bool,
     /// ORDER datagrams drained unread since deposition (INV-REP-5).
     pub dropped: u64,
@@ -217,10 +232,14 @@ pub struct Tally {
     committee: Committee,
     seq_order: Vec<PubKey>,
     epoch: Epoch,
+    /// The tenure this voter follows: a report of another counts nowhere.
+    tenure: u8,
     me: u8,
     abort: std::time::Duration,
-    reports: BTreeMap<u8, TailReport>,
-    dep: Deposition,
+    /// Each reporter's newest report and when it last arrived.
+    reports: BTreeMap<u8, (Instant, TailReport)>,
+    /// This voter's own report is in `reports`, or it has none to give.
+    own_in: bool,
     sent_at: Option<Instant>,
     deposed: bool,
     decided: bool,
@@ -231,18 +250,19 @@ impl Tally {
         committee: Committee,
         seq_order: Vec<PubKey>,
         epoch: Epoch,
+        tenure: u8,
         me: u8,
         abort_us: u64,
     ) -> Self {
-        let dep = Deposition::new(&committee);
         Self {
             committee,
             seq_order,
             epoch,
+            tenure,
             me,
             abort: std::time::Duration::from_micros(abort_us),
             reports: BTreeMap::new(),
-            dep,
+            own_in: false,
             sent_at: None,
             deposed: false,
             decided: false,
@@ -251,38 +271,77 @@ impl Tally {
 
     /// This voter's own `Silence`, signed, when the order thread has frozen and it was not sent.
     pub fn own(&mut self, shared: &Shared, vote_seed: &[u8; 32]) -> Option<Vec<u8>> {
-        let report = shared.st().own.take()?;
+        let report = {
+            let mut st = shared.st();
+            if std::mem::take(&mut st.own_none) {
+                self.own_in = true;
+            }
+            st.own.take()?
+        };
         let s = Silence::sign(0, Reason::Silence, report.clone(), vote_seed);
-        self.sent_at = Some(Instant::now());
-        self.reports.insert(self.me, report);
-        self.dep.add(self.me);
+        // The check every peer runs (Codex r4618501052): a report they would refuse counts
+        // nowhere, here included.
+        if let Err(e) = Silence::decode(&s.encode())
+            .map_err(|e| e.to_string())
+            .and_then(|d| {
+                d.verify(&self.committee, &self.seq_order)
+                    .map_err(|e| e.to_string())
+            })
+        {
+            println!("SILENCE_UNREPORTABLE {e}");
+            self.own_in = true;
+            return None;
+        }
+        self.own_in = true;
+        if !self.deposed {
+            self.sent_at = Some(Instant::now());
+        }
+        self.reports.insert(self.me, (Instant::now(), report));
         Some(s.encode())
     }
 
-    /// A peer's `Silence` from the tail channel. Only this epoch's and the first tenure seen
-    /// count; a standby's report counts toward the prefix, never toward Q (07 §9.1).
+    /// A peer's `Silence` from the tail channel. Only this voter's epoch and tenure count (a
+    /// signed report of another tenure is refused, never adopted); a standby's report counts
+    /// toward the prefix, never toward Q (07 §9.1). A repeat refreshes its arrival time.
     pub fn on_silence(&mut self, bytes: &[u8]) -> Result<(), String> {
         let s = Silence::decode(bytes).map_err(|e| e.to_string())?;
-        let who = s
-            .verify(&self.committee, &self.seq_order)
+        s.verify(&self.committee, &self.seq_order)
             .map_err(|e| e.to_string())?;
-        let tenure = self.reports.values().next().map(|r| r.tenure);
-        if s.report.epoch != self.epoch || tenure.is_some_and(|t| t != s.report.tenure) {
+        if s.report.epoch != self.epoch || s.report.tenure != self.tenure {
             return Err("another epoch or tenure".into());
         }
-        if self.decided {
-            return Ok(());
+        if s.report.reporter == self.me {
+            return Err("this voter's own index".into());
         }
-        if let Reporter::Voter(v) = who {
-            self.dep.add(v);
+        if !self.decided {
+            self.reports
+                .insert(s.report.reporter, (Instant::now(), s.report));
         }
-        self.reports.insert(s.report.reporter, s.report);
         Ok(())
+    }
+
+    /// 07 §9.1–9.2: Silence from Q distinct voters, each of them held within the abort window
+    /// (a frozen voter repeats its own every 2 ms, an aborted one stops), this voter's own
+    /// while it is frozen.
+    fn quorum(&self) -> bool {
+        let mut dep = Deposition::new(&self.committee);
+        let n = self.committee.n();
+        for (&who, (at, _)) in &self.reports {
+            let fresh = if who == self.me {
+                self.sent_at.is_some()
+            } else {
+                at.elapsed() < self.abort
+            };
+            if fresh && usize::from(who) < n {
+                dep.add(who);
+            }
+        }
+        dep.deposed()
     }
 
     /// Advances the failover; returns a line to print when it moves.
     pub fn poll(&mut self, shared: &Shared, now_real_ns: u64) -> Option<String> {
-        if !self.deposed && self.dep.deposed() {
+        if !self.deposed && self.quorum() {
             self.deposed = true;
             shared.st().phase = Phase::Deposed;
             return Some(format!(
@@ -292,9 +351,11 @@ impl Tally {
             ));
         }
         if self.deposed && !self.decided {
-            let reports: Vec<TailReport> = self.reports.values().cloned().collect();
+            let reports: Vec<TailReport> = self.reports.values().map(|(_, r)| r.clone()).collect();
             let all = reports.len() >= self.committee.n();
-            if all || tail_deadline(&reports).is_some_and(|d| now_real_ns >= d) {
+            // Never without this voter's own tail (07 §9.2 waits for every report).
+            let due = all || tail_deadline(&reports).is_some_and(|d| now_real_ns >= d);
+            if due && self.own_in {
                 let p = prefix(&reports)?;
                 // seq_order[0] is the deposed one; no standby report yet, so none is promotable.
                 let next = next_seq(&self.committee, self.seq_order.len(), 0, &[0], &reports);
@@ -311,8 +372,8 @@ impl Tally {
         }
         if !self.deposed && self.sent_at.is_some_and(|t| t.elapsed() >= self.abort) {
             self.sent_at = None;
-            self.reports.clear();
-            self.dep = Deposition::new(&self.committee);
+            self.own_in = false;
+            self.reports.remove(&self.me);
             let mut s = shared.st();
             s.phase = Phase::Live;
             s.own = None;
@@ -397,5 +458,79 @@ mod tests {
         assert_eq!(s.header.last_step, StepId(9));
         assert_eq!(s.header.order_root, order_root(&[1, 2, 3], &[]));
         assert_eq!(s.header.data_root, data_root(&[Hash([0; 32]); 2], &[]));
+    }
+
+    fn seed(i: u8) -> [u8; 32] {
+        [i + 1; 32]
+    }
+
+    /// A committee of 4 (seeds `[i + 1; 32]`) and this voter's tally at index 0.
+    fn tally(abort_us: u64) -> (Tally, Shared) {
+        let keys = (0..4)
+            .map(|i| vyrn_crypto::ed25519::public_key(&seed(i)))
+            .collect();
+        let seq = vyrn_crypto::ed25519::public_key(&[0x99; 32]);
+        let c = Committee::new(vyrn_types::Mode::Base, keys, &[seq]).unwrap();
+        (
+            Tally::new(c, vec![seq], Epoch(0), 0, 0, abort_us),
+            Shared::default(),
+        )
+    }
+
+    fn silence(from: u8, tenure: u8) -> Vec<u8> {
+        let r = report(&tail(12), Epoch(0), tenure, from, 1);
+        Silence::sign(0, Reason::Silence, r, &seed(from)).encode()
+    }
+
+    /// 07 §9.1 "within REP_SUSPECT_ABORT_MS" (Vercel r4618491834): Silence a peer sent before
+    /// it aborted does not add up with later ones into a quorum.
+    #[test]
+    // The abort window is wall-clock (`Instant`): the test waits it out.
+    #[allow(clippy::disallowed_methods)]
+    fn stale_silence_does_not_add_up_to_a_quorum() {
+        let (mut t, sh) = tally(20_000);
+        t.on_silence(&silence(1, 0)).unwrap();
+        t.on_silence(&silence(2, 0)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        t.on_silence(&silence(3, 0)).unwrap();
+        assert_eq!(t.poll(&sh, 0), None);
+        assert_eq!(sh.phase(), Phase::Live);
+        // The two repeat theirs (a frozen voter does every 2 ms): now Q are fresh.
+        t.on_silence(&silence(1, 0)).unwrap();
+        t.on_silence(&silence(2, 0)).unwrap();
+        assert!(t.poll(&sh, 0).unwrap().starts_with("DEPOSED"));
+    }
+
+    /// Vercel r4618491826: a signed report of another tenure is refused and does not pin the
+    /// tally to that tenure.
+    #[test]
+    fn a_report_of_another_tenure_pins_nothing() {
+        let (mut t, sh) = tally(1_000_000);
+        assert!(t.on_silence(&silence(1, 5)).is_err());
+        for v in 1..=3 {
+            t.on_silence(&silence(v, 0)).unwrap();
+        }
+        assert!(t.poll(&sh, 0).unwrap().starts_with("DEPOSED"));
+    }
+
+    /// Codex r4618501027: deposed by its peers before it suspected, a voter decides the prefix
+    /// only with its own tail in it (07 §9.2), however late the deadline.
+    #[test]
+    fn a_voter_deposed_by_its_peers_waits_for_its_own_tail() {
+        let (mut t, sh) = tally(1_000_000);
+        for v in 1..=3 {
+            t.on_silence(&silence(v, 0)).unwrap();
+        }
+        assert!(t.poll(&sh, u64::MAX).unwrap().starts_with("DEPOSED"));
+        assert_eq!(t.poll(&sh, u64::MAX), None);
+        assert_eq!(sh.take_decision(), None);
+        // Its own tail holds two more frames than the others'.
+        sh.publish(Some(report(&tail(14), Epoch(0), 0, 0, 2)));
+        assert!(t.own(&sh, &seed(0)).is_some());
+        let line = t.poll(&sh, u64::MAX).unwrap();
+        assert!(
+            line.contains("end_a=14 ") && line.contains("reports=4"),
+            "{line}"
+        );
     }
 }

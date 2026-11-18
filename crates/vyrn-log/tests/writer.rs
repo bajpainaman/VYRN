@@ -371,3 +371,45 @@ fn a_take_frames_right_before_its_packet() {
         assert!(r.is_err(), "{t:?} framed");
     }
 }
+
+/// An idle stream (07 §9.1): heartbeats take `frame_seq`s and leave pending records unframed,
+/// none goes out before frame 1's `TenureStart`, and an empty block closed after them (what
+/// `vyrn-seq` does to keep a TailReport's span bounded) decodes and chains like any other.
+#[test]
+fn heartbeats_and_an_empty_block_decode_in_order() {
+    let layout = Layout::new(3, 1, 0).unwrap();
+    let ident = Ident {
+        book: BookId(2),
+        epoch: Epoch(3),
+        tenure: 0,
+        sender: 0,
+    };
+    let mut w = SeqWriter::new(layout, ident, ts(), SEED, 1472).unwrap();
+    assert_eq!(w.heartbeat(Nanos(1)).unwrap(), None);
+    let mut frames = w
+        .packet(pkt(0, 0x22, 9, 1, 1), Some(Hash([1; 32])))
+        .unwrap();
+    let (f, h0) = w.close_block().unwrap();
+    frames.extend(f);
+    for t in 0..5 {
+        frames.push(w.heartbeat(Nanos(t)).unwrap().unwrap());
+    }
+    let (f, h1) = w.close_block().unwrap();
+    frames.extend(f);
+    // The empty block: no steps, no ORDER bytes before its mark but the mark itself.
+    assert_eq!(h1.height, Height(1));
+    assert_eq!(h1.first_step, StepId(h0.last_step.0 + 1));
+    assert_eq!(h1.last_step, h0.last_step);
+    assert_eq!(check_link(&h0, &h1), Ok(()));
+    let mut dec = StreamDecoder::new(layout, 0).unwrap();
+    let mut beats = 0;
+    for (i, f) in frames.iter().enumerate() {
+        let fr = dec
+            .decode(f)
+            .unwrap_or_else(|e| panic!("frame {}: {e:?}", i + 1));
+        assert_eq!(fr.header.frame_seq, i as u64 + 1);
+        beats += usize::from(matches!(fr.body, Body::Heartbeat(_)));
+    }
+    assert_eq!(beats, 5);
+    assert_eq!(dec.take_closed().len(), 2);
+}

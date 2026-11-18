@@ -684,6 +684,7 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
             epoch: view_epoch,
             me: u8::try_from(p.me).unwrap_or(u8::MAX),
             was_frozen: false,
+            reported: false,
             sealed: false,
             dropped: 0,
         }),
@@ -1499,12 +1500,22 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             let phase = f.shared.phase();
             if phase == depose::Phase::Live && f.was_frozen {
                 f.was_frozen = false;
+                f.reported = false;
                 last_frame = Some((now(), realtime_ns()));
                 println!("UNFROZEN");
             }
             if phase != depose::Phase::Live {
                 f.was_frozen = true;
                 if phase == depose::Phase::Deposed {
+                    // Deposed by the others before this voter suspected: its tail as of now.
+                    if !f.reported {
+                        f.reported = true;
+                        let real = last_frame.map_or(0, |x| x.1);
+                        f.shared.publish(
+                            core.tail()
+                                .map(|t| depose::report(&t, f.epoch, 0, f.me, real)),
+                        );
+                    }
                     for (rx, b) in rxs.iter_mut().zip(bursts.iter_mut()) {
                         if let Some(rx) = rx {
                             let n = rx.poll(b);
@@ -1565,6 +1576,7 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                     t.subs.get(1).map_or(0, |s| s.last)
                 );
                 f.shared.freeze(depose::report(&t, f.epoch, 0, f.me, real));
+                f.reported = true;
                 continue;
             }
         }
@@ -1634,6 +1646,14 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             let Ok(f) = frame::parse(bytes) else {
                 continue;
             };
+            // 07 §9.1: a frame of the tenure that *arrived* restarts the silence clock, even
+            // one `Paths` then holds behind a gap (Vercel r4618491843).
+            if fo.is_some()
+                && let Ok((h, _)) = vyrn_log::frame::FrameHeader::parse(f.payload)
+                && (h.book, h.epoch16, h.tenure, h.sender) == (ctx.0, ctx.1, 0, 0)
+            {
+                last_frame = Some((now(), realtime_ns()));
+            }
             // The sequencer's answer to a Nack for frames its ring no longer holds.
             if let (Some(t), Some(ps)) = (NackTooOld::decode(f.payload), paths.as_mut()) {
                 rep_stats[2] = rep_stats[2].saturating_add(1);
