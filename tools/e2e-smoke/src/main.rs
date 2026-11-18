@@ -50,7 +50,7 @@
 //!   vyrn-seq (a 300 ms client stall drops 281, and the shortfall is 281). In the loaded
 //!   `--dropcopy` run d-28 the same starvation also stopped validator-0 at `REP_E_HASHLAG`
 //!   height 0: it shared CPU 1 with the client, against the validators' 50 ms DEV bound
-//!   (`--dev-hashlag-us 50000`); load, not a fault. The replay side is every `lane_resp` and every fill `tx` with
+//!   (`--dev-hashlag-us 50000` then); load, not a fault. The replay side is every `lane_resp` and every fill `tx` with
 //!   `resp_seq ≠ 0` (the box does not send `resp_seq` 0 TX packets yet). Fill TX `step`, `lane`
 //!   and `role`, which `output_hash` covers, are not on the wire, so the per-block output hash
 //!   itself cannot be recomputed from the box's side.
@@ -204,9 +204,14 @@
 //!   `REP_E_HASHLAG` stop too and requires one validator to cover every height. The shipped
 //!   bound stays 1 ms. `--dev-hashlag-us` (DEV only, needs `--data`) gives the validators
 //!   `dev = true` and a larger `[replay] hashlag_us`; CI runs it with `--strict-hashlag`, so every
-//!   CI run must cover and finalize every height. The observer then gets its own bound, at least
-//!   200 ms (`OBS_DEV_HASHLAG_US`): its order thread also replays, feeds the drop copy and
-//!   finalizes, so DEV stalls reach it first. Its `REP_E_HASHLAG` still fails the run. `--seq-cpus` and `--validator-cpus` (taskset masks)
+//!   CI run must cover and finalize every height. The observer gets the voters' bound (or
+//!   `--obs-hashlag-us`): with `REP_E_HASHLAG` measured from the kernel's receive stamp (07 §3.7)
+//!   the time its order thread spends replaying, feeding the drop copy and finalizing no longer
+//!   counts, so it no longer needs the 200 ms it had. CI runs 20 ms: on a loaded 2-vCPU orb (all
+//!   validators and the harness on one CPU, two CPU hogs) 40 of 40 runs at 20 ms had no stop, 1 of
+//!   10 at 10 ms and 1 of 5 at 2 ms stopped, the latter with every replica at one height, as the
+//!   box's sender was preempted between an ORDER frame and its HASH frame (DEV, not a latency
+//!   result). Its `REP_E_HASHLAG` still fails the run. `--seq-cpus` and `--validator-cpus` (taskset masks)
 //!   keep the box's two polling threads off the validators' cores. Without them all validators
 //!   can stop at one height when the box is preempted between an ORDER frame and its HASH frame.
 //!
@@ -296,8 +301,6 @@ struct Rep {
     order_b_as: Option<u16>,
 }
 
-/// With `--dev-hashlag-us`, the observer's `[replay] hashlag_us` (R5): 200 ms, DEV only.
-const OBS_DEV_HASHLAG_US: u64 = 200_000;
 const LANES: usize = 2;
 const NA: usize = 16;
 const BOOK: u16 = 7;
@@ -351,6 +354,10 @@ struct Cli {
     /// needs --data). The spec's bound is 1000; CI sets a larger one with --strict-hashlag (R5).
     #[arg(long, value_name = "US")]
     dev_hashlag_us: Option<u64>,
+    /// DEV only, with --dev-hashlag-us: the observer's bound in µs, in place of the voters'
+    /// (R5). For measuring how far the bounds go down.
+    #[arg(long, value_name = "US", requires = "dev_hashlag_us")]
+    obs_hashlag_us: Option<u64>,
     /// Key the vyrn-data node from the roster and drop some of validator 0's data frames, so
     /// its sealed fetches must be served (R7; needs --data and --finality).
     #[arg(long)]
@@ -1690,9 +1697,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 Some((&box_fetch[..], &ports[..], seq_repair.ok_or("seq_repair")?)),
                 &sessions,
                 cons.as_ref(),
-                // The observer's own DEV bound (R5): it replays, taps and finalizes on its
-                // order thread, so DEV scheduler stalls reach it first. Never below the voters'.
-                cli.dev_hashlag_us.map(|us| us.max(OBS_DEV_HASHLAG_US)),
+                // The observer's DEV bound (R5): the voters' unless --obs-hashlag-us sets it.
+                cli.dev_hashlag_us
+                    .map(|us| cli.obs_hashlag_us.unwrap_or(us)),
                 false,
                 Some((&ring, ctrl)),
                 true,

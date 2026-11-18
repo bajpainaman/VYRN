@@ -242,6 +242,11 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
         self.hashlag_max = ns;
     }
 
+    /// The `REP_E_HASHLAG` bound in ns.
+    pub const fn hashlag_max(&self) -> u64 {
+        self.hashlag_max
+    }
+
     /// Runs the `REP_E_HASHLAG` timer at `now` (ns, the receive clock).
     pub fn tick(&mut self, now: u64) -> Result<(), FrameErr> {
         if let Some(f) = self.fault {
@@ -495,6 +500,16 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
         }
         for &(seq, hash) in entries {
             let a = st.on_hash(seq, hash).map_err(FaultKind::Lane)?;
+            // Each entry against its own record: after a gap fill a lane's records need not be
+            // in receive order, so the head check above may not see a late one.
+            let waited = rx.saturating_sub(a.arrived);
+            if waited > max {
+                return Err(FaultKind::HashLag {
+                    lane,
+                    lane_seq: a.lane_seq,
+                    waited,
+                });
+            }
             let part = sub
                 .parts
                 .get_mut(&a.height.0)

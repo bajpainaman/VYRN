@@ -1409,6 +1409,9 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
+/// The longest a monotonic/realtime read pair may take for `order_thread` to use its offset.
+const OFFSET_READ_MAX_NS: u64 = 20_000;
+
 /// The most frames `order_thread` holds back for its next poll behind a full burst; past it a
 /// frame goes to the core at once.
 const CARRY_MAX: usize = 4 * RX_BURST;
@@ -1432,6 +1435,7 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     let t0 = Instant::now();
     let now = || u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let mut bursts = [[RxPkt::empty(); RX_BURST]; 2];
+    let grace = core.hashlag_max();
     // Frames held back to the next poll behind a full burst, and one poll's receive order.
     let mut carry: Vec<(u64, usize, Vec<u8>)> = Vec::new();
     let mut order: Vec<(u64, u8, usize, usize)> = Vec::with_capacity(2 * RX_BURST + CARRY_MAX);
@@ -1469,7 +1473,15 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                 *n = rx.poll(b);
             }
         }
-        let (mono, real) = (now(), realtime_ns());
+        // The offset between the clocks, from a pair of reads not split by a deschedule: one
+        // that was would shift this poll's frames by the stall.
+        let (mut mono, mut real) = (now(), realtime_ns());
+        for _ in 0..4 {
+            if now().saturating_sub(mono) <= OFFSET_READ_MAX_NS {
+                break;
+            }
+            (mono, real) = (now(), realtime_ns());
+        }
         let at_of = |p: &RxPkt| mono.saturating_sub(real.saturating_sub(p.rx_ts().0));
         let cap = (0..2)
             .filter(|&i| n[i] == RX_BURST)
@@ -1520,6 +1532,9 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             // Deadlines stop at the oldest frame `Paths` holds behind a gap (07 §3.7).
             let hm = paths.as_ref().map_or(u64::MAX, Paths::held_min);
             let mut on = |payload: &[u8], at: u64| {
+                // A held frame keeps the deadlines back at most one bound, so a hole never
+                // filled (no `[repair]`) cannot stop REP_E_HASHLAG.
+                let hm = hm.max(at.saturating_sub(grace));
                 delivered += 1;
                 // A frame past `cap` that the full carry let through still keeps the deadlines at
                 // `cap`, as its path's unread frames may hold a timely HashRun.
@@ -1573,11 +1588,17 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         // them): the deadlines `on_frame` would have checked (REP_E_HASHLAG), whatever the data
         // queue is doing.
         if delivered == 0 {
-            let hm = paths.as_ref().map_or(u64::MAX, Paths::held_min);
+            // The poll's own time, not now: a frame received after it is still in the socket,
+            // and a pause since then must not run the deadlines past it.
+            let t = mono;
+            let hm = paths
+                .as_ref()
+                .map_or(u64::MAX, Paths::held_min)
+                .max(t.saturating_sub(grace));
             // A full burst's unread frames came no later than its last one read (`cap`), even
             // when the frames read were all duplicates and nothing was delivered.
             let carried = carry.first().map_or(u64::MAX, |c| c.0);
-            let r = core.tick(now().min(hm).min(carried).min(cap));
+            let r = core.tick(t.min(hm).min(carried).min(cap));
             report(
                 &mut core,
                 r,

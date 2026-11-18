@@ -155,29 +155,29 @@ jobs:
       # Release: a debug validator can take longer than REP_HASHLAG_MAX_NS (1 ms) on one frame.
       - run: cargo build --locked --release -p vyrn-seq -p vyrn-validator -p vyrn-data-box -p vyrn-md -p e2e-smoke
       - name: 4 validators with finality, an observer and vyrn-dropcopy, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --dev-hashlag-us 50000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --dev-hashlag-us 20000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: 4 validators with finality, the tap's data socket losing every 25th frame, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R14)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 50000 --strict-hashlag --tap-loss 25 --workload tools/e2e-smoke/wl-smoke-nocross.toml
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 20000 --strict-hashlag --tap-loss 25 --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: 4 validators with finality, keyed data box, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R7)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 50000 --strict-hashlag --keyed --workload tools/e2e-smoke/wl-smoke-nocross.toml
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 20000 --strict-hashlag --keyed --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: 4 validators with finality, keyed data box on 2 ingest shards, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R7, R10)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 50000 --strict-hashlag --keyed --data-shards 2 --workload tools/e2e-smoke/wl-smoke-nocross.toml
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 20000 --strict-hashlag --keyed --data-shards 2 --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: 4 validators with finality, keyed home and backup data boxes, the home killed mid-run, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R12)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 50000 --strict-hashlag --keyed --data-kill --workload tools/e2e-smoke/wl-smoke-nocross.toml
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 20000 --strict-hashlag --keyed --data-kill --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: 4 validators with finality, keyed home and backup data boxes, the home killed mid-run, 2 000 sessions, WL-SMOKE-MANY seed 1 (tools/e2e-smoke R13, R15)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 50000 --strict-hashlag --keyed --data-kill --dr4-dev --packets 8000 --workload tools/e2e-smoke/wl-smoke-many.toml
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 20000 --strict-hashlag --keyed --data-kill --dr4-dev --packets 8000 --workload tools/e2e-smoke/wl-smoke-many.toml
       - name: 4 validators with finality and vyrn-dropcopy, validator 3 killed mid-run (f = 1), WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R16)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --kill-voter --dev-hashlag-us 50000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --kill-voter --dev-hashlag-us 20000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: 4 validators with finality, an observer and vyrn-dropcopy, WL-SMOKE seed 1 (tools/e2e-smoke)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --dev-hashlag-us 50000 --strict-hashlag
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --dev-hashlag-us 20000 --strict-hashlag
       - name: 4 validators and an observer on two replication paths, vyrn-dropcopy, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R12)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --two-path --dev-hashlag-us 50000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --two-path --dev-hashlag-us 20000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: observer path B loses one frame and sequencer retransmit repairs it, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R12, R14)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --drop-path-b 300 --dev-hashlag-us 50000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --drop-path-b 300 --dev-hashlag-us 20000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: observer path B loses one frame and every retransmit, so it holds the block, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R14)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --drop-path-b 300 --drop-rtx --dev-hashlag-us 50000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --drop-path-b 300 --drop-rtx --dev-hashlag-us 20000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: validator 0 path A loses one frame, repaired, finalizes through the last block, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R14)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --drop-path-a 300 --dev-hashlag-us 50000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --drop-path-a 300 --dev-hashlag-us 20000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
 
   site-diagrams:
     name: site spec copy and diagram inventory
