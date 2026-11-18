@@ -114,7 +114,16 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
         self.taker_end(taker.take());
         // B2.
         let c = at.cut.min(self.applied);
-        while let Some(p) = self.pend.front().copied() {
+        loop {
+            let front = self.pend.front().copied();
+            if let Some(cs) = self.auction_out
+                && front.is_none_or(|p| p.seq > cs)
+            {
+                self.auction_out = None;
+                self.end_auction_only(cs);
+                continue;
+            }
+            let Some(p) = front else { break };
             if p.seq > c || self.in_flight(&p) {
                 break;
             }
@@ -182,7 +191,7 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
                 // The auction ends (05 §8.8); histograms are a follow-up.
                 self.phase = Phase::Continuous;
                 let cstar = LaneSeq(u64::from(ev.handle.0) | (u64::from(ev.vslot) << 32));
-                self.end_auction_only(cstar);
+                self.auction_out = Some(cstar);
                 return;
             }
             _ => {}
@@ -435,18 +444,12 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
     }
 
     /// 05 §8.8 item 6: after the last uncross chunk, every auction-only order visible at `C*[l]`
-    /// with `open > 0` is dead (§2.5 P2). B1 queues one `PendK::AuctionOut` per auction-only
-    /// root created at or before `C*`, session by session in creation order, into B2 at `C*`:
-    /// every op at or before `C*` (a cancel, reduce or `CancelAll`) settles first, and every
-    /// later one finds the order ended. The settle sends the `Out` (`settle_auction_out`).
+    /// with `open > 0` is dead (§2.5 P2). B2 runs this once every pending op at or before `C*`
+    /// (a cancel, reduce or `CancelAll`) has settled and before any later one, so earlier ops
+    /// keep their answers and later ones find the order ended. Sessions in slot order, each
+    /// session's roots in creation order. Allocation-free: it runs on the sealed engine thread.
     /// The BBO core stops seeing these orders at the same step (vyrn-bbo `State::adead`).
     fn end_auction_only(&mut self, cstar: LaneSeq) {
-        let at = self
-            .pend
-            .iter()
-            .position(|p| p.seq > cstar)
-            .unwrap_or(self.pend.len());
-        let mut q = Vec::new();
         for si in 0..MAX_SESSIONS_PER_LANE {
             let Some(s) = u16::try_from(si)
                 .ok()
@@ -466,38 +469,18 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
                     && cur.flags.tif() == Tif::AuctionOnly
                     && cur.ins_seq <= cstar
                 {
-                    q.push(PendE {
-                        seq: cstar,
-                        k: PendK::AuctionOut,
-                        root: r,
-                        v: rp.cur,
-                        w: 0,
-                        r: 0,
-                        ix: INDEX_MAKER,
-                        sess: rp.sess,
-                        pkt: 0,
-                        tag: rp.tag,
-                    });
+                    self.auction_out_of(r, &rp);
                 }
                 r = rp.next;
             }
         }
-        for (k, p) in q.into_iter().enumerate() {
-            self.pend.insert(at.saturating_add(k), p);
-        }
     }
 
     /// The `Out { cause: AUCTION }` of an auction-only remainder (04 `AUCTION_UNFILLED`), for
-    /// its open quantity, unless an op at or before `C*` ended it. The record follows every
-    /// event record already queued (05 §8.10 rule 4.2), so no event is flushed here.
-    fn settle_auction_out(&mut self, p: &PendE) {
-        let Some(rp) = self.root(p.root).copied() else {
-            return;
-        };
-        if !rp.live || rp.ended {
-            return;
-        }
-        let open = self.open_of(p.root, rp.cur);
+    /// its open quantity. The record follows every event record already queued (05 §8.10
+    /// rule 4.2), so no event is flushed here.
+    fn auction_out_of(&mut self, r: u32, rp: &crate::lane::RootP) {
+        let open = self.open_of(r, rp.cur);
         if open == 0 {
             return;
         }
@@ -506,18 +489,18 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
         if let Some(x) = self.slot_mut(leg) {
             x.dead = true;
         }
-        self.end_root(p.root, PROTO_D_OUT);
-        let handle = self.handle(p.root);
+        self.end_root(r, PROTO_D_OUT);
+        let handle = self.handle(r);
         self.emit(
             rp.cur,
-            p.sess,
+            rp.sess,
             0,
             Record::Out {
                 index: INDEX_MAKER,
                 cause: OUT_AUCTION,
                 handle,
                 qty: Qty(open),
-                client_tag: p.tag,
+                client_tag: rp.tag,
             },
         );
     }
@@ -874,7 +857,6 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
             }
             PendK::ReplaceAck => self.settle_replace(p, h),
             PendK::CancelAllAck => self.settle_cancel_all(p),
-            PendK::AuctionOut => self.settle_auction_out(p),
         }
     }
 

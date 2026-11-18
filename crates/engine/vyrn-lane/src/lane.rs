@@ -221,9 +221,6 @@ pub(crate) enum PendK {
     ReduceAck,
     ReplaceAck,
     CancelAllAck,
-    /// 05 §8.8 item 6: the auction-only remainder of `root` ends at `C*` (`seq`), after every
-    /// op at or before `C*` settles and before any later one.
-    AuctionOut,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -283,6 +280,9 @@ pub struct Lane<'a, V: Visibility, const NA: usize> {
     /// ([`Lane::set_snap_lag_max`], 05 §6.5).
     pub(crate) lag_max: u64,
     pub(crate) pend: std::collections::VecDeque<PendE>,
+    /// `C*` of an uncross whose auction-only remainders B2 has not ended yet (05 §8.8 item 6):
+    /// they end once every pending op at or before it has settled.
+    pub(crate) auction_out: Option<LaneSeq>,
     pub(crate) evbuf: std::collections::VecDeque<vyrn_bbo::FillEvent>,
     pub(crate) fwd: std::collections::VecDeque<FwdOut>,
     pub(crate) out: Outbox,
@@ -419,6 +419,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             },
             lag_max: u64::from(SNAP_LAG_MAX),
             pend: std::collections::VecDeque::with_capacity(n),
+            auction_out: None,
             evbuf: std::collections::VecDeque::with_capacity(ENG_FILL_RING),
             fwd: std::collections::VecDeque::with_capacity(ENG_FWD_RING),
             out: Outbox::new(cfg.out_cap),
