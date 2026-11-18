@@ -242,6 +242,31 @@ fn finish_waits_for_the_step_channel() {
 }
 
 #[test]
+fn finish_waits_for_every_lane() {
+    let tick = Event {
+        rx_ts: Nanos(3),
+        kind: EventKind::TimerTick,
+    };
+    let mut out: Vec<Vec<u8>> = vec![];
+    MboEncoder::new(BOOK, EPOCH)
+        .run(
+            &mut [add(1, 0, 0), step(1, 0, 1), tick].into_iter(),
+            &mut out,
+        )
+        .unwrap();
+    // Channel 0 sends a tick heartbeat (W = 0), then its final packet (W = 1). Hold the last.
+    let late = out.iter().rposition(|p| p[0] == 0).unwrap();
+    let held = out.remove(late);
+    let mut sub = MboSubscriber::new(BOOK, EPOCH);
+    for p in &out {
+        sub.on_packet(p).unwrap();
+    }
+    assert_eq!(sub.finish(), Err(SubError::Incomplete));
+    sub.on_packet(&held).unwrap();
+    sub.finish().unwrap();
+}
+
+#[test]
 fn a_rejected_duplicate_add_keeps_the_live_order() {
     let mut book = vyrn_md::Book::default();
     let add = |qty| Record::Add {

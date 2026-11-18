@@ -255,15 +255,17 @@ impl MboSubscriber {
     /// Ends the epoch: applies the lane ops after the last step. Call it once every channel's
     /// final packet arrived; it fails with `Incomplete` otherwise.
     ///
-    /// Complete means: every lane channel has a watermark, and every step up to the highest
-    /// one is applied with all its `MD_EXEC`s. A step op that
+    /// Complete means: every lane channel has the same watermark, and every step up to it
+    /// is applied with all its `MD_EXEC`s. A step op that
     /// trails its execs in a later step-channel packet is not detectable here (spec gap 4).
     pub fn finish(&mut self) -> Result<(), SubError> {
-        let mut final_w = 0;
+        // Every lane's final packet carries W = the last step, so all must agree with it.
+        let (mut lo, mut hi) = (u64::MAX, 0);
         for w in self.lane_w {
-            final_w = final_w.max(w.ok_or(SubError::Incomplete)?);
+            let w = w.ok_or(SubError::Incomplete)?;
+            (lo, hi) = (lo.min(w), hi.max(w));
         }
-        if self.last_step < final_w || self.exec_left > 0 || !self.steps.is_empty() {
+        if lo < hi || self.last_step < hi || self.exec_left > 0 || !self.steps.is_empty() {
             return Err(SubError::Incomplete);
         }
         self.release(self.last_step + 1)?;
