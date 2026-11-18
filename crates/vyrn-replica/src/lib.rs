@@ -88,6 +88,7 @@ pub mod feed;
 pub mod hashlag;
 pub mod lane;
 pub mod order;
+pub mod paths;
 pub mod ports;
 pub mod rust;
 
@@ -103,6 +104,7 @@ pub use feed::{DataFeed, Fed, FeedErr, Gap, REP_DATA_SILENCE_NS};
 pub use hashlag::{REP_HASHLAG_MAX_NS, check_hashlag};
 pub use lane::{LaneErr, LaneState};
 pub use order::{Fault, FaultKind, FrameErr, HeaderErr, OrderCore};
+pub use paths::{Mark, Path, Paths};
 pub use ports::{
     BlockInputs, BlockOutputs, CanonicalStateWriter, EngineClient, EpochView, ReplayEngine,
     ReplayError, StateSnapshot,

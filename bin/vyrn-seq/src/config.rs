@@ -151,8 +151,14 @@ impl Default for Cores {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Replication {
-    /// Every replica's ORDER port (F4–F6 share it in this version).
+    /// Every replica's ORDER port (F4–F6 share it in this version): path A.
     pub order: Vec<SocketAddrV4>,
+    /// Path B's ORDER ports (07 §3.1): every frame goes here too, flagged `PATH_B`, before any
+    /// response it releases (`INV-FRAME-FIRST`). Empty: one path (DEV). Opt-in cost: one header
+    /// copy and one send per frame per replica here, on the stream thread (DEV, 5 replicas,
+    /// kernel_udp: +30–40% per frame; not a latency result).
+    #[serde(default)]
+    pub order_b: Vec<SocketAddrV4>,
     /// A block closes this often while steps are pending.
     pub block_ms: u64,
 }
