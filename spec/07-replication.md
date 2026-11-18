@@ -1224,8 +1224,9 @@ has not configured. Source 2's peer turns round-robin across fetches. **Every un
 escalates on its own (reading, `vyrn-validator`):** once the first one has missed at its data
 boxes and a peer (2 × `REP_DATA_WAIT_US`, so it was lost at its box), a replica asks for all of
 them at once, not for one key after another: a round at most every 100 µs examines at most
-4,096 pending records and asks at most 128 keys, starting where the last round stopped, so every
-missing key gets its turn however long the backlog. A replica catching up, whose data is still in flight,
+256 pending records and asks at most 32 keys, starting where the last round stopped, so every
+missing key gets its turn however long the backlog, and keeps its timer until two full passes of
+the scan go by without it. A replica catching up, whose data is still in flight,
 keeps asking for one. Source 3 holds a packet only
 `REP_SEQ_PKT_RETAIN_MS` after the newest one it took, so a burst lost at the data box (a socket
 overflow) that is walked one key at a time, at up to 3 × 300 µs a key, outlives that window: 89

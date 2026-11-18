@@ -15,8 +15,8 @@
 //! A round ([`Sources::begin_round`]) runs at most every [`ROUND_NS`], examines at most
 //! [`FETCH_SCAN_MAX`] pending records and asks at most [`FETCH_KEYS_MAX`] keys, starting where
 //! the last round stopped ([`Sources::scan_start`], [`Sources::scanned`]), so every missing key
-//! gets its turn however long the backlog; a key is forgotten after a full cycle of the scan
-//! that does not name it.
+//! gets its turn however long the backlog; a key is forgotten after two full cycles of the scan
+//! that do not name it.
 //!
 //! **`PeerDataFetch`** (reading (a), accepted). The request is the same KEY fetch as `DataFetch`
 //! and `SeqDataReq`. A replica answers on its data port, so `[[data.peer]]` lists the peers'
@@ -62,12 +62,14 @@ pub const PEER_KEEP: usize = 16_384;
 /// `REP_SEQ_DATA_MAX_PPS`, reused as each replica's peer-serving rate (reading (d)).
 const PEER_MAX_PPS: u64 = 50_000;
 const BURST_NS: u64 = 10_000_000;
-/// Missing keys one round of [`Sources`] asks for at most (reading (j)): a burst this size
-/// reaches source 3 in one escalation, a longer one in turns of this many.
-pub const FETCH_KEYS_MAX: usize = 128;
+/// Missing keys one round of [`Sources`] asks for at most (reading (j)). Rounds are
+/// [`ROUND_NS`] apart and a key is asked every `REP_DATA_WAIT_US`, so 3 rounds ask 96 keys: an
+/// 89-packet burst reaches source 3 in one escalation.
+pub const FETCH_KEYS_MAX: usize = 32;
 /// Pending records one round examines at most; the next round goes on from there (Codex
-/// r4618145217).
-pub const FETCH_SCAN_MAX: usize = 4096;
+/// r4618145217). Small, so the scan stays a few µs of the order thread's time: 4,096 every
+/// 100 µs stopped a restarted voter at `REP_E_HASHLAG` while it caught up.
+pub const FETCH_SCAN_MAX: usize = 256;
 /// The least time between two rounds, so a replica far behind (catching up from a restart) does
 /// not rescan its pending blocks on every poll.
 pub const ROUND_NS: u64 = 100_000;
@@ -209,9 +211,12 @@ impl Sources {
     }
 
     /// The round examined `examined` records from [`Sources::scan_start`]. When the scan wraps
-    /// past the last record a cycle ends, and keys the cycle did not name (joined, or released)
-    /// are forgotten; so is everything not named this cycle once more than
-    /// 2 × [`FETCH_SCAN_MAX`] keys are held.
+    /// past the last record a cycle ends, and keys neither it nor the cycle before named
+    /// (joined, or released) are forgotten: a wrapping round names its prefix under the cycle
+    /// it ends, so a key is named at least once in any two cycles in a row (Vercel
+    /// r4618223901). Nothing is cut mid-cycle, so a key the scan has not reached keeps its
+    /// escalation (Codex r4618241007); the keys held are those of the pending records named in
+    /// the last two cycles.
     pub fn scanned(&mut self, examined: usize, total: usize) {
         let at = self.scan_start(total).saturating_add(examined);
         let ended = total > 0 && at >= total;
@@ -219,9 +224,10 @@ impl Sources {
         let r = self.round;
         if ended {
             self.round = r.wrapping_add(1);
-            self.missing.retain(|_, x| x.round == r);
-        } else if self.missing.len() > FETCH_SCAN_MAX.saturating_mul(2) {
-            self.missing.retain(|_, x| x.round == r);
+        }
+        if ended {
+            self.missing
+                .retain(|_, x| x.round == r || x.round.wrapping_add(1) == r);
         }
     }
 
@@ -553,11 +559,13 @@ mod tests {
         assert_eq!(round(&mut s, &[1, 2, 3], 0), vec![vec![]; 3]);
         assert_eq!(round(&mut s, &[1, 2, 3], w), vec![vec![t(1)]; 3]);
         assert_eq!(round(&mut s, &[1, 2, 3], 2 * w), vec![vec![t(11)]; 3]);
-        // Key 2 joined: it drops out; 1 and 3 reach the sequencer at the same time.
+        // Key 2 joined: 1 and 3 reach the sequencer at the same time; two cycles without key 2
+        // forget it.
         assert_eq!(round(&mut s, &[1, 3], 3 * w), vec![vec![t(21)]; 2]);
+        assert_eq!(round(&mut s, &[1, 3], 4 * w), vec![vec![t(1)]; 2]);
+        assert_eq!(s.missing.len(), 2);
         // Key 2 missing again starts over.
-        assert_eq!(round(&mut s, &[2], 4 * w), vec![vec![]]);
-        assert_eq!(s.missing.len(), 1);
+        assert_eq!(round(&mut s, &[2], 5 * w), vec![vec![]]);
         // Two keys with two peers: each still turns through both peers (Vercel r4617946666).
         let mut s = Sources::new(Vec::new(), vec![t(11), t(12)], None);
         let mut got: [Vec<Target>; 2] = [Vec::new(), Vec::new()];
@@ -607,7 +615,9 @@ mod tests {
         );
         s.scanned(10, 10); // cycle 1 named it: stays
         assert_eq!(s.missing.len(), 1);
-        s.scanned(10, 10); // cycle 2 did not: forgotten
+        s.scanned(10, 10); // cycle 2 did not, cycle 1 did: stays (Vercel r4618223901)
+        assert_eq!(s.missing.len(), 1);
+        s.scanned(10, 10); // neither cycle 3 nor 2: forgotten
         assert!(s.missing.is_empty());
         // A shrinking backlog cannot leave the cursor past its end.
         s.scanned(3, 10);
