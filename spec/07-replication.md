@@ -1124,7 +1124,7 @@ is one frame with no packets. A peer holds a key's variants in its join and, aft
 them (§5.4), in a FIFO of its last 16,384 released payloads, so a slower peer can still fetch
 them (reading, config). A replica answers at most `REP_SEQ_DATA_MAX_PPS` packets/s (a miss costs
 one, 10 ms of tokens) and refuses RANGE and BLOCK fetches. An answer with fewer tokens on hand
-than variants carries as many as they buy, and the next fetch of that key resumes after them, so
+than variants carries as many as they buy, and that requester's (source address's) next fetch of the key resumes after them, so
 a key holding more variants than a full bucket is still served in full (reading). Its key is
 `K_fetch(e, i, VOTER_TARGET + j)` under the context `"vyrn      v1 peerfetch"` (08 §9.6), for
 requester `i` and serving voter `j`; source 3's is `K_fetch(e, i, SEQ_TARGET + j)` for

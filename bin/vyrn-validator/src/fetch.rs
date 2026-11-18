@@ -184,9 +184,10 @@ pub struct PeerServer {
     kept: BTreeMap<(SessionId, u32), Vec<Vec<u8>>>,
     order: VecDeque<(SessionId, u32)>,
     buf: FrameBuf,
-    /// Per requester IPv4 and key whose variants outnumber the tokens one answer got: where
-    /// its next answer starts, so requesters interleaving fetches of one key each progress.
-    resume: BTreeMap<(Ipv4Addr, SessionId, u32), usize>,
+    /// Per requester source address and key whose variants outnumber the tokens one answer got:
+    /// where its next answer starts, so requesters interleaving fetches of one key each progress,
+    /// even when they share an IPv4.
+    resume: BTreeMap<(SocketAddrV4, SessionId, u32), usize>,
 }
 
 impl PeerServer {
@@ -259,12 +260,12 @@ impl PeerServer {
     pub fn serve(
         &mut self,
         join: &DataJoin,
-        from: Ipv4Addr,
+        from: SocketAddrV4,
         req: &[u8],
         now: u64,
         counts: &mut Counts,
     ) -> Vec<Vec<u8>> {
-        let Some((session, pkt_seq)) = self.open(from, req) else {
+        let Some((session, pkt_seq)) = self.open(*from.ip(), req) else {
             counts.bad = counts.bad.saturating_add(1);
             return Vec::new();
         };
@@ -493,7 +494,7 @@ mod tests {
         j.put(sid(), 1, pkt(2));
         let mut srv = PeerServer::new(&[a(11)], None);
         let mut c = Counts::default();
-        let hit = srv.serve(&j, PEER, &fetch(1), 0, &mut c);
+        let hit = srv.serve(&j, SocketAddrV4::new(PEER, 9), &fetch(1), 0, &mut c);
         assert_eq!(hit.len(), 1);
         let f = decode(&hit[0]).unwrap();
         assert_eq!(
@@ -513,12 +514,18 @@ mod tests {
         let mut feed = vyrn_replica::DataFeed::new(BookId(7), 1, 0);
         let mut mine = DataJoin::default();
         assert_eq!(feed.on_frame(&mut mine, &hit[0], 0).unwrap().stored, 2);
-        let miss = srv.serve(&j, PEER, &fetch(2), 0, &mut c);
+        let miss = srv.serve(&j, SocketAddrV4::new(PEER, 9), &fetch(2), 0, &mut c);
         assert_eq!(miss.len(), 1);
         assert_eq!(decode(&miss[0]).unwrap().n_pkts, 0);
         assert!(
-            srv.serve(&j, Ipv4Addr::new(10, 0, 0, 9), &fetch(1), 0, &mut c)
-                .is_empty()
+            srv.serve(
+                &j,
+                SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 9), 9),
+                &fetch(1),
+                0,
+                &mut c
+            )
+            .is_empty()
         );
         let range = Fetch::Range {
             dst: 0,
@@ -526,18 +533,28 @@ mod tests {
             to: 1,
         }
         .encode();
-        assert!(srv.serve(&j, PEER, &range, 0, &mut c).is_empty());
+        assert!(
+            srv.serve(&j, SocketAddrV4::new(PEER, 9), &range, 0, &mut c)
+                .is_empty()
+        );
         assert_eq!((c.served, c.missed, c.bad, c.limited), (2, 1, 2, 0));
         // 10 ms of 50k/s is 500 tokens: the 251st two-variant answer at one instant is refused.
         let mut srv = PeerServer::new(&[a(11)], None);
         let mut c = Counts::default();
         for _ in 0..250 {
-            assert!(!srv.serve(&j, PEER, &fetch(1), 0, &mut c).is_empty());
+            assert!(
+                !srv.serve(&j, SocketAddrV4::new(PEER, 9), &fetch(1), 0, &mut c)
+                    .is_empty()
+            );
         }
-        assert!(srv.serve(&j, PEER, &fetch(1), 0, &mut c).is_empty());
+        assert!(
+            srv.serve(&j, SocketAddrV4::new(PEER, 9), &fetch(1), 0, &mut c)
+                .is_empty()
+        );
         assert_eq!(c.limited, 1);
         assert!(
-            !srv.serve(&j, PEER, &fetch(1), 40_000, &mut c).is_empty(),
+            !srv.serve(&j, SocketAddrV4::new(PEER, 9), &fetch(1), 40_000, &mut c)
+                .is_empty(),
             "40 µs refills 2"
         );
     }
@@ -557,17 +574,14 @@ mod tests {
             }
         }
         all.sort_unstable();
-        // Two requesters interleave: each one's answers still cover every variant.
-        let other = Ipv4Addr::new(127, 0, 0, 2);
-        let mut srv = PeerServer::new(&[a(11), SocketAddrV4::new(other, 11)], None);
+        // Two requesters on one IPv4 interleave: each one's answers still cover every variant.
+        let mut srv = PeerServer::new(&[a(11)], None);
         let mut c = Counts::default();
         let mut got = [Vec::new(), Vec::new()];
-        for (t, (who, ip)) in [(0, PEER), (1, other), (0, PEER), (1, other)]
-            .into_iter()
-            .enumerate()
-        {
+        for (t, (who, port)) in [(0, 9), (1, 10), (0, 9), (1, 10)].into_iter().enumerate() {
             let now = u64::try_from(t).unwrap() * BURST_NS;
-            let ans = packets(&srv.serve(&j, ip, &fetch(1), now, &mut c));
+            let ans =
+                packets(&srv.serve(&j, SocketAddrV4::new(PEER, port), &fetch(1), now, &mut c));
             assert_eq!(ans.len(), 500, "a full bucket");
             got[who].extend(ans);
         }
@@ -596,7 +610,13 @@ mod tests {
             "the test needs more than one frame"
         );
         let mut srv = PeerServer::new(&[a(11)], None);
-        let frames = srv.serve(&j, PEER, &fetch(1), 0, &mut Counts::default());
+        let frames = srv.serve(
+            &j,
+            SocketAddrV4::new(PEER, 9),
+            &fetch(1),
+            0,
+            &mut Counts::default(),
+        );
         assert!(frames.len() >= 2, "{} frames", frames.len());
         let mut want = vars.clone();
         want.sort_unstable();
@@ -626,7 +646,13 @@ mod tests {
         srv.keep(&j, &recs);
         j.release(vyrn_types::Height(1), &recs);
         assert!(j.resolve(&rec).is_err(), "the join no longer holds it");
-        let frames = srv.serve(&j, PEER, &fetch(1), 0, &mut Counts::default());
+        let frames = srv.serve(
+            &j,
+            SocketAddrV4::new(PEER, 9),
+            &fetch(1),
+            0,
+            &mut Counts::default(),
+        );
         assert_eq!(packets(&frames), vec![p]);
     }
 
@@ -643,21 +669,40 @@ mod tests {
             pkt_seq: 1,
         };
         assert_eq!(
-            packets(&srv.serve(&j, PEER, &seal_fetch(&k, &q), 0, &mut c)),
+            packets(&srv.serve(
+                &j,
+                SocketAddrV4::new(PEER, 9),
+                &seal_fetch(&k, &q),
+                0,
+                &mut c
+            )),
             vec![pkt(1)]
         );
         assert!(
-            srv.serve(&j, PEER, &q.encode(), 0, &mut c).is_empty(),
+            srv.serve(&j, SocketAddrV4::new(PEER, 9), &q.encode(), 0, &mut c)
+                .is_empty(),
             "unsealed"
         );
         assert!(
-            srv.serve(&j, PEER, &seal_fetch(&[0x43; 16], &q), 0, &mut c)
-                .is_empty()
+            srv.serve(
+                &j,
+                SocketAddrV4::new(PEER, 9),
+                &seal_fetch(&[0x43; 16], &q),
+                0,
+                &mut c
+            )
+            .is_empty()
         );
         let other = Ipv4Addr::new(10, 0, 0, 9);
         assert!(
-            srv.serve(&j, other, &seal_fetch(&k, &q), 0, &mut c)
-                .is_empty(),
+            srv.serve(
+                &j,
+                SocketAddrV4::new(other, 9),
+                &seal_fetch(&k, &q),
+                0,
+                &mut c
+            )
+            .is_empty(),
             "wrong IP"
         );
         assert_eq!((c.served, c.bad), (1, 3));
@@ -674,7 +719,10 @@ mod tests {
             session: sid(),
             pkt_seq: 1,
         };
-        assert!(srv.serve(&j, PEER, &q.encode(), 0, &mut c).is_empty());
+        assert!(
+            srv.serve(&j, SocketAddrV4::new(PEER, 9), &q.encode(), 0, &mut c)
+                .is_empty()
+        );
         assert_eq!(c.served, 0);
     }
 }

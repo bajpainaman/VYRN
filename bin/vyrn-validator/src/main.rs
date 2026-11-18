@@ -599,7 +599,7 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 let to = SocketAddrV4::new(from.ip, from.port);
                 for r in self
                     .peer
-                    .serve(join, from.ip, f.payload, now, &mut self.sources.counts)
+                    .serve(join, to, f.payload, now, &mut self.sources.counts)
                 {
                     let _ = self.repair.send_to(&r, to);
                 }
