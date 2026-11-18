@@ -217,7 +217,12 @@
 //!   read before it closes), plus, with `--tap-order-loss N`, the relay's drops and its socket's;
 //!   without that count, none. A hole given up fails. `--tap-order-loss N` relays the tap's order
 //!   socket and drops every N-th datagram, retransmits included; `replay` then also needs the
-//!   relay to have dropped and the tap to have repaired at least one frame. The replay line
+//!   relay to have dropped and the tap to have repaired at least one frame. Before the box stops,
+//!   the tap drains: it Nacks past its last frame of each substream every retry until a probe
+//!   brings nothing and no frame is held, as a hole at the tail has no later frame to show it
+//!   (Codex r4617210353); the box ignores seqs it has not framed yet. At `--tap-order-loss 3`,
+//!   4 of 4 runs without the drain readied 21 to 37 of about 125 blocks, and 4 of 4 with it
+//!   passed. The replay line
 //!   prints `tap_sock_drops=`, `tap_relay_dropped=`, `tap_repaired=`, `tap_nacks=`, `tap_gaps=`
 //!   and `tap_too_old=`.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
@@ -960,10 +965,15 @@ struct TapRepair {
 
 /// The order frames the tap received, until `stop`, in `frame_seq` order. With `nack` (the
 /// box's CTRL, and the port the box has for the tap) the tap repairs its holes as a path-A replica does (R17, 07 §4.10); without it
-/// the frames stay in arrival order.
+/// the frames stay in arrival order. Once `drain` is set, while the box still runs, the tap
+/// also Nacks past its last frame of each substream, every retry, until a probe brings nothing
+/// and no frame is held, then sends on `drained`: a hole at the tail has no later frame to
+/// show it (Codex r4617210353), and the box ignores seqs it has not framed yet.
 fn tap(
     sock: UdpSocket,
     nack: Option<(SocketAddrV4, u16)>,
+    drain: Arc<AtomicBool>,
+    drained: std::sync::mpsc::Sender<()>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<(Vec<Vec<u8>>, TapRepair)> {
     use vyrn_log::frame::{FrameFlags, FrameHeader};
@@ -985,10 +995,17 @@ fn tap(
         };
         let t0 = Instant::now();
         let mut asks = Vec::new();
+        // The last frame handed on per substream; the tap's one substream when none came yet.
+        let mut last: BTreeMap<vyrn_replica::paths::Key, u64> = BTreeMap::from([((0, 0, 0, 0), 0)]);
+        let mut probed: Option<(u64, BTreeMap<vyrn_replica::paths::Key, u64>)> = None;
+        let mut sent_drained = false;
         while !stop.load(Ordering::Acquire) {
             let got = sock.recv(&mut buf).ok().and_then(|k| buf.get(..k));
             let (Some(ps), Some((to, port))) = (paths.as_mut(), nack) else {
                 frames.extend(got.map(<[u8]>::to_vec));
+                if drain.load(Ordering::Acquire) && !sent_drained {
+                    sent_drained = drained.send(()).is_ok();
+                }
                 continue;
             };
             let now = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1001,6 +1018,9 @@ fn tap(
                         let rtx = FrameHeader::parse(d)
                             .is_ok_and(|(h, _)| h.flags & FrameFlags::RETRANSMIT != 0);
                         st.repaired = st.repaired.saturating_add(u64::from(rtx));
+                        if let Some((k, q)) = vyrn_replica::paths::frame_key(d) {
+                            last.insert(k, q);
+                        }
                         frames.push(d.to_vec());
                     });
                 }
@@ -1030,6 +1050,30 @@ fn tap(
                     }
                     Ask::Gap { .. } => st.gaps = st.gaps.saturating_add(1),
                 }
+            }
+            // The tail probe.
+            let due = probed
+                .as_ref()
+                .is_none_or(|(at, _)| now.saturating_sub(*at) >= timers.retry_ns);
+            if drain.load(Ordering::Acquire) && !sent_drained && due {
+                if probed.as_ref().is_some_and(|(_, l)| *l == last) && ps.held_min() == u64::MAX {
+                    sent_drained = drained.send(()).is_ok();
+                    continue;
+                }
+                for (k, q) in &last {
+                    let n = Nack {
+                        path: vyrn_replica::Path::A,
+                        epoch16: k.0,
+                        tenure: k.1,
+                        stream: k.3,
+                        port,
+                        from_seq: q.saturating_add(1),
+                        to_seq: q.saturating_add(vyrn_log::nack::NACK_SPAN_MAX - 1),
+                    };
+                    st.nacks = st.nacks.saturating_add(1);
+                    let _ = sock.send_to(&n.encode(), to);
+                }
+                probed = Some((now, last.clone()));
             }
         }
         (frames, st)
@@ -1941,9 +1985,13 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .map(|a| a.parse().map_err(|e| format!("lane address {a}: {e}")))
         .collect::<Result<_, String>>()?;
 
+    let (tap_drained_tx, tap_drained) = channel();
+    let tap_drain = Arc::new(AtomicBool::new(false));
     let tap_h = tap(
         tap_sock,
         cons.as_ref().map(|c| (c.ctrl, tap_as)),
+        Arc::clone(&tap_drain),
+        tap_drained_tx,
         Arc::clone(&stop_tap),
     );
     let stop_cl = Arc::new(AtomicBool::new(false));
@@ -2226,6 +2274,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 &pkts,
             )
         });
+    // R17: the tap repairs its tail while the box can still retransmit it.
+    tap_drain.store(true, Ordering::Release);
+    if tap_drained.recv_timeout(wait).is_err() {
+        println!("WARN the tap's ORDER tail did not drain within {wait:?} (R17)");
+    }
     let seq_ok = nodes.stop(seq, &rx, Instant::now() + wait)?;
     // The data node flushes its open frames on stop. R13: the home box was killed, so the
     // backup is the one checked.
