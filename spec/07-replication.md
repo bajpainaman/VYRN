@@ -2314,7 +2314,9 @@ sequencer. The standby sends a TailReport too, but its Silence never counts towa
   `REP_SUSPECT_ABORT_MS` only with `dev = true`.
 - **Transport**: `Silence` and its TailReport travel on their own `commonware-p2p` channel among
   the voters (§3.1), not on `REP_UDP_CTRL`. A voter repeats its own every 2 ms until it is live
-  again, because a send reaches only peers connected at that moment.
+  again, because a send reaches only peers connected at that moment. A report counts only when
+  the connection it arrived on authenticated its own reporter (the voter's `node_key`, or the
+  standby's `seq_key`), so a peer cannot replay another's earlier `Silence` as fresh.
 
 ### 9.2 Deposition
 
@@ -2531,6 +2533,28 @@ notice, so a client can switch without waiting.
 | > `last(session) + 1` | `Reject BAD_SEQ` with `detail = last(session) + 1`. The client resends from there. |
 
 Clients resend every packet that has no response, from their retained buffer.
+
+*Readings* (`vyrn-seq` `standby.rs`, `vyrn-validator`; DEV, ruled for this release):
+- **Standby transport** (**wire**): the standby joins the voters' `commonware-p2p` network as a
+  non-voting peer authenticated by `seq_order[1]`'s `seq_key`, with its roster `repl_addr`.
+  Voters hear it on the tail channel only, never on vote, certificate or resolver, and Simplex's
+  broadcasts do not reach it. `REP_UDP_CTRL` does not change.
+- **Standby report** (**semantics**): this standby holds no frames, so from its start it sends,
+  every 50 ms, a signed `Silence` whose TailReport (reporter `n + 1`) has empty tails,
+  `promotable = 1` and `replay_lag_us = 0`. Voters count it toward `next_seq` only: neither Q,
+  nor the prefix, nor when the prefix is due.
+- **Seal header to the standby** (**wire**): a kind-1 certificate carries `last_hash`, not
+  `last_step(Hs)`, which `TenureStart` needs. After the seal is final, each voter that holds the
+  seal sends its 190-byte header to the standby on the tail channel, and the standby takes it
+  only when its hash is a verified certificate's `last_hash` with `next_seq` naming it.
+- **Promotion without prefix replay** (DEV gap; the follow-up replays the prefix to rebuild the
+  book at `Hs` and hands the engine to the live thread): the standby's engine starts from its
+  config, its lane bases are `next_lane_seq = 1` with `prev_cut` zero (not `lane_bounds`), and
+  its log step ids are the engine's plus `last_step(Hs)`. Replicas therefore stop replaying at
+  the seal. What diverges: the seal block's own records, which no replica replays (they come in
+  no `BlockInputs`), and every session's `resp_seq`, which restarts in the fresh engine.
+- **No `SeqChange` and no resend dedupe** yet: the e2e harness moves its client to the standby.
+- **One failover per run**: tenure 1 has no silence detection.
 
 ### 9.6 The fill-revert condition
 

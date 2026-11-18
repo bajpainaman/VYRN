@@ -3785,7 +3785,9 @@ name = "vyrn-seq"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "commonware-runtime",
  "serde",
+ "tokio",
  "toml",
  "vyrn-bbo",
  "vyrn-consensus",

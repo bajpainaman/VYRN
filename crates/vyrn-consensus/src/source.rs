@@ -55,6 +55,13 @@ pub trait BlockSource: Clone + Send + Sync + 'static {
         None
     }
 
+    /// The `seq_key` that signs the headers above `parent`, when it is not the voter's configured
+    /// one: after a finalized seal whose `next_seq` names a standby (07 §9.5), the promoted box's
+    /// for every height above the seal. Default: `None`, the configured key.
+    fn seq_key_after(&self, _epoch: Epoch, _parent: Height) -> Option<PubKey> {
+        None
+    }
+
     /// The tenure is deposed at this voter (07 §9.2), with or without a seal it holds. A deposed
     /// leader proposes only the seal (07 §9.4); one that holds none (it lacks a frame of the
     /// prefix and has no tail fetch yet) proposes nothing, and the view nullifies. Default: as

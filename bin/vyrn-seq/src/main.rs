@@ -19,7 +19,8 @@
 //! | `[replication] order = ["ip:port", ...], order_b = [...], block_ms, heartbeat_us` | where ORDER, HASH and HEADER frames go on path A and, flagged `PATH_B`, on path B (optional; 07 §3.1; opt-in cost: one header copy and one send per frame per path-B replica on the stream thread, +30–40% per frame in DEV with 5 replicas, not a latency result); block period. `rtx_ring_bytes` (default 64 MiB, `REP_RTX_RING_BYTES`): path A frames kept for a replica's `Nack` on `[consensus] ctrl`, served only to configured replicas, at their configured address (07 §4.10, `rtx.rs`); prints `RTX nacks= sent= too_old= refused= limited=` at exit. `heartbeat_us` (optional; 07 §9.1 sets 50): a HEARTBEAT frame after that long with no frame sent; unset sends none |
 //! | `[keys] seq` | the `seq_key` handle (Ed25519 seed) |
 //! | `[epoch_boundary] next, t_ns, to_home, seq_index` | optional: per-lane `EpochNotice` triggers (08 §2.4) |
-//! | `[[dev_session]] lane, slot, account, k_seq, k_out, quote, base` | DEV only: sessions opened at start |
+//! | `[[dev_session]] lane, slot, account, k_seq, k_out, quote, base, generation = 1` | DEV only: sessions opened at start |
+//! | `[standby] repl` | DEV, needs `[consensus]`: this box is a standby of `seq_order` (`standby.rs`); it starts its engine only once a finalized seal names it, then sequences the next tenure. Prints `STANDBY seq_index= repl=` and `SEAL_FINAL height= next_seq= next_tenure=` |
 //! | `[repair] port, slots = 65536, max_pps = 50000, session_pps = 2000, xchg` | optional: `SeqDataReq` (07 §5.5 source 3) on its own thread; with `xchg` (needs `[consensus]`) only fetches sealed under `K_fetch` are served; see `repair.rs` |
 //! | `[consensus] ctrl, roster, roster_hash, genesis_hash, seq_order` | optional: the finality listener (`finality.rs`) on `REP_UDP_CTRL`; committee from the roster file (08 §9.6), checked against `roster_hash` |
 //!
@@ -82,6 +83,7 @@ mod config;
 mod finality;
 mod repair;
 mod rtx;
+mod standby;
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
@@ -336,7 +338,6 @@ where
         None => (None, None),
     };
 
-    let writer = writer(cfg, n, seed)?;
     let k_out: Vec<(SessionId, [u8; 16])> = cfg
         .dev_session
         .iter()
@@ -347,6 +348,14 @@ where
     let mut plan = EnginePlan::from(cfg)?;
     // Nacks from the finality listener to the stream core (`rtx.rs`).
     let (nack_tx, nack_rx) = std::sync::mpsc::sync_channel::<rtx::Req>(rtx::NACK_QUEUE);
+    // A standby's finality listener hands it the seal certificates (`standby.rs`).
+    let (seals_tx, seals_rx) = match cfg.standby {
+        Some(_) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (Some(tx), Some(rx))
+        }
+        None => (None, None),
+    };
     let fin = match &cfg.consensus {
         Some(c) => {
             let st = Arc::clone(&stats);
@@ -359,6 +368,7 @@ where
                 Arc::new(move || st.blocks.load(Ordering::Acquire)),
                 Arc::clone(&stop),
                 nack_tx,
+                seals_tx,
             )?;
             println!("CONSENSUS ctrl={}", f.ctrl);
             plan.gate = Some(Arc::clone(&f.counts));
@@ -366,6 +376,21 @@ where
         }
         None => None,
     };
+    // 07 §9.5: a standby starts its engine only once a finalized seal names it. Its stdin is
+    // not read meanwhile: an unpromoted standby is stopped by a signal.
+    let promo = match (&cfg.standby, &cfg.consensus, &seals_rx) {
+        (Some(sb), Some(c), Some(rx)) => {
+            let home = home_code(&cfg.home).ok_or("config home is not TYO, LDN or NYC")?;
+            match standby::wait(c, sb, home, Epoch(cfg.epoch), seed, rx, &stop)? {
+                Some(p) => Some(p),
+                None => return Ok(()),
+            }
+        }
+        _ => None,
+    };
+    let writer = writer(cfg, n, seed, promo.as_ref())?;
+    let step_base = promo.as_ref().map_or(0, |p| p.header.last_step.0);
+    let tenure = promo.as_ref().map_or(0, |p| p.tenure);
     let r = std::thread::scope(|sc| {
         // However this closure exits, a panic included (stdout closed before `READY` makes
         // `println!` panic), both threads are told to finish, so the scope's join cannot hang.
@@ -414,7 +439,8 @@ where
                         path_b_down: vec![false; replicas_b.len()],
                         replicas_b,
                         path_b: Vec::new(),
-                        rtx: rtx::Ring::new(epoch16, 0, ring_bytes),
+                        rtx: rtx::Ring::new(epoch16, tenure, ring_bytes),
+                        step_base,
                         nacks: nack_rx,
                         rtx_out: Vec::new(),
                         heartbeat,
@@ -636,26 +662,43 @@ impl LocalAddr for vyrn_nic::sim::SimRx {
 }
 
 fn dev_sid(s: &config::DevSession) -> Result<SessionId, String> {
-    vyrn_wire::session_id(s.slot, LaneId(s.lane), 1).ok_or_else(|| "dev_session slot".to_owned())
+    vyrn_wire::session_id(s.slot, LaneId(s.lane), s.generation)
+        .ok_or_else(|| "dev_session slot or generation".to_owned())
 }
 
-fn writer(cfg: &Config, n: usize, seed: [u8; 32]) -> Result<SeqWriter, String> {
+/// Tenure 0's writer, or with `promo` the promoted standby's, anchored on the seal (07 §9.5).
+fn writer(
+    cfg: &Config,
+    n: usize,
+    seed: [u8; 32],
+    promo: Option<&standby::Promotion>,
+) -> Result<SeqWriter, String> {
     let n8 = u8::try_from(n).map_err(|e| e.to_string())?;
     let layout = Layout::new(n8, 1, 0).map_err(|e| e.to_string())?;
     let epoch = Epoch(cfg.epoch);
+    let (tenure, sender, first_step, first_height, prev) = match promo {
+        Some(p) => (
+            p.tenure,
+            p.sender,
+            StepId(p.header.last_step.0.saturating_add(1)),
+            vyrn_types::Height(p.header.height.0.saturating_add(1)),
+            vyrn_log::block::header_hash(&p.header),
+        ),
+        None => (0, 0, StepId(1), vyrn_types::Height(0), Hash([0; 32])),
+    };
     let ident = Ident {
         book: BookId(cfg.book),
         epoch,
-        tenure: 0,
-        sender: 0,
+        tenure,
+        sender,
     };
     let ts = TenureStart {
         epoch,
-        tenure: 0,
-        sender: 0,
-        first_step: StepId(1),
-        first_height: vyrn_types::Height(0),
-        prev_header_hash: Hash([0; 32]),
+        tenure,
+        sender,
+        first_step,
+        first_height,
+        prev_header_hash: prev,
         lanes: vec![
             LaneBase {
                 next_lane_seq: LaneSeq(1),
@@ -706,7 +749,7 @@ fn step_payload(
 fn writer_for_test() -> SeqWriter {
     let p = concat!(env!("CARGO_MANIFEST_DIR"), "/dev.toml");
     let c = Config::load(std::path::Path::new(p)).unwrap_or_else(|e| panic!("{e}"));
-    writer(&c, 2, [0x42; 32]).unwrap_or_else(|e| panic!("{e}"))
+    writer(&c, 2, [0x42; 32], None).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// What the engine thread builds, taken from the config before the thread starts.
@@ -1198,6 +1241,9 @@ struct StreamCore<T: TxRing> {
     pending_tx: Vec<(Endpoint, TxEntry, u8, [Record; MAX_RECS])>,
     /// Payloads of queued commands, for their `Control` steps in order.
     control: std::collections::VecDeque<[u8; vyrn_engine::CONTROL_PAYLOAD_LEN]>,
+    /// Added to the engine's step ids in the log: 0, or a promoted standby's seal `last_step`
+    /// (DEV, `standby.rs`: its engine numbers steps from 1).
+    step_base: u64,
 }
 
 impl<T: TxRing> StreamCore<T> {
@@ -1300,7 +1346,12 @@ impl<T: TxRing> StreamCore<T> {
 
     fn take(&mut self, o: Out) -> Result<(), String> {
         let frames = match o {
-            Out::Pkt(p, full) => self.writer.packet(p, full),
+            Out::Pkt(mut p, full) => {
+                if p.fills_applied.0 != 0 {
+                    p.fills_applied.0 = p.fills_applied.0.saturating_add(self.step_base);
+                }
+                self.writer.packet(p, full)
+            }
             Out::Route(t) => self.writer.route(t),
             Out::GroupEnd => return Ok(()),
             Out::Control(p) => {
@@ -1328,8 +1379,9 @@ impl<T: TxRing> StreamCore<T> {
                 } else {
                     0
                 };
+                let step = StepId(e.step.0.saturating_add(self.step_base));
                 self.writer
-                    .step(e.step, kind, src, flags, payload, &self.cut, e.lowver)
+                    .step(step, kind, src, flags, payload, &self.cut, e.lowver)
             }
             Out::Resp(l, ep, p) => {
                 self.pending.push((l, ep, p));
@@ -1359,7 +1411,7 @@ impl<T: TxRing> StreamCore<T> {
         let frames = self.writer.flush().map_err(|e| e.to_string())?;
         self.ship(&frames)?;
         for (l, ep, p) in core::mem::take(&mut self.pending) {
-            if !gate_open(&self.writer, l, p.gate) {
+            if !gate_open(&self.writer, l, p.gate, self.step_base) {
                 self.pending.push((l, ep, p));
                 continue;
             }
@@ -1370,7 +1422,7 @@ impl<T: TxRing> StreamCore<T> {
         }
         for (ep, h, n, rs) in core::mem::take(&mut self.pending_tx) {
             // A TX packet goes out after its step is framed (05 §8.10 rules 1 and 2).
-            if self.writer.framed_step().0 < h.step.0 {
+            if self.writer.framed_step().0 < h.step.0.saturating_add(self.step_base) {
                 self.pending_tx.push((ep, h, n, rs));
                 continue;
             }
@@ -1478,11 +1530,11 @@ impl<T: TxRing> StreamCore<T> {
 const FLAGS_AT: usize = 16;
 
 /// Whether frames already returned by `w` cover what `gate` waits for on `lane`.
-fn gate_open(w: &SeqWriter, lane: LaneId, gate: Gate) -> bool {
+fn gate_open(w: &SeqWriter, lane: LaneId, gate: Gate, step_base: u64) -> bool {
     match gate {
         Gate::None => true,
         Gate::Packet(s) => w.framed_lane_seq(lane).is_some_and(|f| f.0 >= s.0),
-        Gate::Step(s) => w.framed_step().0 >= s.0,
+        Gate::Step(s) => w.framed_step().0 >= s.0.saturating_add(step_base),
     }
 }
 
@@ -1742,8 +1794,8 @@ mod tests {
         use vyrn_types::{LaneId, LaneSeq, Nanos, PacketRecord, PktHash, SessionId, StepId};
         let mut w = super::writer_for_test();
         let gp = super::Gate::Packet(LaneSeq(1));
-        assert!(super::gate_open(&w, LaneId(0), super::Gate::None));
-        assert!(!super::gate_open(&w, LaneId(0), gp), "nothing pushed");
+        assert!(super::gate_open(&w, LaneId(0), super::Gate::None, 0));
+        assert!(!super::gate_open(&w, LaneId(0), gp, 0), "nothing pushed");
         let p = PacketRecord {
             lane: LaneId(0),
             count: 1,
@@ -1758,21 +1810,23 @@ mod tests {
         };
         w.packet(p, Some(vyrn_types::Hash([1; 32]))).unwrap();
         assert!(
-            !super::gate_open(&w, LaneId(0), gp),
+            !super::gate_open(&w, LaneId(0), gp, 0),
             "pushed but not framed"
         );
         w.flush().unwrap();
-        assert!(super::gate_open(&w, LaneId(0), gp));
-        assert!(!super::gate_open(&w, LaneId(1), gp), "another lane");
+        assert!(super::gate_open(&w, LaneId(0), gp, 0));
+        assert!(!super::gate_open(&w, LaneId(1), gp, 0), "another lane");
         assert!(!super::gate_open(
             &w,
             LaneId(0),
-            super::Gate::Packet(LaneSeq(2))
+            super::Gate::Packet(LaneSeq(2)),
+            0
         ));
         assert!(!super::gate_open(
             &w,
             LaneId(0),
-            super::Gate::Step(StepId(1))
+            super::Gate::Step(StepId(1)),
+            0
         ));
     }
 }

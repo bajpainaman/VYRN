@@ -365,13 +365,22 @@ impl Tally {
             ));
         }
         if self.deposed && !self.decided {
-            let reports: Vec<TailReport> = self.reports.values().map(|(_, r)| r.clone()).collect();
-            let all = reports.len() >= self.committee.n();
+            let n = self.committee.n();
+            // The voters' reports decide the prefix and when it is due; the standby's (reporter
+            // `n + j`) only whether it is promotable (07 §9.3, §9.5).
+            let voters: Vec<TailReport> = self
+                .reports
+                .range(..u8::try_from(n).unwrap_or(u8::MAX))
+                .map(|(_, (_, r))| r.clone())
+                .collect();
+            let all = voters.len() >= n;
             // Never without this voter's own tail (07 §9.2 waits for every report).
-            let due = all || tail_deadline(&reports).is_some_and(|d| now_real_ns >= d);
+            let due = all || tail_deadline(&voters).is_some_and(|d| now_real_ns >= d);
             if due && self.own_in {
-                let p = prefix(&reports)?;
-                // seq_order[0] is the deposed one; no standby report yet, so none is promotable.
+                let p = prefix(&voters)?;
+                let reports: Vec<TailReport> =
+                    self.reports.values().map(|(_, r)| r.clone()).collect();
+                // seq_order[0] is the deposed one.
                 let next = next_seq(&self.committee, self.seq_order.len(), 0, &[0], &reports);
                 self.decided = true;
                 shared.st().decided = Some((p, next));
@@ -484,11 +493,46 @@ mod tests {
             .map(|i| vyrn_crypto::ed25519::public_key(&seed(i)))
             .collect();
         let seq = vyrn_crypto::ed25519::public_key(&[0x99; 32]);
+        let standby = vyrn_crypto::ed25519::public_key(&STANDBY);
         let c = Committee::new(vyrn_types::Mode::Base, keys, &[seq]).unwrap();
         (
-            Tally::new(c, vec![seq], Epoch(0), 0, 0, abort_us),
+            Tally::new(c, vec![seq, standby], Epoch(0), 0, 0, abort_us),
             Shared::default(),
         )
+    }
+
+    const STANDBY: [u8; 32] = [0x98; 32];
+
+    /// 07 §9.5: the standby (reporter `n + 1`) is never one of Q, and its promotable report
+    /// makes it `next_seq`.
+    #[test]
+    fn the_standby_names_next_seq_but_is_not_one_of_q() {
+        let (mut t, sh) = tally(1_000_000);
+        // As `vyrn-seq`'s standby sends it: no frames, promotable.
+        let r = TailReport {
+            epoch: Epoch(0),
+            tenure: 0,
+            reporter: 5,
+            held_height: Height(0),
+            tails: [Tail::default(), Tail::default()],
+            t_last_rx: 0,
+            replay_lag_us: 0,
+            promotable: true,
+        };
+        let sb = Silence::sign(0, Reason::Silence, r, &STANDBY).encode();
+        t.on_silence(5, &sb).unwrap();
+        // A voter cannot forward it either.
+        assert!(t.on_silence(1, &sb).is_err());
+        t.on_silence(1, &silence(1, 0)).unwrap();
+        t.on_silence(2, &silence(2, 0)).unwrap();
+        assert_eq!(t.poll(&sh, 0), None, "two voters and the standby are not Q");
+        t.on_silence(3, &silence(3, 0)).unwrap();
+        assert!(t.poll(&sh, 0).unwrap().starts_with("DEPOSED"));
+        sh.publish(Some(report(&tail(12), Epoch(0), 0, 0, 2)));
+        assert!(t.own(&sh, &seed(0)).is_some());
+        let line = t.poll(&sh, u64::MAX).unwrap();
+        assert!(line.contains("next_seq=1"), "{line}");
+        assert_eq!(sh.take_decision().map(|d| d.1), Some(1));
     }
 
     fn silence(from: u8, tenure: u8) -> Vec<u8> {

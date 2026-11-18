@@ -6,6 +6,7 @@
 //! | Who a voter connects to | [`Peer`]: `vote_key`, `node_key`, `repl_addr` of each voter | 07 §3.1, §13.1 |
 //! | What `Engine::start` takes | [`VoterNet`]: three channels and a blocker, keyed by vote key | 07 §6.3 |
 //! | Where `Silence` and its TailReport go | [`VoterNet::tail`], a fourth channel | 07 §3.1, §9.1 |
+//! | The standby's TailReport (07 §9.5) | a non-voting peer keyed by `seq_order[1]`'s `seq_key`, heard on the tail channel only ([`start_standby`]) | 07 §3.1, §9.5 |
 //!
 //! **Two keys.** A connection authenticates the peer's `node_key` (its p2p identity, as in the
 //! roster). Simplex names participants by `vote_key`. [`VoterNet`]'s senders, receivers and
@@ -47,8 +48,9 @@ const CH_VOTE: u64 = 0;
 const CH_CERT: u64 = 1;
 const CH_RESOLVER: u64 = 2;
 /// `Silence` and its TailReport (07 §3.1: "TailReports use commonware-p2p"). *Reading*
-/// (transport): a channel of its own on the voters' network, next to Simplex's three; the
-/// standby joins it in a later change.
+/// (transport): a channel of its own on the voters' network, next to Simplex's three. The
+/// standby joins the network as a non-voting peer and is heard on this channel only: its
+/// messages on vote, cert or resolver are dropped, and Simplex's broadcasts never reach it.
 const CH_TAIL: u64 = 3;
 /// Messages per second one peer may send on one channel: three votes a view at ~1 kHz views,
 /// with headroom for catch-up. Commonware sizes each channel's mailbox as peers × this burst, so
@@ -76,19 +78,25 @@ fn key(k: &PubKey) -> Result<ed25519::PublicKey, NetErr> {
     ed25519::PublicKey::decode(k.to_vec()).map_err(|_| NetErr::Key)
 }
 
-/// `node_key` ↔ `vote_key` of the committee.
+/// `node_key` ↔ `vote_key` of the committee, and the standby's key when it is a peer.
 #[derive(Debug)]
 struct Keys {
     node_of: BTreeMap<ed25519::PublicKey, ed25519::PublicKey>,
     vote_of: BTreeMap<ed25519::PublicKey, ed25519::PublicKey>,
+    standby: Option<ed25519::PublicKey>,
 }
 
 impl Keys {
     fn to_node(&self, r: Recipients<ed25519::PublicKey>) -> Recipients<ed25519::PublicKey> {
         let map = |k: ed25519::PublicKey| self.node_of.get(&k).cloned();
         match r {
+            // With a standby among the peers, "all" means the committee's nodes.
+            Recipients::All if self.standby.is_some() => {
+                Recipients::Some(self.node_of.values().cloned().collect())
+            }
             Recipients::All => Recipients::All,
             Recipients::Some(ks) => Recipients::Some(ks.into_iter().filter_map(map).collect()),
+            Recipients::One(k) if self.standby.as_ref() == Some(&k) => Recipients::One(k),
             Recipients::One(k) => {
                 map(k).map_or_else(|| Recipients::Some(Vec::new()), Recipients::One)
             }
@@ -200,23 +208,45 @@ type Channel = (
     VoteReceiver<lookup::Receiver<ed25519::PublicKey>>,
 );
 
-/// The tail channel: encoded `Silence` messages among the voters (07 §3.1, §9.1).
-pub struct TailChannel(Channel);
+/// The tail channel: encoded `Silence` messages among the voters and from the standby (07
+/// §3.1, §9.1, §9.5).
+pub struct TailChannel {
+    send: VoteSender<lookup::Sender<ed25519::PublicKey, Context>>,
+    recv: lookup::Receiver<ed25519::PublicKey>,
+    keys: Arc<Keys>,
+}
 
 impl TailChannel {
-    /// Sends `bytes` to every other voter. Reliable while a connection is up; a voter that was
-    /// disconnected misses it, so the caller repeats its own `Silence`.
+    /// Sends `bytes` to every voter (the standby's to every voter too). Reliable while a
+    /// connection is up; a peer that was disconnected misses it, so the caller repeats its own.
     pub fn broadcast(&mut self, bytes: Vec<u8>) {
         use commonware_p2p::Sender as _;
-        let _ = self.0.0.send(Recipients::All, bytes, true);
+        let _ = self.send.send(Recipients::All, bytes, true);
     }
 
-    /// The next message and the vote key of the voter whose connection carried it; `None` once
-    /// the network stopped.
+    /// Sends `bytes` to the standby only, if it is a peer (07 §9.5: the seal header it opens
+    /// its tenure on). *Reading* (wire): the 190-byte `BlockHeader`, which the standby accepts
+    /// only when its hash is a verified kind-1 certificate's `last_hash`.
+    pub fn send_standby(&mut self, bytes: Vec<u8>) {
+        use commonware_p2p::Sender as _;
+        if let Some(k) = self.keys.standby.clone() {
+            let _ = self.send.send(Recipients::One(k), bytes, true);
+        }
+    }
+
+    /// The next message and who sent it: the vote key of the voter whose connection carried
+    /// it, or the standby's `seq_key`. `None` once the network stopped.
     pub async fn recv(&mut self) -> Option<(PubKey, Vec<u8>)> {
-        let (from, msg) = self.0.1.recv().await.ok()?;
-        let key: &[u8] = from.as_ref();
-        Some((PubKey::try_from(key).ok()?, msg.as_ref().to_vec()))
+        loop {
+            let (from, msg) = self.recv.recv().await.ok()?;
+            let who = match self.keys.vote_of.get(&from) {
+                Some(v) => v.clone(),
+                None if self.keys.standby.as_ref() == Some(&from) => from,
+                None => continue,
+            };
+            let key: &[u8] = who.as_ref();
+            return Some((PubKey::try_from(key).ok()?, msg.as_ref().to_vec()));
+        }
     }
 }
 
@@ -230,16 +260,97 @@ pub struct VoterNet {
     pub blocker: VoteBlocker<lookup::Oracle<ed25519::PublicKey>>,
 }
 
+/// The standby as a peer of the voters' network (07 §9.5): its `seq_key`, which it
+/// authenticates with, and its `repl_addr`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Standby {
+    pub seq_key: PubKey,
+    pub addr: SocketAddr,
+}
+
 /// Starts this voter's lookup network on `listen`, authenticated as `node_seed`'s key, with the
-/// committee `peers` (this voter among them) as peer set 0.
+/// committee `peers` (this voter among them), and the `standby` if any, as peer set 0.
 pub fn start(
     context: Context,
     node_seed: [u8; 32],
     listen: SocketAddr,
     peers: &[Peer],
+    standby: Option<Standby>,
 ) -> Result<VoterNet, NetErr> {
+    let (mut network, oracle, keys) = network(context, node_seed, listen, peers, standby)?;
+    let quota = Quota::per_second(NonZeroU32::new(RATE).unwrap_or(NonZeroU32::MIN));
+    let mut channel = |c| {
+        let (s, r) = network.register(c, quota);
+        let keys = Arc::clone(&keys);
+        (
+            VoteSender {
+                inner: s,
+                keys: Arc::clone(&keys),
+            },
+            VoteReceiver { inner: r, keys },
+        )
+    };
+    let (vote, cert, resolver) = (channel(CH_VOTE), channel(CH_CERT), channel(CH_RESOLVER));
+    let tail = tail_channel(&mut network, &keys);
+    network.start();
+    Ok(VoterNet {
+        vote,
+        cert,
+        resolver,
+        tail,
+        blocker: VoteBlocker {
+            inner: oracle,
+            keys,
+        },
+    })
+}
+
+/// The standby's side (07 §9.5): it joins the committee `peers`' network on `listen`,
+/// authenticated as `seq_seed`'s key, and registers only the tail channel, where it hears the
+/// voters' `Silence` and sends its own TailReport.
+pub fn start_standby(
+    context: Context,
+    seq_seed: [u8; 32],
+    listen: SocketAddr,
+    peers: &[Peer],
+) -> Result<TailChannel, NetErr> {
+    let (mut network, _oracle, keys) = network(context, seq_seed, listen, peers, None)?;
+    let tail = tail_channel(&mut network, &keys);
+    network.start();
+    Ok(tail)
+}
+
+fn tail_channel(
+    network: &mut lookup::Network<Context, SakeCups<ed25519::PrivateKey, ChaCha20Poly1305>>,
+    keys: &Arc<Keys>,
+) -> TailChannel {
+    let quota = Quota::per_second(NonZeroU32::new(RATE).unwrap_or(NonZeroU32::MIN));
+    let (s, r) = network.register(CH_TAIL, quota);
+    TailChannel {
+        send: VoteSender {
+            inner: s,
+            keys: Arc::clone(keys),
+        },
+        recv: r,
+        keys: Arc::clone(keys),
+    }
+}
+
+type Net = (
+    lookup::Network<Context, SakeCups<ed25519::PrivateKey, ChaCha20Poly1305>>,
+    lookup::Oracle<ed25519::PublicKey>,
+    Arc<Keys>,
+);
+
+fn network(
+    context: Context,
+    seed: [u8; 32],
+    listen: SocketAddr,
+    peers: &[Peer],
+    standby: Option<Standby>,
+) -> Result<Net, NetErr> {
     use commonware_codec::DecodeExt;
-    let signer = ed25519::PrivateKey::decode(node_seed.to_vec()).map_err(|_| NetErr::Key)?;
+    let signer = ed25519::PrivateKey::decode(seed.to_vec()).map_err(|_| NetErr::Key)?;
     let mut node_of = BTreeMap::new();
     let mut vote_of = BTreeMap::new();
     let mut addrs = Vec::new();
@@ -251,8 +362,26 @@ pub fn start(
         }
         addrs.push((n, Address::Symmetric(p.repl_addr)));
     }
-    let keys = Arc::new(Keys { node_of, vote_of });
-    let n = NonZeroUsize::new(peers.len()).unwrap_or(NonZeroUsize::MIN);
+    let standby = match standby {
+        Some(s) => {
+            let k = key(&s.seq_key)?;
+            if vote_of.contains_key(&k) {
+                return Err(NetErr::Duplicate);
+            }
+            addrs.push((k.clone(), Address::Symmetric(s.addr)));
+            Some(k)
+        }
+        None => None,
+    };
+    let keys = Arc::new(Keys {
+        node_of,
+        vote_of,
+        standby,
+    });
+    // The peer set counts this node too: a voter is among `peers`, the standby is not.
+    let local = commonware_cryptography::Signer::public_key(&signer);
+    let n = addrs.len() + usize::from(!addrs.iter().any(|(k, _)| *k == local));
+    let n = NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN);
     let max = u32::try_from(peers.len()).unwrap_or(u32::MAX);
     let handshake: SakeCups<_, ChaCha20Poly1305> = Cups::new(
         Sake {
@@ -280,31 +409,7 @@ pub fn start(
         Quota::per_second(NonZeroU32::new(16).unwrap_or(NonZeroU32::MIN));
     cfg.dial_frequency = Duration::from_millis(200);
     cfg.peer_connection_cooldown = Duration::from_secs(1);
-    let (mut network, mut oracle) = lookup::Network::new(context, cfg);
+    let (network, mut oracle) = lookup::Network::new(context, cfg);
     let _ = oracle.track(0, Map::from_iter_dedup(addrs));
-    let quota = Quota::per_second(NonZeroU32::new(RATE).unwrap_or(NonZeroU32::MIN));
-    let mut channel = |c| {
-        let (s, r) = network.register(c, quota);
-        let keys = Arc::clone(&keys);
-        (
-            VoteSender {
-                inner: s,
-                keys: Arc::clone(&keys),
-            },
-            VoteReceiver { inner: r, keys },
-        )
-    };
-    let (vote, cert, resolver) = (channel(CH_VOTE), channel(CH_CERT), channel(CH_RESOLVER));
-    let tail = TailChannel(channel(CH_TAIL));
-    network.start();
-    Ok(VoterNet {
-        vote,
-        cert,
-        resolver,
-        tail,
-        blocker: VoteBlocker {
-            inner: oracle,
-            keys,
-        },
-    })
+    Ok((network, oracle, keys))
 }

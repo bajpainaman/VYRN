@@ -373,7 +373,7 @@ storage = "{}"
         }
         assert_eq!(
             v.wait("CONSENSUS", 30),
-            format!("CONSENSUS voter={i} repl=127.0.0.1:{port}")
+            format!("CONSENSUS voter={i} repl=127.0.0.1:{port} standby=none")
         );
         let a = v.wait("READY vyrn-validator order=", 30);
         orders.push(a.rsplit('=').next().unwrap().parse().unwrap());
