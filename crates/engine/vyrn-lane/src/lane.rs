@@ -47,8 +47,9 @@ pub const ROOT_GEN: u8 = 1;
 pub const PROTO_D_FILLED: u32 = 1;
 pub const PROTO_D_CANCELED: u32 = 2;
 pub const PROTO_D_OUT: u32 = 3;
-/// `SESSION_CLOSED` detail of a draining session (04 M4).
-pub const PROTO_D_DRAINING: u32 = 1;
+/// `SESSION_CLOSED` detail of a draining session (04 M4): 7, after the six close causes of
+/// 04 §4.3, so a client tells it from `PROTO_D_LOGOUT` (1).
+pub const PROTO_D_DRAINING: u32 = 7;
 
 /// Book and lane parameters, fixed at epoch start (05 §13).
 #[derive(Clone, Copy, Debug)]
