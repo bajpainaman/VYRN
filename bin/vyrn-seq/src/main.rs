@@ -898,10 +898,13 @@ fn ingest(
     };
     let r = engine.ingest(l, input, clock, sink);
     // Exactly the packets with a PacketRecord are retained (05 §6.10); a full ring drops the copy.
-    if let Ok(Rx::Accepted | Rx::Shed) = &r
+    if let Ok(v @ (Rx::Accepted | Rx::Shed)) = &r
         && let Some(q) = sink.tx.retain.as_mut()
-        && let Some(k) = vyrn_engine::retain::Kept::new(body, rx_ts, pkt_hash)
-        && q.push(&Hw, k).is_err()
+        && let Some(mut k) = vyrn_engine::retain::Kept::new(body, rx_ts, pkt_hash)
+        && {
+            k.verified = *v == Rx::Accepted;
+            q.push(&Hw, k).is_err()
+        }
     {
         sink.stats.retain_dropped.fetch_add(1, Ordering::Relaxed);
     }

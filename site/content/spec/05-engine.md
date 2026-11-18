@@ -1508,7 +1508,9 @@ The packets kept are the lane verdicts `Accepted` and `Shed`.
     at dequeue (§6.8 test D) is retained without a MAC check, because its `SHED` record is logged
     and the sequencer holds the only copy a replica can fetch. Such a packet must still name an open
     session and a `pkt_seq` inside its V5 window, so a sender cannot aim several keys at one bucket.
-    A record joins only the variant its `pkt_hash` names (07 §5.4).
+    Repeating one key can fill its bucket, but an unchecked packet never takes an index way from an
+    `Accepted` (MAC-checked) one; it stays unindexed instead. Shed copies a flood displaces fall to
+    07 §5.5's DAV-3 unavailable rule. A record joins only the variant its `pkt_hash` names (07 §5.4).
 - **Determinism.** Retention changes no engine state and no output. Replay neither reads it nor
   rebuilds it.
 

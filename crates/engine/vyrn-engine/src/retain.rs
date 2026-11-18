@@ -22,7 +22,8 @@
 //! test D) is retained without a MAC check, because its `SHED` record is logged and the sequencer
 //! is the only source of its bytes. Such a packet still names an open session and a `pkt_seq` in
 //! its V5 window, so a sender picks among a few thousand keys against ≥ 2 × slots buckets and
-//! cannot aim several at one bucket. A record joins only the variant its `pkt_hash` names (07
+//! cannot aim several at one bucket. Repeating one key fills its bucket, but an unchecked packet
+//! never takes a way from an accepted (MAC-checked) one. A record joins only the variant its `pkt_hash` names (07
 //! §5.4), so foreign bytes never enter a block.
 //!
 //! **Window.** A packet is served while its `rx_ts` is within [`REP_SEQ_PKT_RETAIN_NS`] of the
@@ -45,6 +46,9 @@ pub struct Kept {
     pub pkt_seq: u32,
     pub pkt_hash: PktHash,
     pub rx_ts: Nanos,
+    /// The lane checked its MAC (verdict `Accepted`). A packet shed at dequeue (05 §6.8 test D)
+    /// was never checked, and never takes an index way from one that was.
+    pub verified: bool,
     len: u8,
     bytes: [u8; MAX_REQ_PAYLOAD],
 }
@@ -66,6 +70,7 @@ impl Kept {
             pkt_seq: word(4)?,
             pkt_hash,
             rx_ts,
+            verified: false,
             len,
             bytes: b,
         })
@@ -115,6 +120,7 @@ impl Retain {
                 pkt_seq: 0,
                 pkt_hash: PktHash(0),
                 rx_ts: Nanos(0),
+                verified: false,
                 len: 0,
                 bytes: [0; MAX_REQ_PAYLOAD],
             },
@@ -164,9 +170,11 @@ impl Retain {
         };
         let mine = u32::try_from(at.wrapping_add(1)).unwrap_or(0);
         // A way that already names this slot is reused, so no two ways name one slot. Else a way
-        // is free when empty or when its slot left this bucket; else the oldest goes.
-        let mut pick = 0usize;
-        let mut oldest = u64::MAX;
+        // is free when empty or when its slot left this bucket. Else the oldest unverified way
+        // goes, then the oldest verified one, but only for a verified packet: an unchecked shed
+        // packet is left unindexed before it displaces an accepted one.
+        let mut free = None;
+        let mut victim: Option<(bool, u64, usize)> = None;
         let reuse = ways.iter().position(|&w| w == mine);
         for (i, &w) in ways.iter().enumerate() {
             if reuse.is_some() {
@@ -179,17 +187,23 @@ impl Retain {
                 .filter(|s| bucket_of(s.kept.session, s.kept.pkt_seq, self.mask()) == b);
             match held {
                 None => {
-                    pick = i;
+                    free = Some(i);
                     break;
                 }
-                Some(s) if s.seq < oldest => {
-                    oldest = s.seq;
-                    pick = i;
+                Some(s) => {
+                    let rank = (s.kept.verified, s.seq, i);
+                    if victim.is_none_or(|v| rank < v) {
+                        victim = Some(rank);
+                    }
                 }
-                Some(_) => {}
             }
         }
-        let pick = reuse.unwrap_or(pick);
+        let pick = match (reuse.or(free), victim) {
+            (Some(i), _) => i,
+            (None, Some((false, _, i))) => i,
+            (None, Some((true, _, i))) if k.verified => i,
+            _ => return,
+        };
         if let Some(w) = self.index.get_mut(b).and_then(|ws| ws.get_mut(pick)) {
             *w = mine;
         }
@@ -246,6 +260,24 @@ mod tests {
         r.put(pkt(1, 5, 0xF, 2 + REP_SEQ_PKT_RETAIN_NS + 1));
         assert_eq!(r.find(SessionId(1), 2).count(), 0, "outside the window");
         assert_eq!(r.find(SessionId(1), 5).count(), 1);
+    }
+
+    /// Unchecked shed packets of one key never evict its accepted packet from the index.
+    #[test]
+    fn shed_floods_never_displace_an_accepted_packet() {
+        let mut r = Retain::new(64);
+        r.put(Kept {
+            verified: true,
+            ..pkt(1, 1, 0xA, 0)
+        });
+        for t in 0..20u8 {
+            r.put(pkt(1, 1, 0x10 + t, 1));
+        }
+        let v: Vec<_> = r.find(SessionId(1), 1).map(|k| k.pkt_hash.0).collect();
+        assert_eq!(v.len(), WAYS);
+        assert_eq!(v[0], 0xA, "the accepted copy stays: {v:x?}");
+        // Unverified ways still rotate oldest first among themselves.
+        assert_eq!(v[WAYS - 1], 0x10 + 19);
     }
 
     /// A wrapped FIFO that overwrites a slot with another key of the same bucket names it once.
