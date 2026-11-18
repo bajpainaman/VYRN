@@ -927,6 +927,24 @@ Vx-owned rings inside `pbv_ctx`. Output records go to one Rust-owned output ring
 shell hashes the outputs into the block's output hash, and hashes the state bytes into the state
 root, with the one BLAKE3 in `vyrn-crypto`.
 
+**Output hash.** Both clients produce the same bytes for every block, over that block's outputs
+only:
+
+```text
+out       = BLAKE3("vyrn v1 out" ‖ H(lane 0) ‖ … ‖ H(lane N−1) ‖ H(tx))      // "vyrn v1 out": 11 ASCII bytes
+H(lane l) = BLAKE3(each response packet of lane l, in its production order:
+                   session u32 ‖ resp_seq u32 ‖ echo_pkt u32 ‖ n u8 ‖ n × record[16])
+H(tx)     = BLAKE3(each fill TX packet, in step order:
+                   step u64 ‖ session u32 ‖ resp_seq u32 ‖ pkt_seq u32 ‖ lane u8 ‖ n_rec u8 ‖ role u8 ‖
+                   n_rec × record[16])
+```
+
+Integers are little-endian. `record[16]` is the response record's 16-byte wire form (04). `N` is
+the box's lane count, and a lane with no response hashes the empty string. Responses are hashed
+per lane because 07 §7.1 `REP_MERGE` fixes each lane's order but not the order across lanes. A
+response's `LaneCut` gate is physical (when the frame may leave) and is not hashed. The reference
+implementation is `vyrn-replica`'s `output_hash`, `encode_resp` and `encode_tx`.
+
 **What the Vx client implements itself:** SipHash-2-4 (it decides `BAD_MAC` rejects, so it is
 part of the state machine; checked against `tests/golden/siphash.txt`), checked arithmetic,
 the arena, the lane and BBO replay logic, settlement, the auction uncross and the canonical state

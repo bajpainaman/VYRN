@@ -31,8 +31,7 @@
 //! all little-endian, over the outputs of this call only. Responses are hashed per lane because
 //! `REP_MERGE` fixes each lane's order but not the order across lanes, so two clients agree on
 //! these bytes and on nothing finer. The response `gate` is physical (when a frame is sent) and
-//! is not hashed. 11 §5.3 names the output hash but not its bytes, so this encoding is a spec
-//! gap [Guessing: ours, PR body].
+//! is not hashed. This is 11 §5.3's output hash.
 //!
 //! **Reject reasons** ([`ReplayError`]; any of them halts this replica's attestations):
 //! - the block's step records are not `N` lanes wide where the engine has a different count;
