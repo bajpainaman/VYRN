@@ -66,6 +66,19 @@ pkt 6 3 1
 busy 5 3
 expect SHED-LOGGED 1
 
+case shed_twice_logged_twice
+pkt 5 3 1
+busy 5 3
+pkt 5 3 1
+busy 5 3
+expect ok
+
+case shed_twice_logged_once
+pkt 5 3 1
+busy 5 3
+busy 5 3
+expect SHED-LOGGED 2
+
 case session_order
 resp 5 1
 resp 6 1

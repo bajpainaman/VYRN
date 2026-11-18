@@ -28,5 +28,5 @@ fn checker_vectors_hold() {
             obs.push(Obs::parse(line).unwrap_or_else(|e| panic!("case {name}: {line}: {e}")));
         }
     }
-    assert!(cases >= 13, "only {cases} cases");
+    assert!(cases >= 15, "only {cases} cases");
 }

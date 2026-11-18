@@ -11,7 +11,8 @@
 //!   seed is independent, so the result does not depend on `j` or on thread timing.
 //! - `--classes` masks the fault classes every seed may draw (bit 0 network, 1 lane stall,
 //!   2 BBO stall; default 7, all). A masked class is removed from the generated schedule.
-//! - `--seed-file` (default `tests/seeds.toml`) lists pinned seeds (11 §6.4: "every seed that ever
+//! - `--seed-file` (default `tests/seeds.toml`; a missing file is an error, so the pinned seeds
+//!   never drop out silently) lists pinned seeds (11 §6.4: "every seed that ever
 //!   failed ... runs on every PR"). Each `[[seed]]` has `seed` (hex), optional `faults` (schedule
 //!   text; default the seed's own) and `expect`: `"pass"` or the name of the check it must fail
 //!   (a known bug that a follow-up fixes). A pinned seed whose result differs from `expect` fails
@@ -99,7 +100,6 @@ struct Pinned {
 fn pinned(path: &str) -> Result<(Vec<Pinned>, Vec<String>), String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(format!("{path}: {e}")),
     };
     let v: toml::Table = text.parse().map_err(|e| format!("{path}: {e}"))?;

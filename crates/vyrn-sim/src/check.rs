@@ -10,13 +10,13 @@
 //! | `INV-CUT-MONO` | `step` | every lane's cut entry is ≥ its value in every earlier step (01 §14.3) |
 //! | `STEP-FILL-CAP` | `step` | `n_fills` ≤ [`STEP_FILL_CAP`] (01 §14.15 item 6) |
 //! | `INV-UNCROSSED` | `snap` | `bid < ask`, or no bid (0), or no ask (`u32::MAX`) |
-//! | `SHED-LOGGED` | `busy` | a `pkt` record with `SHED` for the same session and `pkt_seq` came before it |
+//! | `SHED-LOGGED` | `busy` | an unused `pkt` record with `SHED` for the same session and `pkt_seq` came before it; each record covers one `busy` |
 //! | `SESSION-ORDER` | `resp` | in-stream `resp_seq` (non-zero) is strictly increasing per session |
 //!
 //! `SESSION-ORDER` is weaker than 11 §6.4's "gapless": fill TX packets take `MakerSeq` numbers
 //! that the lane's `resp_seq` count does not show the sim, so gaps are allowed (spec gap, PR).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// No step writes more than this many fill records (01 §14.15 item 6).
 pub const STEP_FILL_CAP: u32 = 64;
@@ -57,7 +57,8 @@ pub struct Violation {
 #[derive(Default, Debug)]
 pub struct Checker {
     cut: BTreeMap<u8, u64>,
-    shed: BTreeSet<(u32, u32)>,
+    /// `SHED` records not yet matched by a `busy`, per `(session, pkt_seq)`.
+    shed: BTreeMap<(u32, u32), u32>,
     resp: BTreeMap<u32, u32>,
     seen: u64,
 }
@@ -93,17 +94,19 @@ impl Checker {
                 shed,
             } => {
                 if *shed {
-                    self.shed.insert((*session, *pkt_seq));
+                    let n = self.shed.entry((*session, *pkt_seq)).or_insert(0);
+                    *n = n.saturating_add(1);
                 }
             }
-            Obs::Busy { session, pkt_seq } => {
-                if !self.shed.contains(&(*session, *pkt_seq)) {
+            Obs::Busy { session, pkt_seq } => match self.shed.get_mut(&(*session, *pkt_seq)) {
+                Some(n) if *n > 0 => *n = n.saturating_sub(1),
+                _ => {
                     return Err((
                         "SHED-LOGGED",
-                        format!("session {session} pkt_seq {pkt_seq} has no SHED record"),
+                        format!("session {session} pkt_seq {pkt_seq} has no unused SHED record"),
                     ));
                 }
-            }
+            },
             Obs::Resp { session, resp_seq } => {
                 if *resp_seq != 0 {
                     let prev = self.resp.entry(*session).or_insert(0);
