@@ -23,10 +23,21 @@ use vyrn_types::{
 
 /// Steps whose cut replay keeps for `MID` boundaries (`ENG_STEP_LOG`).
 pub(crate) const STEP_HIST: usize = ENG_STEP_LOG;
-/// Snapshot versions replay keeps (07 §7.1): a packet record becomes due only once the
-/// replayed BBO has published the version its `snap_lag` names, so that version is the newest
-/// one or close to it; 4096 is `ENG_SNAP_HIST`, the BBO core's own version window.
-pub const REPLAY_SNAP_HIST: usize = vyrn_bbo::ENG_SNAP_HIST;
+/// Snapshot versions replay keeps (07 §7.1): `ENG_SNAP_HIST` = 4096, the BBO core's own version
+/// window; 16 in this crate's unit tests, so they can evict a version.
+pub const REPLAY_SNAP_HIST: usize = if cfg!(test) {
+    16
+} else {
+    vyrn_bbo::ENG_SNAP_HIST
+};
+/// The `snap_lag` window every lane of the engine uses, `min(u16::MAX, REPLAY_SNAP_HIST − 1)`
+/// (05 §6.5, 07 §3.6): a logged lag names a version replay still holds.
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+pub const SNAP_LAG_WINDOW: u16 = if REPLAY_SNAP_HIST - 1 < u16::MAX as usize {
+    (REPLAY_SNAP_HIST - 1) as u16
+} else {
+    u16::MAX
+};
 /// Lane records 07 replay can carry from one block to the next (`ENG_FWD_RING` × 4).
 pub(crate) const CARRY_CAP: usize = 4 * vyrn_cut::ENG_FWD_RING;
 /// Records one fill TX packet can carry (`TxEntry.n_rec` is a `u8`).
@@ -238,7 +249,9 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
                 snapshot,
                 lane_cut,
             };
-            lanes.push(mk(*cfg, aw, ports));
+            let mut lane = mk(*cfg, aw, ports);
+            lane.set_snap_lag_max(SNAP_LAG_WINDOW);
+            lanes.push(lane);
             views.push(av);
             fwd_c.push(fc);
             fill_p.push(ip);

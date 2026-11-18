@@ -61,6 +61,8 @@
 //! `fills_applied` step published (carried in `LaneCut`). Replay restores that version from a ring
 //! of [`REPLAY_SNAP_HIST`] versions before the packet, and a record is due only once its version is
 //! published.
+//! The engine sets every lane's lag window to [`SNAP_LAG_WINDOW`] = `min(u16::MAX,
+//! REPLAY_SNAP_HIST − 1)`, so a live lane catches up before a lag could name an evicted version.
 //!
 //! **Replay rejects** ([`Diverged`]): a record the replayed engine does not reproduce byte for
 //! byte ([`Why::Mismatch`]), a packet record without payload ([`Why::NoPayload`]), a step
@@ -115,9 +117,13 @@ pub mod alloc;
 mod engine;
 mod replay;
 pub mod retain;
+#[cfg(test)]
+extern crate self as vyrn_engine;
 pub mod role;
+#[cfg(test)]
+mod snap_window_tests;
 
-pub use engine::{Engine, Fault, REPLAY_SNAP_HIST, Rec, Shared, Sink};
+pub use engine::{Engine, Fault, REPLAY_SNAP_HIST, Rec, SNAP_LAG_WINDOW, Shared, Sink};
 pub use replay::{
     CONTROL_PAYLOAD_LEN, Diverged, NoResponses, OwnedRec, Payloads, Responses, Why, WireAt,
     WireDiverged, WireStep, control_of_payload, control_payload,

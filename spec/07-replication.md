@@ -231,6 +231,9 @@ rx_ts     ZigZag LEB128 of (rx_ts − prev_rx_ts) as i64
 [MID]     LEB128 back = next_lane_seq − first_lane_seq          // MID Advance record only; 0 ≤ back ≤ count
 [SEQ_EXC] LEB128 pkt_seq                                       // absolute; never in an Advance record
 [PKT]     LEB128 snap_lag                                      // packet record without SHED only; ≤ u16::MAX
+                                                               // on the wire, ≤ W = min(u16::MAX,
+                                                               // REPLAY_SNAP_HIST − 1) = 4095 from an
+                                                               // honest lane (05 §6.5 rule 3)
 ```
 
 Decoding rebuilds the full logical record of 01 §6.6:
@@ -1589,8 +1592,11 @@ record is *due* (item 2 above) only once `v` is published as well as once `f(r) 
 snapshot never moves back, so a later record of the lane never needs an older version than an
 earlier one, and the wait never blocks another lane's record. A `v` that the ring no longer
 holds (more than 4096 versions older than the newest when the record is due) is a divergence
-(`Why::NoSnapshot` in `vyrn-engine`). The lag itself is bounded by `u16::MAX` (05 §6.5 rule 3);
-the ring is the tighter bound and is the one `band_env` already uses (05 §8.6).
+(`Why::NoSnapshot` in `vyrn-engine`). An honest log never names one. Without a `MID`, a record is
+replayed right after the later of its `fills_applied` step and the step that published `v`, and no
+later version exists then. A `MID` raises the due step, and the live lane takes a `MID` only
+while that step's version is within `W` of the packet's snapshot. The lag itself stays within
+`W = min(u16::MAX, REPLAY_SNAP_HIST − 1)` (05 §6.5 rule 3; §3.6).
 
 **Fields replay derives.** 07's `StepRecord` carries the kind, the source with its `CROSS`
 route bit (§3.8), the cut and the kind payload; the lane's route records (§3.6) carry the route

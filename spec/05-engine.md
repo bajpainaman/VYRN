@@ -931,6 +931,9 @@ MakerSeq[session] (16 B, lane-written, fill-TX-read; 01 §14.14):
 LaneCut[l] (48 B, one per line, stream core of l's half → lane l):
   { step: StepId, cut: LaneSeq, snap: Snapshot }   snap: the snapshot step `step` published, the
   base of the lane's next `snap_lag` (§6.5); written and read under the entry's seqlock
+  (ruling, #151: 48 B under vyrn-cut's per-entry seqlock replaces the 16-B atomic entry). A lane
+  keeps its lag within W = min(u16::MAX, REPLAY_SNAP_HIST − 1) = 4095 of `snap.version` (§6.5
+  rule 3, 07 §3.6)
 ```
 
 - **Two stream cores, frame gating (01 §14.15.3, §14.16).** Stream core A (core 4) frames the
@@ -1323,9 +1326,13 @@ which the lane learns from `LaneCut` (§4.15). The rules are:
    own snapshot instead, so `snap.version ≥ base` always holds.
 2. `PacketRecord.snap_lag = snap.version − base` (01 §6.6). `SHED` and Advance records classify
    nothing and log 0.
-3. The lag never saturates: a refresh that would make it exceed `u16::MAX` is skipped, and a lane
-   whose newest visible snapshot is more than `u16::MAX` versions past `base` first takes a
-   catch-up boundary at the newest framed step (an Advance record, §6.2), which moves `base`.
+3. The lag stays inside the window `W = min(u16::MAX, REPLAY_SNAP_HIST − 1)` = 4095 (§4.15,
+   07 §3.6), so it never saturates and every logged lag names a version replay still holds. A
+   lane whose newest visible snapshot is more than `W` versions past `base` first takes a
+   catch-up boundary at the newest framed step (an Advance record, §6.2), which moves `base`. A
+   refresh that would still exceed `W` is skipped. A `MID` boundary inside the packet whose step
+   published a version more than `W` past the packet's snapshot is not taken (it raises the
+   packet's due step in 07 §7.1); the lane takes it at the next boundary point instead.
 4. Replay classifies the packet against version `base + snap_lag` from its snapshot history
    (07 §7.1), so it reproduces the live routes and band checks exactly (`INV-DET`).
 
