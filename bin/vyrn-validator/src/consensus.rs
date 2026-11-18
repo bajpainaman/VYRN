@@ -326,28 +326,46 @@ impl Plan {
     }
 
     /// The keys this voter serves peer fetches under: `K_fetch(e, i, VOTER_TARGET + me)` of
-    /// every requester `i` with a usable key (08 §9.6), by its `repl_addr` IPv4.
-    pub fn peer_keys(&self, secret: &[u8; 32]) -> Vec<(std::net::Ipv4Addr, [u8; 16])> {
+    /// every requester `i` with a usable key (08 §9.6), by its `repl_addr` IPv4. A keyed server
+    /// with none serves nothing. An `Err` when the roster gives this voter a usable `xchg_key`
+    /// and `secret` is not its private half.
+    pub fn peer_keys(
+        &self,
+        secret: &[u8; 32],
+    ) -> Result<Vec<(std::net::Ipv4Addr, [u8; 16])>, String> {
         let Some(d) = u8::try_from(self.me)
             .ok()
             .and_then(|m| vyrn_epoch::VOTER_TARGET.checked_add(m))
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        self.roster
-            .box_fetch_keys(
-                PEER_FETCH_CONTEXT,
-                &self.domain,
-                self.epoch,
-                self.home,
-                d,
-                secret,
-            )
-            .unwrap_or_default()
+        let keys = self.roster.box_fetch_keys(
+            PEER_FETCH_CONTEXT,
+            &self.domain,
+            self.epoch,
+            self.home,
+            d,
+            secret,
+        );
+        let Some(keys) = keys else {
+            let usable = self
+                .roster
+                .fetch_target(self.home, d)
+                .is_some_and(|k| k.len() >= 32);
+            return if usable {
+                Err(format!(
+                    "[data] xchg is not the private half of voter {}'s roster xchg_key",
+                    self.me
+                ))
+            } else {
+                Ok(Vec::new())
+            };
+        };
+        Ok(keys
             .into_iter()
             .filter(|(i, _, _)| usize::from(*i) != self.me)
             .filter_map(|(_, a, k)| Some((a.ipv4()?, k)))
-            .collect()
+            .collect())
     }
 
     pub fn repl_addr(&self) -> SocketAddr {

@@ -427,8 +427,16 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
             let sources = fetch::Sources::new(boxes, peers, seq);
             let peer_addrs: Vec<SocketAddrV4> = d.peer.iter().map(|p| p.addr).collect();
             let peer_keys = match (&secret, &plan) {
-                (Some(s), Some(p)) => p.peer_keys(s),
-                _ => Vec::new(),
+                (Some(s), Some(p)) => {
+                    let k = p.peer_keys(s)?;
+                    if k.is_empty() {
+                        eprintln!(
+                            "vyrn-validator: keyed, but no peer has a usable K_fetch; serving no peer fetches"
+                        );
+                    }
+                    Some(k)
+                }
+                _ => None,
             };
             let peer = fetch::PeerServer::new(&peer_addrs, peer_keys);
             // A box keys a requester by its repl_addr's IPv4 (08 §9.6), so fetches leave from

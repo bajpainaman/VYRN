@@ -175,8 +175,9 @@ pub fn send_key(sock: &UdpSocket, session: SessionId, pkt_seq: u32, to: &[Target
 pub struct PeerServer {
     /// Unkeyed: the peers' IPs, the only requesters served.
     peers: Vec<Ipv4Addr>,
-    /// Keyed: each requester's `K_fetch(e, i, VOTER_TARGET + me)` by its IPv4.
-    keys: Vec<(Ipv4Addr, [u8; 16])>,
+    /// Keyed (`Some`, even empty: then nothing is served): each requester's
+    /// `K_fetch(e, i, VOTER_TARGET + me)` by its IPv4. `None`: unkeyed (DEV).
+    keys: Option<Vec<(Ipv4Addr, [u8; 16])>>,
     level: u64,
     at: u64,
     kept: BTreeMap<(SessionId, u32), Vec<Vec<u8>>>,
@@ -185,7 +186,7 @@ pub struct PeerServer {
 }
 
 impl PeerServer {
-    pub fn new(peers: &[SocketAddrV4], keys: Vec<(Ipv4Addr, [u8; 16])>) -> Self {
+    pub fn new(peers: &[SocketAddrV4], keys: Option<Vec<(Ipv4Addr, [u8; 16])>>) -> Self {
         Self {
             peers: peers.iter().map(|p| *p.ip()).collect(),
             keys,
@@ -232,16 +233,16 @@ impl PeerServer {
     }
 
     fn open(&self, from: Ipv4Addr, req: &[u8]) -> Option<(SessionId, u32)> {
-        let q = if self.keys.is_empty() {
-            self.peers
+        let q = match &self.keys {
+            None => self
+                .peers
                 .contains(&from)
                 .then(|| Fetch::decode(req).ok())
-                .flatten()
-        } else {
-            self.keys
+                .flatten(),
+            Some(keys) => keys
                 .iter()
                 .filter(|(ip, _)| *ip == from)
-                .find_map(|(_, k)| Fetch::open(req, k).ok())
+                .find_map(|(_, k)| Fetch::open(req, k).ok()),
         };
         match q? {
             Fetch::Key { session, pkt_seq } => Some((session, pkt_seq)),
@@ -467,7 +468,7 @@ mod tests {
         let mut j = DataJoin::default();
         j.put(sid(), 1, pkt(1));
         j.put(sid(), 1, pkt(2));
-        let mut srv = PeerServer::new(&[a(11)], Vec::new());
+        let mut srv = PeerServer::new(&[a(11)], None);
         let mut c = Counts::default();
         let hit = srv.serve(&j, PEER, &fetch(1), 0, &mut c);
         assert_eq!(hit.len(), 1);
@@ -505,7 +506,7 @@ mod tests {
         assert!(srv.serve(&j, PEER, &range, 0, &mut c).is_empty());
         assert_eq!((c.served, c.missed, c.bad, c.limited), (2, 1, 2, 0));
         // 10 ms of 50k/s is 500 tokens: the 251st two-variant answer at one instant is refused.
-        let mut srv = PeerServer::new(&[a(11)], Vec::new());
+        let mut srv = PeerServer::new(&[a(11)], None);
         let mut c = Counts::default();
         for _ in 0..250 {
             assert!(!srv.serve(&j, PEER, &fetch(1), 0, &mut c).is_empty());
@@ -534,7 +535,7 @@ mod tests {
             total > vyrn_data::frame::MAX_FRAME,
             "the test needs more than one frame"
         );
-        let mut srv = PeerServer::new(&[a(11)], Vec::new());
+        let mut srv = PeerServer::new(&[a(11)], None);
         let frames = srv.serve(&j, PEER, &fetch(1), 0, &mut Counts::default());
         assert!(frames.len() >= 2, "{} frames", frames.len());
         let mut want = vars.clone();
@@ -561,7 +562,7 @@ mod tests {
         let recs = [LaneRec::Pkt(rec)];
         let mut j = DataJoin::default();
         j.put(sid(), 1, p.clone());
-        let mut srv = PeerServer::new(&[a(11)], Vec::new());
+        let mut srv = PeerServer::new(&[a(11)], None);
         srv.keep(&j, &recs);
         j.release(vyrn_types::Height(1), &recs);
         assert!(j.resolve(&rec).is_err(), "the join no longer holds it");
@@ -575,7 +576,7 @@ mod tests {
         let mut j = DataJoin::default();
         j.put(sid(), 1, pkt(1));
         let k = [0x42; 16];
-        let mut srv = PeerServer::new(&[], vec![(PEER, [0x41; 16]), (PEER, k)]);
+        let mut srv = PeerServer::new(&[], Some(vec![(PEER, [0x41; 16]), (PEER, k)]));
         let mut c = Counts::default();
         let q = Fetch::Key {
             session: sid(),
@@ -600,5 +601,20 @@ mod tests {
             "wrong IP"
         );
         assert_eq!((c.served, c.bad), (1, 3));
+    }
+
+    /// Keyed with no usable requester key: fails closed, even for a configured peer's IP.
+    #[test]
+    fn a_keyed_server_without_keys_serves_nothing() {
+        let mut j = DataJoin::default();
+        j.put(sid(), 1, pkt(1));
+        let mut srv = PeerServer::new(&[a(11)], Some(Vec::new()));
+        let mut c = Counts::default();
+        let q = Fetch::Key {
+            session: sid(),
+            pkt_seq: 1,
+        };
+        assert!(srv.serve(&j, PEER, &q.encode(), 0, &mut c).is_empty());
+        assert_eq!(c.served, 0);
     }
 }

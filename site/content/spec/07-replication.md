@@ -1127,8 +1127,10 @@ one, 10 ms of tokens) and refuses RANGE and BLOCK fetches. Its key is
 `K_fetch(e, i, VOTER_TARGET + j)` under the context `"vyrn      v1 peerfetch"` (08 §9.6), for
 requester `i` and serving voter `j`; source 3's is `K_fetch(e, i, SEQ_TARGET + j)` for
 `vyrn-seq` box `j`. A keyed replica serves only fetches that open under a key of a requester at
-the source's IPv4; an unkeyed one serves the 32-byte form to its configured peers. A target
-whose roster key is unusable holds no keys, so it is sent the 32-byte form (reading, DEV).
+the source's IPv4, so one with no usable requester key serves nothing, and a `[data] xchg`
+that is not the private half of its roster key fails startup. An unkeyed one (no `xchg`)
+serves the 32-byte form to its configured peers (DEV). A target whose roster key is unusable
+holds no keys, so it is sent the 32-byte form (reading, DEV).
 
 **`SeqDataReq` bytes (source 3).** The request is the data tier's 32-byte KEY fetch
 (`vyrn-data` frame docs: magic `PF`, kind 1, `session u32, pkt_seq u32`), sent to the
