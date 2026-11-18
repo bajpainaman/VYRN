@@ -136,7 +136,14 @@ jobs:
       # The runner's Node and its corepack, pinned to package.json's packageManager (pnpm 10.7.0).
       - run: corepack enable && pnpm install --frozen-lockfile
       - name: site/content/spec matches spec/
-        run: node scripts/sync-spec.mjs && git diff --exit-code -- content/spec
+        # status, not diff: a new chapter's copy is an untracked file, which diff ignores.
+        run: |
+          node scripts/sync-spec.mjs
+          if [ -n "$(git status --porcelain -- content/spec)" ]; then
+            git status --short -- content/spec
+            git diff -- content/spec
+            exit 1
+          fi
       - name: diagrams/inventory.json matches the spec (regenerate, then remap manifests whose asciiIndex moved)
         run: node scripts/diagram-inventory.mjs && git diff --exit-code -- diagrams/inventory.json
       - name: every figure points at an inventory block
