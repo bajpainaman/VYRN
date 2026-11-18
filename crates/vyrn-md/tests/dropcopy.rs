@@ -32,6 +32,7 @@ use vyrn_engine::{Engine, OwnedRec, Rec, Shared, Sink};
 use vyrn_lane::{Config, Lane, PathTable, RespPkt, Rx, RxIn, SessionSpec};
 use vyrn_log::{Ident, LaneBase, Layout, SeqWriter, TenureStart};
 use vyrn_md::SinkStream;
+use vyrn_md::dropcopy::ring::{RING_CAP, RingError, RingFrame, RingReader, RingTap};
 use vyrn_md::dropcopy::{DcAccount, DcConfig, DcRecord, DcType, DropCopy, EOD_HASH, StreamId};
 use vyrn_replica::{
     BlockInputs, DataJoin, EpochView, OrderCore, ReplayEngine, ReplayError, RustReplay, full_hash,
@@ -630,4 +631,211 @@ fn replay_drop_copy_equals_live_and_the_response_stream() {
             }
         }
     }
+}
+
+fn ring_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("vyrn-dc-{}-{name}.ring", std::process::id()))
+}
+
+/// The observer's side of `vyrn-dropcopy` (10 §8.6): `RustReplay` over `blocks` into a
+/// `SinkStream` whose tap is a [`RingTap`], each block final right after it replays. `poll`
+/// runs after each block and once at the end; it returns the reader's error, if any.
+fn replay_ring(
+    live_j: &Journal,
+    store: &Store,
+    blocks: &[BlockInputs<N>],
+    path: &std::path::Path,
+    cap: u64,
+    mut poll: impl FnMut(u64),
+) {
+    let mut data = DataJoin::default();
+    for ((_, s, q, _), b) in &store.0 {
+        data.put(*s, *q, b.clone());
+    }
+    let (bbo, mut sh) = new_box();
+    let e = fee_engine(bbo, &mut sh);
+    let mut ring = RingTap::create(path, cap).unwrap();
+    ring.begin_epoch(Epoch(0));
+    let sink = SinkStream::with_tap(BOOK, Epoch(0), N, Vec::<Vec<u8>>::new(), ring);
+    let mut rep = RustReplay::new(e, data, RespLog::of(live_j), sink);
+    for b in blocks {
+        rep.payloads_mut().check(b).unwrap();
+        let (p, m) = rep.payloads_and_sink();
+        m.prepare(b, p);
+        rep.replay_block(b).unwrap();
+        rep.release(b.header.height);
+        let tap = rep.payloads_and_sink().1.tap_mut();
+        tap.final_block(b.header.height, b.header.last_step);
+        poll(tap.head());
+    }
+    rep.finish().unwrap();
+    let (_, mut ring) = rep.into_sink().finish_tap().unwrap();
+    ring.end_epoch(Vec::new());
+    assert_eq!(ring.error(), None);
+    poll(ring.head());
+}
+
+/// Applies every ring frame to a fresh `DropCopy`, as `vyrn-dropcopy` does.
+struct RingDc {
+    rd: RingReader,
+    dc: DropCopy<Recs>,
+    begun: bool,
+}
+
+impl RingDc {
+    fn open(path: &std::path::Path) -> Self {
+        Self {
+            rd: RingReader::open(path).unwrap(),
+            dc: DropCopy::new(&dc_config(), Vec::new()),
+            begun: false,
+        }
+    }
+    fn poll(&mut self) -> Result<usize, RingError> {
+        let (dc, begun) = (&mut self.dc, &mut self.begun);
+        self.rd.poll(|f| {
+            if let RingFrame::Begin(e) = f {
+                assert_eq!(e, Epoch(0));
+                *begun = true;
+            }
+            f.apply(dc).unwrap();
+        })
+    }
+}
+
+#[test]
+fn the_ring_reader_makes_the_in_process_drop_copy_byte_for_byte() {
+    let (j, store, _) = live(&script());
+    let every: Vec<usize> = (0..j.recs.len() - 1).collect();
+    // A big ring read once at the end; then a small one, read after each of many small
+    // blocks, which wraps.
+    let cases = [
+        (vec![], RING_CAP, false),
+        (vec![0], RING_CAP, false),
+        (vec![j.recs.len() / 2], RING_CAP, false),
+        (every, 512, true),
+    ];
+    for (k, (cuts, cap, every_block)) in cases.into_iter().enumerate() {
+        let bs = blocks(&j, &store, &cuts);
+        let want = replay(&j, &store, &bs).unwrap().recs;
+        let path = ring_path(&format!("eq-{k}"));
+        let mut r: Option<RingDc> = None;
+        let mut wrapped = false;
+        replay_ring(&j, &store, &bs, &path, cap, |head| {
+            let r = r.get_or_insert_with(|| RingDc::open(&path));
+            wrapped |= head > cap;
+            if every_block {
+                r.poll().unwrap();
+            }
+        });
+        let mut r = r.unwrap();
+        r.poll().unwrap();
+        assert!(r.begun);
+        assert_eq!(r.dc.error(), None);
+        let got = r.dc.into_out().unwrap();
+        assert_eq!(got, want, "case {k}");
+        assert_eq!(wrapped, every_block, "case {k}: only the small ring wraps");
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn a_reader_the_writer_laps_stops_and_a_torn_head_is_refused() {
+    let (j, store, _) = live(&script());
+    let bs = blocks(&j, &store, &[]);
+    let path = ring_path("lag");
+    let mut heads = Vec::new();
+    replay_ring(&j, &store, &bs, &path, 512, |h| heads.push(h));
+    assert!(*heads.last().unwrap() > 512);
+    let mut r = RingDc::open(&path);
+    assert!(matches!(r.poll(), Err(RingError::Lagged { tail: 0, .. })));
+    use std::os::unix::fs::FileExt;
+    // A writer that overwrote the reader's bytes but has not published `head` yet: its `resv`
+    // stops the reader after the copy.
+    let mut w = RingTap::create(&path, 512).unwrap();
+    w.final_block(Height(1), StepId(1));
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let mut resv = [0u8; 16];
+    resv[..8].copy_from_slice(&600u64.to_le_bytes());
+    resv[8..].copy_from_slice(&(!600u64).to_le_bytes());
+    f.write_all_at(&resv, 32).unwrap();
+    assert!(matches!(
+        RingDc::open(&path).poll(),
+        Err(RingError::Lagged { tail: 0, head: 600 })
+    ));
+    // `!head` that disagrees with `head`: a torn header, read again, never taken.
+    f.write_all_at(&0u64.to_le_bytes(), 24).unwrap();
+    assert_eq!(RingDc::open(&path).poll(), Err(RingError::Torn));
+    // A new ring at the path: a reader of the old one stops instead of going quiet.
+    let _first = RingTap::create(&path, 512).unwrap();
+    let mut old = RingReader::open(&path).unwrap();
+    assert_eq!(old.poll(|_| {}), Ok(0));
+    let mut fresh = RingTap::create(&path, 512).unwrap();
+    assert_eq!(old.poll(|_| {}), Err(RingError::Replaced));
+    fresh.final_block(Height(1), StepId(1));
+    assert_eq!(RingReader::open(&path).unwrap().poll(|_| {}), Ok(1));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn shell_frames_round_trip_through_the_ring() {
+    use vyrn_md::dropcopy::{Alloc, AllocAsset, Balances, DcRoute};
+    use vyrn_types::{BookId, SessionId};
+    let frames = vec![
+        RingFrame::Begin(Epoch(0x0102_0304)),
+        RingFrame::Alloc(Alloc {
+            step: StepId(7),
+            account: AccountId(101),
+            asset: AllocAsset::Base,
+            debit: true,
+            amount: 0x1122_3344_5566_7788,
+        }),
+        RingFrame::Revert(StepId(5)),
+        RingFrame::Route(DcRoute {
+            account: AccountId(102),
+            session: SessionId(0x0010_0002),
+            lane_seq: 9,
+            index: 3,
+            resp_seq: 4,
+            asset: 1,
+            to_book: BookId(8),
+            amount: 500,
+            client_tag: 22,
+            fee: -3,
+        }),
+        RingFrame::Final(Height(2), StepId(6)),
+        RingFrame::Settled(Epoch(0x0102_0303), Height(2), StepId(6)),
+        RingFrame::End(vec![(
+            AccountId(101),
+            Balances {
+                quote_free: 1,
+                quote_resv: 2,
+                base_free: 3,
+                base_resv: 4,
+            },
+        )]),
+    ];
+    let path = ring_path("shell");
+    let mut w = RingTap::create(&path, 64).unwrap();
+    let mut rd = RingReader::open(&path).unwrap();
+    let mut got = Vec::new();
+    for f in &frames {
+        match f {
+            RingFrame::Begin(e) => w.begin_epoch(*e),
+            RingFrame::Alloc(a) => w.alloc(*a),
+            RingFrame::Revert(k) => w.revert_after(*k),
+            RingFrame::Route(r) => w.route(r),
+            RingFrame::Final(h, s) => w.final_block(*h, *s),
+            RingFrame::Settled(e, h, s) => w.settled(*e, *h, *s),
+            RingFrame::End(b) => w.end_epoch(b.clone()),
+            _ => unreachable!(),
+        }
+        rd.poll(|f| got.push(f)).unwrap();
+    }
+    assert_eq!(w.error(), None);
+    assert!(w.head() > 64, "wraps");
+    assert_eq!(got, frames);
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the ring is owner-only");
+    let _ = std::fs::remove_file(&path);
 }

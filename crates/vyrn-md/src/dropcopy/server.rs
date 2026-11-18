@@ -98,6 +98,18 @@ impl DcStore {
     }
 }
 
+impl DcStore {
+    /// Appends to `stream` in `epoch`, which may have ended (a late `DC_SETTLED`, 10 §8.4
+    /// item 11). An epoch outside the window takes nothing.
+    pub fn push_at(&mut self, epoch: Epoch, stream: StreamId, seq: u64, rec: &DcRecord) {
+        if let Some(e) = self.epochs.iter_mut().find(|e| e.epoch == epoch) {
+            let v = e.streams.entry(stream).or_default();
+            debug_assert_eq!(v.len() as u64 + 1, seq);
+            v.push(*rec);
+        }
+    }
+}
+
 impl DcOut for DcStore {
     fn push(&mut self, stream: StreamId, seq: u64, rec: &DcRecord) {
         if let Some(e) = self.epochs.back_mut() {
@@ -302,8 +314,8 @@ impl Session {
 
 impl DcStore {
     /// A store from `store <epoch> <account> <master 0|1> <seq> <hex>` lines (other lines are
-    /// skipped), in epoch order: the input of `vyrn-dropcopy --records` until the observer's
-    /// output ring feeds a [`DropCopy`](super::DropCopy) directly.
+    /// skipped), in epoch order: the input of `vyrn-dropcopy --records` (`--ring` feeds a
+    /// [`DropCopy`](super::DropCopy) from the observer's output ring instead, 10 §8.6).
     pub fn load_text(text: &str) -> Result<Self, String> {
         let mut s = Self::new();
         for (n, line) in text.lines().enumerate() {
