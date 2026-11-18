@@ -60,8 +60,8 @@
 //! epoch are served without a restart. A refused or unknown line prints `CONTROL_ERR <why>` on
 //! stderr and changes nothing. `REDIRECT <down> <to> <session>:<resend_from>[,…]` sends each
 //! session's `DataRedirect{down → to, resend_from}` (07 §5.7 step 3) from the shard that owns it
-//! and prints `REDIRECT_QUEUED <n>`; *reading:* 07 §5.7 has the replicas send `resend_from` to
-//! the boxes but names no message, so the operator channel carries it until one exists. Lines
+//! and prints `REDIRECT_QUEUED <n>` (DEV); replicas send the same as REDIRECT fetches on the
+//! fetch port (`vyrn-data` crate docs, § Fetch; *reading*, 07 §5.7). Lines
 //! reach the RX core through a queue of `CONTROL_QUEUE`; while
 //! it is full the stdin reader waits, never a core.
 //!

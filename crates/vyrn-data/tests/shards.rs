@@ -255,4 +255,39 @@ fn shards_forward_one_data_seq_per_dest_and_answer_key_fetches_from_the_owner() 
         |f: fn(&vyrn_data::Counters) -> u64| cores.iter().map(|c| f(c.counters())).sum::<u64>();
     assert_eq!(sum(|c| c.redirects), sessions.len() as u64);
     assert_eq!(sum(|c| c.redirect_unknown), 1);
+
+    // The same from replicas' REDIRECT fetches (07 §5.7 step 3, reading): the RX core admits
+    // each and hands it to the owning shard, which seals and sends it.
+    for &s in &sessions {
+        let q = Fetch::Redirect {
+            session: SessionId(s),
+            resend_from: s + 20,
+            down: 0,
+            to: 1,
+        };
+        inject(&nic, client, me_fetch, &q.encode());
+    }
+    turn!(40);
+    let mut got: Vec<Redirect> = drain(&mut client_rx)
+        .iter()
+        .map(|b| {
+            let s = u32::from_le_bytes(b[8..12].try_into().unwrap());
+            Redirect::open(b, &key(s)).unwrap()
+        })
+        .collect();
+    got.sort_by_key(|r| r.session.0);
+    let want: Vec<Redirect> = sessions
+        .iter()
+        .map(|&s| Redirect {
+            down: 0,
+            to: 1,
+            session: SessionId(s),
+            resend_from: s + 20,
+        })
+        .collect();
+    assert_eq!(got, want);
+    let sum =
+        |f: fn(&vyrn_data::Counters) -> u64| cores.iter().map(|c| f(c.counters())).sum::<u64>();
+    assert_eq!(sum(|c| c.redirects), 2 * sessions.len() as u64);
+    assert_eq!(sum(|c| c.fetch_bad), 0);
 }

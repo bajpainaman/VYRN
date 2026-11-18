@@ -83,6 +83,8 @@
 //!          1 KEY    session u32, pkt_seq u32        DataFetch{session, pkt_seq}
 //!          2 RANGE  dst u8, 7 × 0, from u64, to u64 DataFetch{from, to} of dst's data_seq
 //!          3 BLOCK  height u64                      the payloads of a logged block
+//!          4 REDIRECT session u32, resend_from u32, down u8, to u8, 14 × 0
+//!                                                    a replica's resend_from (07 §5.7 step 3)
 //! ```
 //!
 //! - KEY: one `FETCH_RESP` with `data_seq = session << 32 | pkt_seq` and every variant of the
@@ -93,6 +95,12 @@
 //! - BLOCK: the block's payloads (07 §8.2 data region, split by `count`) in O-order, as
 //!   `FETCH_RESP` frames with `data_seq = height`; one empty frame if the block has none or is
 //!   not stored. The block is read through `BlockStore::read`, which checks `order_root`.
+//! - REDIRECT (*reading*, wire, recorded in 07 §5.7): no answer to the requester. The box
+//!   sends the session's `DataRedirect{down → to, resend_from}` (04 §7.6) as its operator
+//!   `REDIRECT` line does: to the session's newest copy's address, from the owning shard.
+//!   `down` and `to` must be below 8 and differ (04 DR1), else `FrameErr::Position`. Each
+//!   message costs one token of the requester's bucket, like any fetch. The box acts on every
+//!   admitted one, without a quorum: the client's DR2 makes the replicas' duplicates no-ops.
 //!
 //! **Authentication and rate (*reading*, recorded in 07 §5.5).** A box configured with
 //! `K_fetch` keys ([`NodeConfig::fetch_keys`], one 16-byte key per requester address; the `vyrn-data`

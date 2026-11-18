@@ -1109,7 +1109,7 @@ fetch, with these sources in order:
 
 **Fetch request bytes (reading, `vyrn-data`).** `DataFetch` is a 32-byte request (`magic`
 0x4650 "PF", version 1, kind 1 KEY `{session, pkt_seq}`, 2 RANGE `{dst, from, to}`, 3 BLOCK
-`{height}`; layout and vectors in `crates/vyrn-data` docs and `tests/golden/vyrn_data_vectors`).
+`{height}`, 4 REDIRECT `{session, resend_from, down, to}` of §5.7 step 3; layout and vectors in `crates/vyrn-data` docs and `tests/golden/vyrn_data_vectors`).
 A data box with fetch keys accepts only the 40-byte authenticated form: those 32 bytes, then
 `tag` u64 LE = SipHash-2-4(`K_fetch`, bytes 0..32), with one `K_fetch(e, i, d)` per requester,
 derived per epoch from the roster's X25519 keys (08 §9.6) and keyed by the requester's `repl_addr`
@@ -1232,9 +1232,18 @@ sends it nothing and counts it; another live box has its address. Vectors: V19 (
 **Redirects on a sharded box (reading, `vyrn-data::shards`).** The shard that owns a session
 (§5.2, RSS by session) holds its MAC key and its newest copy's address, so it seals and sends that
 session's `DataRedirect` on its own TX queue. The RX core takes the `(session, resend_from)` list
-and hands each pair to its owner. Step 3 has the replicas send `resend_from` to the boxes but names
-no message for it; until one exists, the box takes the list on its operator control channel
-(`REDIRECT <down> <to> <session>:<resend_from>,…`, DEV).
+and hands each pair to its owner.
+
+**Replica to box (reading, wire).** A replica sends each `(session, resend_from)` of step 3 as a
+REDIRECT fetch (§5.5's request, kind 4): bytes 8..12 `session` u32, 12..16 `resend_from` u32, 16
+`down` u8, 17 `to` u8, 18..32 zero. A box refuses `down` or `to` ≥ 8, or `down` = `to`. It goes
+to the box's fetch port, sealed under the requester's `K_fetch` on a keyed box, and passes the
+same gate and token bucket as any fetch. The box sends no answer; it sends that session's
+`DataRedirect` as above. It acts on every admitted REDIRECT, with no quorum of replicas: every
+replica's copy names the same `down` and `to`, and the first that reaches the client moves copy
+2, so DR2 drops the rest. One session per message; a box limits them per replica at its fetch
+rate. The box's operator line (`REDIRECT <down> <to> <session>:<resend_from>,…`, DEV) does the
+same for a list.
 
 Effect: fills and acks are unaffected. Blocks that reference the affected sessions cannot be voted
 until their data arrives. Finality stalls for those blocks for ≤ 1 + 0.5 + 1 + 0.5 = **3 ms**

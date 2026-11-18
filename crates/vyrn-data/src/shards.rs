@@ -232,6 +232,25 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
                 Fetch::Block { height } => {
                     usize::try_from(height.0 % n_shards.max(1) as u64).unwrap_or(0)
                 }
+                // A replica's `resend_from` (07 §5.7 step 3): the owning shard seals and sends
+                // the redirect, as for the operator's `REDIRECT` line.
+                Fetch::Redirect {
+                    session,
+                    resend_from,
+                    down,
+                    to,
+                } => {
+                    let r = ToShard::Redirect {
+                        down,
+                        to,
+                        session,
+                        resend_from,
+                    };
+                    if let Some(s) = shards.get_mut(shard_of(session, n_shards)) {
+                        hop(s, r, &mut self.counters);
+                    }
+                    continue;
+                }
             };
             if let Some(s) = shards.get_mut(shard) {
                 hop(s, ToShard::Fetch { to: src, q }, &mut self.counters);
@@ -316,8 +335,9 @@ impl<T: TxRing> ShardCore<T> {
                             self.resp.key(to, session, pkt_seq, ring, store, tx, c, cfg);
                         }
                         Fetch::Block { height } => self.resp.block(to, height, store, tx, c, cfg),
-                        // The RX core sends RANGE fetches to the sender.
-                        Fetch::Range { .. } => bump(&mut c.fetch_bad),
+                        // The RX core sends RANGE fetches to the sender and REDIRECTs as
+                        // `ToShard::Redirect`.
+                        Fetch::Range { .. } | Fetch::Redirect { .. } => bump(&mut c.fetch_bad),
                     }
                 }
                 ToShard::Redirect {

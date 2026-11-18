@@ -259,6 +259,23 @@ fn serves(shards: Option<String>) {
         (r.down, r.to, r.session, r.resend_from),
         (0, 1, SessionId(5), 2)
     );
+    // The same from a replica (07 §5.7 step 3, reading): a REDIRECT fetch sealed under the
+    // requester's K_fetch.
+    let q = vyrn_data::frame::Fetch::Redirect {
+        session: SessionId(5),
+        resend_from: 3,
+        down: 0,
+        to: 2,
+    };
+    client
+        .send_to(&q.seal(&key(EPOCH + 2).unwrap()), &fetch_at)
+        .unwrap();
+    let got = client.recv(&mut buf).unwrap();
+    let r = vyrn_data::redirect::Redirect::open(&buf[..got], &K).unwrap();
+    assert_eq!(
+        (r.down, r.to, r.session, r.resend_from),
+        (0, 2, SessionId(5), 3)
+    );
 
     let t = Instant::now();
     loop {
@@ -286,7 +303,7 @@ fn serves(shards: Option<String>) {
     assert_eq!(field(&stats, "events_unprinted="), "0", "{stats}");
     assert_eq!(field(&stats, "fetch_unauth="), "2", "{stats}");
     assert_eq!(field(&stats, "fetch_ring_hit="), "4", "{stats}");
-    assert_eq!(field(&stats, "redirects="), "1", "{stats}");
+    assert_eq!(field(&stats, "redirects="), "2", "{stats}");
     assert_eq!(field(&stats, "redirect_unknown="), "1", "{stats}");
     let n = if shards.is_some() { "2" } else { "1" };
     assert_eq!(field(&stats, "shards="), n, "{stats}");
