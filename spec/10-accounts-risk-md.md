@@ -151,7 +151,8 @@ The map publishes both fields, so each client knows its class and its BUSY bound
 
 **Who computes it.** Every replica computes `lane_map(e+1)` from the finalized log, by the
 algorithm below, during epoch `e`. The result is deterministic, so all replicas agree on its hash.
-The hash goes into the epoch configuration record that 08 certifies (Requests to 01, item 4). The
+Replicas compute it for each home's class sizes, and the three hashes go into the epoch
+configuration record that 08 certifies (08 §2.3, §9.2; Requests to 01, item 4). The
 sequencer never computes it, so a sequencer cannot place a victim in a slow lane.
 
 **Load metric.** The cost of an account to its lane is measured from the log, not from the live

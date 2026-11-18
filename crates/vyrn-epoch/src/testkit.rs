@@ -41,9 +41,20 @@ pub fn domain(mode: Mode) -> Domain {
     }
 }
 
-fn boxes(base: u8) -> [SeqBox; 2] {
+/// `NK` seed of voter i of home h (1 TYO, 2 LDN, 3 NYC), as in [`roster`].
+pub fn node_seed(h: u8, i: u8) -> [u8; 32] {
+    [0x10 + 0x08 * h + i; 32]
+}
+
+/// `NK` seed of `vyrn-seq` box j of home h, as in [`roster`].
+pub fn seq_node_seed(h: u8, j: u8) -> [u8; 32] {
+    [0xD0 + 0x08 * h + j; 32]
+}
+
+fn boxes(base: u8, h: u8) -> [SeqBox; 2] {
     [0u8, 1].map(|j| SeqBox {
         index: 5 + j,
+        node_key: pk(seq_node_seed(h, j)),
         seq_key: pk([base + j; 32]),
         xchg_key: pk([base + 8 + j; 32]),
     })
@@ -51,12 +62,17 @@ fn boxes(base: u8) -> [SeqBox; 2] {
 
 pub fn old(mode: Mode) -> Membership {
     let voters = (0..n(mode)).map(|i| pk(seed(i))).collect();
-    Membership::new(Epoch(7), HomeCode::Tyo, mode, voters, boxes(0x80))
+    let nks = (0..n(mode)).map(|i| pk(node_seed(1, i))).collect();
+    Membership::new(Epoch(7), HomeCode::Tyo, mode, voters, nks, boxes(0x80, 1))
         .unwrap_or_else(|e| panic!("{e}"))
 }
 
 pub fn next_voters(mode: Mode) -> Vec<PubKey> {
     (0..n(mode)).map(|i| pk(next_seed(i))).collect()
+}
+
+pub fn next_node_keys(mode: Mode) -> Vec<PubKey> {
+    (0..n(mode)).map(|i| pk(node_seed(2, i))).collect()
 }
 
 pub fn next(mode: Mode) -> Membership {
@@ -65,7 +81,8 @@ pub fn next(mode: Mode) -> Membership {
         HomeCode::Ldn,
         mode,
         next_voters(mode),
-        boxes(0x90),
+        next_node_keys(mode),
+        boxes(0x90, 2),
     )
     .unwrap_or_else(|e| panic!("{e}"))
 }
@@ -110,9 +127,9 @@ pub fn ready(member: u8, sent: Nanos, domain: &Domain) -> EpoReady {
         sig: [0; 64],
     };
     let seed = if is_seq {
-        seq_seed((member & !crate::SEQ_MEMBER) - 5)
+        seq_node_seed(2, (member & !crate::SEQ_MEMBER) - 5)
     } else {
-        next_seed(member)
+        node_seed(2, member)
     };
     r.signed(&seed, domain)
 }
@@ -195,7 +212,7 @@ pub fn roster(mode: Mode, scheme: u8) -> crate::Roster {
                     // R1 Rust, R2 Vx, R3 Rust, ...: 07 §2.1, 09 §2.1 (3 Rust + 2 Vx).
                     client: i % 2,
                     facility: i + 1,
-                    node_key: key([0x10 + 0x08 * h + i; 32], i),
+                    node_key: key(node_seed(h, i), i),
                     vote_key: key(voter_seed(i), i),
                     xchg_key: kex(gxk_seed(h, i), i),
                     data_addr: addr(h, i, 7_000),
@@ -204,8 +221,9 @@ pub fn roster(mode: Mode, scheme: u8) -> crate::Roster {
                 .collect(),
             seq: (0..n_seq)
                 .map(|j| SeqEntry {
-                    facility: j + 1,
-                    node_key: key([0xD0 + 0x08 * h + j; 32], j),
+                    // CHAIN: box 2k is operator k's F1 box, 2k + 1 its F2 box.
+                    facility: j % 2 + 1,
+                    node_key: key(seq_node_seed(h, j), j),
                     seq_key: key([seq_base + j; 32], j),
                     xchg_key: kex([seq_base + 8 + j; 32], j),
                     client_addr: addr(h, 0x40 + j, 9_000),
@@ -240,24 +258,28 @@ pub fn roster(mode: Mode, scheme: u8) -> crate::Roster {
     }
 }
 
-/// `vyrn-seq` boxes per home in [`roster`]: 2 in BASE, one per operator in CHAIN.
+/// `vyrn-seq` boxes per home in [`roster`]: 2 in BASE, an F1 and an F2 box per operator in CHAIN.
 pub fn n_seq(mode: Mode) -> u8 {
     match mode {
         Mode::Base => 2,
-        Mode::Chain => n(mode),
+        Mode::Chain => 2 * n(mode),
     }
 }
 
-/// `EpoConfig(8)` for LDN naming `roster`, primary and standby at roster indices n and n + 1.
+/// `EpoConfig(8)` for LDN naming `roster`, with the schedule's `seq_order`: BASE `[n, n + 1]`,
+/// CHAIN operator 0's F1 box and operator 1's F2 box, `[n, n + 3]`.
 pub fn config(domain: &Domain, roster: &crate::Roster) -> crate::EpoConfig {
-    let n = n(domain.mode);
+    let ops = (domain.mode == Mode::Chain).then_some((0, 1));
+    let seq_order = roster
+        .seq_order(HomeCode::Ldn, ops)
+        .unwrap_or_else(|| panic!("fixture seq_order"));
     crate::EpoConfig {
         epoch: Epoch(8),
         home: HomeCode::Ldn,
         t_start: Nanos(0),
         roster_hash: roster.hash(domain),
-        seq_order: [n, n + 1],
-        lane_map_hash: Hash([2; 32]),
+        seq_order,
+        lane_map_hash: [Hash([2; 32]), Hash([4; 32]), Hash([6; 32])],
         n_lanes: [49, 49, 11],
         version: VERSION,
         endpoint_hash: Hash([3; 32]),

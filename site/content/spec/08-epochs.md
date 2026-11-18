@@ -92,7 +92,7 @@ struct EpoConfig {            // control record in the log of epoch e (07 contro
     t_start: Nanos,           // nominal start (TAI); T of the epoch before it
     roster_hash: Hash,        // the roster of all three homes: keys and replica addresses (§9.6)
     seq_order: [u8; 2],       // roster indices of home(epoch)'s vyrn-seq boxes: [primary F1, warm standby F2] (01 §14.4)
-    lane_map_hash: Hash,      // lane_map(epoch) with each account's class, by replicas (10 §1.3)
+    lane_map_hash: [Hash; 3], // lane_map(epoch) for each home's class sizes, TYO, LDN, NYC (10 §1.3)
     n_lanes: [u8; 3],         // lane count of each home's boxes, TYO, LDN, NYC: n_ded + n_pool (REF 42 + 7)
     version: u32,             // engine semantics version in force for the epoch (§9.4)
     endpoint_hash: Hash,      // the endpoint table of all three homes (§11.1)
@@ -106,8 +106,11 @@ Rules:
 - The `EpoConfig` for e+1 must be final at least `EPO_CONFIG_LEAD_S` (3,600 s) before T. If it is
   not, the replicas carry the previous epoch's configuration forward with `home`, `t_start` and
   `seq_order` recomputed from the schedule. Reason: a missing record must never block a handoff.
-  `roster_hash`, `n_lanes` and `endpoint_hash` cover all three homes, so carrying them forward
-  stays right when `home` changes; `home(epoch)`'s part is read at use.
+  `roster_hash`, `lane_map_hash`, `n_lanes` and `endpoint_hash` cover all three homes, so carrying
+  them forward stays right when `home` changes; `home(epoch)`'s part is read at use. The
+  recomputed `seq_order` is the schedule's for the carried roster at `home(epoch)` (§9.6).
+  A carried `lane_map_hash` names the maps of the previous epoch; replicas apply its entry for
+  `home(epoch)`, which was computed for that home's class sizes.
 - 10 publishes the full `lane_map(e+1)` with the same lead (10 §1.4, `ACC_MAP_PUBLISH_LEAD_S`).
 - The `HandoffRecord` covers `EpoConfig` through `log_hash`, so the certificate certifies the next
   epoch's configuration as well as the final state.
@@ -1176,7 +1179,9 @@ fairness and the window length, not safety. vyrn-sim tests skew up to ±10 s (§
 ### 9.2 Lane map
 
 `lane_map(e+1)` is computed by replicas (10 §1.3), fixed in `EpoConfig(e+1)` and published 1 h
-ahead. It gives each account a class, dedicated or pooled (01 §14.15), and a firm is promoted or
+ahead. Replicas compute it for each home's class sizes and `EpoConfig(e+1).lane_map_hash` holds
+all three hashes (TYO, LDN, NYC), so a carried-forward configuration names a map built for the
+home it lands on. It gives each account a class, dedicated or pooled (01 §14.15), and a firm is promoted or
 demoted only here, at a boundary. At most `ACC_MAX_MOVES_PER_EPOCH` (1,024) accounts move per
 boundary, class changes included. An account that stays pooled keeps its pool queue and does not
 move. 04 binds a session to its lane for life, so for a moved account:
@@ -1248,7 +1253,7 @@ Roster {                      // little-endian (01 §3)
 }
 Home {
     voters:   [Voter; n],     // n = N_BASE or N_CHAIN; voter index = position
-    n_seq:    u8,             // BASE ≥ 2; CHAIN = N_CHAIN, box j is operator j's
+    n_seq:    u8,             // BASE ≥ 2; CHAIN = 2 × N_CHAIN: box 2k is operator k's F1 box, 2k + 1 its F2 box
     seq:      [SeqBox; n_seq],// roster index = n + position
     recovery: u8,             // voter index of the recovery service (07 §8.5)
     n_data:   u8,
@@ -1268,9 +1273,10 @@ roster_hash = derive_key("vyrn      v1 roster", genesis_hash ‖ mode ‖ Roster
 `K` is the `PubKey` length of `sig_scheme` (01 §3: 32 or 1,344 B). `X` is the `KexKey` length of
 `sig_scheme` (01 §3, PQ-6(a): X25519, 32 B, or X25519 ‖ ML-KEM-768, 1,216 B). `mode` is one byte, 0 BASE and 1 CHAIN, as in every
 `genesis_hash ‖ mode` prefix of this chapter; it also fixes `n` and `Q`, so the roster stores
-neither. CHAIN: voter i and box j = i are operator i's validator and sequencer boxes, from
-`NodeCert(i, home)`, so they share `node_key`; the voter's `xchg_key` is the `NodeCert`'s GXK and
-the box's is its XK. BASE voters carry a GXK that nothing reads. Client-facing addresses (per-lane
+neither. CHAIN: voter i and boxes 2i and 2i + 1 are operator i's validator box and its F1 and F2
+sequencer boxes (09 §1), from `NodeCert(i, home)`, so they share `node_key`; the voter's
+`xchg_key` is the `NodeCert`'s GXK and the boxes' is its XK. `node_key` (NK) verifies `EpoReady`
+(§2.6), for voters and boxes alike. BASE voters carry a GXK that nothing reads. Client-facing addresses (per-lane
 order addresses, the recovery address) are in the endpoint table (§11.1), not here.
 
 **Decode rules.** A node rejects roster bytes, before it uses any key, unless all of these hold:
@@ -1284,15 +1290,20 @@ order addresses, the recovery address) are in the endpoint table (§11.1), not h
 | R5 | Per home: no key repeats among the `vote_key`s and `seq_key`s (07 §13.1) |
 | R6 | Per home: `recovery` names a Rust voter; `n_seq` as above |
 | R7 | CHAIN: no bridge or guardian key is zero or repeats within its list, and the set equals the bridge signer table's set of `rotation_no`, activated or scheduled to activate at or before e (§9.5), so `R_{e+1}` is checked before its boundary |
-| R8 | `EpoConfig(e).seq_order` names two distinct boxes of `home(e)`: BASE the primary in F1 and the standby in F2; CHAIN in two different facilities |
+| R8 | `EpoConfig(e).seq_order` names two distinct boxes of `home(e)`: BASE the primary in F1 and the standby in F2; CHAIN an F1 box (even position) as primary and another operator's F2 box (odd position) as standby |
+
+**The schedule's `seq_order`.** BASE: the first box in F1 and the first in F2. CHAIN: the F1 box
+of `seq_op(e)` and the F2 box of `next_seq(e, seq_op(e))` (09 §3.1–3.2), roster indices
+`n + 2·seq_op(e)` and `n + 2·next_seq + 1`. A published `EpoConfig` names this value; a
+carried-forward one recomputes it from the carried roster (§2.3).
 
 **The view.** `REP_Membership(e)` (07 §13.1) is not a separate record: it is `home(e)`'s part of
 the roster, with `seq_order` = `[EpoConfig(e).seq_order[0], seq_order[1]]` and then the other
 boxes in roster order. `HandoffCert(e − 1)` certifies it through `EpoConfig(e)`.
 
 **Size.** A scheme-0 BASE roster with 2 boxes and 4 data boxes per home is 2,649 B; a scheme-0
-CHAIN roster is 4,513 B and a scheme-1 one 118,753 B (computed, `vyrn-epoch` `vectors/roster.txt`).
-A node hashes it once per `EpoConfig`, off every hot path: 119 KB of BLAKE3 is ≤ 0.1 ms (budget).
+CHAIN roster is 6,508 B and a scheme-1 one 177,868 B (computed, `vyrn-epoch` `vectors/roster.txt`).
+A node hashes it once per `EpoConfig`, off every hot path: 178 KB of BLAKE3 is ≤ 0.15 ms (budget).
 
 **Vectors.** `crates/vyrn-epoch/vectors/roster.txt` holds the bytes and `roster_hash` of a BASE and
 a CHAIN scheme-0 roster, the hash and length of a scheme-1 one, and one reject per rule R1–R8.

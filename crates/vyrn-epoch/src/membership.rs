@@ -26,6 +26,8 @@ use vyrn_types::{Epoch, HomeCode, Mode, PubKey, StepId};
 pub struct SeqBox {
     /// Roster index, as `EpoConfig.seq_order` and `EpoGo.seq_index` name it.
     pub index: u8,
+    /// Node key `NK(index, home)`: `EpoReady` (08 §2.6).
+    pub node_key: PubKey,
     /// Block-signing key `SK(index, home)`.
     pub seq_key: PubKey,
     /// Exchange key `XK(index, home)` for session keys (§9.1).
@@ -37,6 +39,8 @@ pub struct SeqBox {
 pub enum MembershipErr {
     #[error("voters: {0}")]
     Committee(CommitteeErr),
+    #[error("one node key per voter is needed")]
+    NodeKeys,
     #[error("the primary and the standby are the same box")]
     SeqBoxes,
 }
@@ -47,6 +51,8 @@ pub struct Membership {
     epoch: Epoch,
     home: HomeCode,
     committee: Committee,
+    /// `NK(i, home)` of voter i.
+    node_keys: Vec<PubKey>,
     seq: [SeqBox; 2],
     spares: Vec<SeqBox>,
 }
@@ -73,15 +79,19 @@ pub struct Activation {
 }
 
 impl Membership {
-    /// `voters` in voter-index order and `seq` as `[primary F1, standby F2]`. The committee
-    /// refuses a sequencer key among the voters (01 §14.4).
+    /// `voters` (vote keys) and `node_keys` in voter-index order, and `seq` as `[primary F1,
+    /// standby F2]`. The committee refuses a sequencer key among the voters (01 §14.4).
     pub fn new(
         epoch: Epoch,
         home: HomeCode,
         mode: Mode,
         voters: Vec<PubKey>,
+        node_keys: Vec<PubKey>,
         seq: [SeqBox; 2],
     ) -> Result<Self, MembershipErr> {
+        if node_keys.len() != voters.len() {
+            return Err(MembershipErr::NodeKeys);
+        }
         if seq[0].index == seq[1].index || seq[0].seq_key == seq[1].seq_key {
             return Err(MembershipErr::SeqBoxes);
         }
@@ -91,6 +101,7 @@ impl Membership {
             epoch,
             home,
             committee,
+            node_keys,
             seq,
             spares: Vec::new(),
         })
@@ -112,6 +123,11 @@ impl Membership {
 
     pub fn committee(&self) -> &Committee {
         &self.committee
+    }
+
+    /// `NK(voter, home)`, which signs the voter's `EpoReady` (08 §2.6).
+    pub fn node_key(&self, voter: u8) -> Option<&PubKey> {
+        self.node_keys.get(usize::from(voter))
     }
 
     /// `[primary F1, standby F2]`.
@@ -200,6 +216,7 @@ mod tests {
             HomeCode::Ldn,
             Mode::Base,
             testkit::next_voters(Mode::Base),
+            testkit::next_node_keys(Mode::Base),
             seq,
         )
         .unwrap_or_else(|e| panic!("{e}"));
@@ -221,6 +238,7 @@ mod tests {
             HomeCode::Ldn,
             Mode::Base,
             testkit::next_voters(Mode::Base),
+            testkit::next_node_keys(Mode::Base),
             *next.seq(),
         )
         .unwrap_or_else(|e| panic!("{e}"));
@@ -238,7 +256,14 @@ mod tests {
         let mut voters = testkit::next_voters(Mode::Base);
         voters[1] = seq[1].seq_key;
         assert!(matches!(
-            Membership::new(Epoch(8), HomeCode::Ldn, Mode::Base, voters, seq),
+            Membership::new(
+                Epoch(8),
+                HomeCode::Ldn,
+                Mode::Base,
+                voters,
+                testkit::next_node_keys(Mode::Base),
+                seq
+            ),
             Err(MembershipErr::Committee(CommitteeErr::Sequencer(1)))
         ));
     }

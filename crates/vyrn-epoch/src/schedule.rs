@@ -258,7 +258,9 @@ pub struct EpoConfig {
     pub roster_hash: Hash,
     /// Roster indices of the home's `vyrn-seq` boxes: `[primary F1, warm standby F2]` (01 §14.4).
     pub seq_order: [u8; 2],
-    pub lane_map_hash: Hash,
+    /// `lane_map(epoch)` for each home's class sizes, in [`crate::HOMES`] order (08 §9.2), so a
+    /// carried-forward configuration stays right when `home` changes.
+    pub lane_map_hash: [Hash; 3],
     /// Lane count of each home's boxes, in [`crate::HOMES`] order (REF 49). All three homes, so a
     /// carried-forward configuration stays right when `home` changes (08 §2.3).
     pub n_lanes: [u8; 3],
@@ -277,13 +279,21 @@ impl EpoConfig {
     pub const FLAG_DATE_ROLL: u16 = 1 << 1;
     pub const FLAG_LEAP: u16 = 1 << 2;
 
-    /// Lane count of `home(epoch)`'s boxes.
-    pub fn lanes(&self) -> u8 {
-        let i = crate::HOMES
+    fn home_index(&self) -> usize {
+        crate::HOMES
             .iter()
             .position(|h| *h == self.home)
-            .unwrap_or(0);
-        self.n_lanes[i]
+            .unwrap_or(0)
+    }
+
+    /// Lane count of `home(epoch)`'s boxes.
+    pub fn lanes(&self) -> u8 {
+        self.n_lanes[self.home_index()]
+    }
+
+    /// The hash of `lane_map(epoch)` for `home(epoch)`.
+    pub fn lane_map(&self) -> Hash {
+        self.lane_map_hash[self.home_index()]
     }
 
     /// The configuration in force for `boundary.to` (08 §2.3): `published` if it names that
@@ -291,9 +301,15 @@ impl EpoConfig {
     /// with `home`, `t_start` and `seq_order` recomputed from the schedule. A missing record
     /// never blocks a handoff.
     ///
-    /// `seq_order` from the schedule is 09's `seq_op(e)` in CHAIN and fixed in BASE; this crate
-    /// has no roster, so the carried value keeps `prev.seq_order` [Guessing; spec gap].
-    pub fn in_force(prev: &Self, published: Option<(&Self, Nanos)>, boundary: &Boundary) -> Self {
+    /// `seq_order` is the schedule's for `boundary.to`: [`crate::Roster::seq_order`] of the
+    /// carried roster at `boundary.to_home`, with 09 §3's `seq_op(e)` and
+    /// `next_seq(e, seq_op(e))` in CHAIN (08 §9.6).
+    pub fn in_force(
+        prev: &Self,
+        published: Option<(&Self, Nanos)>,
+        boundary: &Boundary,
+        seq_order: [u8; 2],
+    ) -> Self {
         let deadline = boundary.t.0.saturating_sub(EPO_CONFIG_LEAD_S * NS_PER_S);
         match published {
             Some((cfg, final_at)) if cfg.epoch == boundary.to && final_at.0 <= deadline => *cfg,
@@ -301,6 +317,7 @@ impl EpoConfig {
                 epoch: boundary.to,
                 home: boundary.to_home,
                 t_start: boundary.t,
+                seq_order,
                 flags: prev.flags & !Self::FLAG_SKIP,
                 ..*prev
             },
@@ -455,7 +472,7 @@ mod tests {
             t_start: G,
             roster_hash: Hash([1; 32]),
             seq_order: [4, 5],
-            lane_map_hash: Hash([2; 32]),
+            lane_map_hash: [Hash([2; 32]); 3],
             n_lanes: [49, 49, 11],
             version: 3,
             endpoint_hash: Hash([3; 32]),
@@ -468,9 +485,13 @@ mod tests {
             ..prev
         };
         let on_time = at_before(b.t, EPO_CONFIG_LEAD_S);
-        assert_eq!(EpoConfig::in_force(&prev, Some((&next, on_time)), &b), next);
+        assert_eq!(
+            EpoConfig::in_force(&prev, Some((&next, on_time)), &b, [6, 7]),
+            next
+        );
         let late = Nanos(on_time.0 + 1);
-        let carried = EpoConfig::in_force(&prev, Some((&next, late)), &b);
+        let carried = EpoConfig::in_force(&prev, Some((&next, late)), &b, [6, 7]);
+        assert_eq!(carried.seq_order, [6, 7]);
         assert_eq!(
             (
                 carried.epoch,
