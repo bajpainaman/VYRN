@@ -1405,9 +1405,14 @@ into one sequence by this rule, so the Rust and Vx clients run the same schedule
    `r`, as one lane call.
 2. Before step `s`, every lane in increasing lane id replays, in O-order, each of its remaining
    records with `f(r) < s`. Then step `s` is replayed.
-3. After the block's last step, every lane in increasing lane id replays its remaining records.
-   A record with `f(r)` greater than the last step replayed so far is a sequencer fault
-   (`REP_E_ORDER`): its lane applied a step that the log does not hold yet.
+3. After the block's last step, every lane in increasing lane id replays its remaining records
+   with `f(r)` at most the last step, in O-order, and stops at the first record that is not
+   settled. A record is *not settled* when `f(r)` is greater than the last step, or when it is a
+   packet (not `SHED`) with an op above the block's last cut that no step of the block names as
+   its source: a step of a later block may still name that op, so the lane cannot classify it
+   yet. That record and every later record of its lane **carry** into the next block, where they
+   come before the next block's records. A record carried past a cut that covers one of its ops
+   is `REP_E_ORDER`.
 
 `REP_MERGE` respects both dependencies above: a lane reads a step's fill events only after the
 step, and a step's cut covers only ops that its lane applied before the step was published, so

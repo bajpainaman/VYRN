@@ -44,11 +44,13 @@
 //!   in lane id order replays its records due at `f < s`, where `f` is a packet's
 //!   `fills_applied` raised to that of its `MID` records. `n_tx`, `n_fills`, `fill_lanes`,
 //!   `flags`, `pub_a/b` and `CONT` are derived, not compared; the `Rescan` band is the payload
-//!   (8 B, or empty for all ticks). Errors are [`WireDiverged`] at a lane record index, a step,
+//!   (8 B, or empty for all ticks). Call it once per block on the same engine: records a block
+//!   does not settle carry to the next call ([`Engine::carried`], `REP_MERGE` item 3). Errors are [`WireDiverged`] at a lane record index, a step,
 //!   or the end.
 //! - **Response log** ([`Responses`]): both entry points check every lane response (per lane, in
-//!   order) and fill TX packet (in order) against a log when one is given, and that the log is
-//!   used up at the end ([`Why::Response`]). [`NoResponses`] checks nothing.
+//!   order) and fill TX packet (in order) against a log when one is given ([`Why::Response`]).
+//!   [`Engine::replay`] also checks that the log is used up at the end; after
+//!   [`Engine::replay_wire`] the caller checks [`Responses::finished`] after its last block. [`NoResponses`] checks nothing.
 //!
 //! **Replay rejects** ([`Diverged`]): a record the replayed engine does not reproduce byte for
 //! byte ([`Why::Mismatch`]), a packet record without payload ([`Why::NoPayload`]), a step

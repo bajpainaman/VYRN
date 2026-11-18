@@ -366,19 +366,63 @@ fn replay_from_07_rejects_what_07_carries() {
             why: Why::Order
         })
     );
-    // A lane record due at a step the input lacks is left over (REP_E_ORDER).
-    let cut = steps.len() - 1;
-    let r = replay_wire(&lanes, &steps[..cut], &store, None).0;
-    assert!(
-        matches!(
-            r,
-            Err(WireDiverged {
-                at: WireAt::Lane(_),
-                why: Why::Order
-            })
-        ),
-        "{r:?}"
-    );
+    // A lane record due at a step the block lacks is carried, not replayed (REP_MERGE item 3).
+    let k = steps.len() - 1;
+    let (r, _, carried) = replay_blocks(&[(&lanes, &steps[..k])], &store, None);
+    assert_eq!(r, Ok(()));
+    assert!(carried > 0);
+}
+
+#[test]
+fn replay_from_07_carries_unsettled_records_across_blocks() {
+    // 07 §7.1 REP_MERGE item 3: split the run into two blocks at every step. A packet whose op is
+    // stepped in the second block (forwarded, then Cross/Improve/Shed later) must carry, not be
+    // replayed as local at the end of the first. Each split must reproduce the one-block replay.
+    let (j, store, _, _) = live(&script());
+    let (lanes, steps) = to_wire(&j.recs);
+    let (r, one) = replay_wire(&lanes, &steps, &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    // Lane records before each step in journal order: block 1 holds exactly what 07 would.
+    let mut before = Vec::new();
+    let mut n = 0;
+    for x in &j.recs {
+        match x {
+            OwnedRec::Packet(_) => n += 1,
+            OwnedRec::Step(..) => before.push(n),
+        }
+    }
+    let mut carried_any = false;
+    for k in 1..steps.len() {
+        let b1 = (&lanes[..before[k]], &steps[..k]);
+        let b2 = (&lanes[before[k]..], &steps[k..]);
+        let (r, rep, left) = replay_blocks(&[b1, b2], &store, Some(&j));
+        assert_eq!(r, Ok(()), "split at step {k}");
+        assert_eq!(left, 0, "split at step {k}");
+        // Carrying moves records relative to other lanes, never within a lane (07 §7.1).
+        for l in 0..N as u8 {
+            let pk = |x: &[OwnedRec]| {
+                packets(x)
+                    .filter(|p| p.lane.0 == l)
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                pk(&rep.recs) == pk(&one.recs),
+                "split at step {k}, lane {l}"
+            );
+        }
+        let st = |x: &[OwnedRec]| {
+            logical(x)
+                .into_iter()
+                .filter(|r| matches!(r, OwnedRec::Step(..)))
+                .collect::<Vec<_>>()
+        };
+        assert!(st(&rep.recs) == st(&one.recs), "split at step {k}: steps");
+        assert!(rep.tx == one.tx, "split at step {k}: fill TX");
+        let (_, _, c) = replay_blocks(&[b1], &store, None);
+        carried_any |= c > 0;
+    }
+    assert!(carried_any, "some split must carry a record");
 }
 
 #[test]

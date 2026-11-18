@@ -371,37 +371,65 @@ pub fn to_wire(
     (lanes, steps)
 }
 
+/// One step as `to_wire` gives it.
+pub type Wire = (
+    vyrn_types::StepId,
+    vyrn_types::StepKind,
+    Option<(LaneId, vyrn_types::LaneSeq)>,
+    Vec<vyrn_types::LaneSeq>,
+    Vec<u8>,
+);
+
 /// Replays 07-only inputs on a fresh box (`Engine::replay_wire`).
 pub fn replay_wire(
     lanes: &[PacketRecord],
-    steps: &[(
-        vyrn_types::StepId,
-        vyrn_types::StepKind,
-        Option<(LaneId, vyrn_types::LaneSeq)>,
-        Vec<vyrn_types::LaneSeq>,
-        Vec<u8>,
-    )],
+    steps: &[Wire],
     store: &Store,
     log: Option<&Journal>,
 ) -> (Result<(), vyrn_engine::WireDiverged>, Journal) {
+    let (r, j, _) = replay_blocks(&[(lanes, steps)], store, log);
+    (r, j)
+}
+
+/// Replays blocks of 07-only inputs, one `replay_wire` call each, on one fresh box. Returns the
+/// first error (or `Ok`), the outputs, and how many records the last call carried.
+pub fn replay_blocks(
+    blocks: &[(&[PacketRecord], &[Wire])],
+    store: &Store,
+    log: Option<&Journal>,
+) -> (Result<(), vyrn_engine::WireDiverged>, Journal, usize) {
     let (bbo, mut sh) = new_box();
     let mut e = engine(bbo, &mut sh);
     let mut j = Journal::default();
-    let ws: Vec<WireStep<'_>> = steps
-        .iter()
-        .map(|(step, kind, src, cut, payload)| WireStep {
-            step: *step,
-            kind: *kind,
-            src: *src,
-            cut,
-            payload,
-        })
-        .collect();
-    let r = match log {
-        Some(l) => e.replay_wire(lanes, &ws, store, &mut RespLog::of(l), &mut j),
-        None => e.replay_wire(lanes, &ws, store, &mut NoResponses, &mut j),
-    };
-    (r, j)
+    let mut rl = log.map(RespLog::of);
+    for (lanes, steps) in blocks {
+        let ws: Vec<WireStep<'_>> = steps
+            .iter()
+            .map(|(step, kind, src, cut, payload)| WireStep {
+                step: *step,
+                kind: *kind,
+                src: *src,
+                cut,
+                payload,
+            })
+            .collect();
+        let r = match &mut rl {
+            Some(l) => e.replay_wire(lanes, &ws, store, l, &mut j),
+            None => e.replay_wire(lanes, &ws, store, &mut NoResponses, &mut j),
+        };
+        if r.is_err() {
+            return (r, j, e.carried().len());
+        }
+    }
+    let n = e.carried().len();
+    if rl.is_some_and(|l| !l.finished()) {
+        let end = vyrn_engine::WireDiverged {
+            at: vyrn_engine::WireAt::End,
+            why: vyrn_engine::Why::Response,
+        };
+        return (Err(end), j, n);
+    }
+    (Ok(()), j, n)
 }
 
 pub fn hex(b: &[u8]) -> String {

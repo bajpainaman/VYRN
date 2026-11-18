@@ -21,6 +21,8 @@ use vyrn_types::{AccountId, AcctTake, LaneId, LaneSeq, PacketRecord, SessionId, 
 
 /// Steps whose cut replay keeps for `MID` boundaries (`ENG_STEP_LOG`).
 pub(crate) const STEP_HIST: usize = ENG_STEP_LOG;
+/// Lane records 07 replay can carry from one block to the next (`ENG_FWD_RING` × 4).
+pub(crate) const CARRY_CAP: usize = 4 * vyrn_cut::ENG_FWD_RING;
 /// Records one fill TX packet can carry (`TxEntry.n_rec` is a `u8`).
 const TX_RECS: usize = 256;
 /// Polls per step before the engine reports no step (`Bbo::poll` may return `Idle` while it
@@ -153,6 +155,10 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     unread: Option<StepId>,
     /// Per lane: `(session, account, token)` of each pooled session ([`Engine::pool_session`]).
     pool: Vec<Vec<(SessionId, AccountId, &'a PoolTok)>>,
+    /// 07 replay: lane records carried to the next block (07 §7.1 `REP_MERGE` item 3), and the
+    /// buffer the next carry is built in. Both hold [`CARRY_CAP`] records.
+    pub(crate) carry: Vec<PacketRecord>,
+    pub(crate) carry_next: Vec<PacketRecord>,
 }
 
 impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
@@ -252,6 +258,8 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             scratch: Vec::with_capacity(32),
             unread: None,
             pool: (0..n).map(|_| Vec::new()).collect(),
+            carry: Vec::with_capacity(CARRY_CAP),
+            carry_next: Vec::with_capacity(CARRY_CAP),
         })
     }
 

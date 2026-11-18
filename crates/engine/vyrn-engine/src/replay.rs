@@ -299,7 +299,8 @@ impl<'p> WireStep<'p> {
 /// Where [`Engine::replay_wire`] stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireAt {
-    /// At this index of the lane records.
+    /// At this index of the lane records: the records carried from the previous block
+    /// ([`Engine::carried`] before the call) come first, then this call's `lanes`.
     Lane(usize),
     /// At this step.
     Step(StepId),
@@ -338,27 +339,44 @@ const NO_REC: PacketRecord = PacketRecord {
     fills_applied: StepId(0),
 };
 
-/// The next call of `lane` in `recs` from index `from`, skipping other lanes' records.
-fn next_call(recs: &[PacketRecord], lane: LaneId, from: usize) -> Option<Result<Call, usize>> {
-    let (i, r) = recs
-        .iter()
-        .enumerate()
-        .skip(from)
-        .find(|(_, r)| r.lane == lane)?;
-    if is_mid(r) {
-        return Some(Err(i));
+/// The carried records followed by one block's records, indexed as one sequence.
+#[derive(Clone, Copy)]
+struct Recs<'a> {
+    a: &'a [PacketRecord],
+    b: &'a [PacketRecord],
+}
+
+impl Recs<'_> {
+    fn len(&self) -> usize {
+        self.a.len().saturating_add(self.b.len())
+    }
+    fn get(&self, i: usize) -> Option<&PacketRecord> {
+        match i.checked_sub(self.a.len()) {
+            None => self.a.get(i),
+            Some(k) => self.b.get(k),
+        }
+    }
+}
+
+/// The next call of `lane` from index `from`: `(index of its first record, call)`.
+fn next_call(recs: Recs<'_>, lane: LaneId, from: usize) -> Option<(usize, Result<Call, usize>)> {
+    let i = (from..recs.len()).find(|&i| recs.get(i).is_some_and(|r| r.lane == lane))?;
+    let r = *recs.get(i)?;
+    if is_mid(&r) {
+        return Some((i, Err(i)));
     }
     let mut c = Call {
-        rec: *r,
+        rec: r,
         f: r.fills_applied,
         mids: [NO_REC; MAX_MIDS],
         n_mid: 0,
         end: i.saturating_add(1),
     };
-    if is_advance(r) {
-        return Some(Ok(c));
+    if is_advance(&r) {
+        return Some((i, Ok(c)));
     }
-    for (j, m) in recs.iter().enumerate().skip(i.saturating_add(1)) {
+    for j in i.saturating_add(1)..recs.len() {
+        let Some(m) = recs.get(j) else { break };
         if m.lane != lane {
             continue;
         }
@@ -366,17 +384,39 @@ fn next_call(recs: &[PacketRecord], lane: LaneId, from: usize) -> Option<Result<
             break;
         }
         let Some(d) = c.mids.get_mut(c.n_mid) else {
-            return Some(Err(j));
+            return Some((i, Err(j)));
         };
         *d = *m;
         c.n_mid = c.n_mid.saturating_add(1);
         c.f = c.f.max(m.fills_applied);
         c.end = j.saturating_add(1);
     }
-    Some(Ok(c))
+    Some((i, Ok(c)))
+}
+
+/// A packet whose ops are not all decided by this block (07 §7.1 item 3): one of them is above
+/// the block's last cut, so a step of a later block may still name it as a source. It is
+/// carried unless a step left in this block names one of its ops, which must be replayed now.
+fn undecided(c: &Call, final_cut: LaneSeq, later: &[WireStep<'_>]) -> bool {
+    let r = &c.rec;
+    if is_advance(r) || r.count == 0 || r.flags & PacketFlags::SHED != 0 {
+        return false;
+    }
+    let lo = r.first_lane_seq.0;
+    let hi = lo.saturating_add(u64::from(r.count));
+    let named = later
+        .iter()
+        .filter_map(|w| w.src)
+        .any(|(l, q)| l == r.lane && lo <= q.0 && q.0 < hi);
+    hi.saturating_sub(1) > final_cut.0 && !named
 }
 
 impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
+    /// The lane records [`Engine::replay_wire`] carried to the next block, in input order.
+    pub fn carried(&self) -> &[PacketRecord] {
+        &self.carry
+    }
+
     /// Replays the engine's own journal `recs` from its initial state, forwarding every output to
     /// `sink` and checking responses against `log` ([`NoResponses`] for none).
     pub fn replay<P: Payloads, S: Sink, R: Responses>(
@@ -406,6 +446,12 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
     /// the merged steps in StepId order. The two are merged by `REP_MERGE`. Steps compare only
     /// what 07 carries (kind, source, cut, checked by `Bbo::replay_step`); packet records compare
     /// byte for byte; responses compare against `log`.
+    ///
+    /// Blocks are replayed by calling this once per block, in height order, on the same engine.
+    /// A lane record that is not settled by the block (not yet due, or a packet with an op above
+    /// the block's last cut that no step of the block names) is carried into the next call
+    /// ([`Engine::carried`]), ahead of that call's `lanes` (07 §7.1 `REP_MERGE` item 3). A response
+    /// log spans blocks, so the caller checks [`Responses::finished`] after its last block.
     pub fn replay_wire<P: Payloads, S: Sink, R: Responses>(
         &mut self,
         lanes: &[PacketRecord],
@@ -415,31 +461,50 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         sink: &mut S,
     ) -> Result<(), WireDiverged> {
         let mut buf = core::mem::take(&mut self.scratch);
-        let r = self.wire_in(lanes, steps, payloads, log, sink, &mut buf);
+        let carry = core::mem::take(&mut self.carry);
+        let mut next = core::mem::take(&mut self.carry_next);
+        next.clear();
+        let recs = Recs {
+            a: &carry,
+            b: lanes,
+        };
+        let r = self.wire_in(recs, steps, payloads, log, sink, &mut buf, &mut next);
         buf.clear();
         self.scratch = buf;
-        r?;
-        if log.finished() {
-            Ok(())
-        } else {
-            Err(WireDiverged {
-                at: WireAt::End,
-                why: Why::Response,
-            })
-        }
+        // On success `next` is the new carry; on an error replay stops anyway.
+        self.carry = next;
+        self.carry_next = carry;
+        r
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn wire_in<P: Payloads, S: Sink, R: Responses>(
         &mut self,
-        lanes: &[PacketRecord],
+        lanes: Recs<'_>,
         steps: &[WireStep<'_>],
         payloads: &P,
         log: &mut R,
         sink: &mut S,
         buf: &mut Vec<PacketRecord>,
+        carry: &mut Vec<PacketRecord>,
     ) -> Result<(), WireDiverged> {
         let n = self.lanes.len();
+        if (0..lanes.len()).any(|i| lanes.get(i).is_some_and(|r| usize::from(r.lane.0) >= n)) {
+            return Err(WireDiverged {
+                at: WireAt::End,
+                why: Why::BadRecord,
+            });
+        }
+        // The block's last cut decides which ops are settled in this block (item 3).
+        let mut final_cut = self.cut;
+        if let Some(w) = steps.last() {
+            for (d, c) in final_cut.iter_mut().zip(w.cut) {
+                *d = *c;
+            }
+        }
+        // cur[l]: index of lane l's next record; held[l]: lane l carries from cur[l] on.
         let mut cur = [0usize; MAX_LANES];
+        let mut held = [false; MAX_LANES];
         let (lo, hi) = self.tick_range().ok_or(WireDiverged {
             at: WireAt::End,
             why: Why::BadStep,
@@ -449,7 +514,9 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 lanes,
                 steps.get(k..).unwrap_or(&[]),
                 w.step,
+                &final_cut,
                 &mut cur,
+                &mut held,
                 payloads,
                 log,
                 sink,
@@ -521,35 +588,31 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             lanes,
             &[],
             StepId(last.saturating_add(1)),
+            &final_cut,
             &mut cur,
+            &mut held,
             payloads,
             log,
             sink,
             buf,
         )?;
-        // Every lane record must be consumed: one left over is due at a step the input lacks.
-        if let Some(i) = (0..n)
-            .filter_map(|l| {
-                let c = cur.get(l).copied().unwrap_or(0);
-                lanes
-                    .iter()
-                    .enumerate()
-                    .skip(c)
-                    .find(|(_, r)| usize::from(r.lane.0) == l)
-                    .map(|x| x.0)
-            })
-            .min()
-        {
-            return Err(WireDiverged {
-                at: WireAt::Lane(i),
-                why: Why::Order,
-            });
-        }
-        if lanes.iter().any(|r| usize::from(r.lane.0) >= n) {
-            return Err(WireDiverged {
-                at: WireAt::End,
-                why: Why::BadRecord,
-            });
+        // Item 3: what is left (not yet due, or undecided) carries to the next block, per lane in
+        // O-order.
+        for i in 0..lanes.len() {
+            let Some(r) = lanes.get(i) else { continue };
+            if i >= cur
+                .get(usize::from(r.lane.0))
+                .copied()
+                .unwrap_or(usize::MAX)
+            {
+                if carry.len() >= carry.capacity() {
+                    return Err(WireDiverged {
+                        at: WireAt::Lane(i),
+                        why: Why::Order,
+                    });
+                }
+                carry.push(*r);
+            }
         }
         Ok(())
     }
@@ -559,38 +622,53 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
     #[allow(clippy::too_many_arguments)]
     fn wire_lanes<P: Payloads, S: Sink, R: Responses>(
         &mut self,
-        lanes: &[PacketRecord],
+        lanes: Recs<'_>,
         later: &[WireStep<'_>],
         s: StepId,
+        final_cut: &Cut,
         cur: &mut [usize; MAX_LANES],
+        held: &mut [bool; MAX_LANES],
         payloads: &P,
         log: &mut R,
         sink: &mut S,
         buf: &mut Vec<PacketRecord>,
     ) -> Result<(), WireDiverged> {
         for l in 0..self.lanes.len() {
+            if held.get(l).copied().unwrap_or(true) {
+                continue;
+            }
             let lane = crate::engine::lane_id(l);
             loop {
                 let from = cur.get(l).copied().unwrap_or(0);
-                let c = match next_call(lanes, lane, from) {
-                    None => break,
-                    Some(Err(i)) => {
+                let (i, c) = match next_call(lanes, lane, from) {
+                    None => {
+                        // Nothing left: later passes skip this lane in O(1).
+                        if let Some(x) = cur.get_mut(l) {
+                            *x = lanes.len();
+                        }
+                        break;
+                    }
+                    Some((_, Err(j))) => {
                         return Err(WireDiverged {
-                            at: WireAt::Lane(i),
+                            at: WireAt::Lane(j),
                             why: Why::BadRecord,
                         });
                     }
-                    Some(Ok(c)) => c,
+                    Some((i, Ok(c))) => (i, c),
                 };
+                // Park the cursor on the found record so the next pass starts there.
+                if let Some(x) = cur.get_mut(l) {
+                    *x = i;
+                }
                 if c.f >= s {
                     break;
                 }
-                let i = lanes
-                    .iter()
-                    .enumerate()
-                    .skip(from)
-                    .find(|(_, r)| r.lane == lane)
-                    .map_or(from, |x| x.0);
+                if undecided(&c, final_cut.get(l).copied().unwrap_or(LaneSeq(0)), later) {
+                    if let Some(h) = held.get_mut(l) {
+                        *h = true;
+                    }
+                    break;
+                }
                 let at = |why| WireDiverged {
                     at: WireAt::Lane(i),
                     why,
