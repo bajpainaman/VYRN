@@ -479,6 +479,56 @@ fn deadline_admission_at_the_threshold() {
     assert_eq!(q[1].first_lane_seq, LaneSeq(2));
 }
 
+/// The 04 §11 vector V22's records, from `tests/golden/vyrn_proto_vectors.out`.
+fn v22_records() -> Vec<[u8; 16]> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../tests/golden/vyrn_proto_vectors.out"
+    );
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut bytes = Vec::new();
+    let mut on = false;
+    for line in text.lines() {
+        if line.starts_with('V') || line.starts_with("check") {
+            on = line.starts_with("V22 ");
+        } else if let (true, Some((_, hex))) = (on, line.trim().split_once(": ")) {
+            bytes.extend(hex.split(' ').map(|h| u8::from_str_radix(h, 16).unwrap()));
+        }
+    }
+    let n = usize::from(bytes[8]);
+    bytes[16..16 + 16 * n]
+        .chunks(16)
+        .map(|c| c.try_into().unwrap())
+        .collect()
+}
+
+#[test]
+fn a_shed_new_and_heartbeat_answer_v22_byte_for_byte() {
+    // 04 §3.5, §11 V21/V22: the lane sheds `pkt_seq` 7 (a New and a Heartbeat) with `expected` = 7.
+    // Its BUSY run has one record per message, the Heartbeat's included, each with detail 7 and
+    // `client_tag` 0, so its record bytes are V22's whatever the session or keys.
+    let (_bbo, mut w) = setup();
+    let mut x = w.rig();
+    for i in 0..6u64 {
+        let t = 1_000 + 1_000 * i;
+        assert_eq!(x.send(0, 1, t, &[Msg::Heartbeat]), Rx::Accepted);
+    }
+    let m = [
+        new(day(Side::Sell), 100_005, 1, 0x9999_9999),
+        Msg::Heartbeat,
+    ];
+    assert_eq!(x.send_at(0, 1, 10_000, 20_000, &m, &[]), Rx::Shed);
+    let last = x.packets(0, 1).pop().unwrap().1;
+    let got: Vec<[u8; 16]> = last.iter().map(Record::encode).collect();
+    assert_eq!(got, v22_records());
+    let p = packets(&x, 0);
+    let shed = p.last().unwrap();
+    assert_eq!(
+        (shed.flags, shed.pkt_seq, shed.count),
+        (PacketFlags::SHED, 7, 2)
+    );
+}
+
 /// Lane 1 crosses lane 0's ask; the BBO runs the step but lane 0 has not applied it. Lane 0 then
 /// sends `[sell 1 @ 110, sell 1 @ 111]` (LaneSeq 2, 3) with `mids`. Returns lane 0's log.
 fn mid_run(mids: impl Fn(vyrn_cut::LaneCutEntry) -> Vec<Mid>) -> (StepId, Vec<PacketRecord>) {
