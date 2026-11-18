@@ -153,20 +153,23 @@ PBV_STATIC_ASSERT(offsetof(pbo_event, msg) == 40, pbo_event_msg_offset);
 /* ===================================================================================== */
 
 /* Bumped on any change to a layout, a ring, an error code or the supported subset. */
-#define PBV_ABI_VERSION 2u
+#define PBV_ABI_VERSION 3u
 
 typedef struct pbv_ctx pbv_ctx;
 
 /* Tables, by byte offset (the client reads them byte by byte, so no struct layout is assumed).
  * pbv_config, 64 bytes: 0 abi_version u32 (PBV_ABI_VERSION), 4 size u32 (64), 8 n_lanes u8
  *   (1..=64), 10 book u16, 12 epoch u32, 16 tick_min u32, 20 tick_max u32, 24 tick_size u64,
- *   32 band_bps u32 (<= 10000), 36 slot_cap u32, 40 seg_cap u32; the rest reserved.
+ *   32 band_bps u32 (<= 10000), 36 slot_cap u32, 40 seg_cap u32, 48 pool u64 (pooled lanes,
+ *   bit l); the rest reserved.
  * pbv_account, 80 bytes: 0 slot u32 (AcctSlot), 4 lane u8, 5 state u8 (0 active, 1 killed,
- *   2 closed), 8 max_open u32, 12 max_qty u32, 16 max_notional u64, 24 taker_ppm i32,
+ *   2 closed), 6 has_pool_ix u8, 8 max_open u32, 12 max_qty u32, 16 max_notional u64, 24 taker_ppm i32,
  *   28 maker_ppm i32, 32 auction_ppm i32, 36 msg_fee_improve u32, 40 msg_fee_cross u32,
- *   48 base_free u64, 56 quote_free u128 (low word first).
+ *   44 pool_ix u32 (pool-wide index, STP across pooled lanes), 48 base_free u64,
+ *   56 quote_free u128 (low word first).
  * pbv_session, 32 bytes: 0 id u32 (SessionId; its lane is bits 12..20), 4 acct slot u32,
- *   8 book u16, 16 k_seq[16]. */
+ *   8 book u16, 10 pooled u8, 12 pooled account u32 (AccountId; each record takes an AcctTake),
+ *   16 k_seq[16]. */
 
 /* The shared region (pbv_shared): pbv_shared_bytes(n) bytes, 128-aligned and zeroed, owned by
  * the Rust shell. It starts with 1 + 4(n + 1) control lines of 16 u64 words; each word has one
@@ -190,7 +193,9 @@ typedef struct pbv_ctx pbv_ctx;
                                 24 pkt_hash u64, 32 first_lane_seq u64, 40 fills_applied u64,
                                 48 record index u64 (for errors), 56 snap_lag u16 (0 on an
                                 Advance or SHED record), 64 routes (16 bytes each:
-                                lane_seq u64, cross u8), 224 payload. One slot per PacketRecord,
+                                lane_seq u64, cross u8), 224 payload (<= 192), 416 AcctTake:
+                                has u8, 417 predecessor lane u8, 420 account u32, 424 ver u32,
+                                428 predecessor ver u32 (0: none). One slot per PacketRecord,
                                 MID and Advance records included, in O-order; a packet's
                                 RouteRecords ride in its slot. */
 #define PBV_OUT_BYTES   288u /* 0 session u32, 4 resp_seq u32, 8 echo_pkt u32, 12 n u8,
@@ -210,7 +215,8 @@ typedef struct pbv_ctx pbv_ctx;
 #define PBV_E_TOO_OLD     6u /* a call needs a step older than the client's history */
 #define PBV_E_BAD_RECORD  7u /* a malformed record (a MID record first, too many MIDs) */
 #define PBV_E_UNSUPPORTED 8u /* outside v1's subset, below */
-#define PBV_E_FAULT       9u /* a ledger overflow or a capacity */
+#define PBV_E_FAULT       9u /* a ledger overflow, a capacity, an evicted snapshot or an
+                                AcctTake that differs from the take replay makes */
 
 /* v1 subset: New (Day, IOC, FOK, post-only), Cancel, Reduce, Heartbeat and ResendReq (no
  * LaneSeq, no response); SHED records (from the record alone, no payload, 05 §18 Q17); Cross, Improve, Shed,

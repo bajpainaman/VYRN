@@ -36,7 +36,7 @@ extern "C" {
 // ---- constants ---------------------------------------------------------------------------
 // VX-WORKAROUND W-12 (issue to file): no hex integer literals, so every constant is decimal.
 
-const ABI_VERSION : u64 = 2;
+const ABI_VERSION : u64 = 3;
 const U32_MAX : u64 = 4294967295;
 const U64_MAX : u64 = 18446744073709551615;
 const NS_PER_S : u64 = 1000000000;
@@ -54,6 +54,7 @@ const TX_SLOTS : u64 = 1024;
 const TX_BYTES : i64 = 288;
 const IN_PAYLOAD : i64 = 224;
 const IN_ROUTES : i64 = 64;
+const IN_TAKE : i64 = 416;        // has u8, pred lane u8, 4 account u32, 8 ver u32, 12 pred ver u32
 
 // Vx-owned capacities.
 const OPLOG_CAP : u64 = 16384;
@@ -199,7 +200,7 @@ struct Acct {
 
 struct Sess {
   id : u64, acct : u64, book : u64, k0 : u64, k1 : u64,
-  expected : u64, next_resp : u64, g : i64,
+  expected : u64, next_resp : u64, g : i64, pidx : i64,
 }
 
 struct Slot {
@@ -284,6 +285,9 @@ struct Ctx {
   oplog : *mut LOp, fwdq : *mut u64, evlog : *mut Ev,
   hist_id : *mut AtomicU64, hist_cut : *mut u64, hist_ver : *mut u64,
   sv_id : *mut AtomicU64, sv_bid : *mut u64, sv_ask : *mut u64,
+  // Pooled lanes (bit l) and the pooled accounts (05 §6.9): each one's id and how many of its
+  // takes are reproduced, which is the last `ver` (the token's ver is gapless from 1).
+  pool : u64, pa_id : *mut u64, pa_done : *mut AtomicU64, n_pa : i64,
 }
 
 // ---- bytes, memory -------------------------------------------------------------------------
@@ -378,6 +382,9 @@ const Y_WAIT : i64 = 3;
 const Y_SNAP_VER : i64 = 4;
 // BBO line 2n word 1: the newest snapshot version (replay's `snap_now`).
 const Y_SNAP_NOW : i64 = 1;
+// Lane line 2l word 5: the take this lane waits for, (pred ver << 32) | (pred lane << 24) |
+// (pooled account + 1); 0 when it waits for none.
+const Y_TAKE_WAIT : i64 = 5;
 
 fn stopped(c : *mut Ctx) -> bool { return ld(c, 0i64, 0i64) != 0u64; }
 fn done_step(c : *mut Ctx) -> u64 { unsafe { return sld(c, 2i64 * (*c).n, 0i64); } }
@@ -1012,6 +1019,54 @@ fn find_sess(ln : *mut Lane, id : u64) -> i64 {
     for i in 0i64..(*ln).n_sess { if (*sess(ln, i)).id == id { return i; } }
   }
   return NONE;
+}
+
+fn find_pa(c : *mut Ctx, id : u64) -> i64 {
+  unsafe {
+    for i in 0i64..(*c).n_pa { if *offset_mut((*c).pa_id, i) == id { return i; } }
+  }
+  return NONE;
+}
+fn pa_done(c : *mut Ctx, i : i64) -> *mut AtomicU64 { unsafe { return offset_mut((*c).pa_done, i); } }
+
+// Whether the take waits from lane l lead back to l, each still blocked: then none can move
+// (each waits on a take behind the next one's head), a cyclic take order (Codex r4612327830).
+// A word read stale cannot pass: a lane leaves a wait only once its count reaches its ver,
+// and counts only grow, so a hop whose count is still below its ver is in that wait now.
+fn take_cycle(c : *mut Ctx, l : i64) -> bool {
+  unsafe {
+    let mut cur = l;
+    for _h in 0i64..(*c).n {
+      let w = sld(c, 2i64 * cur, Y_TAKE_WAIT);
+      if w == 0u64 { return false; }
+      let pa = ((w & 16777215u64) as i64) - 1i64;
+      let pv = w >> 32u64;
+      if (*pa_done(c, pa)).load(AtomicOrdering::Acquire) >= pv { return false; }
+      cur = ((w >> 24u64) & 255u64) as i64;
+      if cur == l { return true; }
+    }
+    return false;
+  }
+}
+
+// 05 §6.9: a record of a pooled session takes the account's token, so its slot must hold the
+// take of the next ver; any other record must hold none. A divergence is PBV_E_FAULT.
+fn take_check(c : *mut Ctx, ln : *mut Lane, r : *mut i8) -> void {
+  unsafe {
+    let has = rd8(r, IN_TAKE) != 0u64;
+    let si = find_sess(ln, rd32(r, 4i64));
+    let pa = if si == NONE { NONE } else { (*sess(ln, si)).pidx };
+    if pa == NONE {
+      if has { fail_lane(ln, E_FAULT); }
+      return;
+    }
+    if !has || rd32(r, IN_TAKE + 4i64) != *offset_mut((*c).pa_id, pa) { fail_lane(ln, E_FAULT); return; }
+    let v = (*pa_done(c, pa)).fetch_add(1u64, AtomicOrdering::AcqRel) + 1u64;
+    if v != rd32(r, IN_TAKE + 8i64) { fail_lane(ln, E_FAULT); }
+    // VX-WORKAROUND W-20 (issue to file): an `if` without `else` last in a block is read as
+    // the block's value (E3048), even in a `void` function, so a `return` ends it.
+    return;
+  }
 }
 
 // Immediate rejects of the packet share one response packet (05 §8.10 rule 3).
@@ -1697,6 +1752,8 @@ fn lane_call(c : *mut Ctx, l : i64, k : u64) -> void {
       }
       return;
     }
+    take_check(c, ln, r);
+    if (*ln).err != 0u64 { return; }
     (*ln).n_mid = 0i64;
     (*ln).next_mid = 0i64;
     for j in 1u64..k {
@@ -1774,6 +1831,33 @@ pub fn pbv_lane_run(c : *mut Ctx, l : u32) -> void {
         let ds = done_step(c);
         let v = snap_want(ln, r);
         if v != U64_MAX && v > sld(c, 2i64 * (*c).n, Y_SNAP_NOW) { wait = max(wait, ds + 1u64); }
+        // REP_MERGE's take order (07 §7.1): a pooled record is due once its predecessor (the
+        // account's highest lower take fed, on lane pl) is reproduced. Until then the lane waits
+        // on what lane pl waits on, and says so only while pl is idle on a later step; while pl
+        // can still move it publishes nothing, so the BBO never reads it as settled.
+        if (flags & F_ADVANCE) == 0u64 && rd8(r, IN_TAKE) != 0u64 {
+          let pa = find_pa(c, rd32(r, IN_TAKE + 4i64));
+          let pv = rd32(r, IN_TAKE + 12i64);
+          if pa != NONE && (*pa_done(c, pa)).load(AtomicOrdering::Acquire) < pv {
+            let pl = rd8(r, IN_TAKE + 1i64) as i64;
+            if pl == li || pl >= (*c).n { (*ln).rec_at = rd64(r, 48i64); fail_lane(ln, E_FAULT); continue; }
+            sst(c, 2i64 * li, Y_TAKE_WAIT, (pv << 32u64) | ((pl as u64) << 24u64) | ((pa as u64) + 1u64));
+            if take_cycle(c, li) { (*ln).rec_at = rd64(r, 48i64); fail_lane(ln, E_FAULT); continue; }
+            let head_m = ld(c, l_in_head(pl), 0i64);
+            let fed_m = ld(c, l_in_head(pl), 1i64);
+            let seen_m = ld(c, l_in_tail(pl), 1i64);
+            let need_m = ld(c, l_in_tail(pl), 2i64);
+            // Lane pl publishes its idle state after it bumps the count, so a fresh look at
+            // the count after its state sees any take it reproduced meanwhile.
+            if (*pa_done(c, pa)).load(AtomicOrdering::Acquire) >= pv { continue; }
+            if seen_m != head_m || need_m <= ds || (need_m == U64_MAX && head_m < fed_m) {
+              spin();
+              continue;
+            }
+            wait = max(wait, need_m);
+          }
+        }
+        if sld(c, 2i64 * li, Y_TAKE_WAIT) != 0u64 { sst(c, 2i64 * li, Y_TAKE_WAIT, 0u64); }
         if ds >= wait {
           lane_call(c, li, k);
           // Publish the idle state afresh after every call: the BBO reads this lane's counter
@@ -2318,7 +2402,9 @@ fn end_taker(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, kind : u64, code : 
 fn stp_hit(c : *mut Ctx, l : u64, e : *mut LOp, ml : u64, mr : u64) -> bool {
   unsafe {
     if (((*e).flags >> 4u64) & 3u64) == 0u64 { return false; }
-    return ml == l && (*bord(c, ml, mr)).acct == (*e).acct;
+    // Same account on the same lane, or on two pooled lanes (pool-wide index, 05 §6.9).
+    let pooled = ((*c).pool >> ml) & ((*c).pool >> l) & 1u64;
+    return (ml == l || pooled != 0u64) && (*bord(c, ml, mr)).acct == (*e).acct;
   }
 }
 
@@ -2521,7 +2607,7 @@ fn init_lane(c : *mut Ctx, l : i64, accts : *const i8, na : i64, sp : *const i8,
       let ac = acct(ln, k);
       if (*ac).valid != 0u64 { return false; }
       (*ac).valid = 1u64;
-      (*ac).ix = k;
+      (*ac).ix = if rd8(a, 6i64) != 0u64 { rd32(a, 44i64) } else { k };
       (*ac).state = rd8(a, 5i64);
       (*ac).max_open = rd32(a, 8i64);
       (*ac).max_qty = rd32(a, 12i64);
@@ -2560,6 +2646,7 @@ fn init_lane(c : *mut Ctx, l : i64, accts : *const i8, na : i64, sp : *const i8,
       (*x).expected = 1u64;
       (*x).next_resp = 1u64;
       (*x).g = 2i64 + 5i64 * top + 3i64 * j;
+      (*x).pidx = if rd8(s, 10i64) != 0u64 { find_pa(c, rd32(s, 12i64)) } else { NONE };
       gset(gc(ln, (*x).g), 1000000u64, 256u64);
       gset(gc(ln, (*x).g + 1i64), 5000000u64, 2560u64);
       gset(gc(ln, (*x).g + 2i64), 500000u64, 640u64);
@@ -2667,6 +2754,18 @@ pub fn pbv_new(cfg : *const i8, accts : *const i8, n_accts : u32, sp : *const i8
     (*b).book_r = zalloc(8i64 * n * (slot_cap as i64));
     (*b).tx = zalloc(TX_BYTES * MAX_TX);
     if is_null_mut((*b).ords) || is_null_mut((*b).book_l) || is_null_mut((*b).tx) { return nul; }
+    (*c).pool = rd64(cfg, 48i64);
+    (*c).pa_id = zalloc(8i64 * ((n_sess as i64) + 1i64));
+    let pd : *mut AtomicU64 = zalloc(8i64 * ((n_sess as i64) + 1i64));
+    (*c).pa_done = pd;
+    if is_null_mut((*c).pa_id) || is_null_mut((*c).pa_done) { return nul; }
+    for i in 0i64..(n_sess as i64) {
+      let ss : *const i8 = offset(sp, 32i64 * i);
+      if rd8(ss, 10i64) != 0u64 && find_pa(c, rd32(ss, 12i64)) == NONE {
+        *offset_mut((*c).pa_id, (*c).n_pa) = rd32(ss, 12i64);
+        (*c).n_pa = (*c).n_pa + 1i64;
+      }
+    }
     for l in 0i64..n {
       if !init_lane(c, l, accts, n_accts as i64, sp, n_sess as i64) { return nul; }
     }
@@ -2731,6 +2830,8 @@ pub fn pbv_free(c : *mut Ctx) -> void {
     let s0 : *mut i8 = (*c).sv_id; free(s0);
     let s1 : *mut i8 = (*c).sv_bid; free(s1);
     let s2 : *mut i8 = (*c).sv_ask; free(s2);
+    free((*c).pa_id);
+    let s3 : *mut i8 = (*c).pa_done; free(s3);
   }
   let cc : *mut i8 = c;
   free(cc);

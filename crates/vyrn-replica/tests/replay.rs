@@ -705,8 +705,9 @@ fn payloads_from_a_data_box_replay_the_live_run() {
     );
 }
 
-/// The harness's box for the Vx client (`engine()`'s accounts and sessions).
-fn vx_config() -> vyrn_replica::VxConfig {
+/// The harness's box for the Vx client (`engine()`'s accounts and sessions), with
+/// lanes 1 and 2 pooled as [`pooled_engine`] pools them when `pool` is set.
+fn vx_config_on(pool: bool) -> vyrn_replica::VxConfig {
     use vyrn_replica::{VxAccount, VxConfig, VxSession};
     use vyrn_risk::consts as k;
     let mut c = VxConfig {
@@ -719,8 +720,10 @@ fn vx_config() -> vyrn_replica::VxConfig {
         band_bps: 10_000,
         slot_cap: SLOT_CAP,
         seg_cap: SLOT_CAP,
+        pool: if pool { POOL_MASK } else { 0 },
         ..VxConfig::default()
     };
+    let pooled = |l: usize, a: u32| pool && POOL_MASK & (1 << l) != 0 && a == 1;
     for l in 0..N {
         for a in 1..NA as u32 {
             c.accounts.push(VxAccount {
@@ -737,12 +740,14 @@ fn vx_config() -> vyrn_replica::VxConfig {
                 msg_fee_cross: k::RSK_DEFAULT_MSG_FEE_CROSS,
                 base_free: 1 << 40,
                 quote_free: 1 << 60,
+                pool_ix: pooled(l, a).then_some(9),
             });
             c.sessions.push(VxSession {
                 id: sid(l, a).0,
                 acct: a,
                 book: BOOK.0,
                 k_seq: kseq(l, a),
+                pooled: pooled(l, a).then_some(POOLED.0),
             });
         }
     }
@@ -785,11 +790,21 @@ fn vx_replay(
     blocks: &[BlockInputs<N>],
     lib: &std::path::Path,
 ) -> Result<Vec<VxBlock>, vyrn_replica::ReplayError> {
+    vx_replay_on(store, blocks, lib, false)
+}
+
+/// [`vx_replay`] on the client configured as [`vx_config_on`]`(pool)`.
+fn vx_replay_on(
+    store: &Store,
+    blocks: &[BlockInputs<N>],
+    lib: &std::path::Path,
+    pool: bool,
+) -> Result<Vec<VxBlock>, vyrn_replica::ReplayError> {
     let mut data = DataJoin::default();
     for ((_, s, q, _), b) in &store.0 {
         data.put(*s, *q, b.clone());
     }
-    let mut vx = vyrn_replica::VxReplay::new(lib, &vx_config(), data)?;
+    let mut vx = vyrn_replica::VxReplay::new(lib, &vx_config_on(pool), data)?;
     let mut out = Vec::new();
     for b in blocks {
         let h = vx.replay_block(b)?.output_hash;
@@ -1282,4 +1297,202 @@ fn pooled_takes_replay_through_framed_blocks() {
     // An unpooled engine emits no take, so replaying the pooled blocks diverges at the first.
     let (live_j, store, blocks) = blocks_on(&pool_script(), &[], true);
     assert!(replay(&live_j, &store, &blocks).is_err());
+}
+
+/// `RustReplay` on the pooled (`pool`) or plain box over `blocks`, without the data-root check
+/// (the edited blocks below no longer match their headers).
+fn rust_unchecked(
+    live_j: &Journal,
+    store: &Store,
+    blocks: &[BlockInputs<N>],
+    pool: bool,
+) -> Result<Vec<Hash>, vyrn_replica::ReplayError> {
+    let mut data = DataJoin::default();
+    for ((_, s, q, _), b) in &store.0 {
+        data.put(*s, *q, b.clone());
+    }
+    let (_, mut sh) = new_box();
+    let tok = vyrn_cut::PoolTok::new();
+    let mut rep = RustReplay::new(
+        pooled_engine(&mut sh, &tok, pool),
+        data,
+        RespLog::of(live_j),
+        Journal::default(),
+    );
+    blocks
+        .iter()
+        .map(|b| rep.replay_block(b).map(|o| o.output_hash))
+        .collect()
+}
+
+/// vyrn-engine `replay_wire_reproduces_each_take_and_carries_it_with_its_packet` on the Vx
+/// client (05 §6.9, 07 §7.1): each `AcctTake` is reproduced right before its packet record in
+/// the pool's `ver` order (lane 1's ver 3 waits for lane 2's ver 2), and carries with its packet
+/// across blocks. Vx and `RustReplay` give the live bytes and the same output hashes at every
+/// block split, and both reject each malformed take (`PBV_E_FAULT` on the client).
+#[test]
+fn the_vx_client_reproduces_each_take_in_pool_order() {
+    let script = pool_script();
+    let (live_j, store, blocks) = blocks_on(&script, &[], true);
+    let (_, rust_hashes) = replay_pooled(&live_j, &store, &blocks).unwrap();
+    let Some(lib) = vx_lib() else { return };
+    let vx = vx_replay_on(&store, &blocks, &lib, true).unwrap();
+    let (lanes, tx) = live_bytes(&live_j);
+    for l in 0..N {
+        assert_eq!(vx[0].0[l], lanes[l], "lane {l} responses");
+    }
+    assert_eq!(vx[0].1, tx, "fill TX packets");
+    assert!(!tx.is_empty(), "the pooled IOC fills");
+    assert_eq!(vec![vx[0].2], rust_hashes);
+    for at in 0..live_j.recs.len() - 1 {
+        let (live_j, store, blocks) = blocks_on(&script, &[at], true);
+        let (_, rust_hashes) = replay_pooled(&live_j, &store, &blocks).unwrap();
+        let vx = vx_replay_on(&store, &blocks, &lib, true)
+            .unwrap_or_else(|e| panic!("split after {at}: {e}"));
+        let h: Vec<Hash> = vx.iter().map(|x| x.2).collect();
+        assert_eq!(h, rust_hashes, "split after {at}");
+    }
+
+    // A first block with no steps replays only what is due at step 0; the later pooled packets
+    // carry, each with its take, into a block that holds every step.
+    let b = &blocks[0];
+    let mut first = b.clone();
+    first.steps.clear();
+    first.header.last_step = StepId(0);
+    let rest = BlockInputs {
+        header: b.header,
+        lanes: Vec::new(),
+        split: 0,
+        steps: b.steps.clone(),
+    };
+    let two = [first, rest];
+    let rust = rust_unchecked(&live_j, &store, &two, true).unwrap();
+    let vx = vx_replay_on(&store, &two, &lib, true).unwrap();
+    assert_eq!(vx.iter().map(|x| x.2).collect::<Vec<_>>(), rust);
+    assert_eq!(
+        rust[1], rust_hashes[0],
+        "the carried run gives the one-block hash"
+    );
+
+    // Malformed takes: both engines reject each, the client with PBV_E_FAULT where it is the
+    // one that finds it, the shell where the input is misplaced or repeated.
+    let take_at = |k: usize| {
+        b.lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, vyrn_log::LaneRec::Take(_)))
+            .nth(k)
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    let edit = |f: &dyn Fn(&mut Vec<vyrn_log::LaneRec>)| {
+        let mut x = b.clone();
+        f(&mut x.lanes);
+        x.split = x.lanes.len();
+        vec![x]
+    };
+    let fault = |blocks: &[BlockInputs<N>], pool: bool, why: &str| {
+        assert!(
+            rust_unchecked(&live_j, &store, blocks, pool).is_err(),
+            "rust: {why}"
+        );
+        let e = vx_replay_on(&store, blocks, &lib, pool).unwrap_err();
+        assert!(e.0.contains("diverged (fault)"), "{why}: {e}");
+    };
+    let rejected = |blocks: &[BlockInputs<N>], why: &str| {
+        assert!(
+            rust_unchecked(&live_j, &store, blocks, true).is_err(),
+            "rust: {why}"
+        );
+        let e = vx_replay_on(&store, blocks, &lib, true).unwrap_err();
+        assert!(e.0.contains("AcctTake"), "{why}: {e}");
+    };
+    let set = |k: usize, f: &dyn Fn(&mut vyrn_types::AcctTake)| {
+        edit(&|l: &mut Vec<vyrn_log::LaneRec>| {
+            if let vyrn_log::LaneRec::Take(t) = &mut l[take_at(k)] {
+                f(t);
+            }
+        })
+    };
+    fault(
+        &set(2, &|t| t.ver += 10),
+        true,
+        "the last take's ver changed",
+    );
+    fault(
+        &set(0, &|t| t.account = vyrn_types::AccountId(78)),
+        true,
+        "another account",
+    );
+    fault(
+        &edit(&|l| {
+            l.remove(take_at(0));
+        }),
+        true,
+        "a dropped take",
+    );
+    fault(&blocks, false, "a box without the pool");
+    // A cyclic take order (Codex r4612327830): lane 1 holds vers [3, 1] and lane 2 [2], so
+    // lane 1's head waits for lane 2's ver 2, which waits for ver 1 behind lane 1's head. The
+    // client must halt with PBV_E_FAULT, not spin; RustReplay cannot replay it either.
+    let cyclic = {
+        let mut x = b.clone();
+        let mut k = 0;
+        for r in &mut x.lanes {
+            if let vyrn_log::LaneRec::Take(t) = r {
+                t.ver = 3 - k;
+                k += 1;
+            }
+        }
+        vec![x]
+    };
+    let rust = rust_unchecked(&live_j, &store, &cyclic, true);
+    assert!(
+        rust.is_err() || rust.as_ref().ok() != Some(&rust_hashes),
+        "rust: {rust:?}"
+    );
+    let (txc, rxc) = std::sync::mpsc::channel();
+    let (st, lb) = (Store(store.0.clone()), lib.clone());
+    std::thread::spawn(move || {
+        let _ = txc.send(vx_replay_on(&st, &cyclic, &lb, true).map(|_| ()));
+    });
+    let e = rxc
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the Vx client spun on a cyclic take order")
+        .unwrap_err();
+    assert!(e.0.contains("diverged (fault)"), "cyclic take order: {e}");
+    rejected(
+        &edit(&|l| {
+            let t = l[take_at(0)];
+            l.insert(take_at(0), t);
+        }),
+        "a repeated take",
+    );
+    rejected(
+        &edit(&|l| {
+            let i = take_at(0);
+            if let vyrn_log::LaneRec::Take(t) = l[i] {
+                l.insert(
+                    i,
+                    vyrn_log::LaneRec::Take(vyrn_types::AcctTake { ver: 99, ..t }),
+                );
+            }
+        }),
+        "a second take on one record",
+    );
+    // A take bound to an Advance record of its lane.
+    let adv = b.lanes.iter().position(|r| {
+        matches!(r, vyrn_log::LaneRec::Pkt(p)
+            if p.lane.0 == 1 && p.flags & PacketFlags::ADVANCE != 0)
+    });
+    if let Some(i) = adv {
+        rejected(
+            &edit(&|l| {
+                let t = l.remove(take_at(0));
+                let j = if i > take_at(0) { i - 1 } else { i };
+                l.insert(j, t);
+            }),
+            "a take before an Advance record",
+        );
+    }
 }

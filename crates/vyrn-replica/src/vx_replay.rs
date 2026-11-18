@@ -14,8 +14,15 @@
 //! block's, and [`BlockOutputs::output_hash`] is [`crate::output_hash`] over them: the client
 //! writes each response and TX packet in exactly the bytes `encode_resp` and `encode_tx` hash.
 //!
+//! **Takes.** An `AcctTake` (05 §6.9) must sit right before its packet record, as for
+//! [`crate::RustReplay`]; it rides in that record's slot with its predecessor: the highest-`ver`
+//! take of its account fed so far below it, and that take's lane. The client reproduces the
+//! account's takes in `ver` order (07 §7.1 `REP_MERGE`): a record waits until its predecessor is
+//! reproduced. A repeated `(account, ver)` is rejected here.
+//!
 //! **Rejects.** Any `PBV_E_*` word the client raises (a divergence, or a case outside v1's
-//! subset, pbv.h), an `AcctTake`, a missing payload, and `load_snapshot`/`write_state`.
+//! subset, pbv.h), a misplaced or repeated `AcctTake`, a missing payload, and
+//! `load_snapshot`/`write_state`.
 
 // Offsets are bounded by the region (`pbv_shared_bytes`, at most 64 lanes) and counters count
 // records, so this module's arithmetic cannot overflow; its indexing is by lane, below `N`.
@@ -26,7 +33,7 @@ use std::path::Path;
 
 use vyrn_engine::Payloads;
 use vyrn_log::LaneRec;
-use vyrn_types::{PacketFlags, PacketRecord, RouteRecord};
+use vyrn_types::{AcctTake, PacketFlags, PacketRecord, RouteRecord};
 
 use crate::ports::{
     BlockInputs, BlockOutputs, CanonicalStateWriter, ReplayEngine, ReplayError, StateSnapshot,
@@ -42,6 +49,11 @@ const TX_BYTES: usize = 288;
 const IN_ROUTES: usize = 64;
 const MAX_ROUTES: usize = 10;
 const IN_PAYLOAD: usize = 224;
+const IN_TAKE: usize = 416;
+/// Fed takes kept per account across blocks, to find a later block's predecessors and repeats
+/// (a bound, not a rule: an older repeat differs from the client's `ver` counter and diverges
+/// there). A block's own takes are all kept until its slots are built.
+const TAKE_KEEP: usize = 4096;
 const ERRS: [&str; 10] = [
     "",
     "mismatch",
@@ -60,6 +72,9 @@ const ERRS: [&str; 10] = [
 pub struct VxAccount {
     pub slot: u32,
     pub lane: u8,
+    /// The pool-wide index on a pooled lane (`Lane::set_pool_index`), which STP compares across
+    /// the pool; `None`: the slot.
+    pub pool_ix: Option<u32>,
     /// 0 active, 1 killed, 2 closed.
     pub state: u8,
     pub max_open: u32,
@@ -81,6 +96,9 @@ pub struct VxSession {
     pub acct: u32,
     pub book: u16,
     pub k_seq: [u8; 16],
+    /// The pooled account (`Engine::pool_session`): each record of the session takes its
+    /// token and logs an `AcctTake` (05 §6.9).
+    pub pooled: Option<u32>,
 }
 
 /// The tenure's initial state for the client (pbv.h `pbv_config` and its tables).
@@ -95,6 +113,8 @@ pub struct VxConfig {
     pub band_bps: u32,
     pub slot_cap: u32,
     pub seg_cap: u32,
+    /// Pooled lanes (bit `l`, `vyrn_bbo::Config::pool`).
+    pub pool: u64,
     pub accounts: Vec<VxAccount>,
     pub sessions: Vec<VxSession>,
 }
@@ -102,7 +122,7 @@ pub struct VxConfig {
 impl VxConfig {
     fn tables(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut c = vec![0u8; 64];
-        put(&mut c, 0, &2u32.to_le_bytes());
+        put(&mut c, 0, &crate::vx::ABI_VERSION.to_le_bytes());
         put(&mut c, 4, &64u32.to_le_bytes());
         put(&mut c, 8, &[self.n_lanes]);
         put(&mut c, 10, &self.book.to_le_bytes());
@@ -113,11 +133,13 @@ impl VxConfig {
         put(&mut c, 32, &self.band_bps.to_le_bytes());
         put(&mut c, 36, &self.slot_cap.to_le_bytes());
         put(&mut c, 40, &self.seg_cap.to_le_bytes());
+        put(&mut c, 48, &self.pool.to_le_bytes());
         let mut a = Vec::new();
         for x in &self.accounts {
             let mut b = vec![0u8; 80];
             put(&mut b, 0, &x.slot.to_le_bytes());
-            put(&mut b, 4, &[x.lane, x.state]);
+            put(&mut b, 4, &[x.lane, x.state, u8::from(x.pool_ix.is_some())]);
+            put(&mut b, 44, &x.pool_ix.unwrap_or(0).to_le_bytes());
             put(&mut b, 8, &x.max_open.to_le_bytes());
             put(&mut b, 12, &x.max_qty.to_le_bytes());
             put(&mut b, 16, &x.max_notional.to_le_bytes());
@@ -136,6 +158,8 @@ impl VxConfig {
             put(&mut b, 0, &x.id.to_le_bytes());
             put(&mut b, 4, &x.acct.to_le_bytes());
             put(&mut b, 8, &x.book.to_le_bytes());
+            put(&mut b, 10, &[u8::from(x.pooled.is_some())]);
+            put(&mut b, 12, &x.pooled.unwrap_or(0).to_le_bytes());
             put(&mut b, 16, &x.k_seq);
             s.extend(b);
         }
@@ -161,6 +185,8 @@ pub struct VxReplay<P> {
     tx_tail: u64,
     lane_out: Vec<Vec<u8>>,
     tx_out: Vec<u8>,
+    /// Each account's fed takes: `ver` → lane.
+    fed: std::collections::BTreeMap<u32, std::collections::BTreeMap<u32, u8>>,
 }
 
 /// Shared-region offsets (pbv.h): control lines first, then the rings.
@@ -272,6 +298,7 @@ impl<P: Payloads> VxReplay<P> {
             tx_tail: 0,
             lane_out: vec![Vec::new(); n],
             tx_out: Vec::new(),
+            fed: std::collections::BTreeMap::new(),
         })
     }
 
@@ -296,6 +323,7 @@ impl<P: Payloads> VxReplay<P> {
         at: usize,
         p: &PacketRecord,
         routes: &[RouteRecord],
+        take: Option<(AcctTake, u32, u8)>,
     ) -> Result<Vec<u8>, ReplayError> {
         let mut b = vec![0u8; IN_BYTES];
         let advance = p.flags & PacketFlags::ADVANCE != 0;
@@ -335,6 +363,12 @@ impl<P: Payloads> VxReplay<P> {
             put(&mut b, IN_ROUTES + 16 * i + 8, &[u8::from(x.cross)]);
         }
         put(&mut b, IN_PAYLOAD, pay);
+        if let Some((t, pv, pl)) = take {
+            put(&mut b, IN_TAKE, &[1, pl]);
+            put(&mut b, IN_TAKE + 4, &t.account.0.to_le_bytes());
+            put(&mut b, IN_TAKE + 8, &t.ver.to_le_bytes());
+            put(&mut b, IN_TAKE + 12, &pv.to_le_bytes());
+        }
         Ok(b)
     }
 
@@ -392,11 +426,43 @@ impl<P: Payloads, const N: usize> ReplayEngine<N> for VxReplay<P> {
             .iter()
             .enumerate()
             .filter_map(|(i, r)| match r {
-                LaneRec::Pkt(p) => Some(Ok((i, *p))),
-                LaneRec::Take(_) => Some(Err(ReplayError("AcctTake replay".into()))),
-                LaneRec::Route(_) => None,
+                LaneRec::Pkt(p) => Some((i, *p)),
+                LaneRec::Take(_) | LaneRec::Route(_) => None,
             })
-            .collect::<Result<_, _>>()?;
+            .collect();
+        // Each take binds to the record right after it (as RustReplay checks), by record index.
+        let mut takes = std::collections::BTreeMap::new();
+        for (k, r) in blk.lanes.iter().enumerate() {
+            let LaneRec::Take(t) = r else { continue };
+            let placed = matches!(blk.lanes.get(k + 1), Some(LaneRec::Pkt(p))
+                if p.lane == t.lane
+                    && p.flags & PacketFlags::ADVANCE == 0
+                    && p.first_lane_seq == t.lane_seq);
+            if !placed {
+                return Err(ReplayError(format!(
+                    "height {}: AcctTake {t:?} is not right before its packet record",
+                    blk.header.height.0
+                )));
+            }
+            takes.insert(k + 1, *t);
+        }
+        // Fed in ver order per account, so a take's predecessor is the highest lower ver fed so
+        // far, from this block or an earlier one.
+        for t in takes.values() {
+            let f = self.fed.entry(t.account.0).or_default();
+            if f.insert(t.ver, t.lane.0).is_some() {
+                return Err(ReplayError(format!(
+                    "height {}: AcctTake {t:?} repeats its (account, ver): bad record",
+                    blk.header.height.0
+                )));
+            }
+        }
+        let pred = |t: &AcctTake| -> (AcctTake, u32, u8) {
+            self.fed
+                .get(&t.account.0)
+                .and_then(|f| f.range(..t.ver).next_back())
+                .map_or((*t, 0, t.lane.0), |(v, l)| (*t, *v, *l))
+        };
         // The last packet whose range holds each (lane, LaneSeq), in one pass; then each
         // packet's routes in one more.
         let mut owner = std::collections::BTreeMap::new();
@@ -422,7 +488,15 @@ impl<P: Payloads, const N: usize> ReplayEngine<N> for VxReplay<P> {
             if l >= N {
                 return Err(ReplayError(format!("record {i}: lane {l}")));
             }
-            lanes[l].push(self.slot(*i, p, own)?);
+            let take = takes.get(i).map(pred);
+            lanes[l].push(self.slot(*i, p, own, take)?);
+        }
+        // Pruned only once this block's predecessors are in its slots (Codex r4612264470): a
+        // later block needs only each account's newest takes.
+        for f in self.fed.values_mut() {
+            while f.len() > TAKE_KEEP {
+                f.pop_first();
+            }
         }
         let mut steps = Vec::new();
         for s in &blk.steps {
