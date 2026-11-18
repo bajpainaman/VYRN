@@ -1331,9 +1331,11 @@ block `h + 9` opens only when block `h` is final. 09 §4.6 (`INV-CHN-TXGATE`) us
 
 - **Voters → sequencer.** Every voter sends its finalize vote to the sequencer's and the
   standby's `REP_UDP_CTRL` as well as to the other voters (09 §4.6), and later the
-  `REP_FinalityCert`. The finality listener, a thread of control on core 51 (01 §10), batch-verifies
-  the votes (≤ 4 × ~40 µs per block at ≤ 1 kHz, ≤ 16% of core 51; under scheme 1 the ML-DSA parts,
-  4 × 35 µs, run in parallel on the sequencer's core 63, ≤ 14% of it) and stores `final_height` once
+  `REP_FinalityCert`. On `REP_UDP_CTRL` a finalize vote is a **`REP_FinalizeVote`**: a
+  `REP_FinalityCert` (§6.5) with `count = 1`, so one decoder and one signed message serve both.
+  It is 106 + 65 = 171 B under scheme 0, and 106 + 1 + 2,484 = 2,591 B under scheme 1. The
+  finality listener, a thread of control on core 51 (01 §10), batch-verifies the votes (≤ 4 ×
+  ~40 µs per block at ≤ 1 kHz, ≤ 16% of core 51; under scheme 1 the ML-DSA parts, 4 × 35 µs, run in parallel on the sequencer's core 63, ≤ 14% of it) and stores `final_height` once
   it holds Q valid votes for a proposal. So the sequencer learns finality at hop 4, like the
   voters, not one hop later. No single voter can forge it.
 - **Core 4** checks at every flush: `lag = closed_height − final_height`. If `lag >
@@ -1798,7 +1800,8 @@ The seal is one Simplex proposal of kind 1:
 REP_Proposal { kind: 1, epoch, first_height: parent.last_height + 1, last_height: Hs = H* + 1,
                last_hash: header_hash(seal header), excl_root: over unavailable ∪ CHAIN-excluded }
 REP_SealExt  { end_frame_seq: [F*_A, F*_B] [u64; 2], next_seq: u8, next_tenure: u8, n_unavail: u32,
-               unavail: [(SessionId, u32)] }   // digest = BLAKE3(proposal ‖ seal ext)
+               unavail: [(SessionId, u32)] }
+digest = BLAKE3("vyrn      v1 proposal" ‖ REP_Proposal bytes ‖ REP_SealExt bytes)
 seal header  { height: Hs, epoch, book, first_step: last_step(H*) + 1,
                last_step: last StepId in frames ≤ F*, prev: header_hash(H*),
                order_root: as §6.1, over each substream's ORDER section bytes after its
@@ -1807,6 +1810,10 @@ seal header  { height: Hs, epoch, book, first_step: last_step(H*) + 1,
                seq_sig: [0; 64] }
 ```
 
+- The seal's digest extends the §6.3 rule with the encoded `REP_SealExt` (LE: `end_frame_seq`
+  16 B, `next_seq` 1, `next_tenure` 1, `n_unavail` 4, then `n_unavail` × (`SessionId` u32,
+  `pkt_seq` u32) in ascending order). It is not `digest(REP_Proposal)`, so the signatures of a
+  kind-1 `REP_FinalityCert` verify only together with its `REP_SealExt` (open question 14).
 - A kind-1 range may hold up to `REP_MAX_SEAL_RANGE` = 64 heights: the signed headers
   `(parent.last, H*]` plus the seal header.
 - The seal block's `lane_bounds` are the last `lane_seq` of each lane in frames `≤ F*` of its
@@ -1957,7 +1964,7 @@ with no response.
 
 | Form | Evidence | Attributable |
 |---|---|---|
-| Two headers for one `(epoch, height)` with different bytes, both with valid `seq_sig` | `SeqEquivocation{epoch, height, header_a [190], header_b [190]}`, 384 B, self-verifying | yes |
+| Two headers for one `(epoch, height)` with different bytes, both with valid `seq_sig` | `SeqEquivocation{epoch u32, height u64, header_a [190], header_b [190]}`, 392 B LE, self-verifying | yes |
 | ORDER bytes that do not match a signed header's `order_root` at every source | the signed header plus the frames held by Q participants | no (frames are unsigned), but the sequencer is still at fault |
 | Different bytes under one `frame_seq` in the tail | `TailConflict` from two participants | no |
 
@@ -1979,7 +1986,7 @@ it for the rest of the failover.
 | Behaviour | Effect | Response |
 |---|---|---|
 | Votes for an invalid proposal | none, because it needs Q and at most f = 1 is Byzantine | none |
-| Conflicting votes in one view | none | `ConflictingNotarize`, `ConflictingFinalize` or `NullifyFinalize` from Simplex's reporter becomes evidence. It is removed at the next epoch, and slashed in CHAIN (09). |
+| Conflicting votes in one view | none | `ConflictingNotarize`, `ConflictingFinalize` or `NullifyFinalize` from Simplex's reporter becomes evidence, as a `VoterFault` (below). It is removed at the next epoch, and slashed in CHAIN (09). |
 | A wrong state root | its digest has 1 < f + 1 signatures, so no divergence fires and the others certify | recorded as `RootFault{index, sig}` and removed at the next epoch |
 | Withholds data or repair | the requester moves to its next source (§4.10, §5.5) | `REP_A_PEER` when it fails > 1% of requests over 60 s. Not provable, so ops act on it. |
 | As leader: proposes nothing, or an invalid range | the view nullifies after `t_l` = 2 ms (fits the reserve in §6.6) | the skip policy shortens its later views |
@@ -1987,6 +1994,13 @@ it for the rest of the failover.
 | TailReport claims frames it does not hold | the leader's fetch from it fails within 1 ms | the leader drops that claim and recomputes `F*` |
 | TailReport hides frames | it can shorten the prefix only if it is the sole holder. That needs the sequencer to be faulty as well, which is beyond f. | none needed |
 | Floods p2p or repair | — | per-peer rate limits: `commonware-p2p` quotas, `REP_PEER_RTX_MAX_FPS` |
+
+**`VoterFault`** is the wire form of that evidence: `kind u8` (0 = ConflictingNotarize, 1 =
+ConflictingFinalize, 2 = NullifyFinalize) ‖ `voter u8` (voter index, §13.1) ‖ the two votes in
+the pinned `commonware-consensus` encoding, as §6.5 already pins the signed bytes. It is
+self-verifying given `REP_Membership`: both votes are in one round by the named voter, they
+conflict, and each signature verifies over its namespace (`b"vyrn-v1"` plus `_NOTARIZE`,
+`_NULLIFY` or `_FINALIZE`). `vyrn_consensus::evidence::VoterFault::verify` is the check.
 
 **Frame authenticity** (referenced from §3.1). Frames carry no MAC. These are the threats and
 what stops each one:
@@ -2289,7 +2303,7 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | `REP_WAN_LINKS`, `REP_WAN_LAG` | 2 × 100G, one-way + 10 ms | budget | follower links and lag |
 | `REP_NVME_PER_REPLICA` | 12 × 61.44 TB | budget | §8.1 (06 §2.2) |
 | tenure | u8 | type | §2.2 |
-| `REP_Proposal`, `REP_SealExt`, `REP_FinalityCert`, `REP_RootCert`, `REP_DurableMark`, `REP_RspEntry`, `REP_Membership`, `REP_BlockRecord`, `REP_Snapshot`, `REP_WanBlock`, `TailReport`, `Silence`, `RepAck`, `Nack`, `SeqEquivocation`, `TailConflict` | — | type | defined where first used |
+| `REP_Proposal`, `REP_SealExt`, `REP_FinalityCert`, `REP_RootCert`, `REP_DurableMark`, `REP_RspEntry`, `REP_Membership`, `REP_BlockRecord`, `REP_Snapshot`, `REP_WanBlock`, `TailReport`, `Silence`, `RepAck`, `Nack`, `SeqEquivocation`, `TailConflict`, `REP_FinalizeVote`, `VoterFault` | — | type | defined where first used |
 | `REP_E_*` | `TAG, COUNT, TS, KIND, CUT, TENURE, HASHLAG, ORDER` | error | decoder and stream errors; each is a sequencer fault |
 | `REP_A_*` | `PATH, PEER, DIVERGE, ARCHIVE, WANLAG, STANDBY` | alarm | §4.9, §10.2, §7.4, §8.3, §12, §9.5 |
 | `DUR_PATHS`, `DUR_QUORUM`, `FINAL` | — | attestation | three separate facts, never merged (§6.9) |
@@ -2346,3 +2360,4 @@ Resolved by 01 and removed: `PacketRecord.flags` (§6.6: `SHED`, `ADVANCE`), INV
 | 11 | Replay order of a pooled account across pool lanes: does `AcctTake.ver` alone order every cross-lane dependency, including fills settled on the account while another pool core holds its token? | 05 | T-REP-1 with pooled accounts; B4 |
 | 12 | Do both ports of an X2542, each with its own CTPIO writer, keep the wire lead of B-REP-2W, and does a spanning step stay ≤ 142 ns? | 06 | B-REP-2W, B-REP-13 |
 | 13 | Under scheme 1 (01 §14.20), does data RX on 5 cores (50, 52–55) keep up with 155 Gbps of data frames at peak, now that core 63 signs votes? If not, voters need a larger box or `PQ_HEDGE` = 1 with the 1.35 ms tail budgeted. | 06 | B-REP-9 data mix plus B-PQ-1 on one voter |
+| 14 | How does a seal's `REP_FinalityCert` carry or commit to its `REP_SealExt`, so that an offline verifier can check a kind-1 certificate (§9.4)? | 07 / 08 | review; then `verify_finality_cert` and its vectors |
