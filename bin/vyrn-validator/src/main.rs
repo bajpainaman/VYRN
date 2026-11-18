@@ -1065,7 +1065,7 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
         {
             answers += 1;
             let b = buf.get(..n).unwrap_or(&[]);
-            // A box's empty answer to a KEY fetch: it never stored the key (reading (j)).
+            // A box's empty answer to a KEY fetch: it lacks the key (reading (j)).
             if let Ok(f) = vyrn_data::frame::decode(b)
                 && f.hdr.kind == vyrn_data::frame::Kind::FetchResp
                 && f.n_pkts == 0
@@ -1075,6 +1075,7 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 self.sources.box_missed(
                     vyrn_types::SessionId(u32::try_from(q >> 32).unwrap_or(u32::MAX)),
                     u32::try_from(q & u64::from(u32::MAX)).unwrap_or(u32::MAX),
+                    f.hdr.src,
                 );
             }
             if let Ok(fed) =

@@ -114,8 +114,8 @@ struct Esc {
     /// Its own peer cursor, so each key turns through every peer whatever the other keys do
     /// (Vercel r4617946666).
     peer: usize,
-    /// A data box answered its KEY fetch with a miss (an empty `FETCH_RESP`).
-    box_missed: bool,
+    /// The data boxes (by index, the frames' `src`) that answered its KEY fetch with a miss.
+    box_missed: u64,
 }
 
 /// The fetch sources and the escalation of each missing key the pending blocks wait for.
@@ -194,22 +194,27 @@ impl Sources {
         true
     }
 
-    /// A data box answered `(session, pkt_seq)`'s KEY fetch with a miss: it never stored it.
-    pub fn box_missed(&mut self, session: SessionId, pkt_seq: u32) {
-        if let Some(x) = self.missing.get_mut(&(session, pkt_seq)) {
-            x.box_missed = true;
+    /// Data box `src` answered `(session, pkt_seq)`'s KEY fetch with a miss: it lacks it.
+    pub fn box_missed(&mut self, session: SessionId, pkt_seq: u32, src: u8) {
+        if let (Some(x), Some(bit)) = (
+            self.missing.get_mut(&(session, pkt_seq)),
+            1u64.checked_shl(u32::from(src)),
+        ) {
+            x.box_missed |= bit;
         }
     }
 
-    /// Whether a data box said it lacks `(session, pkt_seq)`: then it was lost at its box, and
-    /// so may the packets after it be, so every missing key is escalated at once (reading (j)).
+    /// Whether every data box said it lacks `(session, pkt_seq)` (a box that is not the
+    /// session's home lacks it anyway, Codex r4618616259): then it was lost at its box, and so
+    /// may the packets after it be, so every missing key is escalated at once (reading (j)).
     /// A replica catching up, whose data is in flight, never gets a box's miss, so it keeps
     /// asking for one key: a timer here (2 × `REP_DATA_WAIT_US`) fired for a restarted voter
     /// catching up and stopped it at `REP_E_HASHLAG` in 8 of 40 loaded runs.
     pub fn stuck(&self, session: SessionId, pkt_seq: u32) -> bool {
-        self.missing
-            .get(&(session, pkt_seq))
-            .is_some_and(|x| x.box_missed)
+        self.missing.get(&(session, pkt_seq)).is_some_and(|x| {
+            let n = u32::try_from(self.boxes.len()).unwrap_or(u32::MAX).min(64);
+            n > 0 && x.box_missed.count_ones() >= n
+        })
     }
 
     /// Where this round's scan starts: the height and record index where the last one stopped,
@@ -261,7 +266,7 @@ impl Sources {
                     at: now,
                     round,
                     peer,
-                    box_missed: false,
+                    box_missed: 0,
                 },
             );
             return Vec::new();
@@ -593,16 +598,18 @@ mod tests {
         for g in &got {
             assert!(g.contains(&t(11)) && g.contains(&t(12)), "{g:?}");
         }
-        // A key is stuck once a box said it lacks it, however long it has waited.
-        let mut s = Sources::new(vec![t(1)], vec![t(11)], Some(t(21)));
+        // A key is stuck once every box said it lacks it, however long it has waited.
+        let mut s = Sources::new(vec![t(1), t(2)], vec![t(11)], Some(t(21)));
         assert!(s.begin_round(5 * w));
         assert!(s.due(k, 9, 5 * w).is_empty());
-        assert_eq!(s.due(k, 9, 6 * w), vec![t(1)]);
+        assert_eq!(s.due(k, 9, 6 * w), vec![t(1), t(2)]);
         assert_eq!(s.due(k, 9, 7 * w), vec![t(11)]);
         assert!(!s.stuck(k, 9));
-        s.box_missed(k, 8);
-        assert!(!s.stuck(k, 9));
-        s.box_missed(k, 9);
+        s.box_missed(k, 8, 0);
+        s.box_missed(k, 9, 1);
+        s.box_missed(k, 9, 1);
+        assert!(!s.stuck(k, 9), "box 0, its home, has not said");
+        s.box_missed(k, 9, 0);
         assert!(s.stuck(k, 9));
         // Rounds are at least ROUND_NS apart.
         assert!(!s.begin_round(5 * w + ROUND_NS - 1));
