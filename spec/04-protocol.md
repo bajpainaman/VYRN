@@ -291,15 +291,13 @@ An **out-of-stream** response answers a packet that the lane did not accept. It 
 Rules:
 
 - The lane sends at most one out-of-stream response per (session, reason) per
-  `PROTO_OOS_HOLDOFF_US`. Later ones in that window are only counted. `BUSY` is the exception: it
-  has no holdoff, and every shed packet gets its own (§3.5).
-- Out-of-stream responses are not retained, not resent, and not part of any state. Except for
-  `BUSY`, they are not engine output: they depend on packets that the order stream does not
-  contain. Their frame gate (01 §14.5) is empty, or for `BUSY` its `PacketRecord` with
-  `flags` bit 0 (`SHED`) set (01 §6.6; bit 1 is `ADVANCE`, a `count` = 0 record that no client
-  packet produces).
-- The five out-of-stream reasons are `EPOCH_MISMATCH`, `BAD_SEQ`, `SESSION_CLOSED`,
-  `WRONG_LANE` and `BUSY` (lane shed, index 0xFF). No other reason is ever sent out of stream.
+  `PROTO_OOS_HOLDOFF_US`. Later ones in that window are only counted.
+- Out-of-stream responses are not retained, not resent, and not part of any state. They are not
+  engine output: they depend on packets that the order stream does not contain. Their frame gate
+  (01 §14.5) is empty.
+- The four out-of-stream reasons are `EPOCH_MISMATCH`, `BAD_SEQ`, `SESSION_CLOSED` and
+  `WRONG_LANE`. No other reason is ever sent out of stream. A lane-shed `BUSY` is in stream
+  (§3.5).
 
 **Other-lane path.** A packet whose `session` names another lane goes to a slow path with a
 budget of `PROTO_WRONG_LANE_PPS` per lane. Above that budget the lane drops and counts.
@@ -398,20 +396,17 @@ also arrives in time.
 |---|---|---|
 | Decided by | the lane, test D, after V1–V5 and before V6 | the BBO core, as a `Shed` step |
 | Logged as | `PacketRecord.flags.SHED` | `StepRecord`, kind `Shed` |
-| Record | out-of-stream `Reject BUSY` (24), index 0xFF, `resp_seq` 0, detail = `expected` | in-stream `Reject BUSY` (24) at the shed message's index, its `client_tag`, sent by the session's lane |
+| Record | in-stream: one response packet with the next `resp_seq` and `echo_pkt` = the shed `pkt_seq`, holding one `Reject BUSY` (24) per message of the packet (a `Heartbeat` or `ResendReq` included) at its index, detail 0, `client_tag` 0; frame-gated on the `SHED` record (01 §14.5) | in-stream `Reject BUSY` (24) at the shed message's index, its `client_tag`, sent by the session's lane |
 | Packet accepted | no: **the whole packet was not applied**, `expected` is unchanged | yes: `pkt_seq` is consumed |
 | What took effect | nothing; no bucket, no fee | every message of the packet except the shed ops, with the outcome of index order minus those ops |
-| Client action | resend from `detail`, same `pkt_seq` and the same logical content (D3), bit0 = 1 | send the shed message again in a new packet |
+| Client action | resend from `echo_pkt` (go-back-N), same `pkt_seq` and the same logical content (D3), bit0 = 1 | send the shed message again in a new packet |
 | Arrives | ≤ `LAT_MAX_NS` | ≤ `LAT_MAX_NS` |
 
 **Matching a lane `BUSY` (05 §6.8, §18 Q17).** A lane-shed `Reject BUSY` carries `client_tag` 0:
 the lane reads none of a shed packet's messages, and replay rebuilds the response from the
 `SHED` record alone. The client matches it to its packet by `echo_pkt` (the shed `pkt_seq`) and
 to a message by `index`, and takes the tag from its own copy of that packet. A BBO-core `BUSY`
-keeps the message's `client_tag`. [Spec gap: the table's out-of-stream form for the lane shed
-(index 0xFF, `resp_seq` 0, detail = `expected`) predates 05 §6.8, which merged `vyrn-lane`
-follows: one `Reject BUSY` per message at its index, detail 0, in a response packet that takes a
-`resp_seq` and is gated on the `SHED` record.]
+keeps the message's `client_tag`. Every shed packet gets its own `BUSY` run, with no holdoff.
 
 A later message of the same packet that lists a shed op in its dependency list, or names the
 handle pre-assigned to it, is shed with it and gets its own `Reject BUSY`. Every shed decision is
@@ -421,14 +416,16 @@ bound address, tagged with `K_out`.
 
 **`BUSY`, gapless `pkt_seq` and deduplication.**
 
-- A lane `BUSY` never acknowledges anything. It carries `resp_seq` 0, so the cumulative rule of
-  §5.1 is unchanged. Its detail = `expected`: every `pkt_seq` below it was accepted.
+- A lane `BUSY` never acknowledges a request. Its packet takes a `resp_seq` like every in-stream
+  response, so the response stream of §5.3 stays gapless and the client finds a lost `BUSY` run
+  as it finds any lost response. It is the one in-stream response that is not an
+  acknowledgement: `echo_pkt` = p says only that p was shed (§5.1).
 - After a lane shed of p, packets p + 1, … of the session are shed too while the lane sheds
-  (each with its own `BUSY`, detail p), or are gaps once it stops (§5.1). Either way the client
-  goes back to p. Go-back-N needs no special case.
+  (each with its own `BUSY` run), or are gaps once it stops (§5.1). Either way the client goes
+  back to the lowest shed `pkt_seq` it holds unacknowledged. Go-back-N needs no special case.
 - A resend of a shed p is a first acceptance, not a duplicate. G1 holds: p executes once.
-- Test D runs before V8, so a duplicate can be shed too. Then detail > p tells the client that p
-  was accepted earlier. It recovers p's responses with `ResendReq` (§5.3).
+- Test D runs before V8, so a duplicate can be shed too. The client resends it with bit0 = 1, and
+  the duplicate path of §5.2 answers (the ring's copies, or `BAD_SEQ` with detail = `expected`).
 - What each lane class can expect at the reference workload is §3.6. `BUSY` answers overload
   within 1 µs. It is never a normal outcome, and a client counts it.
 
@@ -784,7 +781,9 @@ triggers it, so the replicas run it too.
   lane with no reorder buffer has nothing to replay except the packets it accepted.
 - **Acknowledgement is cumulative.** The lane accepts in order and allocates `resp_seq` in order,
   so any in-stream response with `echo_pkt = p ≥ 1` proves that every `pkt_seq ≤ p` was
-  accepted. An out-of-stream `BAD_SEQ` with detail x proves that every `pkt_seq < x` was accepted.
+  accepted, except a lane-shed `Reject BUSY` packet (§3.5): it takes a `resp_seq` but proves
+  nothing about `pkt_seq`, because test D also sheds a duplicate or a packet after a gap. An
+  out-of-stream `BAD_SEQ` with detail x proves that every `pkt_seq < x` was accepted.
 - **Gap.** If `expected < pkt_seq ≤ expected + PROTO_SEQ_AHEAD` and the MAC is good, the lane
   drops the packet and sends out-of-stream `BAD_SEQ` with detail = `expected`, under the holdoff.
   The client then resends every packet from `expected` to its highest sent `pkt_seq`, in order,
@@ -1367,7 +1366,7 @@ out-of-stream (`resp_seq` 0, not accepted, the client resends the same logical c
 | 21 | `ACCOUNT_KILLED` | in | M4 | 0 | the account is killed (10 §3.7); cancels still work; wait for an unkill |
 | 22 | `RESEND_GONE` | in (lane `ResendReq`); out (recovery) | §6.7, §5.4 | the oldest `resp_seq` either store holds | rebuild order state from the drop copy |
 | 23 | `BAD_BOOK` | in | V9 | the packet's `book` | client bug: the session may not trade that book |
-| 24 | `BUSY` | out (lane shed, index 0xFF); in (BBO shed, message index) | test D (§3.5) | `expected` (lane); 0 (BBO) | lane: resend from detail, same `pkt_seq`; BBO: resend the message in a new packet |
+| 24 | `BUSY` | in (lane shed: every message's index, `client_tag` 0; BBO shed: the message's index) | test D (§3.5) | 0 | lane: resend from `echo_pkt`, same `pkt_seq`; BBO: resend the message in a new packet |
 | 26 | `DATA_MISSING` | in (index 0xFF, final record) | 01 §14.19 C (DAV-1) | 0 | the session is closed: Q voters reported its data-tier copies missing; send copy 2 of every packet to the data home |
 
 ## 9. Rate limits and fee classes
@@ -1533,10 +1532,12 @@ Session C = slot 2, lane 0, generation 4 (`0x00400002`), CHAIN mode. The lane's 
 the only bids are A4 (8 @ 100001) and 1 lot @ 100000. V11 answers the first transmission of V12,
 which carried `epoch16` = 999; V12 is the same logical content resent with `epoch16` = 1000 (D3).
 V12 also gets an R-ANSWER `EpochNotice` as `resp_seq` 5 (not printed), so V15 is `resp_seq` 6.
-V16 reaches lane 3 when test D (§3.5) fails, so the lane sheds it: V17 is the out-of-stream
-`BUSY` (`resp_seq` 0, `echo_pkt` 6, detail = `expected` = 6), and nothing was applied. V18 is the
-client's resend of the same `pkt_seq` with the same logical content and bit0 = 1; the lane
-accepts it as a first acceptance.
+V16 reaches lane 3 when test D (§3.5) fails, so the lane sheds it: V17 is its in-stream `BUSY`
+run (`resp_seq` 7, `echo_pkt` 6, one `Reject BUSY` at index 0, detail 0, `client_tag` 0), and
+nothing was applied. V18 is the client's resend of the same `pkt_seq` with the same logical
+content and bit0 = 1; the lane accepts it as a first acceptance, and its answer takes `resp_seq` 8
+(not printed). V19 (`pkt_seq` 7, a New and a Heartbeat) is shed too: V20 is its `BUSY` run, one
+record per message, the Heartbeat's included, as `resp_seq` 9.
 
 ```python
 #!/usr/bin/env python3
@@ -1666,10 +1667,14 @@ V = [
                            cancel_ack(0, 0xFFFFFFFF, 2, 0x77777777)]), False),
     ("V16 req A: New buy IOC 2 @ 100000 (arrives in overload)",
      request(A, 6, E, B, [new(of(0, tif=1), 100_000, 2, 0x88888888)]), True),
-    ("V17 resp A: out-of-stream Reject BUSY (lane shed), index 0xFF, detail = expected 6",
-     response(A, 0, E, 6, [reject(0xFF, 24, 6, 0)]), False),
+    ("V17 resp A: lane shed of V16, in-stream Reject BUSY at index 0, detail 0, client_tag 0",
+     response(A, 7, E, 6, [reject(0, 24, 0, 0)]), False),
     ("V18 req A: resend of V16, same pkt_seq and content, bit0 = 1",
      request(A, 6, E, B, [new(of(0, tif=1), 100_000, 2, 0x88888888)], flags=1), True),
+    ("V19 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload)",
+     request(A, 7, E, B, [new(of(1), 100_005, 1, 0x99999999), heartbeat()]), True),
+    ("V20 resp A: lane shed of V19, BUSY run: one Reject BUSY per message, client_tag 0",
+     response(A, 9, E, 7, [reject(0, 24, 0, 0), reject(1, 24, 0, 0)]), False),
 ]
 for name, pkt, req in V:
     dump(name, pkt, req)
@@ -1683,10 +1688,15 @@ for what, ok in [("V1 verifies with K_SEQ", verify_request(v1, K_SEQ)),
                  ("V10 tag_com = SipHash(K_COM, bytes 0..32)",
                   struct.unpack_from("<Q", v10, 40)[0] == siphash24(K_COM, v10[:32])),
                  ("V13 tag differs from V2 tag", V[12][1][-8:] != V[1][1][-8:]),
-                 ("V17 is out of stream (resp_seq 0), reason BUSY 24, echo_pkt 6",
-                  struct.unpack_from("<I", V[16][1], 4)[0] == 0 and V[16][1][16:18] == b"\x83\xff"
-                  and struct.unpack_from("<H", V[16][1], 18)[0] == 24
+                 ("V17 is in stream (resp_seq 7), echo_pkt 6, Reject BUSY 24 at index 0, detail 0, tag 0",
+                  struct.unpack_from("<I", V[16][1], 4)[0] == 7 and V[16][1][16:18] == b"\x83\x00"
+                  and struct.unpack_from("<HII", V[16][1], 18) == (24, 0, 0)
                   and struct.unpack_from("<I", V[16][1], 12)[0] == 6),
+                 ("V20 answers every message of V19 (count 2, Heartbeat included) with BUSY, tag 0",
+                  V[19][1][8] == V[18][1][8] == 2 and struct.unpack_from("<I", V[19][1], 12)[0] == 7
+                  and all(V[19][1][16 + 16 * i:18 + 16 * i] == bytes([0x83, i])
+                          and struct.unpack_from("<HII", V[19][1], 18 + 16 * i) == (24, 0, 0)
+                          for i in range(2))),
                  ("V18 has V16's logical content (D3) and verifies", V[17][1][16:32] == V[15][1][16:32]
                   and V[17][1][:9] == V[15][1][:9] and verify_request(V[17][1], K_SEQ))]:
     if not ok:
@@ -1694,7 +1704,7 @@ for what, ok in [("V1 verifies with K_SEQ", verify_request(v1, K_SEQ)),
     print(f"check OK: {what}")
 ```
 
-Output of `python3 -I vyrn_proto_vectors.py` on 2026-11-13 (all checks pass):
+Output of `python3 -I vyrn_proto_vectors.py` on 2026-11-18 (all checks pass):
 
 ```
 siphash24(00..0f, 00..0e) = 0xa129ca6149be45e5  reference vector OK (also len 0, 8)
@@ -1804,23 +1814,38 @@ V16 req A: New buy IOC 2 @ 100000 (arrives in overload) (48 B)
   020: fd 45 e4 3b dc 2a da 03 00 00 00 00 00 00 00 00
   tag_seq=0x03da2adc3be445fd  tag_com=0x0000000000000000
 
-V17 resp A: out-of-stream Reject BUSY (lane shed), index 0xFF, detail = expected 6 (40 B)
-  000: 07 30 10 00 00 00 00 00 01 00 e8 03 06 00 00 00
-  010: 83 ff 18 00 06 00 00 00 00 00 00 00 00 00 00 00
-  020: 70 0e fd 35 ea 4e de dc
-  tag=0xdcde4eea35fd0e70
+V17 resp A: lane shed of V16, in-stream Reject BUSY at index 0, detail 0, client_tag 0 (40 B)
+  000: 07 30 10 00 07 00 00 00 01 00 e8 03 06 00 00 00
+  010: 83 00 18 00 00 00 00 00 00 00 00 00 00 00 00 00
+  020: 7d 93 f7 a9 0a e1 d0 0d
+  tag=0x0dd0e10aa9f7937d
 
 V18 req A: resend of V16, same pkt_seq and content, bit0 = 1 (48 B)
   000: 07 30 10 00 06 00 00 00 01 01 e8 03 01 00 00 00
   010: 01 02 00 00 a0 86 01 00 02 00 00 00 88 88 88 88
   020: 37 e2 a3 17 d7 27 2c 64 00 00 00 00 00 00 00 00
   tag_seq=0x642c27d717a3e237  tag_com=0x0000000000000000
+
+V19 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload) (64 B)
+  000: 07 30 10 00 07 00 00 00 02 00 e8 03 01 00 00 00
+  010: 01 01 00 00 a5 86 01 00 01 00 00 00 99 99 99 99
+  020: 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  030: fc 00 f4 62 6c 63 16 ae 00 00 00 00 00 00 00 00
+  tag_seq=0xae16636c62f400fc  tag_com=0x0000000000000000
+
+V20 resp A: lane shed of V19, BUSY run: one Reject BUSY per message, client_tag 0 (56 B)
+  000: 07 30 10 00 09 00 00 00 02 00 e8 03 07 00 00 00
+  010: 83 00 18 00 00 00 00 00 00 00 00 00 00 00 00 00
+  020: 83 01 18 00 00 00 00 00 00 00 00 00 00 00 00 00
+  030: 1a 57 e8 f8 72 1f 54 51
+  tag=0x51541f72f8e8571a
 check OK: V1 verifies with K_SEQ
 check OK: V1 fails with K_OUT
 check OK: V1 with one tag bit flipped fails (bound source: close session)
 check OK: V10 tag_com = SipHash(K_COM, bytes 0..32)
 check OK: V13 tag differs from V2 tag
-check OK: V17 is out of stream (resp_seq 0), reason BUSY 24, echo_pkt 6
+check OK: V17 is in stream (resp_seq 7), echo_pkt 6, Reject BUSY 24 at index 0, detail 0, tag 0
+check OK: V20 answers every message of V19 (count 2, Heartbeat included) with BUSY, tag 0
 check OK: V18 has V16's logical content (D3) and verifies
 ```
 
@@ -1828,8 +1853,9 @@ Expected lane behaviour for the negative vector: the flipped `tag_seq` comes fro
 address, so the lane closes session A at V6 and sends `Reject BAD_MAC` (index 0xFF, detail 1) as
 the final in-stream record. The same bytes from any other address are dropped at V3 and counted,
 and A stays open. The same bytes with `epoch16` = 999 get `EPOCH_MISMATCH` at V4 and close nothing
-(01 §14.8). For V17, the expected client action is: keep `expected` = 6, resend from 6 (V18), and
-do not count V16 as acknowledged.
+(01 §14.8). For V17, the expected client action is: keep `expected` = 6, resend from 6 (V18), do
+not count V16 as acknowledged, and take each record's tag from its own copy of V16. For V20 the
+same holds from 7.
 
 ## 12. Versioning
 
@@ -1896,7 +1922,7 @@ Planned use of reserved fields (informative; not part of v1):
 | 08 | Client handoff rules H1–H9 and the `EpochNotice` variants. |
 | 09 | The session state machine, the key roles, the out-of-stream rules. |
 | 10 | Fee classes, bucket ids, `Out` causes, reject details; the four attestation levels that the drop copy labels separately (§7.5). |
-| 11 | Vectors V1–V18, the script, and the negative checks. |
+| 11 | Vectors V1–V20, the script, and the negative checks. |
 
 ## 14. Local definitions
 
@@ -1960,8 +1986,8 @@ credit bound (`STEP_FILL_CAP`, §14.15), `PacketRecord.flags` (§6.6),
 
 1. **§4 vs §12.5.** §4 still says "the first failed MAC on a session closes the session". Reword
    it to §12.5 plus §14.8: bound address and matching `epoch16`.
-2. **`INV-DET`** says "every response". Out-of-stream responses other than `BUSY` depend on packets
-   that the order stream does not hold. Restrict it to in-stream responses and `BUSY`.
+2. **`INV-DET`** says "every response". Out-of-stream responses depend on packets that the order
+   stream does not hold. Restrict it to in-stream responses (a lane `BUSY` is one, §3.5).
 3. **`PktHash`.** A resend (flags bit0) and a resend into a new epoch (`epoch16`) change the hashed
    bytes. Compute `PktHash` with `flags` bit0 and `epoch16` set to 0, so that every transmission of
    one `pkt_seq` hashes the same and equivocation is exactly a `PktHash` mismatch. Until then, 07
@@ -1970,7 +1996,8 @@ credit bound (`STEP_FILL_CAP`, §14.15), `PacketRecord.flags` (§6.6),
    (§5.4); `resp_seq = 0` is an out-of-stream response (§3.2). Response `flags` bits 1–7 are 0.
 5. **`EpochNotice`.** Define the home word (byte 8 `HomeCode`, byte 9 box index) and the
    sequencer-change variant (`next epoch` = current epoch).
-6. **`BUSY` stream.** State in §14.1 that a lane `BUSY` is out of stream (`resp_seq` 0, no
+6. **`BUSY` stream.** State in §14.1 that a lane `BUSY` is in stream (a response packet with the
+   next `resp_seq`, one `Reject BUSY` per message, `client_tag` 0, gated on the `SHED` record, no
    holdoff) and a BBO-core `BUSY` is in stream at the message index (§3.5).
 7. **Maker numbering.** State in §14.14 that the 16-number range is a relative credit placed by
    the merge rule of §7.1, not a fixed block: a fixed block leaves gaps when a maker stops trading,

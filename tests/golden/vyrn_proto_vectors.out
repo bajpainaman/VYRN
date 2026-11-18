@@ -105,21 +105,36 @@ V16 req A: New buy IOC 2 @ 100000 (arrives in overload) (48 B)
   020: fd 45 e4 3b dc 2a da 03 00 00 00 00 00 00 00 00
   tag_seq=0x03da2adc3be445fd  tag_com=0x0000000000000000
 
-V17 resp A: out-of-stream Reject BUSY (lane shed), index 0xFF, detail = expected 6 (40 B)
-  000: 07 30 10 00 00 00 00 00 01 00 e8 03 06 00 00 00
-  010: 83 ff 18 00 06 00 00 00 00 00 00 00 00 00 00 00
-  020: 70 0e fd 35 ea 4e de dc
-  tag=0xdcde4eea35fd0e70
+V17 resp A: lane shed of V16, in-stream Reject BUSY at index 0, detail 0, client_tag 0 (40 B)
+  000: 07 30 10 00 07 00 00 00 01 00 e8 03 06 00 00 00
+  010: 83 00 18 00 00 00 00 00 00 00 00 00 00 00 00 00
+  020: 7d 93 f7 a9 0a e1 d0 0d
+  tag=0x0dd0e10aa9f7937d
 
 V18 req A: resend of V16, same pkt_seq and content, bit0 = 1 (48 B)
   000: 07 30 10 00 06 00 00 00 01 01 e8 03 01 00 00 00
   010: 01 02 00 00 a0 86 01 00 02 00 00 00 88 88 88 88
   020: 37 e2 a3 17 d7 27 2c 64 00 00 00 00 00 00 00 00
   tag_seq=0x642c27d717a3e237  tag_com=0x0000000000000000
+
+V19 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload) (64 B)
+  000: 07 30 10 00 07 00 00 00 02 00 e8 03 01 00 00 00
+  010: 01 01 00 00 a5 86 01 00 01 00 00 00 99 99 99 99
+  020: 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  030: fc 00 f4 62 6c 63 16 ae 00 00 00 00 00 00 00 00
+  tag_seq=0xae16636c62f400fc  tag_com=0x0000000000000000
+
+V20 resp A: lane shed of V19, BUSY run: one Reject BUSY per message, client_tag 0 (56 B)
+  000: 07 30 10 00 09 00 00 00 02 00 e8 03 07 00 00 00
+  010: 83 00 18 00 00 00 00 00 00 00 00 00 00 00 00 00
+  020: 83 01 18 00 00 00 00 00 00 00 00 00 00 00 00 00
+  030: 1a 57 e8 f8 72 1f 54 51
+  tag=0x51541f72f8e8571a
 check OK: V1 verifies with K_SEQ
 check OK: V1 fails with K_OUT
 check OK: V1 with one tag bit flipped fails (bound source: close session)
 check OK: V10 tag_com = SipHash(K_COM, bytes 0..32)
 check OK: V13 tag differs from V2 tag
-check OK: V17 is out of stream (resp_seq 0), reason BUSY 24, echo_pkt 6
+check OK: V17 is in stream (resp_seq 7), echo_pkt 6, Reject BUSY 24 at index 0, detail 0, tag 0
+check OK: V20 answers every message of V19 (count 2, Heartbeat included) with BUSY, tag 0
 check OK: V18 has V16's logical content (D3) and verifies
