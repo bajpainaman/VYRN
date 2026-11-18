@@ -1,0 +1,3 @@
+fn a() {}
+// VX-WORKAROUND W-04 (vx-lang/Vx#3371): wrong issue number
+// VX-WORKAROUND W-20 (issue to file): no entry at all

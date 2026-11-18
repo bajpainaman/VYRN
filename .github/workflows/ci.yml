@@ -1,7 +1,8 @@
 # S1 of spec/11-build.md §8, the parts that exist today: formatting, clippy, tests on Linux
 # x86-64 and aarch64 (macOS is left out to keep CI cheap), cargo-deny, the 04 §11 protocol
-# vectors, and the unsafe-audit and lint-engine gates (Linux only, §9.2 S1). Miri, TSan, fuzzing
-# and the asm gate join as the crates they cover land. Third-party actions are pinned to a
+# vectors, and the unsafe-audit, lint-engine, shim-gate and vx-friction gates (Linux only, §9.2
+# S1). Miri, TSan, fuzzing and the asm gate (S2, it needs the §4.4 hot wrappers in a release
+# vyrn-seq) join as the crates they cover land; perf-gate runs on the lab runners (§9.3). Third-party actions are pinned to a
 # commit, with the tag it was taken from in a comment.
 name: CI
 
@@ -53,7 +54,7 @@ jobs:
         run: deploy/release/crate.sh vyrn-wire "$RUNNER_TEMP/crate-bundle"
 
   gates:
-    name: gates (unsafe-audit, lint-engine)
+    name: gates (unsafe-audit, lint-engine, shim-gate, vx-friction)
     runs-on: ubuntu-24.04
     env:
       # These two tools need no clang or lld, so build them with the runner's cc and without the
@@ -69,6 +70,10 @@ jobs:
         run: cargo run --locked --quiet -p unsafe-audit
       - name: engine crates keep to the dependency DAG and the engine source rules (11 §1.4, §2.3, §3.3)
         run: cargo run --locked --quiet -p lint-engine
+      - name: the C shim stays within 300 code lines (11 §4.5, 01 §9)
+        run: cargo run --locked --quiet -p shim-gate
+      - name: every Vx workaround marker matches its vx/FRICTION.md entry (11 §5.6)
+        run: cargo run --locked --quiet -p vx-friction
 
   actionlint:
     runs-on: ubuntu-24.04
@@ -100,6 +105,10 @@ jobs:
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_reject_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_reject_vectors.out"
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_log_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_log_vectors.out"
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_admin_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_admin_vectors.out"
+      - name: the independent trace decoder rewrites the trace-dump vectors unchanged (11 §8.3)
+        run: |
+          python3 -I tools/trace-dump/fixtures-src/make.py
+          git diff --exit-code -- tools/trace-dump/fixtures
 
   contracts:
     name: L1 bridge contracts (09 §6)

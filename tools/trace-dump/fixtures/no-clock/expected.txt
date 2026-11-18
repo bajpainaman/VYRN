@@ -1,0 +1,2 @@
+- tsc=250 core=5 KIND_42 arg16=65535 arg32=4294967295
+- tsc=300 core=5 STEP_END arg16=2 arg32=5

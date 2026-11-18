@@ -1,0 +1,6 @@
+#ifndef A
+#define A
+
+#include <stdint.h>
+uint32_t f(void);
+#endif

@@ -1,0 +1,3 @@
+vx/FRICTION.md:5: bad-entry
+vx/FRICTION.md:6: bad-entry
+vx/FRICTION.md:7: duplicate-entry

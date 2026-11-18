@@ -1,0 +1,4 @@
+| ID | What we wanted | Workaround | Files with the marker | Cost | Removed when | Status |
+|---|---|---|---|---|---|---|
+| W-04 | pinning, comment on [#3370](https://github.com/vx-lang/Vx/issues/3370) | the shell pins | `vx/client.vx`, `vx/gone.vx` | none | tasks | open |
+| W-09 | hidden symbols | version script | `vx/build.sh` | none | vxc hides them | open, issue to file |
