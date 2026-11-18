@@ -5,6 +5,12 @@
 //! ([`DataJoin::put`]). A resend of one `pkt_seq` may differ in its unsigned bytes (04 D3), so a
 //! key holds every variant, and a record picks the variant whose `pkt_hash` it names.
 //!
+//! **Retention** (07 §5.4). A payload no ORDER record has referenced yet ([`DataJoin::reference`],
+//! at block readiness) expires once [`REP_SHED_KEEP_BLOCKS`] blocks have become final after it
+//! arrived ([`DataJoin::finalized`]); at most [`REP_DATA_UNREF_MAX`] such payloads are held, and
+//! a put above that evicts the oldest first. [`DataJoin::evictions`] counts both. Referenced
+//! payloads leave only by [`DataJoin::release`].
+//!
 //! **Readers.** The vote reads [`DataJoin::check`] for a ready block: `Missing` (ask again)
 //! while a payload is absent, `Count` when a payload with the record's hash has another number of
 //! numbered messages, `Root` when its own `data_root` differs from the header's. Replay reads payloads
@@ -16,7 +22,7 @@
 //! substream's packets in O-order, Advance and `SHED` records excluded (07 §6.1). A `SHED`
 //! record is not joined: its responses come from the record alone (05 §18 Q17).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use vyrn_log::LaneRec;
 use vyrn_log::block::data_root;
@@ -47,13 +53,44 @@ pub enum DataErr {
 }
 
 /// Payloads by `(session, pkt_seq)`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DataJoin {
     by_key: BTreeMap<(SessionId, u32), Vec<Variant>>,
     /// Variants kept for a bounded window after a release, `(height released, key, hash)`: a
     /// `SHED` record's variant (for its retry), and the unused variants of an accepted packet.
     shed: VecDeque<(Height, (SessionId, u32), PktHash)>,
+    /// Keys a ready block's record names, until that record is released.
+    refs: BTreeSet<(SessionId, u32)>,
+    /// Unreferenced variants by arrival order: `(final height at arrival, key, hash)`.
+    unref: BTreeMap<u64, (u64, (SessionId, u32), PktHash)>,
+    /// The arrival numbers of each key's unreferenced variants, to drop them on reference.
+    unref_keys: BTreeMap<(SessionId, u32), Vec<u64>>,
+    next_arrival: u64,
+    /// The highest final height reported to [`DataJoin::finalized`].
+    final_height: u64,
+    cap: usize,
+    evicted: Evictions,
 }
+
+impl Default for DataJoin {
+    fn default() -> Self {
+        Self::with_cap(REP_DATA_UNREF_MAX)
+    }
+}
+
+/// Unreferenced payloads [`DataJoin`] dropped (07 §5.4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Evictions {
+    /// [`REP_SHED_KEEP_BLOCKS`] blocks became final after it arrived.
+    pub expired: u64,
+    /// Over [`REP_DATA_UNREF_MAX`], oldest first.
+    pub capped: u64,
+}
+
+/// Unreferenced payloads a replica holds at most (07 §5.4): the `vyrn-data` RAM ring's
+/// 65,536 slots, so the box can still serve any payload the replica dropped
+/// [Reading: the coordinator's ruling names a cap, not its size; PR body].
+pub const REP_DATA_UNREF_MAX: usize = 65_536;
 
 /// Blocks a released `SHED` record's payload is kept for its retry, which reuses the packet's
 /// `pkt_seq` (05 §6.8, `vyrn-lane` `answer_busy`) and may have the same bytes. 128 blocks
@@ -103,14 +140,87 @@ fn prefix(h: &Hash) -> PktHash {
 }
 
 impl DataJoin {
-    /// Stores one payload; a byte-identical copy is stored once. Returns its full hash.
+    /// A join that holds at most `cap` unreferenced payloads.
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            by_key: BTreeMap::new(),
+            shed: VecDeque::new(),
+            refs: BTreeSet::new(),
+            unref: BTreeMap::new(),
+            unref_keys: BTreeMap::new(),
+            next_arrival: 0,
+            final_height: 0,
+            cap,
+            evicted: Evictions::default(),
+        }
+    }
+
+    /// Stores one payload; a byte-identical copy is stored once. Returns its full hash. A
+    /// payload of a key no ready block names yet is unreferenced (module docs, retention).
     pub fn put(&mut self, session: SessionId, pkt_seq: u32, bytes: Vec<u8>) -> Hash {
         let full = full_hash(&bytes);
-        let vars = self.by_key.entry((session, pkt_seq)).or_default();
+        let key = (session, pkt_seq);
+        let vars = self.by_key.entry(key).or_default();
         if !vars.iter().any(|v| v.full == full) {
             vars.push(Variant { full, bytes });
+            if !self.refs.contains(&key) {
+                let n = self.next_arrival;
+                self.next_arrival = n.wrapping_add(1);
+                self.unref
+                    .insert(n, (self.final_height, key, prefix(&full)));
+                self.unref_keys.entry(key).or_default().push(n);
+                while self.unref.len() > self.cap {
+                    if let Some((_, (_, k, h))) = self.unref.pop_first() {
+                        self.drop_unref(k, h);
+                        self.evicted.capped = self.evicted.capped.saturating_add(1);
+                    }
+                }
+            }
         }
         full
+    }
+
+    /// A ready block's records name their keys: their payloads, held or to come, are referenced
+    /// and leave only by [`DataJoin::release`].
+    pub fn reference<const N: usize>(&mut self, b: &BlockInputs<N>) {
+        for r in &b.lanes {
+            let LaneRec::Pkt(p) = r else { continue };
+            let key = (p.session, p.pkt_seq);
+            self.refs.insert(key);
+            for n in self.unref_keys.remove(&key).unwrap_or_default() {
+                self.unref.remove(&n);
+            }
+        }
+    }
+
+    /// `height` is final: unreferenced payloads that arrived [`REP_SHED_KEEP_BLOCKS`] or more
+    /// final blocks ago expire.
+    pub fn finalized(&mut self, height: Height) {
+        self.final_height = self.final_height.max(height.0);
+        while let Some((&n, &(at, k, h))) = self.unref.first_key_value() {
+            if at.saturating_add(REP_SHED_KEEP_BLOCKS) > self.final_height {
+                break;
+            }
+            self.unref.remove(&n);
+            self.drop_unref(k, h);
+            self.evicted.expired = self.evicted.expired.saturating_add(1);
+        }
+    }
+
+    /// The unreferenced payloads dropped so far.
+    pub fn evictions(&self) -> Evictions {
+        self.evicted
+    }
+
+    /// Drops an unreferenced variant whose `unref` entry is already gone.
+    fn drop_unref(&mut self, key: (SessionId, u32), hash: PktHash) {
+        if let Some(ns) = self.unref_keys.get_mut(&key) {
+            ns.retain(|n| self.unref.contains_key(n));
+            if ns.is_empty() {
+                self.unref_keys.remove(&key);
+            }
+        }
+        self.evict(key, hash);
     }
 
     fn variant(&self, r: &PacketRecord) -> Option<&Variant> {
@@ -173,6 +283,7 @@ impl DataJoin {
                 continue;
             }
             let key = (p.session, p.pkt_seq);
+            self.refs.remove(&key);
             if p.flags & PacketFlags::SHED != 0 {
                 self.shed.push_back((height, key, p.pkt_hash));
             } else {

@@ -290,6 +290,90 @@ fn release_keeps_what_a_shed_retry_still_needs() {
     assert!(j.resolve(&retry).is_err());
 }
 
+/// A ready block naming `recs`, for the retention test.
+fn block_of(recs: &[PacketRecord]) -> BlockInputs<4> {
+    BlockInputs {
+        header: BlockHeader {
+            height: Height(0),
+            epoch: Epoch(1),
+            book: BookId(1),
+            first_step: StepId(1),
+            last_step: StepId(0),
+            prev: Hash([0; 32]),
+            order_root: Hash([0; 32]),
+            data_root: Hash([0; 32]),
+            seq_sig: [0; 64],
+        },
+        lanes: recs.iter().map(|r| LaneRec::Pkt(*r)).collect(),
+        split: recs.len(),
+        steps: Vec::new(),
+    }
+}
+
+#[test]
+fn unreferenced_payloads_expire_after_finality_and_are_capped() {
+    use vyrn_replica::Evictions;
+    use vyrn_replica::data::REP_SHED_KEEP_BLOCKS as K;
+    let (pa, pb, pc) = (bytes(0xA1), bytes(0xB1), bytes(0xC1));
+    let (a, b, c) = (
+        packet(1, 1, &pa, 0),
+        packet(2, 1, &pb, 0),
+        packet(3, 1, &pc, 0),
+    );
+    let mut j = DataJoin::default();
+    // `a` arrives while height 50 is final; nothing names it.
+    j.finalized(Height(50));
+    j.put(SessionId(1), 1, pa.clone());
+    // `b` is named by a ready block before its payload arrives; `c` after.
+    j.reference(&block_of(&[b]));
+    j.put(SessionId(2), 1, pb.clone());
+    j.put(SessionId(3), 1, pc.clone());
+    j.reference(&block_of(&[c]));
+    // K blocks after the arrival's final height, not after height 0.
+    j.finalized(Height(50 + K - 1));
+    assert!(j.resolve(&a).is_ok(), "one block short of K final blocks");
+    j.finalized(Height(50 + K));
+    assert!(j.resolve(&a).is_err(), "K final blocks after it arrived");
+    // Referenced payloads stay, however many blocks are final.
+    j.finalized(Height(10_000));
+    assert!(j.resolve(&b).is_ok() && j.resolve(&c).is_ok());
+    assert_eq!(
+        j.evictions(),
+        Evictions {
+            expired: 1,
+            capped: 0
+        }
+    );
+
+    // The cap counts only unreferenced payloads and drops the oldest first.
+    let mut j = DataJoin::with_cap(2);
+    j.reference(&block_of(&[c]));
+    j.put(SessionId(3), 1, pc.clone());
+    j.put(SessionId(1), 1, pa.clone());
+    j.put(SessionId(2), 1, pb.clone());
+    assert!(j.resolve(&a).is_ok() && j.resolve(&b).is_ok() && j.resolve(&c).is_ok());
+    let pd = bytes(0xD1);
+    let d = packet(4, 1, &pd, 0);
+    j.put(SessionId(4), 1, pd);
+    assert!(
+        j.resolve(&a).is_err(),
+        "the oldest unreferenced payload goes"
+    );
+    assert!(j.resolve(&b).is_ok() && j.resolve(&d).is_ok() && j.resolve(&c).is_ok());
+    assert_eq!(
+        j.evictions(),
+        Evictions {
+            expired: 0,
+            capped: 1
+        }
+    );
+    // A key named after its payload arrived leaves the unreferenced set: it no longer counts.
+    j.reference(&block_of(&[b]));
+    j.put(SessionId(1), 1, pa);
+    assert!(j.resolve(&a).is_ok() && j.resolve(&b).is_ok() && j.resolve(&d).is_ok());
+    assert_eq!(j.evictions().capped, 1);
+}
+
 #[test]
 fn count_follows_the_lane_numbering() {
     // Two messages: a New (0x01) and a Heartbeat (0x10).

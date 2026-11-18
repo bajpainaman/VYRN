@@ -1054,6 +1054,20 @@ record is matched on `(session, pkt_seq)` only and stays **unhashed**.
   `pkt_hash` picks the variant, against the replica's own hash.
 - The `REP_DATA_SILENCE_MS` clock of a box starts at its first frame.
 
+**Retention.** A payload is **referenced** once a ready block's PacketRecord names its
+`(session, pkt_seq)`, whether the payload arrived before or after; it then stays until that block's
+release (after replay), and a released `SHED` record's variant stays `REP_SHED_KEEP_BLOCKS` = 128
+more blocks for its retry. A payload no record has referenced (a packet the sequencer never
+logged, or bytes a sender pushed unasked) is **unreferenced**:
+- It expires once `REP_SHED_KEEP_BLOCKS` = 128 blocks have become final after it arrived:
+  arrival stamps the replica's final height `f`, and the payload goes when `f + 128` is final.
+- At most `REP_DATA_UNREF_MAX` = 65,536 are held. Storing one more evicts the oldest
+  unreferenced payload first. 65,536 is the `vyrn-data` RAM ring's slot count, so the box still
+  holds what the cap dropped and a later record fetches it under §5.5.
+- Each eviction is counted, by cause (expired, capped). Referenced payloads never count toward the
+  cap and are never evicted by it.
+[Coordinator ruling for the expiry; the cap's size is a reading, `vyrn-replica` PR]
+
 ### 5.5 Fetching a missing packet
 
 A record that stays unresolved for `REP_DATA_WAIT_US` = 300 µs after its ORDER frame triggers a
@@ -2435,6 +2449,7 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | `REP_PEER_RING_MS` | 2000 | budget | replica in-memory frame store |
 | `REP_PATH_LOSS_ALARM`, `REP_PATH_DOWN_MS` | 1e-6, 100 | budget | path alarms |
 | `REP_SEQ_HASHLIST_MS`, `REP_SEQ_PKT_RETAIN_MS` | 50, 50 | budget | sequencer retention of hash lists and packets |
+| `REP_DATA_UNREF_MAX` | 65,536 | reading | unreferenced payloads a replica holds (§5.4); expiry after `REP_SHED_KEEP_BLOCKS` = 128 final blocks |
 | `REP_SEQ_DATA_MAX_PPS` | 50k | budget | sequencer data-repair cap |
 | `REP_DATA_RING_S` | 10 | budget | data box RAM ring |
 | `REP_DATA_BATCH_US`, `REP_DATA_SILENCE_MS`, `REP_DATA_WAIT_US` | 5, 1, 300 | budget | data tier timers |
