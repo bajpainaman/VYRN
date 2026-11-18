@@ -68,6 +68,9 @@
 //!   session): `STATS` must report `shards=N` and `hop_full=0`, with every other `data` check
 //!   unchanged, so the sharded fan-out keeps one `data_seq` per destination (the feed reports no
 //!   gap) and fetches reach the owning shard.
+//! - R11. `--keyed`: before the first packet, validator 0 gets `EPOCH 1` on stdin and re-derives
+//!   its `K_fetch`, then the box gets `EPOCH 1` and drops epoch 0's keys. `data` then needs
+//!   `fetch_unauth = 0`, so every fetch of the run was sealed under an epoch-1 key.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -857,7 +860,9 @@ fn validator_config(
     } else {
         "validator"
     };
-    let dev = if hashlag_us.is_some() {
+    // DEV: a larger hashlag bound, or keyed fetches to peers whose roster keys are unusable
+    // (R8: only validator 0 has a real xchg_key), which only a DEV validator sends unsealed.
+    let dev = if hashlag_us.is_some() || keyed {
         "dev = true\n"
     } else {
         ""
@@ -1266,6 +1271,13 @@ fn run(cli: &Cli) -> Result<bool, String> {
         None => (None, None, None),
     };
 
+    // R11, before any packet: validator 0 moves its K_fetch to epoch 1, then the box drops epoch
+    // 0, so every fetch of the run must be sealed under the re-derived keys.
+    let epoch_step = match (cli.keyed, data_idx, vals.first()) {
+        (true, Some(b), Some(&v)) => Some(rotate_epoch(&mut nodes, &rx, v, b, 1, wait)),
+        _ => None,
+    };
+
     // Send, paced by send_ns.
     let t0 = Instant::now();
     for p in &pkts {
@@ -1470,6 +1482,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
             Ok(stats.clone())
         }
     });
+
+    match epoch_step {
+        Some(r) => rep.check("epoch", r),
+        None => Report::skip("epoch", "off (enable with --keyed, R11)"),
+    }
 
     match seq_repair_probe {
         Some(r) => rep.check("seq-repair", r),
@@ -1855,7 +1872,14 @@ fn run(cli: &Cli) -> Result<bool, String> {
             if field(&st, "shards") != Some(shards.as_str()) || field(&st, "hop_full") != Some("0") {
                 errs.push(format!("--data-shards {shards}: STATS shards/hop_full wrong: {st}"));
             }
-            // R7: validator 0 lost frames, and only sealed fetches are served.
+            // R7: validator 0 lost frames, and only sealed fetches are served. R11: under its
+            // epoch-1 keys, so the box refused none of them.
+            if relay_dropped.is_some() && field(&st, "fetch_unauth") != Some("0") {
+                errs.push(format!(
+                    "--keyed: fetch_unauth is {:?}, not 0 (R11: validator 0's re-derived K_fetch)",
+                    field(&st, "fetch_unauth")
+                ));
+            }
             if let Some(dropped) = relay_dropped {
                 let served: u64 = ["fetch_ring_hit", "fetch_log_hit", "fetch_resent"]
                     .iter()
@@ -2032,6 +2056,36 @@ impl Cons {
 
 /// R8: KEY fetches of the last sent packets to the box's keyed `[repair]` at `addr`. The plain
 /// form must get no answer; the form sealed under `key` must return the packet's exact bytes.
+/// R11: `EPOCH e` to validator `v` (acked `FETCH_EPOCH e`), then to box `b` (acked
+/// `FETCH_EPOCHS e,e+1`), so the box never drops a key the validator still uses.
+fn rotate_epoch(
+    nodes: &mut Nodes,
+    rx: &Lines,
+    v: usize,
+    b: usize,
+    e: u32,
+    wait: Duration,
+) -> Result<String, String> {
+    for (i, ack) in [
+        (v, format!("FETCH_EPOCH {e}")),
+        (b, format!("FETCH_EPOCHS {e},{}", e + 1)),
+    ] {
+        let n = nodes.0.get_mut(i).ok_or("node")?;
+        let name = n.name.clone();
+        let stdin = n.child.stdin.as_mut().ok_or("stdin")?;
+        writeln!(stdin, "EPOCH {e}")
+            .and_then(|()| stdin.flush())
+            .map_err(|x| format!("{name}: {x}"))?;
+        nodes.wait(rx, Instant::now() + wait, &format!("{name} {ack}"), |ns| {
+            ns.get(i).is_some_and(|n| n.lines.contains(&ack))
+        })?;
+    }
+    Ok(format!(
+        "validator-0 acked FETCH_EPOCH {e}, then the box FETCH_EPOCHS {e},{}; the run's fetches use epoch {e}",
+        e + 1
+    ))
+}
+
 fn probe_seq_repair(addr: Option<&str>, key: &[u8; 16], pkts: &[Pkt]) -> Result<String, String> {
     use vyrn_data::frame::{Fetch, decode, seal_fetch};
     let addr: SocketAddrV4 = addr

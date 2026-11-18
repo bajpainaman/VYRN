@@ -171,10 +171,71 @@ pub struct Plan {
     pub storage: PathBuf,
     /// `storage` is this run's temporary directory, removed at exit; a configured one is kept.
     pub temp_storage: bool,
-    /// The roster and the facts that select from it, for `K_fetch` ([`Plan::fetch_key`]).
+    /// The roster and the facts that select from it, for `K_fetch` ([`Plan::keyring`]).
     roster: vyrn_epoch::Roster,
     domain: Domain,
     home: HomeCode,
+}
+
+/// The roster facts a voter derives its `K_fetch` keys from (08 §9.6), apart from the
+/// epoch: `EPOCH <e>` on stdin re-derives them for epoch `e` (crate docs, Control).
+#[derive(Clone)]
+pub struct Keyring {
+    roster: vyrn_epoch::Roster,
+    domain: Domain,
+    home: HomeCode,
+    me: usize,
+}
+
+impl Keyring {
+    /// `K_fetch(e, me, d)` (08 §9.6) under `context` this voter seals its fetches to target `d`
+    /// of its home with (a data box, `SEQ_TARGET + j` or, under [`PEER_FETCH_CONTEXT`],
+    /// `VOTER_TARGET + j`), from its X25519 `secret`. `None` if the roster has no target `d` or
+    /// its key is unusable.
+    pub fn fetch_key(&self, e: Epoch, context: &str, d: u8, secret: &[u8; 32]) -> Option<[u8; 16]> {
+        let i = u8::try_from(self.me).ok()?;
+        self.roster
+            .requester_fetch_key(context, &self.domain, e, self.home, i, d, secret)
+    }
+
+    /// The keys this voter serves peer fetches under in epoch `e`: `K_fetch(e, i,
+    /// VOTER_TARGET + me)` of every requester `i` with a usable key (08 §9.6), by its
+    /// `repl_addr` IPv4. A keyed server with none serves nothing. An `Err` when the roster
+    /// gives this voter a usable `xchg_key` and `secret` is not its private half.
+    pub fn peer_keys(
+        &self,
+        e: Epoch,
+        secret: &[u8; 32],
+    ) -> Result<Vec<(std::net::Ipv4Addr, [u8; 16])>, String> {
+        let Some(d) = u8::try_from(self.me)
+            .ok()
+            .and_then(|m| vyrn_epoch::VOTER_TARGET.checked_add(m))
+        else {
+            return Ok(Vec::new());
+        };
+        let keys =
+            self.roster
+                .box_fetch_keys(PEER_FETCH_CONTEXT, &self.domain, e, self.home, d, secret);
+        let Some(keys) = keys else {
+            let usable = self
+                .roster
+                .fetch_target(self.home, d)
+                .is_some_and(|k| k.len() >= 32);
+            return if usable {
+                Err(format!(
+                    "[data] xchg is not the private half of voter {}'s roster xchg_key",
+                    self.me
+                ))
+            } else {
+                Ok(Vec::new())
+            };
+        };
+        Ok(keys
+            .into_iter()
+            .filter(|(i, _, _)| usize::from(*i) != self.me)
+            .filter_map(|(_, a, k)| Some((a.ipv4()?, k)))
+            .collect())
+    }
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], String> {
@@ -329,57 +390,14 @@ impl Plan {
         })
     }
 
-    /// `K_fetch(e, me, d)` (08 §9.6) under `context` this voter seals its fetches to target `d`
-    /// of its home with (a data box, `SEQ_TARGET + j` or, under [`PEER_FETCH_CONTEXT`],
-    /// `VOTER_TARGET + j`), from its X25519 `secret`. `None` if the roster has no target `d` or
-    /// its key is unusable.
-    pub fn fetch_key(&self, context: &str, d: u8, secret: &[u8; 32]) -> Option<[u8; 16]> {
-        let i = u8::try_from(self.me).ok()?;
-        self.roster
-            .requester_fetch_key(context, &self.domain, self.epoch, self.home, i, d, secret)
-    }
-
-    /// The keys this voter serves peer fetches under: `K_fetch(e, i, VOTER_TARGET + me)` of
-    /// every requester `i` with a usable key (08 §9.6), by its `repl_addr` IPv4. A keyed server
-    /// with none serves nothing. An `Err` when the roster gives this voter a usable `xchg_key`
-    /// and `secret` is not its private half.
-    pub fn peer_keys(
-        &self,
-        secret: &[u8; 32],
-    ) -> Result<Vec<(std::net::Ipv4Addr, [u8; 16])>, String> {
-        let Some(d) = u8::try_from(self.me)
-            .ok()
-            .and_then(|m| vyrn_epoch::VOTER_TARGET.checked_add(m))
-        else {
-            return Ok(Vec::new());
-        };
-        let keys = self.roster.box_fetch_keys(
-            PEER_FETCH_CONTEXT,
-            &self.domain,
-            self.epoch,
-            self.home,
-            d,
-            secret,
-        );
-        let Some(keys) = keys else {
-            let usable = self
-                .roster
-                .fetch_target(self.home, d)
-                .is_some_and(|k| k.len() >= 32);
-            return if usable {
-                Err(format!(
-                    "[data] xchg is not the private half of voter {}'s roster xchg_key",
-                    self.me
-                ))
-            } else {
-                Ok(Vec::new())
-            };
-        };
-        Ok(keys
-            .into_iter()
-            .filter(|(i, _, _)| usize::from(*i) != self.me)
-            .filter_map(|(_, a, k)| Some((a.ipv4()?, k)))
-            .collect())
+    /// What this voter derives its `K_fetch` keys from, for any epoch ([`Keyring`]).
+    pub fn keyring(&self) -> Keyring {
+        Keyring {
+            roster: self.roster.clone(),
+            domain: self.domain,
+            home: self.home,
+            me: self.me,
+        }
     }
 
     pub fn repl_addr(&self) -> SocketAddr {

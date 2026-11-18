@@ -1143,7 +1143,18 @@ requester `i` and serving voter `j`; source 3's is `K_fetch(e, i, SEQ_TARGET + j
 the source's IPv4, so one with no usable requester key serves nothing, and a `[data] xchg`
 that is not the private half of its roster key fails startup. An unkeyed one (no `xchg`)
 serves the 32-byte form to its configured peers (DEV). A target whose roster key is unusable
-holds no keys, so it is sent the 32-byte form (reading, DEV).
+holds no keys: a DEV validator (`dev = true`) sends it the 32-byte form, and any other
+validator fails startup, as for a wrong `xchg`, and never falls back to unsealed fetches.
+
+**Epoch boundary (requester side).** A keyed validator re-derives every `K_fetch` it seals or
+serves fetches under when it moves to epoch `e`: its box, peer and `vyrn-seq` keys for `e`, and
+the peer keys it serves under for `e − 1`, `e` and `e + 1`. Validators move one at a time and
+each is also a peer server, so a peer still on `e − 1` is served until it moves, and one that
+moved first is served under `e + 1`; a data box keeps only `e` and `e + 1` (ruled). A requester
+moves before its boxes drop epoch `e − 1`, so no fetch is refused at the boundary (ruled). Until
+epoch transitions are wired, the transition is the control line `EPOCH <e>` on the validator's
+stdin, like the data box's, acked `FETCH_EPOCH <e>` once the order thread has installed the new
+keys (ruled for now; 07 and 08 name no transport for it).
 
 **`SeqDataReq` bytes (source 3).** The request is the data tier's 32-byte KEY fetch
 (`vyrn-data` frame docs: magic `PF`, kind 1, `session u32, pkt_seq u32`), sent to the
