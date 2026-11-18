@@ -1197,6 +1197,13 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 // Without replay nothing else reads these payloads.
                 (None, _) => self.join.release(h, &b.lanes),
             }
+            // A gated observer replays at most one block per order-thread turn: the gate
+            // releases blocks in bursts, and replaying a burst inline would leave ORDER and
+            // HASH frames unpolled long enough to trip `REP_E_HASHLAG`, which is measured when
+            // a frame is processed (kernel_udp has no RX timestamps yet).
+            if durable.is_some() && !self.replay_dead {
+                return;
+            }
         }
     }
 

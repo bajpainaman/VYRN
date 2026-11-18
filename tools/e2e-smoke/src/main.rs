@@ -111,7 +111,9 @@
 //!   `REP_E_HASHLAG` stop too and requires one validator to cover every height. The shipped
 //!   bound stays 1 ms. `--dev-hashlag-us` (DEV only, needs `--data`) gives the validators
 //!   `dev = true` and a larger `[replay] hashlag_us`; CI runs it with `--strict-hashlag`, so every
-//!   CI run must cover and finalize every height. `--seq-cpus` and `--validator-cpus` (taskset masks)
+//!   CI run must cover and finalize every height. The observer then gets its own bound, at least
+//!   200 ms (`OBS_DEV_HASHLAG_US`): its order thread also replays, feeds the drop copy and
+//!   finalizes, so DEV stalls reach it first. Its `REP_E_HASHLAG` still fails the run. `--seq-cpus` and `--validator-cpus` (taskset masks)
 //!   keep the box's two polling threads off the validators' cores. Without them all validators
 //!   can stop at one height when the box is preempted between an ORDER frame and its HASH frame.
 //!
@@ -182,6 +184,8 @@ const BOX1_XCHG: [u8; 32] = [0x8d; 32];
 const KILL_SILENCE_US: u64 = 100_000;
 /// `--keyed` (R7): the relay to validator 0 drops every this-many-th datagram.
 const LOSS_EVERY: u64 = 25;
+/// With `--dev-hashlag-us`, the observer's `[replay] hashlag_us` (R5): 200 ms, DEV only.
+const OBS_DEV_HASHLAG_US: u64 = 200_000;
 const LANES: usize = 2;
 const NA: usize = 16;
 const BOOK: u16 = 7;
@@ -1308,7 +1312,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 Some((&box_fetch[..], &ports[..], seq_repair.ok_or("seq_repair")?)),
                 &sessions,
                 cons.as_ref(),
-                cli.dev_hashlag_us,
+                // The observer's own DEV bound (R5): it replays, taps and finalizes on its
+                // order thread, so DEV scheduler stalls reach it first. Never below the voters'.
+                cli.dev_hashlag_us.map(|us| us.max(OBS_DEV_HASHLAG_US)),
                 false,
                 Some((&ring, ctrl)),
                 true,
