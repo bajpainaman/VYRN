@@ -1899,13 +1899,17 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     .is_some_and(|n| !finals(n).is_empty())
             });
             t0 += paused.elapsed();
-            if let (Ok(()), Some(i)) = (up, vals.pop()) {
-                let at = nodes.0.get(seq).and_then(|n| finals(n).last().copied());
+            if let (Ok(()), Some(i)) = (up, victim) {
                 if let Some(n) = nodes.0.get_mut(i) {
                     n.child
                         .kill()
                         .map_err(|e| format!("kill {}: {e}", n.name))?;
                 }
+                vals.retain(|&v| v != i);
+                // The baseline: what the box had finalized when the victim died, with every
+                // line queued by then taken.
+                nodes.drain(&rx);
+                let at = nodes.0.get(seq).and_then(|n| finals(n).last().copied());
                 voter_killed = Some((i, at));
             }
         }
@@ -2529,14 +2533,27 @@ fn run(cli: &Cli) -> Result<bool, String> {
         Report::skip("finality", "off (enable with --finality)");
     }
 
-    // R16: the killed validator had voted (finalized something) and its blocks were the box's;
-    // the box finalized past the kill with the n - 1 left (`finality` checks it reached the end).
+    // R16: the killed validator had voted (finalized something), printed no fault (R5's HASHLAG
+    // WARN aside), and the blocks it printed were the box's, `Valid`, with the tap's `out=`; the
+    // box finalized past the kill with the n - 1 left (`finality` checks it reached the end).
     match voter_killed {
         Some((i, at)) => rep.check("voter-kill", {
             let v = nodes.0.get(i).ok_or("killed validator")?;
             let ids: Vec<_> = blocks(v).into_iter().map(|b| b.0).collect();
             let seq_final = nodes.0.get(seq).and_then(|x| finals(x).last().copied());
-            if finals(v).is_empty() {
+            let fault = stopped(v)
+                .filter(|f| cli.strict_hashlag || !f.starts_with("FAULT REP_E_HASHLAG "));
+            let bad_block = blocks(v).into_iter().zip(0..).find(|(b, k)| {
+                field(b.1, "verdict") != Some("Valid")
+                    || field(b.1, "out").is_some_and(|o| {
+                        out_hashes.get(*k).is_none_or(|h| hex(&h.0) != o)
+                    })
+            });
+            if let Some(f) = fault {
+                Err(format!("{}: {f} before the kill", v.name))
+            } else if let Some((b, k)) = bad_block {
+                Err(format!("{} block {k}: {} (tap out= {:?})", v.name, b.1, out_hashes.get(k).map(|h| hex(&h.0))))
+            } else if finals(v).is_empty() {
                 Err(format!(
                     "{} finalized nothing before the kill ({} blocks, vyrn-seq final {at:?})",
                     v.name,
@@ -2550,7 +2567,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 ))
             } else {
                 Ok(format!(
-                    "{} killed with vyrn-seq final at {at:?}, its {} blocks the box's; {} of {n_val} finalized through {seq_final:?} (Q = {q})",
+                    "{} killed with vyrn-seq final at {at:?}, no fault, its {} blocks the box's and Valid; {} of {n_val} finalized through {seq_final:?} (Q = {q})",
                     v.name,
                     ids.len(),
                     vals.len()
