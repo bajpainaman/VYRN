@@ -218,6 +218,8 @@ pub struct Failover {
     redirected: BTreeSet<SessionId>,
     /// Per session, when its last repair REDIRECT was queued ([`Failover::repair`]).
     repaired: BTreeMap<SessionId, u64>,
+    /// Every home the sessions have had, oldest first: [`FIRST_HOME`], then each move's target.
+    homes: Vec<u8>,
     /// The highest `pkt_seq` per session in a final block.
     final_max: BTreeMap<SessionId, u32>,
     /// Released blocks not final yet: height and each session's lowest and highest `pkt_seq`.
@@ -243,6 +245,7 @@ impl Failover {
             moved: false,
             redirected: BTreeSet::new(),
             repaired: BTreeMap::new(),
+            homes: vec![FIRST_HOME],
             final_max: BTreeMap::new(),
             unfinal: VecDeque::new(),
             counts: Counts::default(),
@@ -329,6 +332,7 @@ impl Failover {
                 let live: Vec<bool> = self.effective.iter().map(|e| !e).collect();
                 if let Some(to) = vyrn_data::redirect::backup_home(d, &live) {
                     self.home = to;
+                    self.homes.push(to);
                     self.rounds.push((d, to, REDIRECT_ROUNDS, now));
                     self.moved = true;
                     self.redirected.clear();
@@ -349,7 +353,8 @@ impl Failover {
 
     /// *Reading (07 §5.7):* after a home move, a pending key that every live box lacks may be
     /// one whose session's REDIRECT was lost (no fetch repairs one), so its session's REDIRECT
-    /// from `pkt_seq` is queued again, at most once per [`GOSSIP_EVERY_NS`] per session. The
+    /// from `pkt_seq` is queued again, from every earlier home to the current one, at most once
+    /// per [`GOSSIP_EVERY_NS`] per session. The
     /// client takes only its first (DR2), so a repeat costs one box token and nothing else.
     pub fn repair(&mut self, session: SessionId, pkt_seq: u32, now: u64) {
         if !self.moved {
@@ -361,8 +366,11 @@ impl Failover {
             .is_none_or(|t| now.saturating_sub(*t) >= GOSSIP_EVERY_NS);
         if due {
             self.repaired.insert(session, now);
-            self.outbox
-                .push_back((session, pkt_seq, FIRST_HOME, self.home));
+            // The client may be on any earlier home (it lost a later move's rounds), and DR2
+            // drops a REDIRECT whose `down` is not its home: one from each (Codex r4619507158).
+            for &h in self.homes.iter().filter(|&&h| h != self.home) {
+                self.outbox.push_back((session, pkt_seq, h, self.home));
+            }
             self.counts.repairs = self.counts.repairs.saturating_add(1);
         }
     }
@@ -702,6 +710,24 @@ mod tests {
         assert_eq!((r[0].1, r[0].2, r[0].3), (4, 0, 1));
         f.repair(SessionId(9), 4, 1 + GOSSIP_EVERY_NS);
         assert_eq!(f.counts.repairs, 2);
+        // After 0 → 1 → 2 a client may be on 0 or 1: one REDIRECT from each to 2.
+        let mut f = Failover::new(3, 0, 1, 0, 1);
+        f.silent(&[0], 0);
+        let _ = f.step(0);
+        let _ = f.batch(0);
+        f.silent(&[1], 1);
+        let _ = f.step(1);
+        let _ = f.batch(GOSSIP_EVERY_NS);
+        let _ = f.batch(2 * GOSSIP_EVERY_NS);
+        let _ = f.batch(3 * GOSSIP_EVERY_NS);
+        f.repair(SessionId(9), 4, 4 * GOSSIP_EVERY_NS);
+        let mut r: Vec<_> = flat(&f.batch(5 * GOSSIP_EVERY_NS))
+            .into_iter()
+            .filter(|r| r.0 == SessionId(9))
+            .map(|r| (r.2, r.3))
+            .collect();
+        r.sort_unstable();
+        assert_eq!(r, vec![(0, 2), (1, 2)]);
     }
 
     /// Codex r4612923593: after 0 → 1 and 1 → 2, a late session still sends to box 0, so its
