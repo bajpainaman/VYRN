@@ -88,6 +88,11 @@ fn blake3_official_vectors() {
         // The vectors give 131 bytes of extended output; the first 32 are BLAKE3-256.
         let prefix = |name| arr::<32>(&field(&c, name)[..64]);
         assert_eq!(hash::hash(&input).0, prefix("hash"), "hash, len {len}");
+        // The XOF must reproduce all 131 bytes of extended output.
+        let want = unhex(field(&c, "hash"));
+        let mut xof = vec![0u8; want.len()];
+        hash::hash_xof(&input, &mut xof);
+        assert_eq!(xof, want, "xof, len {len}");
         assert_eq!(
             hash::keyed_hash(&key, &input).0,
             prefix("keyed_hash"),
