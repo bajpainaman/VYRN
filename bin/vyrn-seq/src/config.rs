@@ -122,7 +122,7 @@ pub struct Nic {
 #[serde(deny_unknown_fields)]
 pub struct Cores {
     /// Pin the engine and stream threads to `engine` and `stream` (`vyrn_nic::sys::pin_current_thread`,
-    /// 11 §3.6); both must be set.
+    /// at start, 11 §10.1); both must be set.
     #[serde(default)]
     pub pin: bool,
     pub engine: Option<u16>,

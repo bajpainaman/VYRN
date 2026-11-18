@@ -54,7 +54,8 @@
 //! A block closes `block_ms` after its first packet record or step, and at a clean stop.
 //!
 //! **Events on stdout**, one line each, for tests and operators: `LAYOUT engine=<core|unpinned>
-//! stream=<core|unpinned> control=main`, `REPAIR addr=<ip:port>` (with `[repair]`), `READY ...`,
+//! stream=<core|unpinned> control=main` (the core each thread is pinned to; `unpinned` unless
+//! `[cores] pin`), `REPAIR addr=<ip:port>` (with `[repair]`), `READY ...`,
 //! `BLOCK height=<h> first_step=<s> last_step=<s>`, `NOTICE lane=<l> next=<e> secs=<s>`,
 //! `CONTROL step=<id> phase=<halt|resume>` as it frames a finality-gate `Control` step, and at
 //! exit `STATS records=<n> steps=<n> blocks=<n> responses=<n> tx=<n> tx_unsent=<n>
@@ -66,7 +67,7 @@
 //!
 //! **Not wired yet** (PR follow-ups): maker TX packets (`resp_seq` 0: counted as `tx_unsent`), pooled lanes, two
 //! substreams, retransmits and heartbeats, enforcing the finality gate (`HaltReq`), control
-//! ops, a class A deadline clock (class-E and S backends use `dev_clock`), pinning.
+//! ops, a class A deadline clock (class-E and S backends use `dev_clock`).
 #![forbid(unsafe_code)]
 
 mod config;
@@ -238,6 +239,7 @@ where
     // Set by the stream thread when it exits; set by this thread once the engine thread joined.
     let stream_done = AtomicBool::new(false);
     let engine_done = AtomicBool::new(false);
+    let stream_pin = std::sync::atomic::AtomicU8::new(0);
     let mut ring = Ring::<Out, HANDOFF, 1, Hw>::new(&Hw);
     let (tx, [rx]) = ring.split().ok_or("handoff ring")?;
     let (ready_tx, ready_rx) = sync_channel::<Result<(), String>>(2);
@@ -342,13 +344,16 @@ where
             let (stream_done, engine_done) = (&stream_done, &engine_done);
             let replicas = cfg.replication.order.clone();
             let epoch16 = Epoch(cfg.epoch).low16();
-            let (pin, stream_core) = (cfg.cores.pin, cfg.cores.stream);
+            let (pin, stream_core, stream_pin) = (cfg.cores.pin, cfg.cores.stream, &stream_pin);
             std::thread::Builder::new()
                 .name("vyrn-seq/stream".into())
                 .spawn_scoped(sc, move || {
                     // A failed pin stops the box before READY; this thread still drains the
                     // ring until the engine is done.
-                    let _ = ready.send(pin_to(pin, stream_core, "stream"));
+                    let pinned = pin_to(pin, stream_core, "stream");
+                    let state = if pinned.is_ok() { PIN_OK } else { PIN_FAILED };
+                    stream_pin.store(state, Ordering::Release);
+                    let _ = ready.send(pinned);
                     let mut s = StreamCore {
                         writer,
                         order_tx,
@@ -376,7 +381,7 @@ where
         let engine = {
             let (stats, stop) = (Arc::clone(&stats), Arc::clone(&stop));
             let stream_done = &stream_done;
-            let (pin, engine_core) = (cfg.cores.pin, cfg.cores.engine);
+            let (pin, engine_core, stream_pin) = (cfg.cores.pin, cfg.cores.engine, &stream_pin);
             std::thread::Builder::new()
                 .name("vyrn-seq/engine".into())
                 .spawn_scoped(sc, move || {
@@ -384,6 +389,21 @@ where
                         let _ = ready_tx.send(Err(e.clone()));
                         stop.store(true, Ordering::Release);
                         return Err(e);
+                    }
+                    // No order is taken before both threads are placed: a stream that fails to
+                    // pin must not send frames or responses of a box that never started. The
+                    // stream thread reports its own failure.
+                    let placed = loop {
+                        match stream_pin.load(Ordering::Acquire) {
+                            PIN_OK => break true,
+                            PIN_FAILED => break false,
+                            _ if stop.load(Ordering::Acquire) => break false,
+                            _ => std::thread::yield_now(),
+                        }
+                    };
+                    if !placed {
+                        stop.store(true, Ordering::Release);
+                        return Err("the stream thread was not placed".into());
                     }
                     let h = Handoff {
                         tx,
@@ -479,6 +499,10 @@ impl Drop for Done<'_> {
     }
 }
 
+/// The stream thread's pin result, which the engine waits for before taking orders.
+const PIN_OK: u8 = 1;
+const PIN_FAILED: u8 = 2;
+
 /// Pins the calling thread to `core` when `[cores] pin` is set.
 fn pin_to(pin: bool, core: Option<u16>, name: &str) -> Result<(), String> {
     match core.filter(|_| pin) {
@@ -490,7 +514,11 @@ fn pin_to(pin: bool, core: Option<u16>, name: &str) -> Result<(), String> {
 
 /// The `LAYOUT` and `READY` lines.
 fn start_line(cfg: &Config, n: usize, addrs: &[String]) {
-    let core = |c: Option<u16>| c.map_or_else(|| "unpinned".to_owned(), |c| c.to_string());
+    // Applied placement: a core only when `[cores] pin` put the thread there.
+    let core = |c: Option<u16>| {
+        c.filter(|_| cfg.cores.pin)
+            .map_or_else(|| "unpinned".to_owned(), |c| c.to_string())
+    };
     println!(
         "LAYOUT engine={} stream={} control=main",
         core(cfg.cores.engine),

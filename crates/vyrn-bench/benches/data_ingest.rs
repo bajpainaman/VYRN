@@ -313,7 +313,9 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
                 .unzip();
             let mut rx_out = to_sender.pop().unwrap();
             let (rx_done, shards_done) = (AtomicBool::new(false), AtomicUsize::new(0));
-            let go = Barrier::new(n + 2);
+            // Every core arrives, the timer starts, then all are released: the interval holds
+            // all of their work and none of their start-up.
+            let (arrive, go) = (Barrier::new(n + 2), Barrier::new(n + 2));
             let drain = |done: &dyn Fn() -> bool, work: &mut dyn FnMut() -> usize| {
                 let mut last = false;
                 loop {
@@ -327,8 +329,10 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
                 }
             };
             let (secs, a, stored, dropped, lost) = std::thread::scope(|sc| {
-                let (go, store, rx_done, shards_done) = (&go, &store, &rx_done, &shards_done);
+                let (arrive, go, store) = (&arrive, &go, &store);
+                let (rx_done, shards_done) = (&rx_done, &shards_done);
                 let h_rx = sc.spawn(move || {
+                    arrive.wait();
                     go.wait();
                     seal_counting();
                     let before = violations();
@@ -348,6 +352,7 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
                     .zip(to_sender)
                     .map(|((mut core, mut input), mut out)| {
                         sc.spawn(move || {
+                            arrive.wait();
                             go.wait();
                             seal_counting();
                             let before = violations();
@@ -363,7 +368,7 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
                         })
                     })
                     .collect();
-                // Taken before the barrier releases anyone, so the interval holds every core's work.
+                arrive.wait();
                 let t = Instant::now();
                 go.wait();
                 seal_counting();
@@ -403,11 +408,9 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
             base = m;
         }
         println!(
-            "pipeline {n}  {m:>7.2} Mpps stored  ({:.2}x n = 1, {} threads, median of {ROUNDS}, {PIPE} pkts)  hop_full rx {} shard {}  allocs {allocs}",
+            "pipeline {n}  {m:>7.2} Mpps stored  ({:.2}x n = 1, {} threads, median of {ROUNDS}, {PIPE} pkts)  hop_full over {ROUNDS} rounds: rx {rx_drops} shard {shard_drops}  allocs {allocs}",
             m / base,
-            n + 2,
-            rx_drops / ROUNDS as u64,
-            shard_drops / ROUNDS as u64
+            n + 2
         );
     }
 }
