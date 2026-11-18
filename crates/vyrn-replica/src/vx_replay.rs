@@ -45,6 +45,9 @@ const SLOTS: u64 = 1024;
 const IN_BYTES: usize = 512;
 const OUT_BYTES: usize = 288;
 const STEP_BYTES: usize = 576;
+/// A step slot's payload: its length at byte 12, its bytes from here (pbv.h).
+const STEP_PAYLOAD: usize = 544;
+const STEP_PAYLOAD_CAP: usize = STEP_BYTES - STEP_PAYLOAD;
 const TX_BYTES: usize = 288;
 const IN_ROUTES: usize = 64;
 const MAX_ROUTES: usize = 10;
@@ -500,10 +503,16 @@ impl<P: Payloads, const N: usize> ReplayEngine<N> for VxReplay<P> {
         }
         let mut steps = Vec::new();
         for s in &blk.steps {
-            if !s.payload.is_empty() {
-                return Err(ReplayError("vx client: step payloads are not in v1".into()));
+            // 07 §3.8 payloads are at most 12 bytes (Uncross); the slot holds 32.
+            if s.payload.len() > STEP_PAYLOAD_CAP {
+                return Err(ReplayError(format!(
+                    "vx client: a {}-byte step payload",
+                    s.payload.len()
+                )));
             }
             let mut b = vec![0u8; STEP_BYTES];
+            b[12] = s.payload.len() as u8;
+            put(&mut b, STEP_PAYLOAD, &s.payload);
             put(&mut b, 0, &s.rec.step.0.to_le_bytes());
             let src = s.rec.src_lane_seq.0 != 0;
             let cross = s.rec.flags & vyrn_types::StepFlags::CROSS != 0;

@@ -153,7 +153,7 @@ PBV_STATIC_ASSERT(offsetof(pbo_event, msg) == 40, pbo_event_msg_offset);
 /* ===================================================================================== */
 
 /* Bumped on any change to a layout, a ring, an error code or the supported subset. */
-#define PBV_ABI_VERSION 3u
+#define PBV_ABI_VERSION 4u
 
 typedef struct pbv_ctx pbv_ctx;
 
@@ -201,7 +201,9 @@ typedef struct pbv_ctx pbv_ctx;
 #define PBV_OUT_BYTES   288u /* 0 session u32, 4 resp_seq u32, 8 echo_pkt u32, 12 n u8,
                                 13 n x record[16]: exactly the bytes H(lane l) hashes */
 #define PBV_STEP_BYTES  576u /* 0 step u64, 8 kind u8, 9 has_src u8, 10 src_lane u8, 11 cross u8
-                                (StepFlags::CROSS), 16 src_lane_seq u64, 32 cut (u64 per lane) */
+                                (StepFlags::CROSS), 12 plen u8 (<= 32), 16 src_lane_seq u64,
+                                32 cut (u64 per lane), 544 payload (07 §3.8: Rescan band,
+                                Control code and argument, Uncross p* and Q) */
 #define PBV_TX_BYTES    288u /* 0 step u64, 8 session u32, 12 resp_seq u32, 16 pkt_seq u32,
                                 20 lane u8, 21 n_rec u8, 22 role u8, 23 n_rec x record[16]:
                                 exactly the bytes H(tx) hashes */
@@ -220,9 +222,10 @@ typedef struct pbv_ctx pbv_ctx;
 
 /* v1 subset: New (Day, IOC, FOK, post-only), Cancel, Reduce, Heartbeat and ResendReq (no
  * LaneSeq, no response); SHED records (from the record alone, no payload, 05 §18 Q17); Cross, Improve, Shed,
- * Idle and Depletion steps. Replace, CancelAll, an STP that would trigger, in-packet
- * dependencies, Rescan, Control, Seal and Uncross steps, step payloads and snapshot/state bytes
- * stop with PBV_E_UNSUPPORTED. */
+ * Idle, Depletion and Control steps (Phase and Band, 07 §3.8; PBV_ABI_VERSION 4). Replace,
+ * CancelAll, an STP that would trigger, in-packet dependencies, Rescan, Seal and Uncross steps
+ * and snapshot/state bytes stop with PBV_E_UNSUPPORTED; a malformed step payload is
+ * PBV_E_BAD_RECORD. */
 
 uint32_t pbv_abi_version(void);
 uint64_t pbv_shared_bytes(uint32_t n_lanes);

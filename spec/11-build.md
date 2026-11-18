@@ -990,13 +990,39 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   argument of `pbv_lane_run` is a `uint32_t`.
 - *Output rings.* One per lane and one for fill TX packets; each slot holds exactly the bytes the
   output hash takes, so the shell hashes without decoding.
-- *Subset.* New (Day, IOC, FOK, post-only), Cancel, Reduce, Heartbeat and ResendReq (no
-  LaneSeq), `SHED` records (replayed from the record alone, so their slots carry no payload,
-  05 §18 Q17), and Cross, Improve,
-  Shed, Idle and Depletion steps. Anything else (Replace, CancelAll, a triggered STP, in-packet
-  dependencies, Rescan, Control, Seal, Uncross, step payloads, snapshot and state bytes) stops
-  with `PBV_E_UNSUPPORTED` rather than guess, so a v1 Vx validator halts on it instead of
-  diverging silently.
+- *Subset.* New (Day, IOC, FOK, post-only, auction-only), Cancel, Reduce, Heartbeat and
+  ResendReq (no LaneSeq), `SHED` records (replayed from the record alone, so their slots carry
+  no payload, 05 §18 Q17), and Cross, Improve, Shed, Idle, Depletion, Control and Rescan steps.
+  Anything else stops with `PBV_E_UNSUPPORTED` rather than guess, so a v1 Vx validator halts on
+  it instead of diverging silently; the gap list below is the plan that closes it.
+- *Step kinds and payloads (`PBV_ABI_VERSION` 4).* A step slot carries its 07 §3.8 payload:
+  `plen` at byte 12 (≤ 32) and the bytes from byte 544. A payload on any other kind, or a
+  malformed one, is `PBV_E_BAD_RECORD`. A Control step's Phase command sets the book phase,
+  sends every lane a Phase event, and on a return to Continuous makes (B, A) exact at the cut. A
+  Band command sends every lane a Band event (the lanes' band is not read in v1, as in
+  `vyrn-lane`). Each lane keeps the phase of the last Phase event it applied, as `vyrn-lane`
+  does: a book op is `AUCTION_PHASE` while Frozen (05 §2.5 P4), a New is `BOOK_HALTED` while
+  Halted, and 04 §6.9 decides the rest. At the BBO a forwarded taker is `BOOK_HALTED` or
+  `AUCTION_PHASE` while Halted or Frozen, an IOC or FOK ends `OUT_AUCTION` in an auction, a Day
+  order rests without a sweep, and an auction-only order outside an auction is `AUCTION_PHASE`.
+  Outside Continuous the published snapshot is the empty book, each version records whether
+  it was Continuous, and an envelope over a version that was not is suspect, as in `Bbo::finish`
+  and `Bbo::envelope`. Only a Continuous step other than Rescan widens (B, A) to the envelope
+  first. **[Reading, 1a]** A Rescan step replays its logged cut and band. Its batch taker is the
+  first in-band New of `(prev, cut]` in key order: the client sends it `RESTED_DONE` and makes
+  (B, A) exact from `(max(B, band_hi), min(A, band_lo))`. A batch taker that would cross the
+  book, or a Rescan cut that holds a Cancel or Reduce, stops with `PBV_E_UNSUPPORTED`, because
+  the taker's key visibility and capped CONT sweeps are not in v1.
+- *Gap list (the plan, in order).* What `RustReplay` replays and the Vx client does not yet:
+  1. Uncross and Seal steps (07 §3.8 payloads, #177), checked against the oracle's `uncross`.
+  2. Rescan batch takers that trade: key visibility (05 §5.2), the capped CONT sweep and
+     `RESTED_IN_FLIGHT` (rule B), and post-only batch rejects.
+  3. Replace (keep and new priority) and CancelAll.
+  4. STP that triggers (currently `PBV_E_UNSUPPORTED` in the sweep and the FOK dry run).
+  5. In-packet dependencies (05 §3.7: Join and Cancel dependencies, Reduce barriers).
+  6. The per-step lowver mask (07 `StepRecord`, the engine thread's change), once it is on main.
+  7. `engine.client` wiring in `vyrn-validator` (nothing constructs `VxReplay` today).
+  8. Then a write-up of what a Vx default (`engine.client = vx`) needs; the default stays `rust`.
 - *Pooled lanes (`AcctTake`, 05 §6.9, 07 §7.1).* `pbv_config` byte 48 is the pool mask,
   `pbv_account` byte 6 flags a pool-wide index at byte 44 (`Lane::set_pool_index`), and
   `pbv_session` byte 10 flags a pooled account at byte 12 (`Engine::pool_session`;
