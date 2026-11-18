@@ -31,7 +31,7 @@ use vyrn_nic::frame::{self as nic_frame, Endpoint};
 use vyrn_types::{BookId, MAX_REQ_PAYLOAD, Nanos, SessionId};
 use vyrn_wire::{RX_BURST, RxPkt, RxRing, TxRing};
 
-use crate::frame::Fetch;
+use crate::frame::{Fetch, FetchMsg};
 use crate::ingest::{DataHome, Event};
 use crate::node::{Counters, FetchKeysErr, NodeConfig, bump};
 use crate::redirect::Redirect;
@@ -212,8 +212,24 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
                 continue;
             };
             let src = f.hdr.src;
-            let Some(q) = self.gate.admit(src, f.payload, now, &mut self.counters) else {
-                continue;
+            let q = match self.gate.admit(src, f.payload, now, &mut self.counters) {
+                Some(FetchMsg::One(q)) => q,
+                // Each entry to its owning shard, exactly as a kind-4 REDIRECT.
+                Some(FetchMsg::Batch(b)) => {
+                    for (session, resend_from) in b.entries() {
+                        let r = ToShard::Redirect {
+                            down: b.down,
+                            to: b.to,
+                            session,
+                            resend_from,
+                        };
+                        if let Some(s) = shards.get_mut(shard_of(session, n_shards)) {
+                            hop(s, r, &mut self.counters);
+                        }
+                    }
+                    continue;
+                }
+                None => continue,
             };
             let shard = match q {
                 Fetch::Range {

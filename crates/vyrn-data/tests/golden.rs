@@ -240,3 +240,59 @@ fn v19_of_the_protocol_vectors_opens_and_reseals() {
     let k_out: [u8; 16] = core::array::from_fn(|i| 16 + i as u8);
     assert!(Redirect::open(&bytes, &k_out).is_err());
 }
+
+/// REDIRECT_BATCH (kind 5): encode, decode, seal and open against the published bytes.
+#[test]
+fn redirect_batches_match_the_published_vectors() {
+    use vyrn_data::frame::{FetchMsg, MAX_BATCH, RedirectBatch};
+    let key = |h: &str| -> [u8; 16] { unhex(h).try_into().unwrap() };
+    let (mut ok, mut err, mut auth) = (0, 0, 0);
+    for f in lines() {
+        match f[0].as_str() {
+            "batch_ok" => {
+                let (down, to) = (f[2].parse().unwrap(), f[3].parse().unwrap());
+                let entries: Vec<(SessionId, u32)> = f[4]
+                    .split(',')
+                    .map(|e| {
+                        let (s, r) = e.split_once(':').unwrap();
+                        (SessionId(s.parse().unwrap()), r.parse().unwrap())
+                    })
+                    .collect();
+                let want = unhex(&f[5]);
+                assert_eq!(
+                    RedirectBatch::encode(down, to, &entries).unwrap(),
+                    want,
+                    "{}",
+                    f[1]
+                );
+                let b = RedirectBatch::decode(&want).unwrap();
+                assert_eq!((b.down, b.to), (down, to), "{}", f[1]);
+                assert_eq!(b.entries().collect::<Vec<_>>(), entries, "{}", f[1]);
+                assert_eq!(FetchMsg::decode(&want), Ok(FetchMsg::Batch(b)), "{}", f[1]);
+                ok += 1;
+            }
+            "batch_err" => {
+                let e = RedirectBatch::decode(&unhex(&f[2])).unwrap_err();
+                assert_eq!(format!("{e:?}"), f[3], "{}", f[1]);
+                err += 1;
+            }
+            "batch_auth" => {
+                let (k, plain, sealed) = (key(&f[2]), unhex(&f[3]), unhex(&f[4]));
+                let b = RedirectBatch::decode(&plain).unwrap();
+                let e: Vec<_> = b.entries().collect();
+                assert_eq!(RedirectBatch::seal(&k, b.down, b.to, &e).unwrap(), sealed);
+                assert_eq!(RedirectBatch::open(&sealed, &k), Ok(b));
+                assert_eq!(FetchMsg::open(&sealed, &k), Ok(FetchMsg::Batch(b)));
+                auth += 1;
+            }
+            "batch_auth_err" => {
+                let e = RedirectBatch::open(&unhex(&f[3]), &key(&f[2])).unwrap_err();
+                assert_eq!(format!("{e:?}"), f[4], "{}", f[1]);
+                auth += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((ok, err, auth), (3, 13, 5));
+    assert_eq!(MAX_BATCH, 181);
+}

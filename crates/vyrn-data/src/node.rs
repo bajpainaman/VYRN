@@ -12,7 +12,7 @@ use vyrn_nic::frame::{self as nic_frame, Endpoint};
 use vyrn_types::{BookId, MAX_MSGS_PER_PKT, MSG_BYTES, Nanos, PKT_HDR_BYTES, SessionId, TAG_BYTES};
 use vyrn_wire::{RX_BURST, RxPkt, RxRing, TxRing};
 
-use crate::frame::Fetch;
+use crate::frame::{Fetch, FetchMsg, MAX_BATCH};
 use crate::ingest::{DataHome, Event, HomeConfig, Reject};
 use crate::redirect::Redirect;
 use crate::serve::{Fanout, Gate, Responder, send_to};
@@ -330,8 +330,17 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
                 continue;
             };
             let src = f.hdr.src;
-            if let Some(q) = self.gate.admit(src, f.payload, now, &mut self.counters) {
-                self.serve(src, q);
+            match self.gate.admit(src, f.payload, now, &mut self.counters) {
+                Some(FetchMsg::One(q)) => self.serve(src, q),
+                // Each entry as a kind-4 REDIRECT (07 §5.7 step 3), copied out of the RX
+                // buffer first, on the stack.
+                Some(FetchMsg::Batch(b)) => {
+                    let mut e = [(SessionId(0), 0u32); MAX_BATCH];
+                    let n = e.iter_mut().zip(b.entries()).map(|(d, x)| *d = x).count();
+                    let (down, to) = (b.down, b.to);
+                    self.redirect(down, to, e.get(..n).unwrap_or(&[]));
+                }
+                None => {}
             }
         }
         self.fetch.release(n);

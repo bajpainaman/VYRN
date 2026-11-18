@@ -10,7 +10,7 @@
 use core::net::{Ipv4Addr, SocketAddrV4};
 use std::collections::BTreeMap;
 
-use vyrn_data::frame::{self, Fetch, Kind, key_seq};
+use vyrn_data::frame::{self, Fetch, Kind, RedirectBatch, key_seq};
 use vyrn_data::redirect::Redirect;
 use vyrn_data::{DataNode, Event, HomeConfig, Mode, NodeConfig};
 use vyrn_log::block::{order_root, sign_header};
@@ -598,6 +598,57 @@ fn redirects_go_to_the_sessions_address_and_replays_do_not_move_it() {
     );
     let k = *r.node.counters();
     assert_eq!((k.redirects, k.redirect_unknown), (2, 2));
+}
+
+/// REDIRECT_BATCH (kind 5): every entry is handled as a kind-4 REDIRECT (a redirect to the
+/// session's address, or `redirect_unknown`), and the whole message costs one token. A forged
+/// batch is `fetch_unauth`, a malformed one `fetch_bad`, both before any token is charged.
+#[test]
+fn a_redirect_batch_redirects_each_entry_for_one_token() {
+    const KF: [u8; 16] = [0x33; 16];
+    let mut r = rig_with(MemStore::default(), |c| {
+        c.fetch_keys = BTreeMap::from([(ep(9, 4000).ip, KF)]);
+        (c.fetch_rate, c.fetch_burst) = (1_000, 1);
+    });
+    let mut c = client_rx(&mut r);
+    r.send(&req(5, 1, &[Msg::Heartbeat], &K), 0);
+    r.send(&req(6, 1, &[Msg::Heartbeat], &K), 0);
+    r.node.poll(Nanos(0));
+    let inject = |r: &Rig, b: &[u8]| {
+        let f = wire(r.client, r.me_fetch, b);
+        assert!(r.nic.inject(addr(r.me_fetch), &f, Nanos(0)));
+    };
+    let entries = [(SessionId(5), 4), (SessionId(6), 1), (SessionId(9), 9)];
+    let good = RedirectBatch::seal(&KF, 0, 2, &entries).unwrap();
+    let mut forged = good.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    inject(&r, &forged);
+    // Sessions out of order: refused by the codec, so a hand-built one.
+    let mut bad = RedirectBatch::encode(0, 2, &entries).unwrap();
+    bad[16..24].swap_with_slice(&mut [9, 0, 0, 0, 9, 0, 0, 0]);
+    bad[32..40].swap_with_slice(&mut [5, 0, 0, 0, 4, 0, 0, 0]);
+    let tag = vyrn_crypto::siphash24(&KF, &bad).0;
+    bad.extend_from_slice(&tag.to_le_bytes());
+    inject(&r, &bad);
+    // Burst 1: the three-entry batch passes on one token; the next fetch is limited.
+    inject(&r, &good);
+    inject(&r, &good);
+    r.node.poll(Nanos(1));
+    let k = *r.node.counters();
+    assert_eq!((k.fetch_unauth, k.fetch_bad, k.fetch_limited), (1, 1, 1));
+    assert_eq!((k.redirects, k.redirect_unknown), (2, 1));
+    let mut got: Vec<Redirect> = drain_rx(&mut c)
+        .iter()
+        .map(|b| Redirect::open(b, &K).unwrap())
+        .collect();
+    got.sort_by_key(|r| r.session.0);
+    let r = |s: u32, from: u32| Redirect {
+        down: 0,
+        to: 2,
+        session: SessionId(s),
+        resend_from: from,
+    };
+    assert_eq!(got, vec![r(5, 4), r(6, 1)]);
 }
 
 /// 08 §4.6: from T the home also takes epoch e + 1 under its own keys. `epoch16` picks the key

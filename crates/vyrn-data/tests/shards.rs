@@ -290,4 +290,35 @@ fn shards_forward_one_data_seq_per_dest_and_answer_key_fetches_from_the_owner() 
         |f: fn(&vyrn_data::Counters) -> u64| cores.iter().map(|c| f(c.counters())).sum::<u64>();
     assert_eq!(sum(|c| c.redirects), 2 * sessions.len() as u64);
     assert_eq!(sum(|c| c.fetch_bad), 0);
+
+    // The same as one REDIRECT_BATCH (kind 5): the RX core hands each entry to its owning
+    // shard, exactly as a kind-4 fetch.
+    let mut sorted = sessions.clone();
+    sorted.sort_unstable();
+    let entries: Vec<(SessionId, u32)> = sorted.iter().map(|&s| (SessionId(s), s + 30)).collect();
+    let batch = vyrn_data::frame::RedirectBatch::encode(2, 3, &entries).unwrap();
+    inject(&nic, client, me_fetch, &batch);
+    turn!(40);
+    let mut got: Vec<Redirect> = drain(&mut client_rx)
+        .iter()
+        .map(|b| {
+            let s = u32::from_le_bytes(b[8..12].try_into().unwrap());
+            Redirect::open(b, &key(s)).unwrap()
+        })
+        .collect();
+    got.sort_by_key(|r| r.session.0);
+    let want: Vec<Redirect> = sorted
+        .iter()
+        .map(|&s| Redirect {
+            down: 2,
+            to: 3,
+            session: SessionId(s),
+            resend_from: s + 30,
+        })
+        .collect();
+    assert_eq!(got, want);
+    let sum =
+        |f: fn(&vyrn_data::Counters) -> u64| cores.iter().map(|c| f(c.counters())).sum::<u64>();
+    assert_eq!(sum(|c| c.redirects), 3 * sessions.len() as u64);
+    assert_eq!(sum(|c| c.fetch_bad), 0);
 }
