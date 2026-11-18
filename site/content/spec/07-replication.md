@@ -1234,24 +1234,28 @@ loaded runs). Source 3 holds a packet only
 overflow) that is walked one key at a time, at up to 3 × 300 µs a key, outlives that window: 89
 lost packets stalled every replica on `Missing` for good.
 
-**`PeerDataFetch` bytes (reading, wire; source 2).** The request is the same 32-byte KEY fetch
-as `DataFetch` and `SeqDataReq`, sent to the peer's data port; the answer goes to the request's
-source address. It is `FETCH_RESP` data frames like the sequencer's below, but with `src` = 0xFE,
-carrying every variant the peer holds of the key, split over as many frames as they need; a miss
-is one frame with no packets. A peer holds a key's variants in its join and, after it releases
-them (§5.4), in a FIFO of its last 16,384 released payloads, so a slower peer can still fetch
-them (reading, config). A replica answers at most `REP_SEQ_DATA_MAX_PPS` packets/s (a miss costs
-one, 10 ms of tokens) and refuses RANGE and BLOCK fetches. An answer with fewer tokens on hand
-than variants carries as many as they buy, and that requester's (source address's) next fetch of the key resumes after them, so
-a key holding more variants than a full bucket is still served in full (reading). Its key is
+**`PeerDataFetch` bytes (reading, wire; source 2).** The request is the same 32-byte KEY fetch as
+`DataFetch` and `SeqDataReq`, sent to the peer's data port; the answer goes to the request's source
+address. It is `FETCH_RESP` data frames like the sequencer's below, but with `src` = 0xFE, carrying
+every variant the peer holds of the key, split over as many frames as they need; a miss is one frame
+with no packets. A peer holds a key's variants in its join and, after it releases them (§5.4), in a
+FIFO of its last 16,384 released payloads, so a slower peer can still fetch them (reading, config).
+A replica answers at most `REP_SEQ_DATA_MAX_PPS` packets/s (a miss costs one, 10 ms of tokens) and
+refuses RANGE and BLOCK fetches. An answer with fewer tokens on hand than variants carries as many
+as they buy, and that requester's (source address's) next fetch of the key resumes after them, so a
+key holding more variants than a full bucket is still served in full (reading). Its key is
 `K_fetch(e, i, VOTER_TARGET + j)` under the context `"vyrn      v1 peerfetch"` (08 §9.6), for
-requester `i` and serving voter `j`; source 3's is `K_fetch(e, i, SEQ_TARGET + j)` for
-`vyrn-seq` box `j`. A keyed replica serves only fetches that open under a key of a requester at
-the source's IPv4, so one with no usable requester key serves nothing, and a `[data] xchg`
-that is not the private half of its roster key fails startup. An unkeyed one (no `xchg`)
-serves the 32-byte form to its configured peers (DEV). A target whose roster key is unusable
-holds no keys: a DEV validator (`dev = true`) sends it the 32-byte form, and any other
-validator fails startup, as for a wrong `xchg`, and never falls back to unsealed fetches.
+requester `i` and serving voter `j`; source 3's is `K_fetch(e, i, SEQ_TARGET + j)` for `vyrn-seq`
+box `j`. A keyed replica serves only fetches that open under a key of a requester at the source's
+IPv4, so one with no usable requester key serves nothing, and a `[data] xchg` that is not the
+private half of its roster key fails startup. An unkeyed one (no `xchg`) serves the 32-byte form to
+its configured peers (DEV). A target whose roster key is unusable holds no keys: a DEV validator
+(`dev = true`) sends it the 32-byte form, and any other validator fails startup, as for a wrong
+`xchg`, and never falls back to unsealed fetches. **A keyed DEV replica also serves that peer the
+32-byte form (reading, `fetch.rs`),** from the peer's configured IPv4, as it already takes its
+unsealed `DataDown` (§5.7). Before this, such a peer could fetch from no box, no sequencer and no
+keyed peer, so a loaded run stalled 3 of 4 voters, and finality, on the first packet only another
+replica still held. A non-DEV replica never has such a peer: it fails startup first.
 
 **Epoch boundary (requester side).** A keyed validator re-derives every `K_fetch` it seals or
 serves fetches under when it moves to epoch `e`: its box, peer and `vyrn-seq` keys for `e`, and
@@ -1403,44 +1407,46 @@ box the RX core's hop ring to the owning shard):
    and counted in `hop_full`, as before.
 
 **Replica side (readings, `bin/vyrn-validator` `failover.rs`).** `DataDown{d}` is 24 bytes,
-little-endian: magic 0x4444, version 1, `d` u8, `voter` u8, 3 zero bytes, `epoch` u32, 4 zero
-bytes, then a SipHash-2-4 tag over bytes 0..16 under the sender's peer `K_fetch` toward the
-receiver. It goes to each `[[data.peer]]`'s data port, as a peer fetch does. It counts only as the vote of
-the voter it names: the tag must verify under that voter's peer key, from its `repl_addr` IPv4, so
-one replica cannot cast another's vote, and the voter must be a configured `[[data.peer]]`, so a
-`vyrn-seq` box's peer key casts none. An unkeyed (DEV) sender's tag is 0, and the voter must be
-a configured peer at the source IPv4. A keyed DEV replica also takes tag 0 from a configured peer
-whose roster key is unusable, because it sends that peer unsealed fetches. A replica regossips
-every 10 ms while `d` stays silent, even once `d` is effective, so a peer that lost a message
-still reaches Q. It counts distinct voters, itself included, and keeps each
-vote for the run: 07 names no withdrawal. A `DataDown` tagged `e − 1`, `e` or `e + 1` counts,
-because peers cross an epoch boundary one at a time (the peer-key window, §5.5). Until a session's
-`KeyBundle` reaches the replica, every session's `KeyBundle.data` list is the replica's `[data]
-boxes` in order, with its home at entry 0 (DEV). The replica sends every live box each affected
-session's `resend_from` as REDIRECT_BATCH (kind 5) messages, sealed under that box's `K_fetch`,
-in 3 rounds 10 ms apart, because UDP can lose any one; a message of one session is kind 4. The
-rounds queue and leave at most 64 messages per box every 10 ms, oldest first: 6 400 tokens/s of
-a box's fetch bucket (`vyrn-data` defaults: burst 256, 20 000/s), and with 181 sessions a message
-about 1.16 million sessions/s. A session queued twice in one drain goes in two messages, as a
-message's sessions are strictly ascending. `resend_from` is the session's lowest
-`pkt_seq` in any block the replica holds that is not final yet, resolved there or not, because a
-payload one replica repaired before finality may be held by no other; if it holds none, it is one
-past the highest `pkt_seq` in a final block. Shed records count toward neither. A session the replica first
-holds after the home moved (a checked block enters its pending queue, payloads possibly still
-missing) gets its own rounds then, from its lowest `pkt_seq` in that block,
-with `down` its first home and `to` the current one, since it has followed no move.
-*Former limit (lifted by REDIRECT_BATCH):* with one session per message at 128 per 10 ms, a
-home box with more than about 1 200 sessions could have clients drop packets sent when it failed
-(04 DR4, 100 ms) before their redirect arrived. Batched, a home box's every session gets its first
-round in the first 10 ms period. `bin/vyrn-validator` `failover.rs`
-(`first_round_fits_dr4_at_scale`, 2 000 sessions) checks it, and e2e R13 runs a client that
-discards each packet after 100 ms and fails if a packet it sent to the dead home expired before
-its redirect. Packets sent before the kill reached the home box; the client may discard them, and
-the data check, which needs every payload resolved on the backup, guards them. `REP_DATA_SILENCE_MS`
-is 1 ms. A DEV validator may raise it (`[data] silence_us`) for an unpinned host; e2e R13 uses
-50 ms (ruled, DEV only): on an unpinned 2-vCPU host a live backup's sender core was measured
-going 51.9 ms without a turn, so 20 ms marked it down. e2e R15 runs the failover with 2 000
-sessions.
+little-endian: magic 0x4444, version 1, `d` u8, `voter` u8, 3 zero bytes, `epoch` u32, 4 zero bytes,
+then a SipHash-2-4 tag over bytes 0..16 under the sender's peer `K_fetch` toward the receiver. It
+goes to each `[[data.peer]]`'s data port, as a peer fetch does. It counts only as the vote of the
+voter it names: the tag must verify under that voter's peer key, from its `repl_addr` IPv4, so one
+replica cannot cast another's vote, and the voter must be a configured `[[data.peer]]`, so a
+`vyrn-seq` box's peer key casts none. An unkeyed (DEV) sender's tag is 0, and the voter must be a
+configured peer at the source IPv4. A keyed DEV replica also takes tag 0 from a configured peer
+whose roster key is unusable, because it sends that peer unsealed fetches. A replica regossips every
+10 ms while `d` stays silent, even once `d` is effective, so a peer that lost a message still
+reaches Q. It counts distinct voters, itself included, and keeps each vote for the run: 07 names no
+withdrawal. **The last live box never goes down (reading, `failover.rs`):** Q votes make `d`
+effective only while another box is live. With none left, the mark moves no session, and it would
+leave every session it finds homed on a dead box with no backup, for the run. Under load, a live
+backup silent for the DEV silence bound took Q votes, and the sessions first held after it lost
+their copy 2. A `DataDown` tagged `e − 1`, `e` or `e + 1` counts, because peers cross an epoch
+boundary one at a time (the peer-key window, §5.5). Until a session's `KeyBundle` reaches the
+replica, every session's `KeyBundle.data` list is the replica's `[data] boxes` in order, with its
+home at entry 0 (DEV). The replica sends every live box each affected session's `resend_from` as
+REDIRECT_BATCH (kind 5) messages, sealed under that box's `K_fetch`, in 3 rounds 10 ms apart,
+because UDP can lose any one; a message of one session is kind 4. The rounds queue and leave at most
+64 messages per box every 10 ms, oldest first: 6 400 tokens/s of a box's fetch bucket (`vyrn-data`
+defaults: burst 256, 20 000/s), and with 181 sessions a message about 1.16 million sessions/s. A
+session queued twice in one drain goes in two messages, as a message's sessions are strictly
+ascending. `resend_from` is the session's lowest `pkt_seq` in any block the replica holds that is
+not final yet, resolved there or not, because a payload one replica repaired before finality may be
+held by no other; if it holds none, it is one past the highest `pkt_seq` in a final block. Shed
+records count toward neither. A session the replica first holds after the home moved (a checked
+block enters its pending queue, payloads possibly still missing) gets its own rounds then, from its
+lowest `pkt_seq` in that block, with `down` its first home and `to` the current one, since it has
+followed no move. *Former limit (lifted by REDIRECT_BATCH):* with one session per message at 128 per
+10 ms, a home box with more than about 1 200 sessions could have clients drop packets sent when it
+failed (04 DR4, 100 ms) before their redirect arrived. Batched, a home box's every session gets its
+first round in the first 10 ms period. `bin/vyrn-validator` `failover.rs`
+(`first_round_fits_dr4_at_scale`, 2 000 sessions) checks it, and e2e R13 runs a client that discards
+each packet after 100 ms and fails if a packet it sent to the dead home expired before its redirect.
+Packets sent before the kill reached the home box; the client may discard them, and the data check,
+which needs every payload resolved on the backup, guards them. `REP_DATA_SILENCE_MS` is 1 ms. A DEV
+validator may raise it (`[data] silence_us`) for an unpinned host; e2e R13 uses 50 ms (ruled, DEV
+only): on an unpinned 2-vCPU host a live backup's sender core was measured going 51.9 ms without a
+turn, so 20 ms marked it down. e2e R15 runs the failover with 2 000 sessions.
 
 **Backup addresses (interim reading).** Step 3 needs every live box to know the affected
 sessions' addresses, but only the home box receives copy 2. Until this is settled, a client sends

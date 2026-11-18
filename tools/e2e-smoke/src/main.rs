@@ -601,9 +601,15 @@ struct Nodes(Vec<Node>);
 
 impl Drop for Nodes {
     fn drop(&mut self) {
+        // `E2E_DUMP=<dir>`: each node's stdout lines, for a failed run's post-mortem.
+        let dump = std::env::var_os("E2E_DUMP").map(PathBuf::from);
         for n in &mut self.0 {
             let _ = n.child.kill();
             let _ = n.child.wait();
+            if let Some(d) = &dump {
+                let _ = std::fs::create_dir_all(d);
+                let _ = std::fs::write(d.join(&n.name), n.lines.join("\n"));
+            }
         }
     }
 }

@@ -333,6 +333,9 @@ pub struct PeerServer {
     /// Keyed (`Some`, even empty: then nothing is served): each requester's
     /// `K_fetch(e, i, VOTER_TARGET + me)` by its IPv4. `None`: unkeyed (DEV).
     keys: Option<Vec<(Ipv4Addr, [u8; 16])>>,
+    /// Keyed (DEV): the IPs of configured peers whose roster key is unusable, served the
+    /// 32-byte form too, as this replica sends them (and takes their `DataDown`) unsealed.
+    plain: Vec<Ipv4Addr>,
     level: u64,
     at: u64,
     kept: BTreeMap<(SessionId, u32), Vec<Vec<u8>>>,
@@ -349,6 +352,7 @@ impl PeerServer {
         Self {
             peers: peers.iter().map(|p| *p.ip()).collect(),
             keys,
+            plain: Vec::new(),
             level: cap(),
             at: 0,
             kept: BTreeMap::new(),
@@ -364,6 +368,20 @@ impl PeerServer {
         if self.keys.is_some() {
             self.keys = Some(keys);
         }
+    }
+
+    /// A keyed DEV server's peers whose roster key is unusable: `sealed[i]` is the key it seals
+    /// to the `i`-th configured peer with, `None` for such a peer. Without this a peer with no
+    /// usable key had no source it could fetch from but its own data stream: under load the
+    /// packets only the sequencer still retained stalled it (and 3 of 4 voters, finality).
+    pub fn set_plain(&mut self, sealed: &[Option<[u8; 16]>]) {
+        self.plain = self
+            .peers
+            .iter()
+            .zip(sealed)
+            .filter(|(_, k)| k.is_none())
+            .map(|(ip, _)| *ip)
+            .collect();
     }
 
     /// Before `join.release(recs)`: copies the payloads those records name, so peers can still
@@ -410,7 +428,13 @@ impl PeerServer {
             Some(keys) => keys
                 .iter()
                 .filter(|(ip, _)| *ip == from)
-                .find_map(|(_, k)| Fetch::open(req, k).ok()),
+                .find_map(|(_, k)| Fetch::open(req, k).ok())
+                .or_else(|| {
+                    self.plain
+                        .contains(&from)
+                        .then(|| Fetch::decode(req).ok())
+                        .flatten()
+                }),
         };
         match q? {
             Fetch::Key { session, pkt_seq } => Some((session, pkt_seq)),
@@ -981,5 +1005,22 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(c.served, 0);
+        // DEV: a configured peer whose roster key is unusable is served the plain form; one
+        // with a key must still seal.
+        let (p1, p2) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2));
+        let peers = [SocketAddrV4::new(p1, 1), SocketAddrV4::new(p2, 1)];
+        let mut srv = PeerServer::new(&peers, Some(Vec::new()));
+        srv.set_plain(&[None, Some([0x41; 16])]);
+        let mut c = Counts::default();
+        let ask = |srv: &mut PeerServer, ip, c: &mut Counts| {
+            !srv.serve(&j, SocketAddrV4::new(ip, 9), &q.encode(), 0, c)
+                .is_empty()
+        };
+        assert!(ask(&mut srv, p1, &mut c), "unusable key: plain served");
+        assert!(!ask(&mut srv, p2, &mut c), "a keyed peer must seal");
+        assert!(
+            !ask(&mut srv, Ipv4Addr::new(10, 0, 0, 3), &mut c),
+            "not a peer"
+        );
     }
 }
