@@ -616,6 +616,27 @@ seq = "env:VYRN_E2E_SEQ_SEED"
     Ok(p)
 }
 
+/// `n` free UDP ports below the kernel's ephemeral range, for the validators' data queues. Ports
+/// the kernel hands out (port 0, as every other node binds) never fall there, so a port picked
+/// here and released stays free until its validator binds it, whatever starts in between.
+fn data_ports(n: usize) -> Result<Vec<u16>, String> {
+    let low: u16 = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|r| r.split_whitespace().next()?.parse().ok())
+        .unwrap_or(32_768);
+    let span = low.saturating_sub(20_000).max(1);
+    let start = 20_000 + u16::try_from(std::process::id() % u32::from(span)).unwrap_or(0);
+    let ports: Vec<u16> = (0..span)
+        .map(|k| 20_000 + (start - 20_000 + k) % span)
+        .filter(|&p| UdpSocket::bind(("127.0.0.1", p)).is_ok())
+        .take(n)
+        .collect();
+    if ports.len() < n {
+        return Err("no free UDP ports below the ephemeral range for the validators".into());
+    }
+    Ok(ports)
+}
+
 /// A validator's config. With `data = Some((fetch, port))` (`--data`): its data RX queue on
 /// `port`, the vyrn-data node at `fetch` as box 0 (it is destination `i + 1` there; the tap is
 /// 0), and `[replay]` with the sequencer's engine and sessions, so it prints `out=` per block.
@@ -742,16 +763,10 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let mut nodes = Nodes(Vec::new());
     let timeout = Some(Duration::from_millis(50));
     let stop_tap = Arc::new(AtomicBool::new(false));
-    // With --data, each validator's data port (07 §5.4), picked before vyrn-data starts.
+    // With --data, each validator's data port (07 §5.4), picked before vyrn-data starts and
+    // outside the ephemeral range, so no node's port-0 bind can take it meanwhile.
     let val_data: Vec<u16> = if cli.data {
-        (0..cli.validators)
-            .map(|_| {
-                UdpSocket::bind("127.0.0.1:0")
-                    .and_then(|s| s.local_addr())
-                    .map(|a| a.port())
-                    .map_err(|e| e.to_string())
-            })
-            .collect::<Result<_, String>>()?
+        data_ports(cli.validators)?
     } else {
         Vec::new()
     };
