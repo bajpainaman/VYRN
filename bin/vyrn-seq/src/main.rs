@@ -16,7 +16,7 @@
 //! | `[engine] dedicated, pooled = 0, tick_min, tick_max, win_center, slot_cap` | lanes and book window |
 //! | `[nic] backend, ip, port_base` | `kernel_udp` or `sim`; lane `l` listens on `port_base + l` (0: ephemeral) |
 //! | `[cores] pin = false, engine, stream, seal` | `pin = true` pins the engine and stream threads to `engine` and `stream` (both required); a failed pin fail-stops before `READY`; `seal` is `abort`, `count` or `off` |
-//! | `[replication] order = ["ip:port", ...], order_b = [...], block_ms` | where ORDER, HASH and HEADER frames go on path A and, flagged `PATH_B`, on path B (optional; 07 §3.1; opt-in cost: one header copy and one send per frame per path-B replica on the stream thread, +30–40% per frame in DEV with 5 replicas, not a latency result); block period |
+//! | `[replication] order = ["ip:port", ...], order_b = [...], block_ms` | where ORDER, HASH and HEADER frames go on path A and, flagged `PATH_B`, on path B (optional; 07 §3.1; opt-in cost: one header copy and one send per frame per path-B replica on the stream thread, +30–40% per frame in DEV with 5 replicas, not a latency result); block period. `rtx_ring_bytes` (default 64 MiB, `REP_RTX_RING_BYTES`): path A frames kept for a replica's `Nack` on `[consensus] ctrl`, served only to configured replicas, at their configured address (07 §4.10, `rtx.rs`); prints `RTX nacks= sent= too_old= refused= limited=` at exit |
 //! | `[keys] seq` | the `seq_key` handle (Ed25519 seed) |
 //! | `[epoch_boundary] next, t_ns, to_home, seq_index` | optional: per-lane `EpochNotice` triggers (08 §2.4) |
 //! | `[[dev_session]] lane, slot, account, k_seq, k_out, quote, base` | DEV only: sessions opened at start |
@@ -79,6 +79,7 @@
 mod config;
 mod finality;
 mod repair;
+mod rtx;
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
@@ -336,6 +337,8 @@ where
         .collect::<Result<_, String>>()?;
     let block = Duration::from_millis(cfg.replication.block_ms);
     let mut plan = EnginePlan::from(cfg)?;
+    // Nacks from the finality listener to the stream core (`rtx.rs`).
+    let (nack_tx, nack_rx) = std::sync::mpsc::sync_channel::<rtx::Req>(rtx::NACK_QUEUE);
     let fin = match &cfg.consensus {
         Some(c) => {
             let st = Arc::clone(&stats);
@@ -347,6 +350,7 @@ where
                 vyrn_crypto::ed25519::public_key(&seed),
                 Arc::new(move || st.blocks.load(Ordering::Acquire)),
                 Arc::clone(&stop),
+                nack_tx,
             )?;
             println!("CONSENSUS ctrl={}", f.ctrl);
             plan.gate = Some(Arc::clone(&f.counts));
@@ -383,6 +387,7 @@ where
             let replicas = cfg.replication.order.clone();
             let replicas_b = cfg.replication.order_b.clone();
             let epoch16 = Epoch(cfg.epoch).low16();
+            let ring_bytes = cfg.replication.rtx_ring_bytes;
             let (pin, stream_core, stream_pin) = (cfg.cores.pin, cfg.cores.stream, &stream_pin);
             std::thread::Builder::new()
                 .name("vyrn-seq/stream".into())
@@ -401,6 +406,10 @@ where
                         path_b_down: vec![false; replicas_b.len()],
                         replicas_b,
                         path_b: Vec::new(),
+                        rtx: rtx::Ring::new(epoch16, 0, ring_bytes),
+                        nacks: nack_rx,
+                        rtx_out: Vec::new(),
+                        t0: Instant::now(),
                         src: ip,
                         k_out,
                         epoch16,
@@ -1139,6 +1148,12 @@ struct StreamCore<T: TxRing> {
     /// Per path B replica: a send to it failed and has not succeeded since (`PATH_B_DOWN`
     /// printed once per outage).
     path_b_down: Vec<bool>,
+    /// Path A frames kept for retransmit, the Nacks the finality listener queued, and the
+    /// copies one Nack sends (`rtx.rs`).
+    rtx: rtx::Ring,
+    nacks: std::sync::mpsc::Receiver<rtx::Req>,
+    rtx_out: Vec<(SocketAddrV4, Vec<u8>)>,
+    t0: Instant,
     src: Ipv4Addr,
     k_out: Vec<(SessionId, [u8; 16])>,
     epoch16: u16,
@@ -1190,12 +1205,18 @@ impl<T: TxRing> StreamCore<T> {
                 }
             }
             self.drain()?;
+            self.retransmit()?;
             let end = done && got == 0;
             if open && (end || (!group && opened.elapsed() >= block)) {
                 self.close_block()?;
                 open = false;
             }
             if end {
+                let s = self.rtx.stats;
+                println!(
+                    "RTX nacks={} sent={} too_old={} refused={} limited={}",
+                    s.nacks, s.sent, s.too_old, s.refused, s.limited
+                );
                 return Ok(());
             }
             if got == 0 {
@@ -1332,6 +1353,7 @@ impl<T: TxRing> StreamCore<T> {
             for r in &self.replicas {
                 send(&mut self.order_tx, self.src, dst(r), f)?;
             }
+            self.rtx.push(f);
             if self.replicas_b.is_empty() {
                 continue;
             }
@@ -1353,6 +1375,35 @@ impl<T: TxRing> StreamCore<T> {
                     Err(_) => {}
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+impl<T: TxRing> StreamCore<T> {
+    /// Serves up to [`rtx::NACKS_PER_TURN`] queued Nacks (07 §4.10, `rtx.rs`), so a flood of
+    /// them cannot keep this thread from frames, responses and block closure (Vercel
+    /// r4613653838); the rest wait for the next turn, and a full queue drops new ones. A
+    /// refused send is dropped: the replica asks again.
+    fn retransmit(&mut self) -> Result<(), String> {
+        let now = u64::try_from(self.t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        for _ in 0..rtx::NACKS_PER_TURN {
+            let Ok((src, n)) = self.nacks.try_recv() else {
+                break;
+            };
+            self.rtx_out.clear();
+            let mut out = core::mem::take(&mut self.rtx_out);
+            self.rtx
+                .serve(src, &n, &self.replicas, &self.replicas_b, now, &mut out);
+            for (to, bytes) in &out {
+                let dst = Endpoint {
+                    mac: [0; 6],
+                    ip: *to.ip(),
+                    port: to.port(),
+                };
+                let _ = send(&mut self.order_tx, self.src, dst, bytes);
+            }
+            self.rtx_out = out;
         }
         Ok(())
     }

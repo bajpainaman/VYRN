@@ -12,6 +12,7 @@ enough to regenerate the protocol files.
 | `vyrn_session_vectors.py`, `.out`, `.json` | 35 packets, one per session state (04 §4.3) and message type, each with the lane's verdict (04 §3.1 V2/V7), and the final in-stream record of the 6 close causes | written for this repository from the 04 §3.1 and §4.3 tables |
 | `vyrn_replica_vectors.txt` | 14 order-stream frame sequences and the verdict a replica's order core must reach: the step rules of 07 §3.12 (a cut beyond the decoded lane prefix, a source that is not decoded or is in a `SHED` packet), the `REP_E_HASHLAG` timer at and past 1 ms, also when the late hash itself arrives (07 §3.7), the step merge from the `TenureStart` cuts, a `TenureStart` cut beyond its lane bases, a step missing after both marks (07 §3.8, §3.9), and the header rules (07 §3.10). The file's header gives the format | built with `vyrn-log`'s encoder by `crates/vyrn-replica/tests/conformance.rs` (`VYRN_BLESS=1` rewrites it) |
 | `vyrn_data_vectors.py`, `.out`, `.json` | 5 data frames (07 §5.3) to build and accept and 13 to refuse, 3 fetch requests and 9 refusals, and 5 dedupe-window sequences (07 §5.2 step 3) | written for this repository from the layouts in `crates/vyrn-data/src/lib.rs` |
+| `vyrn_nack_vectors.py`, `.out`, `.json` | 5 `Nack` and `NackTooOld` datagrams (07 §4.10, sequencer retransmit) to build and accept and 10 to refuse | written for this repository from the 07 §4.10 layout; `crates/vyrn-log/tests/nack_vectors.rs` checks `vyrn_log::nack` against it |
 | `siphash.txt` | SipHash-2-4, 64 lengths (the packet MAC, 01 §4) | [veorq/SipHash](https://github.com/veorq/SipHash) `vectors.h` at `32d0676`, `vectors_sip64` |
 | `blake3_test_vectors.json` | BLAKE3 hash, keyed hash and `derive_key` (01 §4) | [BLAKE3-team/BLAKE3](https://github.com/BLAKE3-team/BLAKE3) `test_vectors/test_vectors.json` at `657284b`, byte for byte |
 | `ed25519-edge.txt` | Ed25519 edge cases with ZIP-215 verdicts (spec/11-build.md §2.5) | [novifinancial/ed25519-speccheck](https://github.com/novifinancial/ed25519-speccheck) `cases.json` at `6551933`; verdicts from the Zebra row of its README |
@@ -32,18 +33,19 @@ python3 -I "$REPO/tests/golden/vyrn_reject_vectors.py" | diff - "$REPO/tests/gol
 python3 -I "$REPO/tests/golden/vyrn_admin_vectors.py"  | diff - "$REPO/tests/golden/vyrn_admin_vectors.out"
 python3 -I "$REPO/tests/golden/vyrn_session_vectors.py" | diff - "$REPO/tests/golden/vyrn_session_vectors.out"
 python3 -I "$REPO/tests/golden/vyrn_data_vectors.py"   | diff - "$REPO/tests/golden/vyrn_data_vectors.out"
+python3 -I "$REPO/tests/golden/vyrn_nack_vectors.py"   | diff - "$REPO/tests/golden/vyrn_nack_vectors.out"
 ```
 
 Each command prints nothing when its file matches. CI runs them on every pull request.
 
-**JSON form.** Every `vyrn_*_vectors.py` script (proto, log, session, data, admin, reject) also
+**JSON form.** Every `vyrn_*_vectors.py` script (proto, log, session, data, admin, reject, nack) also
 takes `--json` and print the same vectors as one JSON document, committed beside the `.out` file,
 so an implementation in another language (Vx, for one) needs no parser for the text format. CI
 diffs both forms, and `crates/vyrn-sim/tests/golden_json.rs` reads the proto, reject and session
 JSON and checks it against `vyrn-wire` and `vyrn-lane`:
 
 ```sh
-for v in proto log session data admin reject; do
+for v in proto log session data admin reject nack; do
   python3 -I "$REPO/tests/golden/vyrn_${v}_vectors.py" --json | diff - "$REPO/tests/golden/vyrn_${v}_vectors.json"
 done
 ```
@@ -66,6 +68,8 @@ Every document has `source`, the script that wrote it. Bytes are lowercase hex s
   (`pkt_seqs, verdicts`).
 - `vyrn_admin_vectors.json`: `vectors`, each `{id, message, what, verdict, hex}`, `verdict`
   `ok` or `refuse`.
+- `vyrn_nack_vectors.json`: `vectors`, each `{id, message, verdict, what, hex}`, `message`
+  `Nack` or `NackTooOld` and `verdict` `ok` or `refuse`.
 - `vyrn_reject_vectors.json`: `vectors`, each `{id, dir, what, verdict, results, hex}`: `dir`
   `req` or `resp`, `verdict` `drop`, `msgs` or `recs`, and `results` the per-message or
   per-record verdicts (empty for `drop`).

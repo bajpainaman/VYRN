@@ -161,6 +161,10 @@ pub struct Replication {
     pub order_b: Vec<SocketAddrV4>,
     /// A block closes this often while steps are pending.
     pub block_ms: u64,
+    /// The stream core's retransmit ring (07 §4.10, `REP_RTX_RING_BYTES`): path A frames kept
+    /// for a replica's `Nack`, which reaches it through `[consensus] ctrl`.
+    #[serde(default = "d_rtx_ring")]
+    pub rtx_ring_bytes: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,4 +283,8 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn d_rtx_ring() -> usize {
+    crate::rtx::REP_RTX_RING_BYTES
 }

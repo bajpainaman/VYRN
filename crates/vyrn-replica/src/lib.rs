@@ -111,6 +111,7 @@ pub use ports::{
 };
 pub use rust::{OUTPUT_DOMAIN, RustReplay, output_hash};
 pub use vx_replay::{VxAccount, VxConfig, VxReplay, VxSession};
+pub use vyrn_log::nack::{Nack, NackTooOld};
 
 /// What a [`RustReplay`] sink sees, re-exported so a crate above this one (`vyrn-md`, layer 7)
 /// implements `Sink` with this crate as its only replay dependency (11 §1.4).

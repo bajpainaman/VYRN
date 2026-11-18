@@ -1,0 +1,110 @@
+{
+  "source": "tests/golden/vyrn_nack_vectors.py",
+  "vectors": [
+    {
+      "id": "N01",
+      "message": "Nack",
+      "verdict": "ok",
+      "what": "path A, epoch16 1000, tenure 0, stream 0, port 7400, frames 5..=9",
+      "hex": "3100e8030000e81c05000000000000000900000000000000"
+    },
+    {
+      "id": "N02",
+      "message": "Nack",
+      "verdict": "ok",
+      "what": "path B, epoch16 0xBEEF, tenure 3, stream 1, port 40001, one frame 2^40",
+      "hex": "3101efbe0301419c00000000000100000000000000010000"
+    },
+    {
+      "id": "N03",
+      "message": "Nack",
+      "verdict": "ok",
+      "what": "the longest range: 1..=1024",
+      "hex": "310001000001090001000000000000000004000000000000"
+    },
+    {
+      "id": "T01",
+      "message": "NackTooOld",
+      "verdict": "ok",
+      "what": "path A, epoch16 1000, tenure 0, stream 0, oldest_seq 4096",
+      "hex": "3200e803000000000010000000000000"
+    },
+    {
+      "id": "T02",
+      "message": "NackTooOld",
+      "verdict": "ok",
+      "what": "path B, epoch16 7, tenure 255, stream 1, oldest_seq 2^63",
+      "hex": "32010700ff0100000000000000000080"
+    },
+    {
+      "id": "R01",
+      "message": "Nack",
+      "verdict": "refuse",
+      "what": "from_seq 0",
+      "hex": "310001000000090000000000000000000300000000000000"
+    },
+    {
+      "id": "R02",
+      "message": "Nack",
+      "verdict": "refuse",
+      "what": "to_seq below from_seq",
+      "hex": "310001000000090008000000000000000700000000000000"
+    },
+    {
+      "id": "R03",
+      "message": "Nack",
+      "verdict": "refuse",
+      "what": "1025 frames: 1..=1025",
+      "hex": "310001000000090001000000000000000104000000000000"
+    },
+    {
+      "id": "R04",
+      "message": "Nack",
+      "verdict": "refuse",
+      "what": "path 2",
+      "hex": "310201000000090001000000000000000100000000000000"
+    },
+    {
+      "id": "R05",
+      "message": "Nack",
+      "verdict": "refuse",
+      "what": "stream 2",
+      "hex": "310001000002090001000000000000000100000000000000"
+    },
+    {
+      "id": "R06",
+      "message": "Nack",
+      "verdict": "refuse",
+      "what": "23 bytes: N01 without its last byte",
+      "hex": "3100e8030000e81c050000000000000009000000000000"
+    },
+    {
+      "id": "R07",
+      "message": "Nack",
+      "verdict": "refuse",
+      "what": "N01 with the NackTooOld type",
+      "hex": "3200e8030000e81c05000000000000000900000000000000"
+    },
+    {
+      "id": "R08",
+      "message": "NackTooOld",
+      "verdict": "refuse",
+      "what": "reserved 1",
+      "hex": "3200e803000001000010000000000000"
+    },
+    {
+      "id": "R09",
+      "message": "NackTooOld",
+      "verdict": "refuse",
+      "what": "17 bytes: T01 and a trailing 0",
+      "hex": "3200e80300000000001000000000000000"
+    },
+    {
+      "id": "R10",
+      "message": "NackTooOld",
+      "verdict": "refuse",
+      "what": "path 2",
+      "hex": "3202e803000000000010000000000000"
+    }
+  ]
+}
