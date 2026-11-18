@@ -70,7 +70,7 @@ settle
   step 2 kind=5 src=0:0 flags=0 cut=1,0,0
   log 0 0x0 pkt=0 count=0 flags=0x2 first=2 fills_applied=1
 pkt 1 0x101001 rx=3000 now=3000 01101000010000000300000007000000010100006a000000010000001500000010000000000000000000000000000000010000006a000000030000001600000030ffd30f72b2240a0000000000000000
-  log 1 0x101001 pkt=1 count=3 flags=0x0 first=1 fills_applied=0
+  log 1 0x101001 pkt=1 count=2 flags=0x0 first=1 fills_applied=0
   route 1 seq=2 cross=true
 settle
   step 3 kind=1 src=1:2 flags=2 cut=1,0,0

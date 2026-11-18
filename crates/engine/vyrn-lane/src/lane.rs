@@ -765,9 +765,33 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         let prio_ts = p.rx_ts.max(self.last_prio_ts);
         self.last_prio_ts = prio_ts;
         self.refresh_snapshot(vis);
+        // V9 (header) and V10 (packet buckets): every message gets the reject.
+        let hdr = req.check_header().err().map(|e| rej(e.reason, e.detail));
+        let hdr = hdr.or_else(|| (s.book != h.book()).then(|| rej(RejectReason::BadBook, 0)));
+        let hdr = match hdr {
+            Some(r) => Some(r),
+            None => self.risk_packet(si, prio_ts).err(),
+        };
+        // `count` is the messages that take a LaneSeq (05 §3.1, 07 §3.6): without a
+        // packet-level reject, Heartbeat and ResendReq take none.
+        let numbered = if hdr.is_some() {
+            n
+        } else {
+            let k = req
+                .raw_msgs()
+                .iter()
+                .filter(|raw| {
+                    matches!(
+                        Msg::decode(raw),
+                        Ok(Msg::Heartbeat) | Ok(Msg::ResendReq { .. })
+                    )
+                })
+                .count();
+            n.saturating_sub(u8::try_from(k).unwrap_or(u8::MAX))
+        };
         self.out.log(LogRec::Packet(PacketRecord {
             lane: self.cfg.lane,
-            count: n,
+            count: numbered,
             flags: 0,
             session: sid,
             pkt_seq,
@@ -781,13 +805,6 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         self.cur_pkt = pkt_seq;
         self.cur_ts = prio_ts;
         self.imm = None;
-        // V9 (header) and V10 (packet buckets): every message gets the reject.
-        let hdr = req.check_header().err().map(|e| rej(e.reason, e.detail));
-        let hdr = hdr.or_else(|| (s.book != h.book()).then(|| rej(RejectReason::BadBook, 0)));
-        let hdr = match hdr {
-            Some(r) => Some(r),
-            None => self.risk_packet(si, prio_ts).err(),
-        };
         // Pass 1, index order.
         for (ix, raw) in req.raw_msgs().iter().enumerate() {
             let ix = u8::try_from(ix).unwrap_or(u8::MAX);
