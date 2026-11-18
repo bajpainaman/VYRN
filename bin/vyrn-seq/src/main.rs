@@ -20,6 +20,7 @@
 //! | `[keys] seq` | the `seq_key` handle (Ed25519 seed) |
 //! | `[epoch_boundary] next, t_ns, to_home, seq_index` | optional: per-lane `EpochNotice` triggers (08 §2.4) |
 //! | `[[dev_session]] lane, slot, account, k_seq, k_out, quote, base` | DEV only: sessions opened at start |
+//! | `[repair] port, slots = 65536, max_pps = 50000, session_pps = 2000` | optional: `SeqDataReq` (07 §5.5 source 3) on its own thread; see `repair.rs` |
 //!
 //! **Start sequence** (11 §10.1), each step fail-stops with exit code 2 and one line on stderr:
 //! load and check config → resolve keys → (release manifest and Vx hash: not checked yet) →
@@ -37,6 +38,7 @@
 //! |---|---|---|
 //! | `engine` | 1, 2, 6, 8–49 | polls every lane's RX queue, runs `Engine::ingest`, `Engine::run` (cut cores, BBO, lanes); per-lane `Notifier`s. `vyrn-engine` is single-threaded in this version, so these roles share one thread. |
 //! | `stream` | 4 (and 3, 5 for responses) | `SeqWriter` (vyrn-log): frames every record, sends ORDER and HASH, closes and signs a block every `block_ms`, then sends the responses those frames cover (`INV-FRAME-FIRST`) |
+//! | `repair` | 51 (07 §5.5 source 3) | with `[repair]`: takes the engine's retention copies (`vyrn_engine::retain`, through a second `vyrn_cut::Ring`, [`repair::RETAIN_HANDOFF`] entries, pushed without waiting) and answers replicas' KEY fetches (`repair.rs`) |
 //! | main | 51 | config, start, readiness, stop, stats |
 //!
 //! **Handoff.** The engine thread hands its outputs to the stream thread through one
@@ -50,10 +52,11 @@
 //! A block closes `block_ms` after its first packet record or step, and at a clean stop.
 //!
 //! **Events on stdout**, one line each, for tests and operators: `LAYOUT engine=<core|unpinned>
-//! stream=<core|unpinned> control=main`, `READY ...`,
+//! stream=<core|unpinned> control=main`, `REPAIR addr=<ip:port>` (with `[repair]`), `READY ...`,
 //! `BLOCK height=<h> first_step=<s> last_step=<s>`, `NOTICE lane=<l> next=<e> secs=<s>`, and at
 //! exit `STATS records=<n> steps=<n> blocks=<n> responses=<n> tx=<n> tx_unsent=<n>
-//! seal_violations=<n> handoff_full=<n>`.
+//! seal_violations=<n> handoff_full=<n>`, then with `[repair]` `REPAIR_STATS retain_dropped=<n>
+//! served=<n> missed=<n> limited=<n> bad=<n>`.
 //!
 //! **Stop.** With `--stop-on-stdin-eof`, closing stdin stops both threads, flushes the stream
 //! and prints `STATS`. Otherwise the process runs until killed (06 §4.8: never restarted).
@@ -64,6 +67,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod repair;
 
 use std::io::Read as _;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -154,6 +158,8 @@ struct Stats {
     seal_violations: AtomicU64,
     /// Engine pushes that found the handoff full and waited.
     full: AtomicU64,
+    /// Retention copies lost to a full repair ring (the engine never waits on it).
+    retain_dropped: AtomicU64,
 }
 
 fn fail(what: &str, e: impl std::fmt::Display) -> ExitCode {
@@ -229,6 +235,28 @@ where
     let mut ring = Ring::<Out, HANDOFF, 1, Hw>::new(&Hw);
     let (tx, [rx]) = ring.split().ok_or("handoff ring")?;
     let (ready_tx, ready_rx) = sync_channel::<Result<(), String>>(2);
+    // 07 §5.5 source 3: its queues, ring and server are allocated before any thread starts.
+    let mut retain_ring = cfg.repair.as_ref().map(|_| repair::RetainRing::new(&Hw));
+    let mut repair_q = None;
+    if let Some(r) = &cfg.repair {
+        let bind = RxBind {
+            lane: LaneId(0),
+            port: PortId(0),
+            ip,
+            udp_port: r.port,
+        };
+        let rrx = nic.rx_ring(&bind).map_err(|e| e.to_string())?;
+        let rtx = nic
+            .tx_ring(PortId(0), TxClass::Control)
+            .map_err(|e| e.to_string())?;
+        let replicas = cfg.replication.order.iter().map(|a| *a.ip()).collect();
+        let server = repair::Server::new(r.slots, replicas, r.max_pps, r.session_pps);
+        repair_q = Some((server, rrx, rtx));
+    }
+    let (retain_tx, retain_rx) = match retain_ring.as_mut().and_then(|r| r.split()) {
+        Some((p, [c])) => (Some(p), Some(c)),
+        None => (None, None),
+    };
 
     let writer = writer(cfg, n, seed)?;
     let k_out: Vec<(SessionId, [u8; 16])> = cfg
@@ -242,6 +270,23 @@ where
         // However this closure exits, a panic included (stdout closed before `READY` makes
         // `println!` panic), both threads are told to finish, so the scope's join cannot hang.
         let _stop = Done([&*stop, &engine_done]);
+        let repair = match (repair_q, retain_rx) {
+            (Some((server, rrx, rtx)), Some(copies)) => {
+                let me = Endpoint {
+                    mac: [0; 6],
+                    ip,
+                    port: 0,
+                };
+                println!("REPAIR addr={}", rrx.local());
+                let stop = Arc::clone(&stop);
+                let t = std::thread::Builder::new()
+                    .name("vyrn-seq/repair".into())
+                    .spawn_scoped(sc, move || repair::run(server, copies, rrx, rtx, me, &stop))
+                    .map_err(|e| e.to_string())?;
+                Some(t)
+            }
+            _ => None,
+        };
         let stream = {
             let (stats, stop, ready) = (Arc::clone(&stats), Arc::clone(&stop), ready_tx.clone());
             let (stream_done, engine_done) = (&stream_done, &engine_done);
@@ -284,6 +329,7 @@ where
                         tx,
                         stream_done,
                         dead: false,
+                        retain: retain_tx,
                     };
                     engine_thread(plan, rxs, h, &ready_tx, &stop, &stats, class)
                 })
@@ -322,6 +368,7 @@ where
         engine_done.store(true, Ordering::Release);
         stop.store(true, Ordering::Release);
         let s = stream.join();
+        let r = repair.map(|t| t.join());
         if let Some(f) = failed {
             return Err(f);
         }
@@ -337,6 +384,19 @@ where
             g(&stats.seal_violations),
             g(&stats.full)
         );
+        if let Some(Ok(rs)) = &r {
+            println!(
+                "REPAIR_STATS retain_dropped={} served={} missed={} limited={} bad={}",
+                g(&stats.retain_dropped),
+                rs.served,
+                rs.missed,
+                rs.limited,
+                rs.bad
+            );
+        }
+        if let Some(Err(_)) = r {
+            return Err("repair thread panicked".into());
+        }
         let e = e.map_err(|_| "engine thread panicked")?;
         let s = s.map_err(|_| "stream thread panicked")?;
         e.and(s)
@@ -531,6 +591,8 @@ struct Handoff<'a> {
     stream_done: &'a AtomicBool,
     /// The stream thread exited: nothing more is pushed and the engine loop stops.
     dead: bool,
+    /// Retention copies to the repair thread (07 §5.5 source 3), when `[repair]` is set.
+    retain: Option<Producer<'a, vyrn_engine::retain::Kept, { repair::RETAIN_HANDOFF }, 1, Hw>>,
 }
 
 /// The source endpoint of each session's last accepted packet.
@@ -835,6 +897,17 @@ fn ingest(
         pkt_hash,
     };
     let r = engine.ingest(l, input, clock, sink);
+    // Exactly the packets with a PacketRecord are retained (05 §6.10); a full ring drops the copy.
+    if let Ok(v @ (Rx::Accepted | Rx::Shed)) = &r
+        && let Some(q) = sink.tx.retain.as_mut()
+        && let Some(mut k) = vyrn_engine::retain::Kept::new(body, rx_ts, pkt_hash)
+        && {
+            k.verified = *v == Rx::Accepted;
+            q.push(&Hw, k).is_err()
+        }
+    {
+        sink.stats.retain_dropped.fetch_add(1, Ordering::Relaxed);
+    }
     // Only a packet the lane authenticated and accepted moves the session's endpoint: a spoofed
     // or replayed one must not redirect its responses.
     if let (Ok(Rx::Accepted), Some((s, _, src))) = (&r, sink.from.take())
@@ -1121,6 +1194,7 @@ mod tests {
                 tx,
                 stream_done: &done,
                 dead: false,
+                retain: None,
             },
             recent: std::collections::VecDeque::new(),
             peers,
@@ -1256,6 +1330,7 @@ mod tests {
                 tx,
                 stream_done: &done,
                 dead: false,
+                retain: None,
             };
             let r = std::thread::scope(|sc| {
                 sc.spawn(|| {

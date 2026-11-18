@@ -60,21 +60,53 @@ fn start(
     block_ms: u64,
     tag: &str,
 ) -> (Child, BufReader<ChildStdout>, SocketAddrV4, PathBuf) {
-    let (mut child, dir) = spawn(replica, seal, block_ms, tag);
+    let (child, out, lane0, _, dir) = start_with(replica, seal, block_ms, tag, "");
+    (child, out, lane0, dir)
+}
+
+/// [`start`] with `extra` appended to the config; also returns the `REPAIR` address, if any.
+fn start_with(
+    replica: &UdpSocket,
+    seal: &str,
+    block_ms: u64,
+    tag: &str,
+    extra: &str,
+) -> (
+    Child,
+    BufReader<ChildStdout>,
+    SocketAddrV4,
+    Option<SocketAddrV4>,
+    PathBuf,
+) {
+    let (mut child, dir) = spawn_with(replica, seal, block_ms, tag, extra);
     let mut out = BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
+    let mut repair = None;
     let lane0: SocketAddrV4 = loop {
         line.clear();
         assert!(out.read_line(&mut line).unwrap() > 0, "exited before READY");
+        if let Some(rest) = line.trim().strip_prefix("REPAIR addr=") {
+            repair = Some(rest.parse().unwrap());
+        }
         if let Some(rest) = line.trim().strip_prefix("READY vyrn-seq lanes=2 rx=") {
             break rest.split(',').next().unwrap().parse().unwrap();
         }
     };
-    (child, out, lane0, dir)
+    (child, out, lane0, repair, dir)
 }
 
 /// Writes the DEV config and spawns the box with piped stdin and stdout.
 fn spawn(replica: &UdpSocket, seal: &str, block_ms: u64, tag: &str) -> (Child, PathBuf) {
+    spawn_with(replica, seal, block_ms, tag, "")
+}
+
+fn spawn_with(
+    replica: &UdpSocket,
+    seal: &str,
+    block_ms: u64,
+    tag: &str,
+    extra: &str,
+) -> (Child, PathBuf) {
     let dir = std::env::temp_dir().join(format!("vyrn-seq-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = dir.join("seq.toml");
@@ -119,7 +151,7 @@ k_seq = "{}"
 k_out = "{}"
 quote = 1000000000000
 base = 1000000000
-"#,
+{extra}"#,
             replica.local_addr().unwrap(),
             hex(&K_SEQ),
             hex(&K_OUT)
@@ -440,5 +472,73 @@ fn packet_only_block_closes() {
     assert!(header, "no HEADER before stop: {stats}");
     assert!(ok, "{stats}");
     assert!(stats.contains("records=1 steps=0 "), "{stats}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 07 §5.5 source 3 end to end: the box retains the packet it accepted and answers a replica's
+/// KEY fetch with it as a `FETCH_RESP` that `vyrn-replica`'s `DataFeed` stores, and answers a
+/// miss with an empty one. The engine runs sealed (`abort`), so the retention handoff allocates
+/// nothing on it.
+#[test]
+fn seq_data_req_end_to_end() {
+    use vyrn_data::frame::{Fetch, Kind, decode};
+    let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut child, out, lane0, repair, dir) =
+        start_with(&replica, "abort", 2, "repair", "\n[repair]\nport = 0\n");
+    let repair = repair.expect("no REPAIR line");
+    let session = vyrn_wire::session_id(1, LaneId(0), 1).unwrap();
+    let mut buf = [0u8; vyrn_types::MAX_REQ_PAYLOAD];
+    let n = order(1, vyrn_bbo::Side::Buy, 5, 77, &mut buf);
+    let pkt = buf[..n].to_vec();
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    client.send_to(&pkt, lane0).unwrap();
+    let mut rbuf = [0u8; 2048];
+    client.recv_from(&mut rbuf).expect("no response");
+    // The replica's fetch socket: same IP as the configured replica, so it is allowed.
+    let fetcher = UdpSocket::bind("127.0.0.1:0").unwrap();
+    fetcher
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let ask = |pkt_seq| {
+        let q = Fetch::Key { session, pkt_seq }.encode();
+        fetcher.send_to(&q, repair).unwrap();
+        let mut b = [0u8; 2048];
+        let (k, _) = fetcher.recv_from(&mut b).expect("no FETCH_RESP");
+        b[..k].to_vec()
+    };
+    // The retention copy crosses a ring to the repair thread: ask until it is there.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let hit = loop {
+        let r = ask(1);
+        if decode(&r).unwrap().n_pkts > 0 || Instant::now() > deadline {
+            break r;
+        }
+    };
+    let f = decode(&hit).unwrap();
+    assert_eq!(
+        (f.hdr.kind, f.hdr.src, f.hdr.book, f.hdr.data_seq),
+        (
+            Kind::FetchResp,
+            0xFF,
+            BookId(7),
+            (u64::from(session.0) << 32) | 1
+        )
+    );
+    assert_eq!(
+        f.packets().collect::<Vec<_>>(),
+        vec![&pkt[..]],
+        "the exact bytes"
+    );
+    let mut feed = vyrn_replica::DataFeed::new(BookId(7), 1, 0);
+    let mut join = vyrn_replica::DataJoin::default();
+    assert_eq!(feed.on_frame(&mut join, &hit, 0).unwrap().stored, 1);
+    let miss = ask(2);
+    assert_eq!(decode(&miss).unwrap().n_pkts, 0);
+    let (stats, ok) = stop(&mut child, out);
+    assert!(ok, "{stats}");
+    assert!(stats.contains("seal_violations=0"), "{stats}");
     let _ = std::fs::remove_dir_all(&dir);
 }

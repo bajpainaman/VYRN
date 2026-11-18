@@ -102,6 +102,7 @@
 pub mod alloc;
 mod engine;
 mod replay;
+pub mod retain;
 pub mod role;
 
 pub use engine::{Engine, Fault, Rec, Shared, Sink};

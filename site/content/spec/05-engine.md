@@ -1490,6 +1490,34 @@ core and when, both of which the log records. ∎
 argument ("each core's `LaneSeq` logs the order") is not enough for an account whose work runs on
 two cores: the cross-core order needs `ver`.
 
+### 6.10 Packet retention for `SeqDataReq`
+
+The sequencer keeps the exact bytes of every packet that has a PacketRecord for
+`REP_SEQ_PKT_RETAIN_MS` = 50 ms, so that it can answer `SeqDataReq` (07 §5.5 source 3, 07 §5.6).
+The packets kept are the lane verdicts `Accepted` and `Shed`.
+
+- **Placement.** Retention is not on a lane core. After each `ingest`, the RX path hands a
+  `Copy` value to the repair thread (control, core 51): `vyrn_engine::retain::Kept {session,
+  pkt_seq, pkt_hash, rx_ts, bytes}`. It goes through an SPSC `vyrn_cut::Ring` allocated before
+  `seal()`. The push never waits and never allocates. On a full ring the copy is lost and counted
+  (`retain_dropped`), and the replica uses another source.
+- **Store** (`vyrn_engine::retain::Retain`). A FIFO of fixed slots, sized as peak packet rate ×
+  50 ms and overwritten oldest first. It has a 4-way set-associative index over `(session,
+  pkt_seq)` with at least eight ways per slot, so a bucket holds a mean of ≤ 0.5 live packets.
+  Both are allocated at construction. A lookup returns every retained variant of the key, oldest
+  first, whose `rx_ts` is within 50 ms of the newest one put.
+  - A packet loses its index entry only when its bucket holds more than four live packets, under
+    0.1% at the design load. Such a packet is a miss.
+  - The bucket hash is murmur3's `fmix64` of `session << 32 | pkt_seq`, not keyed. A packet shed
+    at dequeue (§6.8 test D) is retained without a MAC check, because its `SHED` record is logged
+    and the sequencer holds the only copy a replica can fetch. Such a packet must still name an open
+    session and a `pkt_seq` inside its V5 window, so a sender cannot aim several keys at one bucket.
+    Repeating one key can fill its bucket, but an unchecked packet never takes an index way from an
+    `Accepted` (MAC-checked) one; it stays unindexed instead. A shed copy a flood displaces is
+    lost: its record cannot be resolved unless another source holds the bytes, which Q17 covers. A record joins only the variant its `pkt_hash` names (07 §5.4).
+- **Determinism.** Retention changes no engine state and no output. Replay neither reads it nor
+  rebuilds it.
+
 ## 7. The cut core, settlement, and physical maintenance
 
 ### 7.1 Cut core loop
@@ -3057,3 +3085,4 @@ Q9's `liq` half (`liq = 2`), Q12's percentile form (cold lines are paid before t
 | Q14 | `MakerSeq` gives 8 spare numbers, which a market maker hit by many consecutive crosses can use up before its lane refills (`eng_maker_seq_wait`). | 01, 05 | B3 with a market maker at the touch |
 | Q15 | 01 §14.14 bounds every maker fill by the taker's first bit. At index 9 about five continuation steps (≤ 40 fills) fit; later steps' maker fills exceed `LAT_MAX_NS`. Cap the fills one taker may take, or re-budget? | 01 | decision; B3 with a 64-maker sweep |
 | Q16 | A crash after an ack but before its boundary record leaves loses the boundary's position (01 §14.16 gates on op and step records). Gate on the boundary record too? | 07 | failover test with acks in flight |
+| Q17 | Test D (§6.8) sheds before V6, so a packet with a bad MAC still gets a logged `SHED` record whose bytes only the sequencer holds (§6.10). Repeating one key can push those bytes out of retention. The record then stays unresolved and its block's vote waits: DAV-3 (07 §5.5) needs DAV-1's quorum of `DataMissing` (> 16 source-3 resolutions in 10 ms), which one such record does not reach. Check the MAC before logging `SHED`, exempt unchecked `SHED` records from `data_root`, or make an unrepairable `SHED` record unavailable directly? | 05, 07, 13 | decision; `vyrn-sim` shed flood on one key |
