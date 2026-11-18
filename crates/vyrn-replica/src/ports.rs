@@ -2,7 +2,8 @@
 //!
 //! - [`ReplayEngine`] is 11 §5.3's trait. [`crate::RustReplay`] implements it over
 //!   `vyrn_engine::Engine::replay_wire`, which takes 07's fields only (07 §7.1 `REP_MERGE`);
-//!   `VxReplay` (over [`crate::vx`]) is a follow-up. [`crate::DataJoin`] is the payload half
+//!   [`crate::VxReplay`] over `libvyrn_vx_client` ([`crate::vx`]) with the same inputs and
+//!   output hash; [`EngineClient`] is the config key that picks one. [`crate::DataJoin`] is the payload half
 //!   (`vyrn_engine::Payloads`).
 //! - [`EpochView`] is what the replica reads from the epoch schedule (08, `vyrn-epoch`): the
 //!   epoch and book it serves, the sequencer keys of `REP_Membership` (07 §13.1) and the
@@ -67,4 +68,35 @@ pub trait ReplayEngine<const N: usize> {
     /// Hands the engine the inputs of one block. It returns when the block's outputs are done.
     fn replay_block(&mut self, blk: &BlockInputs<N>) -> Result<BlockOutputs, ReplayError>;
     fn write_state(&self, w: &mut CanonicalStateWriter) -> Result<(), ReplayError>;
+}
+
+/// Config key `engine.client` (11 §5.3, C-ONEBIN): which [`ReplayEngine`] a replica runs.
+/// Both are linked; `Vx` loads `libvyrn_vx_client` through [`crate::VxReplay`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineClient {
+    #[default]
+    Rust,
+    Vx,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EngineClient;
+
+    #[test]
+    fn engine_client_reads_the_config_key() {
+        #[derive(serde::Deserialize)]
+        struct Cfg {
+            engine: Engine,
+        }
+        #[derive(serde::Deserialize)]
+        struct Engine {
+            client: EngineClient,
+        }
+        let c: Result<Cfg, _> = toml::from_str("[engine]\nclient = \"vx\"\n");
+        assert!(c.is_ok_and(|c| c.engine.client == EngineClient::Vx));
+        let bad: Result<Cfg, _> = toml::from_str("[engine]\nclient = \"go\"\n");
+        assert!(bad.is_err());
+    }
 }

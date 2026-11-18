@@ -575,3 +575,154 @@ fn payloads_from_a_data_box_replay_the_live_run() {
         vec![0]
     );
 }
+
+/// The harness's box for the Vx client (`engine()`'s accounts and sessions).
+fn vx_config() -> vyrn_replica::VxConfig {
+    use vyrn_replica::{VxAccount, VxConfig, VxSession};
+    use vyrn_risk::consts as k;
+    let mut c = VxConfig {
+        n_lanes: N as u8,
+        book: BOOK.0,
+        epoch: 0,
+        tick_min: 1,
+        tick_max: TICK_MAX,
+        tick_size: 1,
+        band_bps: 10_000,
+        slot_cap: 1024,
+        seg_cap: 1024,
+        ..VxConfig::default()
+    };
+    for l in 0..N {
+        for a in 1..NA as u32 {
+            c.accounts.push(VxAccount {
+                slot: a,
+                lane: l as u8,
+                state: 0,
+                max_open: 1000,
+                max_qty: u32::MAX,
+                max_notional: k::RSK_DEFAULT_MAX_NOTIONAL,
+                taker_ppm: k::RSK_DEFAULT_TAKER_PPM,
+                maker_ppm: k::RSK_DEFAULT_MAKER_PPM,
+                auction_ppm: k::RSK_DEFAULT_AUCTION_PPM,
+                msg_fee_improve: k::RSK_DEFAULT_MSG_FEE_IMPROVE,
+                msg_fee_cross: k::RSK_DEFAULT_MSG_FEE_CROSS,
+                base_free: 1 << 40,
+                quote_free: 1 << 60,
+            });
+            c.sessions.push(VxSession {
+                id: sid(l, a).0,
+                acct: a,
+                book: BOOK.0,
+                k_seq: kseq(l, a),
+            });
+        }
+    }
+    c
+}
+
+/// `target/vx/libvyrn_vx_client` from `vx/build.sh`, or `None` (the test then skips) unless
+/// `VYRN_REQUIRE_VX` is set.
+fn vx_lib() -> Option<std::path::PathBuf> {
+    let ext = if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    let lib = std::env::var_os("VYRN_VX_CLIENT_LIB").map_or_else(
+        || {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../target/vx/libvyrn_vx_client.{ext}"))
+        },
+        std::path::PathBuf::from,
+    );
+    if lib.exists() {
+        return Some(lib);
+    }
+    assert!(
+        std::env::var_os("VYRN_REQUIRE_VX").is_none(),
+        "{} is missing",
+        lib.display()
+    );
+    eprintln!("skipped: {} is missing; run vx/build.sh", lib.display());
+    None
+}
+
+/// One block of the Vx client: per-lane response bytes, TX bytes, output hash.
+type VxBlock = (Vec<Vec<u8>>, Vec<u8>, Hash);
+
+/// Replays `blocks` on the Vx client; returns each block's per-lane and TX bytes and hash.
+fn vx_replay(
+    store: &Store,
+    blocks: &[BlockInputs<N>],
+    lib: &std::path::Path,
+) -> Result<Vec<VxBlock>, vyrn_replica::ReplayError> {
+    let mut data = DataJoin::default();
+    for ((_, s, q, _), b) in &store.0 {
+        data.put(*s, *q, b.clone());
+    }
+    let mut vx = vyrn_replica::VxReplay::new(lib, &vx_config(), data)?;
+    let mut out = Vec::new();
+    for b in blocks {
+        let h = vx.replay_block(b)?.output_hash;
+        out.push((vx.lane_bytes().to_vec(), vx.tx_bytes().to_vec(), h));
+    }
+    Ok(out)
+}
+
+/// The live run's per-lane response bytes and TX bytes, as `output_hash` covers them.
+fn live_bytes(j: &Journal) -> (Vec<Vec<u8>>, Vec<u8>) {
+    let mut lanes = vec![Vec::new(); N];
+    let mut tx = Vec::new();
+    for (l, p) in &j.resp {
+        encode_resp(&mut lanes[usize::from(l.0)], p);
+    }
+    for (h, recs) in &j.tx {
+        encode_tx(&mut tx, h, recs);
+    }
+    (lanes, tx)
+}
+
+/// M3 (11 §8): the Vx client and `RustReplay` produce the same bytes and output hash over the
+/// whole script.
+#[test]
+fn the_vx_client_matches_rust_replay() {
+    let Some(lib) = vx_lib() else { return };
+    let (live_j, store, blocks) = blocks(&[]);
+    let (_, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
+    let vx = vx_replay(&store, &blocks, &lib).unwrap();
+    let (lanes, tx) = live_bytes(&live_j);
+    for l in 0..N {
+        assert_eq!(vx[0].0[l], lanes[l], "lane {l} responses");
+    }
+    assert_eq!(vx[0].1, tx, "fill TX packets");
+    assert!(
+        !tx.is_empty() && !lanes[0].is_empty(),
+        "responses and fills to compare"
+    );
+    assert_eq!(vec![vx[0].2], rust_hashes);
+    // A changed step diverges on the client too.
+    let mut bad = blocks;
+    let s = bad[0]
+        .steps
+        .iter_mut()
+        .find(|m| m.rec.kind == StepKind::Cross)
+        .unwrap();
+    s.rec.kind = StepKind::Improve;
+    let e = vx_replay(&store, &bad, &lib).unwrap_err();
+    assert!(e.0.contains("diverged"), "{e}");
+}
+
+/// Every block boundary the order core allows gives both engines the same output hashes.
+#[test]
+fn the_vx_client_matches_rust_replay_split_anywhere() {
+    let Some(lib) = vx_lib() else { return };
+    let (j, _) = live07(&script());
+    for at in 0..j.recs.len() - 1 {
+        let (live_j, store, blocks) = blocks(&[at]);
+        let (_, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
+        let vx =
+            vx_replay(&store, &blocks, &lib).unwrap_or_else(|e| panic!("split after {at}: {e}"));
+        let h: Vec<Hash> = vx.iter().map(|x| x.2).collect();
+        assert_eq!(h, rust_hashes, "split after {at}");
+    }
+}
