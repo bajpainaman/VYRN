@@ -3604,9 +3604,11 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "vyrn-crypto",
  "vyrn-log",
  "vyrn-nic",
  "vyrn-types",
+ "vyrn-wire",
 ]
 
 [[package]]
