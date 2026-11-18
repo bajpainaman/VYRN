@@ -2247,8 +2247,10 @@ fn post(side: Side, tick: u32, qty: u32, tag: u32) -> vyrn_wire::Msg {
 /// stale snapshot and is the batch taker of a Rescan whose book it crosses, so it ends with a
 /// batch `Reject POST_ONLY_WOULD_CROSS`, its record the lane's. Otherwise lane 2's buy at 102
 /// is a batch taker whose sweep is capped at one level: a `RESTED_IN_FLIGHT` step, its fill
-/// record held by the lane, its Ack held until a CONT Rescan ends the sweep (rule B).
-fn batch_script(post_only: bool) -> Vec<Act> {
+/// record held by the lane, its Ack held until a CONT Rescan ends the sweep (rule B). `rep`
+/// makes lane 2's sell at 104 a local new-priority Replace of a resting sell at 110 (gap item
+/// 3b): the batch taker is then the Replace's version, as `JKind::NewPrio` is in `Bbo::rescan`.
+fn batch_script(post_only: bool, rep: bool) -> Vec<Act> {
     use Side::{Buy, Sell};
     use Tif::{Day, Ioc};
     let p = |l, a, t: u64, m| Act::Pkt {
@@ -2277,13 +2279,27 @@ fn batch_script(post_only: bool) -> Vec<Act> {
             Act::Run,
             p(1, 1, 2_000, new(Sell, Day, 106, 1, 2)),
             p(2, 1, 3_000, new(Sell, Day, 101, 2, 3)),
+            if rep {
+                p(2, 2, 3_500, new(Sell, Day, 110, 3, 10))
+            } else {
+                Act::Run
+            },
             Act::Run,
             p(1, 1, 4_000, new(Buy, Day, 105, 3, 4)),
             p(1, 2, 5_000, cancel(Handle::new(3, 1).unwrap(), 5)),
             p(2, 2, 6_000, post(Buy, 102, 4, 6)),
             p(1, 1, 7_000, post(Buy, 100, 3, 7)),
             p(2, 1, 8_000, post(Sell, 106, 3, 8)),
-            p(2, 2, 9_000, new(Sell, Day, 104, 3, 9)),
+            if rep {
+                p(
+                    2,
+                    2,
+                    9_000,
+                    replace(Handle::new(2, 1).unwrap(), Sell, Day, 104, 3),
+                )
+            } else {
+                p(2, 2, 9_000, new(Sell, Day, 104, 3, 9))
+            },
         ]
     };
     s.extend([Act::Run, Act::Poll, Act::Run]);
@@ -2292,8 +2308,8 @@ fn batch_script(post_only: bool) -> Vec<Act> {
 
 #[test]
 fn the_vx_client_replays_rescan_batch_takers_that_trade() {
-    for post_only in [false, true] {
-        let script = batch_script(post_only);
+    for (post_only, by_replace) in [(false, false), (true, false), (false, true)] {
+        let script = batch_script(post_only, by_replace);
         let (live_j, store, blocks) = blocks_of(&script, &[]);
         let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
         check_same(&live_j, &rep);
@@ -2304,7 +2320,7 @@ fn the_vx_client_replays_rescan_batch_takers_that_trade() {
             .collect();
         assert!(
             rescans.len() >= 2,
-            "post_only {post_only}: the script reaches Rescans"
+            "post_only {post_only}, replace {by_replace}: the script reaches Rescans"
         );
         let (j, _) = live07(&script);
         let traded = j.recs.iter().any(|r| {
@@ -2481,5 +2497,559 @@ fn the_vx_client_replays_in_packet_dependencies() {
         ))),
         "a dependency TOO_LATE: {deps:?}"
     );
+    assert_vx_matches(&script, 0..j.recs.len() - 1);
+}
+
+fn replace(h: Handle, side: Side, tif: Tif, tick: u32, qty: u32) -> vyrn_wire::Msg {
+    vyrn_wire::Msg::Replace {
+        flags: flags(side, tif),
+        handle: h,
+        tick: vyrn_types::Tick(tick),
+        qty: vyrn_types::Qty(qty),
+    }
+}
+
+/// Replace (04 §6.5, 05 §2.3, gap item 3b) in Continuous. Lane 0 rests asks at 105 and 107 and
+/// a bid at 100. A local Replace moves the bid to 101 (new priority, its own leg). A same-tick
+/// smaller Replace of the ask at 107 is a Reduce. A Replace with the wrong side is
+/// `SIDE_MISMATCH`. Lane 1's buy at 105 fills 1 of the ask at 105; a forwarded Replace of that
+/// ask to 104 then crosses lane 2's bid and trades. A Replace to a total at or below the fills
+/// finishes the order (`CancelAck` of the old open), and a Replace of a filled order is
+/// `TOO_LATE`. Last, a packet replaces lane 0's bid at 101 to 102, a local Replace in range of
+/// the sell at 102 behind it, which is that sell's dependency.
+fn replace_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let p = |l, a, t: u64, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs,
+    };
+    let h = |r| Handle::new(r, 1).unwrap();
+    vec![
+        p(
+            0,
+            1,
+            1_000,
+            vec![
+                new(Sell, Day, 105, 3, 1),
+                new(Sell, Day, 107, 4, 2),
+                new(Buy, Day, 100, 2, 3),
+            ],
+        ),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(
+            0,
+            1,
+            2_000,
+            vec![
+                replace(h(3), Buy, Day, 101, 2),
+                replace(h(2), Sell, Day, 107, 3),
+                replace(h(1), Buy, Day, 105, 3),
+            ],
+        ),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(1, 1, 3_000, vec![new(Buy, Day, 105, 1, 4)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(2, 1, 4_000, vec![new(Buy, Day, 103, 1, 5)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(0, 1, 5_000, vec![replace(h(1), Sell, Day, 103, 3)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(0, 1, 6_000, vec![replace(h(1), Sell, Day, 104, 2)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(0, 1, 7_000, vec![replace(h(1), Sell, Day, 106, 1)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(1, 1, 8_000, vec![new(Buy, Day, 101, 1, 6)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(
+            0,
+            1,
+            9_000,
+            vec![replace(h(3), Buy, Day, 102, 2), new(Sell, Day, 102, 1, 7)],
+        ),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        // Local: below the best bid, a Join route; the lane answers it.
+        p(1, 1, 10_000, vec![replace(h(2), Buy, Day, 100, 2)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        // A local Replace in range of a crossing sell behind it: its dependency.
+        p(
+            1,
+            1,
+            11_000,
+            vec![replace(h(2), Buy, Day, 99, 2), new(Sell, Day, 99, 3, 8)],
+        ),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(2, 1, 12_000, vec![new(Buy, Day, 98, 1, 9)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        // A local Replace that moves the bid out of the crossing sell's range: a pass barrier,
+        // so the Join ahead of it is applied first and is no dependency of the sell.
+        p(
+            2,
+            1,
+            13_000,
+            vec![
+                new(Buy, Day, 96, 1, 11),
+                replace(h(2), Buy, Day, 90, 1),
+                new(Sell, Day, 95, 1, 10),
+            ],
+        ),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+    ]
+}
+
+#[test]
+fn the_vx_client_replays_replace() {
+    let script = replace_script();
+    let (live_j, store, blocks) = blocks_of(&script, &[]);
+    let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let (j, _) = live07(&script);
+    assert_vx_matches(&script, 0..j.recs.len() - 1);
+}
+
+/// #210 with 05 §8.8 item 6, the race of [`auction_reduce_script`] with a Replace: lane 0's
+/// auction-only sell at 110 is replaced to 6 at 111 after C* (the lane has not seen the freeze),
+/// and the uncross runs before the BBO sees the Replace. The lane ends the order at C*
+/// (`Out AUCTION` 10, every leg released) and answers the Replace `TOO_LATE` (detail `OUT`); the
+/// BBO refuses the replacement, so in the next auction at 111 lane 1's later sell fills instead.
+fn auction_replace_script(day: bool) -> Vec<Act> {
+    auction_replace_script_seen(day, false)
+}
+
+/// [`auction_replace_script`]; `seen` runs the lanes once more before the uncross step, so with
+/// only act 8 held the step's cut holds the Replaces admitted after C*.
+fn auction_replace_script_seen(day: bool, seen: bool) -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::{AuctionOnly, Day};
+    use vyrn_bbo::{ControlCmd, Phase};
+    let phase = |phase, lo, hi| {
+        Act::Cmd(ControlCmd::Phase {
+            phase,
+            lo: vyrn_types::Tick(lo),
+            hi: vyrn_types::Tick(hi),
+        })
+    };
+    let p = |l, a, t: u64, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs,
+    };
+    let unc = |price, q| {
+        Act::Cmd(ControlCmd::Uncross {
+            price: vyrn_types::Tick(price),
+            qty: q,
+        })
+    };
+    let h = Handle::new(1, 1).unwrap();
+    vec![
+        phase(Phase::Auction, 0, 0),
+        Act::Run,
+        if day {
+            p(1, 1, 1_000, vec![new(Buy, Day, 106, 1, 2)])
+        } else {
+            p(
+                1,
+                1,
+                1_000,
+                vec![new(Sell, Day, 104, 1, 1), new(Buy, Day, 106, 1, 2)],
+            )
+        },
+        if day {
+            p(
+                0,
+                1,
+                2_000,
+                vec![
+                    new(Sell, AuctionOnly, 110, 10, 4),
+                    new(Sell, Day, 104, 1, 3),
+                ],
+            )
+        } else {
+            p(0, 1, 2_000, vec![new(Sell, AuctionOnly, 110, 10, 4)])
+        },
+        Act::Run,
+        Act::Poll,
+        phase(Phase::Frozen, 1, TICK_MAX),
+        // Acts 7 to 10, as in auction_reduce_script ([`REDUCE_HOLD`]).
+        Act::Step(None),
+        if day {
+            p(
+                0,
+                1,
+                3_000,
+                vec![
+                    replace(h, Sell, AuctionOnly, 111, 6),
+                    replace(Handle::new(2, 1).unwrap(), Sell, Day, 108, 1),
+                ],
+            )
+        } else {
+            p(0, 1, 3_000, vec![replace(h, Sell, AuctionOnly, 111, 6)])
+        },
+        if seen { Act::Run } else { Act::Step(None) },
+        unc(105, 1),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        phase(Phase::Auction, 0, 0),
+        Act::Run,
+        p(1, 2, 4_000, vec![new(Sell, Day, 111, 1, 7)]),
+        p(2, 1, 4_100, vec![new(Buy, Day, 111, 1, 8)]),
+        Act::Run,
+        Act::Poll,
+        phase(Phase::Frozen, 1, TICK_MAX),
+        Act::Run,
+        unc(111, 1),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        Act::Cmd(ControlCmd::Seal),
+        Act::Run,
+    ]
+}
+
+fn auction_replace_live() -> (Journal, Store) {
+    live07_sim(&auction_replace_script(false), &REDUCE_HOLD, 7, 1_000_000)
+}
+
+/// [`auction_replace_script`] where lane 0's Day sell at 104 is also replaced after C*: the
+/// uncross matches at C*, so its old version trades there, and the Replace is then `TOO_LATE`.
+fn auction_replace_day_live() -> (Journal, Store) {
+    live07_sim(&auction_replace_script(true), &REDUCE_HOLD, 7, 1_000_000)
+}
+
+/// [`auction_replace_day_live`] where the uncross step's cut holds both Replaces (only act 8 is
+/// held): the BBO has them when it uncrosses, but the uncross matches at C*, where the old
+/// versions are in effect, so the Day sell at 104 still trades.
+fn auction_replace_seen_live() -> (Journal, Store) {
+    live07_sim(&auction_replace_script_seen(true, true), &[8], 7, 1_000_000)
+}
+
+/// Lane `lane`'s response records other than `Ack`, in order.
+fn lane_recs(j: &Journal, lane: u8) -> Vec<vyrn_bbo::Record> {
+    j.resp
+        .iter()
+        .filter(|(l, _)| l.0 == lane)
+        .flat_map(|(_, p)| p.records().iter().copied())
+        .filter(|r| !matches!(r, vyrn_bbo::Record::Ack { .. }))
+        .collect()
+}
+
+/// Fill records at `tick` on lane `lane`, in its responses and the fill TX packets.
+fn fills_at(j: &Journal, lane: u8, tick: u32) -> usize {
+    let resp = lane_recs(j, lane);
+    let tx =
+        j.tx.iter()
+            .filter(|(h, _)| h.lane.0 == lane)
+            .flat_map(|(_, r)| r.iter());
+    resp.iter()
+        .chain(tx)
+        .filter(|r| matches!(r, vyrn_bbo::Record::Fill { tick: t, .. } if t.0 == tick))
+        .count()
+}
+
+#[test]
+fn the_vx_client_refuses_a_replace_admitted_after_the_freeze() {
+    let (live_j, store) = auction_replace_live();
+    let blocks = blocks_from(&live_j, &store, &[], false);
+    let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let lane0 = lane_recs(&live_j, 0);
+    assert!(
+        matches!(
+            lane0.as_slice(),
+            [
+                vyrn_bbo::Record::Out { cause: vyrn_bbo::OUT_AUCTION, qty, client_tag: 4, .. },
+                vyrn_bbo::Record::Reject { reason, detail: 3, client_tag: 4, .. },
+            ] if qty.0 == 10 && *reason == vyrn_types::RejectReason::TooLate
+        ),
+        "{lane0:?}"
+    );
+    assert_eq!(
+        (fills_at(&live_j, 0, 111), fills_at(&live_j, 1, 111)),
+        (0, 1),
+        "the refused replacement does not trade; lane 1's sell fills"
+    );
+    assert_vx_matches_live(&auction_replace_live, 0..live_j.recs.len() - 1);
+    let (day_j, _) = auction_replace_day_live();
+    let late = lane_recs(&day_j, 0)
+        .iter()
+        .filter(|r| matches!(r, vyrn_bbo::Record::Reject { reason, .. } if *reason == vyrn_types::RejectReason::TooLate))
+        .count();
+    assert_eq!(
+        (fills_at(&day_j, 0, 105), late),
+        (1, 2),
+        "{:?}",
+        lane_recs(&day_j, 0)
+    );
+    assert_vx_matches_live(&auction_replace_day_live, 0..day_j.recs.len() - 1);
+    let (seen_j, _) = auction_replace_seen_live();
+    assert_eq!(fills_at(&seen_j, 0, 105), 1, "{:?}", lane_recs(&seen_j, 0));
+    assert_vx_matches_live(&auction_replace_seen_live, 0..seen_j.recs.len() - 1);
+}
+
+/// Replace races with a lagging lane ([`live07_sim`], acts [`RACE_HOLD`]). The BBO halts before
+/// lane 0 sees it, so lane 0 forwards a Replace that the BBO refuses `BOOK_HALTED`: the order
+/// keeps its old version, which trades after the resume, and a Cancel then ends that version's
+/// open 1. Later lane 1 fills lane 0's sell at 107 before lane 0 sees the fill, and lane 0
+/// replaces it to 108: the BBO refuses it (filled to the old total), the lane answers
+/// `TOO_LATE`, and lane 2's buy at 108 rests. In the same race lane 0's sell of 2 at 109 is filled
+/// 1 and replaced to 1 at 110: the BBO finishes it (05 §2.3, `Out FINISHED`), the lane answers
+/// a CancelAck of the old open 1, and lane 2's buy at 110 rests.
+fn replace_race_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    use vyrn_bbo::{ControlCmd, Phase};
+    let phase = |phase| {
+        Act::Cmd(ControlCmd::Phase {
+            phase,
+            lo: vyrn_types::Tick(0),
+            hi: vyrn_types::Tick(0),
+        })
+    };
+    let p = |l, a, t: u64, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs,
+    };
+    let h = |r| Handle::new(r, 1).unwrap();
+    vec![
+        p(
+            0,
+            1,
+            1_000,
+            vec![
+                new(Sell, Day, 105, 2, 1),
+                new(Sell, Day, 107, 1, 2),
+                new(Sell, Day, 109, 2, 10),
+            ],
+        ),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        phase(Phase::Halted),
+        Act::Step(None),
+        p(0, 1, 2_000, vec![replace(h(1), Sell, Day, 104, 3)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        phase(Phase::Continuous),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(1, 1, 3_000, vec![new(Buy, Day, 105, 1, 3)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(0, 1, 4_000, vec![cancel(h(1), 4)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(
+            1,
+            1,
+            5_000,
+            vec![new(Buy, Day, 107, 1, 5), new(Buy, Day, 109, 1, 9)],
+        ),
+        Act::Step(None),
+        p(
+            0,
+            1,
+            6_000,
+            vec![
+                replace(h(2), Sell, Day, 108, 2),
+                replace(h(3), Sell, Day, 110, 1),
+            ],
+        ),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(
+            2,
+            1,
+            7_000,
+            vec![new(Buy, Day, 108, 1, 6), new(Buy, Day, 110, 1, 11)],
+        ),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+    ]
+}
+
+/// The acts of [`replace_race_script`] that see only what was visible before the act ahead.
+const RACE_HOLD: [usize; 2] = [6, 24];
+
+fn replace_race_live() -> (Journal, Store) {
+    live07_sim(&replace_race_script(), &RACE_HOLD, 7, 1_000_000)
+}
+
+#[test]
+fn the_vx_client_replays_replace_races() {
+    let (live_j, store) = replace_race_live();
+    let blocks = blocks_from(&live_j, &store, &[], false);
+    let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let all: Vec<_> = live_j
+        .resp
+        .iter()
+        .flat_map(|(_, p)| p.records().iter().copied())
+        .chain(live_j.tx.iter().flat_map(|(_, r)| r.iter().copied()))
+        .collect();
+    let has = |f: &dyn Fn(&vyrn_bbo::Record) -> bool| all.iter().any(f);
+    use vyrn_bbo::Record as R;
+    use vyrn_types::RejectReason as RR;
+    assert!(
+        has(&|r| matches!(
+            r,
+            R::Reject {
+                reason: RR::BookHalted,
+                client_tag: 1,
+                ..
+            }
+        )),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(r, R::CancelAck { canceled, client_tag: 4, .. } if canceled.0 == 1)),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(
+            r,
+            R::Reject {
+                reason: RR::TooLate,
+                client_tag: 2,
+                ..
+            }
+        )),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(r, R::CancelAck { canceled, client_tag: 10, .. } if canceled.0 == 1)),
+        "{all:?}"
+    );
+    assert_eq!(
+        fills_at(&live_j, 2, 108) + fills_at(&live_j, 2, 110),
+        0,
+        "{all:?}"
+    );
+    assert_vx_matches_live(&replace_race_live, 0..live_j.recs.len() - 1);
+}
+
+/// #210 Codex review 1 (vyrn-lane `a_replace_after_the_auction_of_an_order_that_left_auction_only_is_accepted`):
+/// lane 0's auction-only sell is replaced by a Day sell before the freeze, so it is not
+/// auction-only at C* and survives the uncross; a Replace after it, in Continuous, is accepted
+/// and trades in the next auction.
+fn left_auction_only_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::{AuctionOnly, Day};
+    use vyrn_bbo::{ControlCmd, Phase};
+    let phase = |phase, lo, hi| {
+        Act::Cmd(ControlCmd::Phase {
+            phase,
+            lo: vyrn_types::Tick(lo),
+            hi: vyrn_types::Tick(hi),
+        })
+    };
+    let p = |l, a, t: u64, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs,
+    };
+    let unc = |price, q| {
+        Act::Cmd(ControlCmd::Uncross {
+            price: vyrn_types::Tick(price),
+            qty: q,
+        })
+    };
+    let h = Handle::new(1, 1).unwrap();
+    vec![
+        phase(Phase::Auction, 0, 0),
+        Act::Run,
+        p(
+            1,
+            1,
+            1_000,
+            vec![new(Sell, Day, 104, 1, 1), new(Buy, Day, 106, 1, 2)],
+        ),
+        p(0, 1, 2_000, vec![new(Sell, AuctionOnly, 110, 10, 4)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(0, 1, 2_500, vec![replace(h, Sell, Day, 110, 10)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        phase(Phase::Frozen, 1, TICK_MAX),
+        Act::Run,
+        unc(105, 1),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(0, 1, 3_000, vec![replace(h, Sell, Day, 112, 8)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        phase(Phase::Auction, 0, 0),
+        Act::Run,
+        p(1, 1, 4_000, vec![new(Buy, Day, 112, 8, 9)]),
+        Act::Run,
+        Act::Poll,
+        phase(Phase::Frozen, 1, TICK_MAX),
+        Act::Run,
+        unc(112, 8),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        Act::Cmd(ControlCmd::Seal),
+        Act::Run,
+    ]
+}
+
+#[test]
+fn the_vx_client_accepts_a_replace_of_an_order_that_left_auction_only() {
+    let script = left_auction_only_script();
+    let (live_j, store, blocks) = blocks_of(&script, &[]);
+    let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let (j, _) = live07(&script);
+    assert_eq!(fills_at(&j, 0, 112), 1, "{:?}", lane_recs(&j, 0));
     assert_vx_matches(&script, 0..j.recs.len() - 1);
 }

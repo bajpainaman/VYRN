@@ -116,6 +116,7 @@ const AUCTION_PHASE : u64 = 19;
 const ACCOUNT_KILLED : u64 = 21;
 const BAD_BOOK : u64 = 23;
 const BUSY : u64 = 24;
+const SIDE_MISMATCH : u64 = 20;
 
 // Details.
 const D_UNKNOWN_TYPE : u64 = 1;
@@ -165,6 +166,9 @@ const LIQ_AUCTION : u64 = 2;
 const UNCROSS_CHUNK : u64 = 6;    // ENG_UNCROSS_CHUNK
 const OUT_IOC_REST : u64 = 1;
 const OUT_AUCTION : u64 = 3;
+const OUT_FINISHED : u64 = 0;
+// A Replace dependency whose new total is filled already (vyrn-bbo DEP_ENDED).
+const DEP_ENDED : u64 = 32768;
 const RESTED_DONE : u64 = 0;
 const RESTED_IN_FLIGHT : u64 = 1;
 const ROLE_TAKER : u64 = 0;
@@ -192,6 +196,8 @@ const OP_REDUCE : u64 = 4;
 const OP_KILLALL : u64 = 5;
 // An in-packet dependency of a later forwarded op (05 §3.7): the BBO applies it with that op.
 const OP_DEP : u64 = 6;
+// A local new-priority Replace (05 §2.3): the order's version is the new one if replace_ok.
+const OP_REPLACE : u64 = 7;
 const DK_JOIN : u64 = 1;   // DEP_JOIN
 const DK_CANCEL : u64 = 2; // DEP_CANCEL
 
@@ -201,10 +207,12 @@ const OK_JOIN : u64 = 1;
 const OK_CANCEL : u64 = 2;
 const OK_REDUCE : u64 = 3;
 const OK_CANCEL_ALL : u64 = 4;
+const OK_REPLACE : u64 = 5;
 const PK_ACK : u64 = 1;
 const PK_CXL : u64 = 2;
 const PK_REDUCE : u64 = 3;
 const PK_CANCEL_ALL : u64 = 4;
+const PK_REPLACE : u64 = 5;
 // CancelAck.handle of a CancelAll summary (04 §6.6, PROTO_HANDLE_ALL).
 const HANDLE_ALL : u64 = 4294967295;
 const CANCELALL_TOKENS : u64 = 16; // PROTO_CANCELALL_TOKENS
@@ -213,6 +221,7 @@ const CANCELALL_TOKENS : u64 = 16; // PROTO_CANCELALL_TOKENS
 const SK_FREE : u64 = 0;
 const SK_ORIG : u64 = 1;
 const SK_KEEP : u64 = 2;
+const SK_NEW : u64 = 3;
 
 // Routes (10 M8).
 const RT_JOIN : u64 = 0;
@@ -250,6 +259,9 @@ struct Slot {
   inflt : u64,
   // The version this one replaced (vyrn-lane prev_ver), 0 for an order's first version.
   pv : u64,
+  // SK_NEW: the version it replaces, whether that replace is still at the BBO (an explicit
+  // one), and whether its reservation was trued up for the predecessor's fills (vyrn-lane).
+  pred : u64, ppend : u64, trued : u64,
 }
 
 struct Root {
@@ -283,6 +295,9 @@ struct LOp {
   // OP_DEP: DK_JOIN or DK_CANCEL. OP_FWD: bit b set when the op at LaneSeq seq - b is a
   // dependency (ops per packet < 64).
   dk : u64, dmask : u64,
+  // A new-priority Replace (OP_FWD, OP_DEP or OP_REPLACE): np = 1 and the replaced version's
+  // total (pred_total, 05 §4.3).
+  np : u64, pt : u64,
 }
 
 struct Ev { step : u64, kind : u64, liq : u64, cause : u64, vslot : u64, handle : u64, tick : u64, qty : u64 }
@@ -293,6 +308,11 @@ struct BOrd {
   ts : u64, seq : u64, acct : u64, sess_id : u64, tag : u64, flags : u64, vslot : u64,
   // A Join dependency rested in step dstep as dependency dg - 1 (vyrn-bbo PendEnt.dep).
   dstep : u64, dg : u64,
+  // fin: the seq of the version whose fills brought `filled` to its total (State::fin_seq).
+  // rk: 1 = a NewPrio version whose replace_ok is not decided yet, 2 = ok, 3 = refused; pt its
+  // pred_total. sg: a Replace admitted after C* waits for the uncross (s_* its version).
+  fin : u64, rk : u64, pt : u64, sg : u64, s_tick : u64, s_total : u64, s_ts : u64,
+  s_flags : u64, s_vslot : u64, s_pt : u64,
 }
 
 struct Lane {
@@ -1488,11 +1508,79 @@ fn pass1(c : *mut Ctx, l : i64, ix : u64, m : *mut i8, op : *mut Op, detail : *m
       let rr = resolve(ln, rd32(m, 4i64), detail);
       if rr != 0u64 { return rr; }
       let r = rd32(m, 4i64) & 16777215u64;
-      let rp = root(ln, r);
-      let v = (*rp).cur;
-      let vp = slot(ln, v);
-      let tag = rd32(m, 12i64);
-      if typ == 3u64 && by < sat_sub((*vp).total, (*rp).filled) {
+      return reduce_op(c, ln, ix, op, r, by, rd32(m, 12i64), typ == 2u64, detail);
+    }
+    if typ == 18u64 {
+      // CancelAll (04 §6.6): PROTO_CANCELALL_TOKENS from the MSG buckets.
+      let cr = check_cancel(ln, ts, CANCELALL_TOKENS);
+      if cr == UNKNOWN_HANDLE { *detail = 0u64; return UNKNOWN_HANDLE; }
+      if cr != 0u64 { *detail = cr; return RATE_LIMIT; }
+      (*s).cancel_all = (*op).seq;
+      (*op).k = OK_CANCEL_ALL; (*op).tag = rd32(m, 12i64);
+      return 0u64;
+    }
+    // Replace (04 §6.5, vyrn-lane pass 1): a new version with its own leg and position.
+    let hh = rd32(m, 4i64);
+    let rr = resolve(ln, hh, detail);
+    if rr != 0u64 { return rr; }
+    let r = hh & 16777215u64;
+    let rp = root(ln, r);
+    let v = (*rp).cur;
+    let vp = slot(ln, v);
+    let f = rd8(m, 1i64);
+    let side = f & 1u64;
+    let tick = rd32(m, 8i64);
+    let qty = rd32(m, 12i64);
+    if side != (*vp).side { *detail = 0u64; return SIDE_MISMATCH; }
+    if tick == (*vp).tick && f == (*vp).flags && qty < (*vp).total && qty > 0u64 {
+      // A same-tick reduction is a Reduce (01 §6.2, 04 §6.5), with its buckets.
+      let cr = check_cancel(ln, ts, 1u64);
+      if cr == UNKNOWN_HANDLE { *detail = 0u64; return UNKNOWN_HANDLE; }
+      if cr != 0u64 { *detail = cr; return RATE_LIMIT; }
+      return reduce_op(c, ln, ix, op, r, (*vp).total - qty, (*rp).tag, false, detail);
+    }
+    let seq = (*op).seq;
+    let route = route_of(ln, seq);
+    let fit = slots_free(c, ln, 1u64) && fifo_can(c, ln, side, tick, ts);
+    let w = (*ln).next_slot;
+    let wp = slot(ln, w);
+    let wpp : *mut i8 = wp;
+    clear(wpp, sizeof<Slot>());
+    let nr = check_new(c, ln, si, side, (f >> 1u64) & 3u64, (f >> 3u64) & 1u64, tick, qty, route, ts, fit, wp, detail);
+    if nr != 0u64 {
+      let wq : *mut i8 = wp;
+      clear(wq, sizeof<Slot>());
+      return nr;
+    }
+    (*ln).next_slot = w + 1u64;
+    if !fifo_assign(c, ln, side, tick, ts) { *detail = D_LANE_FULL; return RISK_ORDER_COUNT; }
+    let ex = if route != RT_JOIN { 1u64 } else { 0u64 };
+    (*wp).kind = SK_NEW; (*wp).root = r; (*wp).leg = w; (*wp).side = side; (*wp).flags = f;
+    (*wp).tick = tick; (*wp).total = qty; (*wp).ins_seq = seq; (*wp).ts = ts; (*wp).explicit = ex;
+    (*wp).ix = ix; (*wp).sess = si; (*wp).pkt = (*ln).cur_pkt; (*wp).pv = v; (*wp).pred = v;
+    (*wp).ppend = ex;
+    (*rp).cur = w;
+    (*op).k = OK_REPLACE; (*op).root = r; (*op).v = v; (*op).w = w; (*op).side = side;
+    (*op).has_side = 1u64; (*op).tick = tick; (*op).tag = (*rp).tag;
+    if ex != 0u64 {
+      (*op).explicit = 1u64;
+      forward(c, l, m, op, route == RT_CROSS);
+    }
+    return 0u64;
+  }
+}
+
+// A Reduce (or a Cancel: `cancel`) of root r by `by` (vyrn-lane reduce_op, cancel_op): a
+// keep-priority version with the smaller total, or the order's end when nothing would stay open.
+fn reduce_op(c : *mut Ctx, ln : *mut Lane, ix : u64, op : *mut Op, r : u64, by : u64, tag : u64,
+             cancel : bool, detail : *mut u64) -> u64 {
+  unsafe {
+    let ts = (*ln).cur_ts;
+    let si = (*ln).cur_sess;
+    let rp = root(ln, r);
+    let v = (*rp).cur;
+    let vp = slot(ln, v);
+    if !cancel && by < sat_sub((*vp).total, (*rp).filled) {
         if !slots_free(c, ln, 1u64) { *detail = D_LANE_FULL; return RISK_ORDER_COUNT; }
         let w = (*ln).next_slot;
         (*ln).next_slot = w + 1u64;
@@ -1512,21 +1600,8 @@ fn pass1(c : *mut Ctx, l : i64, ix : u64, m : *mut i8, op : *mut Op, detail : *m
       (*rp).local_end = 1u64;
       (*op).k = OK_CANCEL; (*op).root = r; (*op).v = v; (*op).side = (*vp).side;
       (*op).has_side = 1u64; (*op).tick = (*vp).tick; (*op).tag = tag;
-      if typ == 3u64 { (*op).r = by; }
+      if !cancel { (*op).r = by; }
       return 0u64;
-    }
-    if typ == 18u64 {
-      // CancelAll (04 §6.6): PROTO_CANCELALL_TOKENS from the MSG buckets.
-      let cr = check_cancel(ln, ts, CANCELALL_TOKENS);
-      if cr == UNKNOWN_HANDLE { *detail = 0u64; return UNKNOWN_HANDLE; }
-      if cr != 0u64 { *detail = cr; return RATE_LIMIT; }
-      (*s).cancel_all = (*op).seq;
-      (*op).k = OK_CANCEL_ALL; (*op).tag = rd32(m, 12i64);
-      return 0u64;
-    }
-    // Replace (04 §6.5) is outside the supported subset.
-    fail_lane(ln, E_UNSUPPORTED);
-    return 0u64;
   }
 }
 
@@ -1544,7 +1619,15 @@ fn forward(c : *mut Ctx, l : i64, m : *mut i8, op : *mut Op, cross : bool) -> vo
       if (*o).applied != 0u64 || (*o).explicit != 0u64 { continue; }
       let in_rng = (*o).has_side != 0u64 && (*o).side != js
         && ((js == 0u64 && (*o).tick <= jt) || (js == 1u64 && (*o).tick >= jt));
-      if (*o).k == OK_CANCEL_ALL || ((*o).k == OK_REDUCE && in_rng) { bar = max(bar, (*o).seq); }
+      // A local Replace that moves an order out of j's range: j must not see the old version
+      // (in range it is a dependency).
+      let ot = if (*o).k == OK_REPLACE { (*slot(ln, (*o).v)).tick } else { (*o).tick };
+      let old_in = (*o).has_side != 0u64 && (*o).side != js
+        && ((js == 0u64 && ot <= jt) || (js == 1u64 && ot >= jt));
+      if (*o).k == OK_CANCEL_ALL || ((*o).k == OK_REDUCE && in_rng)
+         || ((*o).k == OK_REPLACE && old_in && !in_rng) {
+        bar = max(bar, (*o).seq);
+      }
     }
     if bar != 0u64 { pass2_through(c, l, bar); }
     if (*ln).err != 0u64 { return; }
@@ -1558,16 +1641,20 @@ fn forward(c : *mut Ctx, l : i64, m : *mut i8, op : *mut Op, cross : bool) -> vo
       if (*o).root == (*op).root { continue; }
       let opp_side = (*o).side != js;
       let in_rng = opp_side && ((js == 0u64 && (*o).tick <= jt) || (js == 1u64 && (*o).tick >= jt));
-      if !in_rng || ((*o).k != OK_JOIN && (*o).k != OK_CANCEL) { continue; }
+      if !in_rng || ((*o).k != OK_JOIN && (*o).k != OK_CANCEL && (*o).k != OK_REPLACE) { continue; }
       (*o).explicit = 1u64;
       dmask = dmask | (1u64 << ((*op).seq - (*o).seq));
       let rp = root(ln, (*o).root);
       let d = put_op(c, l, (*o).seq, OP_DEP);
       (*d).root = (*o).root; (*d).ix = (*o).ix; (*d).tag = (*rp).tag; (*d).ts = (*ln).cur_ts;
-      if (*o).k == OK_JOIN {
-        let sp = slot(ln, (*o).v);
+      if (*o).k == OK_JOIN || (*o).k == OK_REPLACE {
+        let rpl = (*o).k == OK_REPLACE;
+        let jv = if rpl { (*o).w } else { (*o).v };
+        let sp = slot(ln, jv);
         (*sp).explicit = 1u64;
-        (*d).dk = DK_JOIN; (*d).vslot = (*o).v; (*d).side = (*sp).side; (*d).tick = (*sp).tick;
+        // A Replace dependency is explicit: it can be shed or refused.
+        if rpl { (*sp).ppend = 1u64; (*d).np = 1u64; (*d).pt = (*slot(ln, (*o).v)).total; } else { }
+        (*d).dk = DK_JOIN; (*d).vslot = jv; (*d).side = (*sp).side; (*d).tick = (*sp).tick;
         (*d).total = (*sp).total; (*d).flags = (*sp).flags; (*d).ts = (*sp).ts;
         (*d).sess_id = (*sess(ln, (*sp).sess)).id; (*d).acct = (*acct(ln, (*rp).acct)).ix;
       } else {
@@ -1584,11 +1671,13 @@ fn forward(c : *mut Ctx, l : i64, m : *mut i8, op : *mut Op, cross : bool) -> vo
     let rs = (*s).next_resp;
     (*s).next_resp = (rs + (if dmask != 0u64 { 2u64 } else { 1u64 })) & U32_MAX;
     let e = put_op(c, l, (*op).seq, OP_FWD);
-    let v = (*op).v;
+    let rpl = (*op).k == OK_REPLACE;
+    let v = if rpl { (*op).w } else { (*op).v };
     let sp = slot(ln, v);
-    (*e).root = v; (*e).vslot = v; (*e).side = (*op).side; (*e).tick = (*op).tick;
+    (*e).root = (*op).root; (*e).vslot = v; (*e).side = (*op).side; (*e).tick = (*op).tick;
     (*e).total = (*sp).total; (*e).flags = (*sp).flags; (*e).ts = (*ln).cur_ts;
-    (*e).sess_id = (*s).id; (*e).acct = (*acct(ln, (*s).acct)).ix; (*e).tag = rd32(m, 12i64);
+    (*e).sess_id = (*s).id; (*e).acct = (*acct(ln, (*s).acct)).ix; (*e).tag = (*op).tag;
+    if rpl { (*e).np = 1u64; (*e).pt = (*slot(ln, (*op).v)).total; } else { }
     (*e).snap_ver = (*ln).snap_ver;
     (*e).ix = (*op).ix; (*e).cross = if cross { 1u64 } else { 0u64 };
     (*e).resp_seq = rs; (*e).pkt_seq = (*ln).cur_pkt; (*e).dmask = dmask;
@@ -1656,8 +1745,25 @@ fn pass2_apply(c : *mut Ctx, l : i64, op : *mut Op) -> void {
       pend_push(ln, op, PK_ACK);
       return;
     }
-    if k == OK_CANCEL {
+    if k == OK_REPLACE {
       (*slot(ln, (*op).v)).tomb = 1u64;
+      let wp = slot(ln, (*op).w);
+      let rp = root(ln, (*op).root);
+      let e = put_op(c, l, (*op).seq, OP_REPLACE);
+      (*e).root = (*op).root; (*e).vslot = (*op).w; (*e).side = (*wp).side; (*e).tick = (*wp).tick;
+      (*e).total = (*wp).total; (*e).flags = (*wp).flags; (*e).ts = (*wp).ts;
+      (*e).sess_id = (*sess(ln, (*wp).sess)).id; (*e).acct = (*acct(ln, (*rp).acct)).ix;
+      (*e).tag = (*rp).tag; (*e).np = 1u64; (*e).pt = (*slot(ln, (*op).v)).total;
+      pend_push(ln, op, PK_REPLACE);
+      return;
+    }
+    if k == OK_CANCEL {
+      // Every pending predecessor ends too (an explicit Replace still at the BBO, rule R).
+      let mut tv = (*op).v;
+      while tv != 0u64 {
+        (*slot(ln, tv)).tomb = 1u64;
+        tv = pending_pred(ln, (*slot(ln, tv)).leg);
+      }
       let e = put_op(c, l, (*op).seq, OP_CANCEL);
       (*e).root = (*op).root; (*e).ts = (*ln).cur_ts;
       pend_push(ln, op, PK_CXL);
@@ -1731,8 +1837,10 @@ fn boundary(c : *mut Ctx, l : i64, f : u64, pass : u64, next : u64) -> void {
       if (*ln).pend_n == 0i64 { break; }
       let p : *mut Pend = offset_mut((*ln).pend, (*ln).pend_head);
       if (*p).seq > cc { break; }
-      // Rule B: an Ack waits while its version is a batch taker in flight.
-      if (*p).k == PK_ACK && (*slot(ln, (*p).v)).inflt != 0u64 { break; }
+      // Rule B: an Ack or ReplaceAck waits while its version is a batch taker in flight
+      // (vyrn-lane in_flight).
+      if ((*p).k == PK_ACK && (*slot(ln, (*p).v)).inflt != 0u64)
+         || ((*p).k == PK_REPLACE && (*slot(ln, (*p).w)).inflt != 0u64) { break; }
       (*ln).pend_head = ((*ln).pend_head + 1i64) % PEND_CAP;
       (*ln).pend_n = (*ln).pend_n - 1i64;
       settle(c, ln, p);
@@ -1770,8 +1878,23 @@ fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
       // Cancel that took effect ends its order; TOO_LATE, BUSY or AUCTION_PHASE change nothing.
       let c0 = (*ev).cause;
       if (*ev).liq == DK_JOIN {
-        if c0 == 0u64 { return; }
+        if c0 == 0u64 { end_replaced(c, ln, v); return; }
+        if c0 == DEP_ENDED {
+          let pp = pending_pred(ln, v);
+          if pp != 0u64 { release(c, ln, (*slot(ln, pp)).leg); } else { }
+          release(c, ln, leg);
+          end_replaced(c, ln, v);
+          (*rp).ended = 1u64;
+          (*rp).end_detail = D_CANCELED;
+          return;
+        }
         if c0 == BUSY { shed_leg(c, ln, leg); } else { release(c, ln, leg); }
+        if (*sp).kind == SK_NEW {
+          (*slot(ln, leg)).dead = 1u64;
+          revert_replace(ln, v);
+          if c0 == TOO_LATE { (*rp).ended = 1u64; (*rp).end_detail = D_FILLED; } else { }
+          return;
+        }
       } else if c0 == 0u64 && (*ev).qty > 0u64 {
         (*slot(ln, (*rp).cur)).tomb = 1u64;
         release(c, ln, leg);
@@ -1786,6 +1909,8 @@ fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
     if k == EV_FILL {
       let taker = (*ev).liq == LIQ_TAKER;
       if taker {
+        // An explicit Replace took effect at this step even if it never rests or goes out.
+        end_replaced(c, ln, leg);
         if (*ln).taker_leg != NONE && ((*ln).taker_leg as u64) != leg { taker_end(c, ln); }
         (*ln).taker_leg = leg as i64;
       }
@@ -1811,6 +1936,7 @@ fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
         (*rp).end_detail = D_FILLED;
         (*sp).inflt = 0u64;
       } else { }
+      end_replaced(c, ln, v);
       return;
     }
     if k == EV_RESTED {
@@ -1818,7 +1944,9 @@ fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
       if (*sp).explicit == 0u64 {
         if (*ev).cause == RESTED_IN_FLIGHT { (*sp).inflt = 1u64; }
         if (*ev).cause == RESTED_DONE { (*sp).inflt = 0u64; }
-      } else { }
+      } else {
+        end_replaced(c, ln, v);
+      }
       return;
     }
     (*sp).inflt = 0u64;
@@ -1838,9 +1966,77 @@ fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
     let busy = k == EV_REJECT && (*ev).cause == BUSY;
     if busy { shed_leg(c, ln, leg); } else { release(c, ln, leg); }
     (*slot(ln, leg)).dead = 1u64;
-    let d = if k == EV_OUT { D_OUT } else { D_CANCELED };
+    // A refused Replace leaves its order's current version (05 §2.3, §13.3).
+    let cz = (*ev).cause;
+    if k == EV_REJECT && (*sp).kind == SK_NEW
+       && (cz == BOOK_HALTED || cz == AUCTION_PHASE || cz == TOO_LATE || cz == BUSY) {
+      revert_replace(ln, v);
+      if cz == TOO_LATE { (*rp).ended = 1u64; (*rp).end_detail = D_FILLED; } else { }
+      return;
+    }
+    if k == EV_OUT && cz == OUT_FINISHED {
+      let pp = pending_pred(ln, v);
+      if pp != 0u64 { release(c, ln, (*slot(ln, pp)).leg); } else { }
+    } else { }
+    end_replaced(c, ln, v);
+    let d = if k == EV_OUT && cz != OUT_FINISHED { D_OUT } else { D_CANCELED };
     (*rp).ended = 1u64;
     (*rp).end_detail = d;
+  }
+}
+
+// vyrn-lane end_replaced: a forwarded or dependency new-priority Replace took effect at its step;
+// the old version ends there and its leg's remainder is released.
+fn end_replaced(c : *mut Ctx, ln : *mut Lane, w : u64) -> void {
+  unsafe {
+    let sp = slot(ln, w);
+    if (*sp).kind != SK_NEW || (*sp).ppend == 0u64 || (*sp).pred == 0u64 { return; }
+    (*sp).ppend = 0u64;
+    let prev = (*sp).pred;
+    (*slot(ln, prev)).tomb = 1u64;
+    release(c, ln, (*slot(ln, prev)).leg);
+    true_up(c, ln, w);
+  }
+}
+
+// vyrn-lane true_up: the new version reserved its whole total, but the predecessor's fills, now
+// final, are part of it; release them from the new leg (10 §4.4).
+fn true_up(c : *mut Ctx, ln : *mut Lane, w : u64) -> void {
+  unsafe {
+    let s = slot(ln, w);
+    if (*s).kind != SK_NEW || (*s).trued != 0u64 { return; }
+    (*s).trued = 1u64;
+    if !r_open(s) { return; }
+    let fold = sat_sub((*root(ln, (*s).root)).filled, (*s).r_settled);
+    if fold == 0u64 { return; }
+    let rem = sat_sub((*s).r_qty, (*s).r_settled);
+    if fold < rem { reduce_risk(c, ln, w, fold); } else { release(c, ln, w); }
+  }
+}
+
+// The predecessor of pending SK_NEW version w, or 0.
+fn pending_pred(ln : *mut Lane, w : u64) -> u64 {
+  unsafe {
+    let s = slot(ln, w);
+    if (*s).kind == SK_NEW && (*s).ppend != 0u64 { return (*s).pred; }
+    return 0u64;
+  }
+}
+
+// vyrn-lane revert_replace: the version before a refused explicit Replace is current again.
+fn revert_replace(ln : *mut Lane, w : u64) -> void {
+  unsafe {
+    let sp = slot(ln, w);
+    if (*sp).kind != SK_NEW || (*sp).ppend == 0u64 { return; }
+    (*sp).ppend = 0u64;
+    let rp = root(ln, (*sp).root);
+    if (*rp).cur == w { (*rp).cur = (*sp).pred; return; }
+    let mut x = (*rp).cur;
+    while x != 0u64 {
+      let leg = (*slot(ln, x)).leg;
+      if (*slot(ln, leg)).pred == w { (*slot(ln, leg)).pred = (*sp).pred; return; }
+      x = pending_pred(ln, leg);
+    }
   }
 }
 
@@ -1964,6 +2160,40 @@ fn settle(c : *mut Ctx, ln : *mut Lane, p : *mut Pend) -> void {
       if (*s).taker_end == 0u64 && (*s).taker_filled < (*s).total && (*s).dead == 0u64 {
         stage(ln, p, rec_lo(R_ACK, (*p).ix, 0u64, h), rec_hi((*s).tick, (*rp).tag));
       }
+      return;
+    }
+    if k == PK_REPLACE {
+      // vyrn-lane settle_replace.
+      flush_held(ln, (*p).w);
+      let old = slot(ln, (*p).v);
+      let nw = slot(ln, (*p).w);
+      let fnew = if (*nw).has_risk != 0u64 { (*nw).r_settled } else { 0u64 };
+      let fold = sat_sub((*rp).filled, fnew);
+      let oopen = if (*slot(ln, (*old).leg)).dead != 0u64 { 0u64 } else { sat_sub((*old).total, fold) };
+      let tag = (*rp).tag;
+      if oopen == 0u64 {
+        // TOO_LATE: the order had ended; the new version never trades (replace_ok).
+        release(c, ln, (*p).w);
+        (*nw).dead = 1u64;
+        let d = if (*rp).end_detail == 0u64 { D_FILLED } else { (*rp).end_detail };
+        (*rp).ended = 1u64;
+        (*rp).end_detail = d;
+        stage(ln, p, rec_lo(R_REJECT, (*p).ix, TOO_LATE, d), rec_hi(0u64, tag));
+        return;
+      }
+      release(c, ln, (*old).leg);
+      if (*nw).total <= fold {
+        // 05 §2.3: qty' <= filled finishes the order: CancelAck of the old open.
+        release(c, ln, (*p).w);
+        (*rp).ended = 1u64;
+        (*rp).end_detail = D_CANCELED;
+        stage(ln, p, rec_lo(R_CXL, (*p).ix, 0u64, h), rec_hi(oopen, tag));
+        return;
+      }
+      true_up(c, ln, (*p).w);
+      if (*nw).taker_end == 0u64 && (*nw).taker_filled < sat_sub((*nw).total, fold) && (*nw).dead == 0u64 {
+        stage(ln, p, rec_lo(R_ACK, (*p).ix, 0u64, h), rec_hi((*nw).tick, tag));
+      } else { }
       return;
     }
     if k == PK_CXL {
@@ -2225,8 +2455,72 @@ fn key_lt(c : *mut Ctx, la : u64, ra : u64, lb : u64, rb : u64) -> bool {
 // (Bbo::ctx sets `auction: false` elsewhere), so it rests unseen in Continuous and auction
 // steps. Its open quantity, for its own events, is still bopen.
 fn blive(c : *mut Ctx, l : u64, r : u64) -> u64 {
+  rk_eval(c, l, r);
   unsafe { if (((*bord(c, l, r)).flags >> 1u64) & 3u64) == 3u64 { return 0u64; } }
   return bopen(c, l, r);
+}
+
+// A NewPrio version's replace_ok, decided the first time its liveness is asked (State::rok
+// caches it the same way); refused, the order is dead.
+fn rk_eval(c : *mut Ctx, l : u64, r : u64) -> void {
+  unsafe {
+    let o = bord(c, l, r);
+    if (*o).rk != 1u64 { return; }
+    if rok(c, l, r, (*o).vslot, (*o).seq, (*o).pt) { (*o).rk = 2u64; } else { (*o).rk = 3u64; (*o).killed = 1u64; }
+  }
+}
+
+// vyrn-bbo State::replace_ok for NewPrio version w (LaneSeq seq) of root r: not killed, not
+// ended by an uncross while auction-only (#210), not filled to its predecessor's total, and not
+// after the version that finished the order.
+fn rok(c : *mut Ctx, l : u64, r : u64, w : u64, seq : u64, pt : u64) -> bool {
+  unsafe {
+    let o = bord(c, l, r);
+    let ad = *offset_mut((*(*c).bbo).adead, l as i64);
+    let ao = ad != 0u64 && seq > ad && ao_at(c, l, w, ad);
+    return (*o).killed == 0u64 && !ao && (*o).filled < pt && !((*o).fin != 0u64 && seq > (*o).fin);
+  }
+}
+
+// vyrn-bbo State::ao_at: whether the version in effect at `cut` of the order whose NewPrio
+// version is w was auction-only: back through each predecessor's position (its leg) to the
+// newest at or before `cut`. The lane wrote these slot fields before it published the op.
+fn ao_at(c : *mut Ctx, l : u64, w : u64, cut : u64) -> bool {
+  unsafe {
+    let ln = lane(c, l as i64);
+    let root_w = (*slot(ln, w)).root;
+    let mut cur = w;
+    let mut k = 0u64;
+    while k < (*c).slot_cap {
+      let pv = (*slot(ln, cur)).pv;
+      if pv == 0u64 { return false; }
+      let pp = (*slot(ln, pv)).leg;
+      let p = slot(ln, pp);
+      if (*p).root != root_w || (*p).ins_seq >= (*slot(ln, cur)).ins_seq { fail_bbo(c, E_FAULT); return false; }
+      if (*p).ins_seq <= cut { return (((*p).flags >> 1u64) & 3u64) == 3u64; }
+      if (*p).kind != SK_NEW { return false; }
+      cur = pp;
+      k = k + 1u64;
+    }
+    fail_bbo(c, E_FAULT);
+    return false;
+  }
+}
+
+// A fill brought the order to its version's total: later versions are dead (State::add_fill).
+fn note_fin(o : *mut BOrd) -> void {
+  unsafe { if (*o).filled >= (*o).total { (*o).fin = max((*o).fin, (*o).seq); } else { } }
+}
+
+// The order's version becomes the NewPrio one (np_seq: the old one ends): fills stay the root's.
+fn put_version(c : *mut Ctx, l : u64, r : u64, tick : u64, total : u64, ts : u64, seq : u64,
+               flags : u64, vslot : u64) -> void {
+  unsafe {
+    book_drop(c, l, r);
+    let o = bord(c, l, r);
+    (*o).tick = tick; (*o).total = total; (*o).ts = ts; (*o).seq = seq; (*o).flags = flags;
+    (*o).vslot = vslot; (*o).state = 2u64;
+  }
 }
 
 // blive at the batch taker's key while it sweeps (Ctx::done at key k): the order joined in
@@ -2439,6 +2733,19 @@ fn kill_session(c : *mut Ctx, l : u64, q : u64, sid : u64) -> void {
   }
 }
 
+// A forwarded op of root r on lane l is still queued at the BBO.
+fn fwd_queued(c : *mut Ctx, l : u64, r : u64) -> bool {
+  unsafe {
+    let li = l as i64;
+    let head = sld(c, 2i64 * li, Y_FWD_HEAD);
+    for t in (*offset_mut((*(*c).bbo).fwd_tail, li))..head {
+      let sq = *offset_mut((*c).fwdq, li * (FWDQ_CAP as i64) + ((t % FWDQ_CAP) as i64));
+      if (*lop(c, li, sq)).root == r { return true; }
+    }
+    return false;
+  }
+}
+
 fn ingest(c : *mut Ctx, l : u64, from : u64, to : u64) -> void {
   for q in (from + 1u64)..(to + 1u64) {
     let e = lop(c, l as i64, q);
@@ -2458,8 +2765,26 @@ fn ingest(c : *mut Ctx, l : u64, from : u64, to : u64) -> void {
       } else if k == OP_KILLALL {
         kill_session(c, l, q, (*e).sess_id);
         if (*(*c).bbo).err != 0u64 { return; }
+      } else if k == OP_REPLACE {
+        let r = (*e).root;
+        // A forwarded op of this order still queued would apply after it (unreplayed).
+        if fwd_queued(c, l, r) { fail_bbo(c, E_UNSUPPORTED); return; }
+        let o = bord(c, l, r);
+        let b = (*c).bbo;
+        if (*b).has_fz != 0u64 && q > *offset_mut((*b).fz, l as i64) {
+          // Admitted after C*: the uncross matches at C*, where the old version is in effect.
+          if (*o).sg != 0u64 { fail_bbo(c, E_UNSUPPORTED); return; }
+          (*o).sg = q; (*o).s_tick = (*e).tick; (*o).s_total = (*e).total; (*o).s_ts = (*e).ts;
+          (*o).s_flags = (*e).flags; (*o).s_vslot = (*e).vslot; (*o).s_pt = (*e).pt;
+        } else {
+          put_version(c, l, r, (*e).tick, (*e).total, (*e).ts, q, (*e).flags, (*e).vslot);
+          (*o).rk = 1u64;
+          (*o).pt = (*e).pt;
+          book_add(c, l, r);
+        }
       } else if k == OP_REDUCE {
         let o = bord(c, l, (*e).root);
+        rk_eval(c, l, (*e).root);
         (*o).total = (*e).total;
         (*o).vslot = (*e).vslot;
         if bopen(c, l, (*e).root) == 0u64 { book_drop(c, l, (*e).root); }
@@ -2832,8 +3157,8 @@ fn klevel(c : *mut Ctx, side : u64, from : u64, limit : u64) -> u64 {
 }
 
 // Bbo::exec_rescan in replay (05 §8.6): the logged cut is taken as is. The batch taker is the
-// first in-band New of (prev, cut] in key order; it sweeps at its key. A Cancel or Reduce of
-// the batch after the key (the taker still sees the order it ends, the replayer's book does
+// first in-band New or new-priority Replace of (prev, cut] in key order; it sweeps at its key.
+// A Cancel, Reduce or Replace of the batch after the key (the taker still sees the order it ends, the replayer's book does
 // not) stops with PBV_E_UNSUPPORTED rather than guess.
 fn exec_rescan(c : *mut Ctx, lo : u64, hi : u64) -> void {
   unsafe {
@@ -2845,7 +3170,8 @@ fn exec_rescan(c : *mut Ctx, lo : u64, hi : u64) -> void {
       let cl = *offset_mut((*b).cut, l);
       for q in (pv + 1u64)..(cl + 1u64) {
         let e = lop(c, l, q);
-        if (*e).kind != OP_JOIN || (*e).tick < lo || (*e).tick > hi { continue; }
+        // Bbo::rescan: the first in-band New or new-priority Replace (JKind::New | NewPrio).
+        if ((*e).kind != OP_JOIN && (*e).kind != OP_REPLACE) || (*e).tick < lo || (*e).tick > hi { continue; }
         if sl == NONE {
           sl = l; sq = q;
         } else {
@@ -2865,7 +3191,7 @@ fn exec_rescan(c : *mut Ctx, lo : u64, hi : u64) -> void {
     for l in 0i64..(*c).n {
       for q in (*offset_mut((*b).prev, l) + 1u64)..(*offset_mut((*b).cut, l) + 1u64) {
         let k = (*lop(c, l, q)).kind;
-        if (k == OP_CANCEL || k == OP_REDUCE || k == OP_KILLALL) && after_key(c, l, q) {
+        if (k == OP_CANCEL || k == OP_REDUCE || k == OP_KILLALL || k == OP_REPLACE) && after_key(c, l, q) {
           fail_bbo(c, E_UNSUPPORTED);
           return;
         }
@@ -2924,6 +3250,7 @@ fn rescan_run(c : *mut Ctx, cont : bool) -> void {
 // holds one stops with PBV_E_UNSUPPORTED (uncross_chunk).
 fn at_fz(c : *mut Ctx, l : u64, r : u64) -> u64 {
   unsafe {
+    rk_eval(c, l, r);
     let o = bord(c, l, r);
     if (*o).seq > *offset_mut((*(*c).bbo).fz, l as i64) { return 0u64; }
     // 05 §8.8 item 6: an auction-only order an earlier uncross ended is not live (Ctx::live).
@@ -2991,6 +3318,7 @@ fn uncross_chunk(c : *mut Ctx) -> void {
         let mo = bord(c, ml, mr);
         let qf = min(rem, bopen(c, ml, mr));
         (*mo).filled = (*mo).filled + qf;
+        note_fin(mo);
         event(c, ml, EV_FILL, LIQ_AUCTION, 0u64, (*mo).vslot, handle(mr), p, qf);
         (*b).n_fills = (*b).n_fills + 1u64;
         if bopen(c, ml, mr) == 0u64 { book_drop(c, ml, mr); }
@@ -3008,6 +3336,19 @@ fn uncross_chunk(c : *mut Ctx) -> void {
       (*b).phase = PH_CONT;
       (*b).has_fz = 0u64;
       (*b).has_unc = 0u64;
+      // Replaces admitted after C*: now in effect, decided against the new adead.
+      for l in 0i64..n {
+        for r in 1u64..(*c).slot_cap {
+          let o = bord(c, l as u64, r);
+          if (*o).sg != 0u64 {
+            put_version(c, l as u64, r, (*o).s_tick, (*o).s_total, (*o).s_ts, (*o).sg, (*o).s_flags, (*o).s_vslot);
+            (*o).rk = 1u64;
+            (*o).pt = (*o).s_pt;
+            (*o).sg = 0u64;
+            book_add(c, l as u64, r);
+          } else { }
+        }
+      }
       (*b).unc_last = 0u64;
       exact_bounds(c, NO_ASK - 1u64, 1u64);
     } else { }
@@ -3078,7 +3419,8 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
       return;
     }
     let o = bord(c, l, r);
-    if !cont {
+    let np = (*e).np != 0u64;
+    if !cont && !np {
       let op : *mut i8 = o;
       clear(op, sizeof<BOrd>());
       (*o).side = (*e).side; (*o).tick = (*e).tick; (*o).total = (*e).total; (*o).ts = (*e).ts;
@@ -3111,16 +3453,18 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
     let mut ended = false;
     let ph = (*b).phase;
     if first && ph == PH_HALTED {
-      end_taker(c, l, e, src, EV_REJECT, BOOK_HALTED, true, 0u64);
+      if np { keep_reject(c, l, e, src, BOOK_HALTED); } else { end_taker(c, l, e, src, EV_REJECT, BOOK_HALTED, true, 0u64); }
       ended = true;
     } else if first && ph == PH_FROZEN {
-      end_taker(c, l, e, src, EV_REJECT, AUCTION_PHASE, true, 0u64);
+      if np { keep_reject(c, l, e, src, AUCTION_PHASE); } else { end_taker(c, l, e, src, EV_REJECT, AUCTION_PHASE, true, 0u64); }
       ended = true;
     } else if first && ph == PH_AUCTION && (tif == 1u64 || tif == 2u64) {
       end_taker(c, l, e, src, EV_OUT, OUT_AUCTION, false, 0u64);
       ended = true;
     } else if first && ph == PH_CONT && tif == 3u64 {
-      end_taker(c, l, e, src, EV_REJECT, AUCTION_PHASE, true, 0u64);
+      if np { keep_reject(c, l, e, src, AUCTION_PHASE); } else { end_taker(c, l, e, src, EV_REJECT, AUCTION_PHASE, true, 0u64); }
+      ended = true;
+    } else if first && np && np_entry(c, l, q, e, src) {
       ended = true;
     } else if first && ph == PH_AUCTION {
       // An auction rests the taker without a sweep (Bbo::rest_taker).
@@ -3212,14 +3556,29 @@ fn apply_deps(c : *mut Ctx, s : u64, l : u64, q : u64, e : *mut LOp, shed : bool
           let why = if ph == PH_FROZEN { AUCTION_PHASE } else { BOOK_HALTED };
           event(c, l, EV_DEP, dk, why, (*d).vslot, h, (*d).tick, 0u64);
           tx_push_g(c, dh, g, rec_lo(R_REJECT, ix, why, 0u64), rec_hi(0u64, (*d).tag));
+        } else if dk == DK_JOIN && (*d).np != 0u64 && !rok(c, l, r, (*d).vslot, dq, (*d).pt) {
+          event(c, l, EV_DEP, DK_JOIN, TOO_LATE, (*d).vslot, h, (*d).tick, 0u64);
+          tx_push_g(c, dh, g, rec_lo(R_REJECT, ix, TOO_LATE, 0u64), rec_hi(0u64, (*d).tag));
+        } else if dk == DK_JOIN && (*d).np != 0u64 && (*d).total <= (*bord(c, l, r)).filled {
+          let o = bord(c, l, r);
+          let old = sat_sub((*d).pt, (*o).filled);
+          book_drop(c, l, r);
+          (*o).killed = 1u64;
+          event(c, l, EV_DEP, DK_JOIN, DEP_ENDED, (*d).vslot, h, (*d).tick, old);
+          tx_push_g(c, dh, g, rec_lo(R_CXL, ix, 0u64, h), rec_hi(old, (*d).tag));
         } else if dk == DK_JOIN {
           let o = bord(c, l, r);
-          let op : *mut i8 = o;
-          clear(op, sizeof<BOrd>());
-          (*o).side = (*d).side; (*o).tick = (*d).tick; (*o).total = (*d).total; (*o).ts = (*d).ts;
-          (*o).seq = dq; (*o).acct = (*d).acct; (*o).sess_id = (*d).sess_id; (*o).tag = (*d).tag;
-          (*o).flags = (*d).flags; (*o).vslot = (*d).vslot;
-          (*o).state = 2u64;
+          if (*d).np != 0u64 {
+            put_version(c, l, r, (*d).tick, (*d).total, (*d).ts, dq, (*d).flags, (*d).vslot);
+            (*o).rk = 2u64;
+          } else {
+            let op : *mut i8 = o;
+            clear(op, sizeof<BOrd>());
+            (*o).side = (*d).side; (*o).tick = (*d).tick; (*o).total = (*d).total; (*o).ts = (*d).ts;
+            (*o).seq = dq; (*o).acct = (*d).acct; (*o).sess_id = (*d).sess_id; (*o).tag = (*d).tag;
+            (*o).flags = (*d).flags; (*o).vslot = (*d).vslot;
+            (*o).state = 2u64;
+          }
           // It enters like a New (Bbo::join_dep): one that a visible level crosses at the
           // source's cut matches first, at that cut, with the sweep's cap (D14).
           let mut lvl = 0u64;
@@ -3306,12 +3665,61 @@ fn join_rest(c : *mut Ctx, s : u64, l : u64, d : *mut LOp, g : u64) -> u64 {
   return 0u64;
 }
 
+// The taker's open quantity (Taker::open): a Replace not yet in effect has its new total.
+fn topen(c : *mut Ctx, l : u64, e : *mut LOp) -> u64 {
+  unsafe {
+    let o = bord(c, l, (*e).root);
+    if (*e).np != 0u64 && (*o).seq != (*e).seq {
+      if (*o).killed != 0u64 { return 0u64; }
+      return sat_sub((*e).total, (*o).filled);
+    }
+    return bopen(c, l, (*e).root);
+  }
+}
+
+// A refused forwarded Replace that leaves its order's current version (reject_taker keeps_old).
+fn keep_reject(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, code : u64) -> void {
+  unsafe {
+    event(c, l, EV_REJECT, LIQ_TAKER, code, (*e).vslot, handle((*e).root), (*e).tick, topen(c, l, e));
+    tx_push(c, src, rec_lo(R_REJECT, (*e).ix, code, 0u64), rec_hi(0u64, (*e).tag));
+  }
+}
+
+// Bbo::entry_checks for a NewPrio taker: TOO_LATE unless replace_ok; else the old version
+// ends (np_seq), and a total at or below the fills finishes the order (CancelAck of the old
+// open, Out FINISHED). true when the taker ended.
+fn np_entry(c : *mut Ctx, l : u64, q : u64, e : *mut LOp, src : i64) -> bool {
+  unsafe {
+    let r = (*e).root;
+    if !rok(c, l, r, (*e).vslot, q, (*e).pt) {
+      keep_reject(c, l, e, src, TOO_LATE);
+      return true;
+    }
+    let o = bord(c, l, r);
+    let h = handle(r);
+    if (*e).total <= (*o).filled {
+      let old = sat_sub((*e).pt, (*o).filled);
+      book_drop(c, l, r);
+      (*o).killed = 1u64;
+      (*o).state = 3u64;
+      event(c, l, EV_OUT, LIQ_TAKER, OUT_FINISHED, (*e).vslot, h, (*e).tick, old);
+      tx_push(c, src, rec_lo(R_CXL, (*e).ix, 0u64, h), rec_hi(old, (*e).tag));
+      return true;
+    }
+    put_version(c, l, r, (*e).tick, (*e).total, (*e).ts, q, (*e).flags, (*e).vslot);
+    (*o).rk = 2u64;
+    return false;
+  }
+}
+
 // Ends the taker with a Reject (reason) or an Out (cause), its open quantity and its record.
 fn end_taker(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, kind : u64, code : u64, reject : bool,
              detail : u64) -> void {
   unsafe {
     let r = (*e).root;
-    let open = bopen(c, l, r);
+    let open = topen(c, l, e);
+    // A Replace not yet in effect: its old version ends with the order.
+    if (*e).np != 0u64 && (*bord(c, l, r)).seq != (*e).seq { book_drop(c, l, r); } else { }
     let o = bord(c, l, r);
     (*o).killed = 1u64;
     (*o).state = 3u64;
@@ -3423,6 +3831,7 @@ fn sweep(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, kb : bool, from : u64) 
         let mo = bord(c, ml, mr);
         let q = min(open, bopen(c, ml, mr));
         (*mo).filled = (*mo).filled + q;
+        note_fin(mo);
         let mh = handle(mr);
         event(c, ml, EV_FILL, LIQ_MAKER, 0u64, (*mo).vslot, mh, lvl, q);
         (*b).n_fills = (*b).n_fills + 1u64;
@@ -3439,6 +3848,7 @@ fn sweep(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, kb : bool, from : u64) 
         if bopen(c, ml, mr) == 0u64 { book_drop(c, ml, mr); }
         let o = bord(c, l, r);
         (*o).filled = (*o).filled + q;
+        note_fin(o);
         level_qty = level_qty + q;
         work = work + 1u64;
       }
