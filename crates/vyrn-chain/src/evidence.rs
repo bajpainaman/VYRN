@@ -14,7 +14,13 @@
 //! - *Duplicate key:* "the same fault by the same operator" is (kind, operator, slot), with slot
 //!   (book, height) for `SeqEquivocation`, (epoch, view) for `DoubleVote`, second for
 //!   `DoubleCommit` and post number for `BadPost`.
-//! - *Age:* evidence is older than 42 epochs when its fault epoch + 42 < the current epoch.
+//! - *Age:* evidence is older than 42 epochs when its fault epoch + 42 < the current epoch. For
+//!   `SeqEquivocation` the fault epoch is the later header's; for `BadPost` it is the epoch in
+//!   which the chain made post `post_no` ([`EvidenceState::post_epoch`]), and a post number the
+//!   chain has not reached is never too old.
+//! - *`SeqEquivocation` across epochs:* the two headers need the same book and height only (09
+//!   §8.2); their epoch fields may differ, as long as the one `SK` belongs to the same operator in
+//!   each header's epoch.
 //! - `FenceViolation`, `HandoffWithheld`, `CrossHomeVote`, `Censorship` and `WrongExclusion` need
 //!   records 09 does not encode yet (`HandoffRecord` cert, `NodeCert` homes, item proofs); they are
 //!   follow-ups.
@@ -162,6 +168,8 @@ pub trait EvidenceState {
     fn bridge_key_owner(&self, addr: &Address) -> Option<OpIdx>;
     /// The struct hash of the chain's own post `post_no`, if it made one.
     fn post_hash(&self, post_no: u64) -> Option<[u8; 32]>;
+    /// The epoch in which the chain made post `post_no`, if it made one.
+    fn post_epoch(&self, post_no: u64) -> Option<Epoch>;
     /// The bridge's EIP-712 domain.
     fn domain(&self) -> Domain;
 }
@@ -211,15 +219,17 @@ impl Evidence {
             Evidence::SeqEquivocation { a, b, seq_key } => {
                 if a.book != b.book
                     || a.height != b.height
-                    || a.epoch != b.epoch
                     || vyrn_log::block::header_hash(a) == vyrn_log::block::header_hash(b)
                 {
                     return Err(NoConflict);
                 }
-                if too_old(st, a.epoch) {
+                if too_old(st, a.epoch.max(b.epoch)) {
                     return Err(TooOld);
                 }
                 let op = st.seq_key_owner(a.epoch, seq_key).ok_or(BadSignature)?;
+                if st.seq_key_owner(b.epoch, seq_key) != Some(op) {
+                    return Err(BadSignature);
+                }
                 if !vyrn_log::block::verify_seq_sig(a, seq_key)
                     || !vyrn_log::block::verify_seq_sig(b, seq_key)
                 {
@@ -294,6 +304,9 @@ impl Evidence {
                 if st.post_hash(post.post_no) == Some(h) {
                     return Err(NoConflict);
                 }
+                if st.post_epoch(post.post_no).is_some_and(|e| too_old(st, e)) {
+                    return Err(TooOld);
+                }
                 let signer =
                     eip712::recover(&st.domain().digest(&h), sig).map_err(|_| BadSignature)?;
                 let op = st.bridge_key_owner(&signer).ok_or(BadSignature)?;
@@ -357,6 +370,7 @@ mod tests {
         vks: Vec<PubKey>,
         bk: Address,
         post: Option<[u8; 32]>,
+        post_epoch: Option<Epoch>,
         epoch: u32,
     }
     impl EvidenceState for St {
@@ -375,6 +389,9 @@ mod tests {
         fn post_hash(&self, _: u64) -> Option<[u8; 32]> {
             self.post
         }
+        fn post_epoch(&self, _: u64) -> Option<Epoch> {
+            self.post_epoch
+        }
         fn domain(&self) -> Domain {
             Domain {
                 chain_id: 1,
@@ -392,14 +409,19 @@ mod tests {
             ],
             bk: eip712::address_of_secret(&[4; 32]).unwrap(),
             post: None,
+            post_epoch: None,
             epoch: 10,
         }
     }
 
     fn header(root: u8) -> BlockHeader {
+        header_in(root, 10)
+    }
+
+    fn header_in(root: u8, epoch: u32) -> BlockHeader {
         let mut h = BlockHeader {
             height: Height(5),
-            epoch: Epoch(10),
+            epoch: Epoch(epoch),
             book: BookId(1),
             first_step: StepId(1),
             last_step: StepId(2),
@@ -464,6 +486,13 @@ mod tests {
             EvidenceLedger::new().process(&bad, &s),
             Err(EvidenceError::BadSignature)
         );
+        // The same SK signing one height under two epoch fields is still equivocation.
+        let cross = Evidence::SeqEquivocation {
+            a: header(1),
+            b: header_in(1, 11),
+            seq_key: s.seq,
+        };
+        assert!(EvidenceLedger::new().process(&cross, &s).is_ok());
         // Epoch 10 + 42 = 52: still in time at 52, too old at 53.
         assert!(
             EvidenceLedger::new()

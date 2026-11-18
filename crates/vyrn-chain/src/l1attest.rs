@@ -56,8 +56,9 @@ pub enum AttestError {
     Conflict(OpIdx),
 }
 
-/// The deposit tally: attestations per nonce, and the next nonce to credit.
-#[derive(Clone, Debug, Default)]
+/// The deposit tally: attestations per nonce, and the next nonce to credit. No `Default`: the
+/// bridge's first nonce is 1 (`++depositCount`), so callers choose the start with [`Self::new`].
+#[derive(Clone, Debug)]
 pub struct DepositTally {
     next: u64,
     pending: BTreeMap<u64, BTreeMap<OpIdx, Deposited>>,
