@@ -391,7 +391,6 @@ fn the_script_reaches_every_case() {
     assert_eq!(hb.count, 1, "{hb:?}");
 }
 
-/// A lane reads the BBO snapshot only at its boundaries (05 §6.5, 07 §7.1 `REP_MERGE` item 2).
 /// Band scripts for `snap_lag` (05 §6.5, 07 §7.1): lane 2 takes no boundary after its last
 /// fill step, then classifies a buy at 300 against the newest snapshot, many versions after
 /// the one its `fills_applied` step published. Replay must use the logged version, not that
@@ -1020,5 +1019,166 @@ fn the_vx_client_halts_on_a_forwarded_queue_overflow() {
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the Vx client deadlocked on its forwarded queue");
     let e = r.unwrap_err();
+    assert!(e.0.contains("diverged (fault)"), "{e}");
+}
+
+/// The Vx client and `RustReplay` produce the live run's bytes and the same output hash in one
+/// block, and the same output hashes with the blocks split after each record index in `splits`.
+fn assert_vx_matches(script: &[Act], splits: impl IntoIterator<Item = usize>) {
+    let Some(lib) = vx_lib() else { return };
+    let (live_j, store, blocks) = blocks_of(script, &[]);
+    let (_, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
+    let vx = vx_replay(&store, &blocks, &lib).unwrap();
+    let (lanes, tx) = live_bytes(&live_j);
+    for l in 0..N {
+        assert_eq!(vx[0].0[l], lanes[l], "lane {l} responses");
+    }
+    assert_eq!(vx[0].1, tx, "fill TX packets");
+    assert_eq!(vec![vx[0].2], rust_hashes);
+    for at in splits {
+        let (live_j, store, blocks) = blocks_of(script, &[at]);
+        let (_, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
+        let vx =
+            vx_replay(&store, &blocks, &lib).unwrap_or_else(|e| panic!("split after {at}: {e}"));
+        let h: Vec<Hash> = vx.iter().map(|x| x.2).collect();
+        assert_eq!(h, rust_hashes, "split after {at}");
+    }
+}
+
+/// `snap_lag` (05 §6.5, 07 §7.1) on the Vx client: each packet is classified against the
+/// version its record names, not its `fills_applied` step's, in both band cases of
+/// [`snap_lag_script`], at every block boundary.
+#[test]
+fn the_vx_client_classifies_each_packet_against_its_logged_snapshot() {
+    for ask_kept in [true, false] {
+        let script = snap_lag_script(ask_kept);
+        let (j, _) = live07(&script);
+        assert_vx_matches(&script, 0..j.recs.len() - 1);
+    }
+}
+
+/// More snapshot versions than replay keeps (`REPLAY_SNAP_HIST` = 4096, 07 §7.1): each of 5
+/// sweeps rests 500 rising bids on lane 1 (one version each) and fills them with IOC sells
+/// from lane 2, while lane 0 has no work and takes no boundary. Then lane 0 sends a join
+/// (`join`) or a Heartbeat. Slots are not reused, so the harness's `SLOT_CAP` (4096) is what
+/// lets each lane take 2500 ops.
+fn window_script(join: bool) -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::{Day, Ioc};
+    let p = |l, a, rx_ts, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts,
+        now: rx_ts,
+        msgs,
+    };
+    let mut s = Vec::new();
+    let mut t = 1_000u64;
+    let mut tag = 0u32;
+    for _ in 0..5 {
+        for (l, a0, n) in [(1, 1, 10), (2, 1, 5)] {
+            for k in 0..500u32 {
+                tag += 1;
+                let m = if l == 1 {
+                    new(Buy, Day, 2 + k, 1, tag)
+                } else {
+                    new(Sell, Ioc, 1, 1, tag)
+                };
+                s.push(p(l, a0 + k % n, t, vec![m]));
+                s.push(Act::Run);
+                t += 1_000;
+            }
+        }
+    }
+    let last = if join {
+        new(Buy, Day, 1, 1, tag + 1)
+    } else {
+        vyrn_wire::Msg::Heartbeat
+    };
+    s.push(p(0, 1, t, vec![last]));
+    s.push(Act::Run);
+    s
+}
+
+/// 05 §6.5: a lane whose lag would pass the window (`REPLAY_SNAP_HIST` − 1) first takes a
+/// catch-up boundary, so every logged lag names a version replay holds; the Vx client follows
+/// the catch-up Advance and the join's lag as `RustReplay` does (vyrn-engine
+/// `a_lagging_lane_catches_up_before_its_lag_leaves_the_replay_window`).
+#[test]
+fn the_vx_client_follows_a_lagging_lanes_catch_up() {
+    let script = window_script(true);
+    let (j, _) = live07(&script);
+    let window = u16::try_from(vyrn_engine::REPLAY_SNAP_HIST - 1).unwrap();
+    assert_eq!(vyrn_engine::SNAP_LAG_WINDOW, window);
+    for r in &j.recs {
+        if let OwnedRec::Packet(p) = r {
+            assert!(p.snap_lag <= window, "{p:?}");
+        }
+    }
+    let l0 = lane_pkts(&j, 0);
+    let k = l0.iter().position(|p| p.count > 0).unwrap();
+    assert!(
+        k > 0 && l0[k - 1].flags & vyrn_types::PacketFlags::ADVANCE != 0,
+        "{l0:?}"
+    );
+    assert!(l0[k].fills_applied.0 > 0, "{:?}", l0[k]);
+    // One block, then splits around lane 0's catch-up and join.
+    let at = j
+        .recs
+        .iter()
+        .position(|r| matches!(r, OwnedRec::Packet(p) if p.lane.0 == 0))
+        .unwrap();
+    assert_vx_matches(&script, [at - 1, at, at + 1, at + 2]);
+}
+
+/// 07 §7.1: a packet record whose version the ring no longer holds is `NoSnapshot` on
+/// `RustReplay` and `PBV_E_FAULT` on the Vx client (vyrn-engine
+/// `a_packet_naming_an_evicted_snapshot_is_no_snapshot`). Lane 0's Heartbeat moves to a later
+/// block without its catch-up Advance, so it names version 0 + its lag, evicted after the
+/// script's 5000 versions.
+#[test]
+fn the_vx_client_reports_an_evicted_snapshot() {
+    let (live_j, store, mut blocks) = blocks_of(&window_script(false), &[]);
+    let b = &mut blocks[0];
+    let is_l0 = |r: &vyrn_log::LaneRec| matches!(r, vyrn_log::LaneRec::Pkt(p) if p.lane.0 == 0);
+    let i = b.lanes.iter().position(is_l0).unwrap();
+    let vyrn_log::LaneRec::Pkt(adv) = b.lanes[i] else {
+        unreachable!()
+    };
+    let vyrn_log::LaneRec::Pkt(mut hb) = b.lanes[i + 1] else {
+        unreachable!()
+    };
+    assert!(adv.flags & vyrn_types::PacketFlags::ADVANCE != 0, "{adv:?}");
+    assert!(hb.lane.0 == 0 && hb.count == 0 && hb.flags == 0, "{hb:?}");
+    assert!(hb.snap_lag < 4096, "{hb:?}");
+    b.lanes.drain(i..i + 2);
+    if i < b.split {
+        b.split -= 2;
+    }
+    hb.fills_applied = vyrn_types::StepId(0);
+    let later = BlockInputs {
+        header: b.header,
+        lanes: vec![vyrn_log::LaneRec::Pkt(hb)],
+        split: 1,
+        steps: Vec::new(),
+    };
+    blocks.push(later);
+    // RustReplay without `payloads_mut().check`: the edited blocks no longer match their roots.
+    let mut data = DataJoin::default();
+    for ((_, s, q, _), b) in &store.0 {
+        data.put(*s, *q, b.clone());
+    }
+    let (bbo, mut sh) = new_box();
+    let mut rep = RustReplay::new(
+        engine(bbo, &mut sh),
+        data,
+        RespLog::of(&live_j),
+        Journal::default(),
+    );
+    rep.replay_block(&blocks[0]).unwrap();
+    let e = rep.replay_block(&blocks[1]).unwrap_err();
+    assert!(e.0.contains("NoSnapshot"), "{e}");
+    let Some(lib) = vx_lib() else { return };
+    let e = vx_replay(&store, &blocks, &lib).unwrap_err();
     assert!(e.0.contains("diverged (fault)"), "{e}");
 }

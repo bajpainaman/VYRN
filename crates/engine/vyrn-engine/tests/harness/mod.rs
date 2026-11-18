@@ -30,9 +30,11 @@ pub const N: usize = 3;
 pub const NA: usize = 16;
 pub const BOOK: BookId = BookId(7);
 pub const TICK_MAX: u32 = 512;
-/// Order slots and FIFO segments per lane, above `ENG_FWD_RING` + the BBO's lane buffer (as in vyrn-sim's 4096) so
-/// a lane can have more forwarded ops in flight than the forward ring holds.
-pub const SLOT_CAP: u32 = 2048;
+/// Order slots and FIFO segments per lane, as in vyrn-sim. Above `ENG_FWD_RING` + the BBO's lane
+/// buffer, so a lane can have more forwarded ops in flight than the forward ring holds; and,
+/// since slots are not reused, enough for two lanes to publish more than `ENG_SNAP_HIST`
+/// snapshot versions (vyrn-replica's window tests).
+pub const SLOT_CAP: u32 = 4096;
 /// `FwdEntry.deadline − rx_ts` used by every lane here.
 pub const FWD_DL: u32 = vyrn_lane::lane::FWD_DEADLINE_NS;
 

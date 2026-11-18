@@ -102,7 +102,7 @@ pub struct VxConfig {
 impl VxConfig {
     fn tables(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut c = vec![0u8; 64];
-        put(&mut c, 0, &1u32.to_le_bytes());
+        put(&mut c, 0, &2u32.to_le_bytes());
         put(&mut c, 4, &64u32.to_le_bytes());
         put(&mut c, 8, &[self.n_lanes]);
         put(&mut c, 10, &self.book.to_le_bytes());
@@ -329,6 +329,7 @@ impl<P: Payloads> VxReplay<P> {
         put(&mut b, 32, &p.first_lane_seq.0.to_le_bytes());
         put(&mut b, 40, &p.fills_applied.0.to_le_bytes());
         put(&mut b, 48, &(at as u64).to_le_bytes());
+        put(&mut b, 56, &p.snap_lag.to_le_bytes());
         for (i, x) in rs.iter().enumerate() {
             put(&mut b, IN_ROUTES + 16 * i, &x.lane_seq.0.to_le_bytes());
             put(&mut b, IN_ROUTES + 16 * i + 8, &[u8::from(x.cross)]);

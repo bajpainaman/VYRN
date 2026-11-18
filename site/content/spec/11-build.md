@@ -997,21 +997,23 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   dependencies, Rescan, Control, Seal, Uncross, step payloads, snapshot and state bytes) stops
   with `PBV_E_UNSUPPORTED` rather than guess, so a v1 Vx validator halts on it instead of
   diverging silently.
-- *Band reference.* A lane reads the BBO snapshot only at a boundary: every call checks the
-  price band against the snapshot published after the step its packet's `fills_applied` names
-  (a `MID` boundary inside the packet moves it on for the ops after it). The snapshot is Rust's `Bbo` bounds, not
-  the exact book: before each step `band_env` widens (B, A) to the envelope of the snapshot
-  versions the cut's ops may hold, `touch`, a resting taker and an Idle/Depletion observation
-  move them, and `finish` publishes them as a new version when they change. The client keeps
-  the same bounds, version history and per-lane lowest versions (the BBO reads each lane's
-  applied seq and snapshot version once the lane has replayed every call due before the step,
-  as Rust's cut cores publish them), so a stale bound after a fill empties the last ask rejects
-  as in `RustReplay` (`tests/replay.rs`, band test).
-  **Ruling (c), superseding #137's boundary-only rule:** live lanes read the snapshot at accept
-  (05 §6.5) and log `PacketRecord.snap_lag`; Rust replay restores version
-  `base + snap_lag` from its snapshot history (07 §7.1). The Vx client still reads at boundaries
-  only and must follow `snap_lag` next; until it does, it diverges once the band binds, and
-  `engine.client` defaults to `rust`.
+- *Band reference.* Each packet record that classifies (not Advance, not `SHED`) checks the
+  price band against snapshot version `base + snap_lag` (05 §6.5, 07 §7.1, ruling (c), which
+  supersedes #137's boundary-only rule). `base` is the version the lane's latest boundary step
+  published, and the slot carries `snap_lag` at byte 56 (`PBV_ABI_VERSION` 2). A `MID` boundary
+  inside a packet moves `base` for later packets but not the packet's own snapshot, and an
+  Advance boundary also raises the lane's snapshot version to `base`, as `vyrn-lane` does. A
+  record is due once its `fills_applied` step ran and the BBO has published that version. The
+  client looks it up in a ring of `REPLAY_SNAP_HIST` = 4096 versions, and a version the ring no
+  longer holds is `NoSnapshot`, which the client reports as `PBV_E_FAULT`. The snapshot is
+  Rust's `Bbo` bounds, not the exact book: before each step `band_env` widens (B, A) to the
+  envelope of the snapshot versions the cut's ops may hold, `touch`, a resting taker and an
+  Idle/Depletion observation move them, and `finish` publishes them as a new version when
+  they change. The client keeps the same bounds, version history and per-lane lowest versions
+  (the BBO reads each lane's applied seq and snapshot version once the lane has replayed every
+  call due before the step, as Rust's cut cores publish them). `tests/replay.rs` checks this
+  against `RustReplay` byte for byte: the band and `snap_lag` scripts at every block boundary,
+  a lane's catch-up past the 4095-version window, and an evicted version.
 - *Capacity.* The op log (`OPLOG_CAP`) and the forwarded queue (`FWDQ_CAP` = 1024 per lane) are
   fixed. A live lane can have up to `ENG_FWD_RING` + the BBO's lane buffer forwarded ops in
   flight, so more than `FWDQ_CAP` forwarded ops due before one step (or an op log full before
