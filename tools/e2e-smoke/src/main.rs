@@ -109,12 +109,13 @@
 //!   leaves the rest of the window to gossip and REDIRECT: at 100 ms redirects arrive after about
 //!   114 ms and the check fails. At 20 ms, before #189, the backup, busy serving every
 //!   validator's KEY fetches for the lost packets, went silent long enough to be marked down too
-//!   (4 of 4 runs). Since #189 the backup keeps its heartbeat cadence, but 20 ms still fails 3 of
-//!   5 runs on a 2-vCPU orb: every validator marks the live backup down with only about 25 KEY
-//!   misses served, so the false `DataDown` starts on the validators' side (*hypothesis*: a
-//!   validator stamps a frame when it polls it, `RX_BURST` per turn, from a data queue it shares
-//!   with peer fetches and `DataDown` gossip). Passing runs redirect in about 32 ms. Four sessions sit far below 07 §5.7's ~1 200-session bound, which
-//!   `bin/vyrn-validator` `failover.rs` pins in a unit test instead.
+//!   (4 of 4 runs). Since #189 20 ms still fails 3 of 5 runs. *Ruled (DEV only; 07's
+//!   `REP_DATA_SILENCE_MS` stays 1 ms):* 50 ms. On an unpinned 2-vCPU host the backup's sender
+//!   core was measured going 51.9 ms without a turn (vyrn-seq and vyrn-data busy-polling), and
+//!   every validator marked it down 20 ms into that stall while still polling its data queue at
+//!   least every 0.8 ms with no full burst: the box really sent nothing, so neither validator
+//!   backlog nor receipt timestamps explain it. With the default workloads' four sessions this
+//!   is one REDIRECT_BATCH per round; R15 runs 2 000.
 //! - R14. The tap repairs its own data gaps, as a replica does (07 §5.5 source 1): a gap its
 //!   `DataFeed` reports in box `src`'s `data_seq` is asked for by `Fetch::Range{dst: 0}` at
 //!   that box's fetch address, the box resends those `DATA` frames to the tap, and a seq still
@@ -126,6 +127,29 @@
 //!   roster gives the tap no `K_fetch`, so under `--keyed` a tap gap still fails. `--tap-loss N`
 //!   relays the tap's data socket and drops every N-th datagram; `data` then also needs the
 //!   relay to have dropped and the tap to have repaired at least one frame.
+//! - R15. `--workload tools/e2e-smoke/wl-smoke-many.toml` (WL-SMOKE-MANY) is WL-SMOKE-NOCROSS
+//!   with 1 000 MM sessions per lane; with `--packets 8000` about 1 960 of them send. Every
+//!   session's DEV entries go into the `vyrn-seq`, data box and `[replay]` configs as for four.
+//!   *Reading* (harness): a session's account is `slot mod 15 + 1`, so the sessions of a lane
+//!   share its 15 account slots (`NA` = 16, slot 0 unused); a shared account changes which
+//!   orders self-trade and which balance binds, not what replay must reproduce. With
+//!   `--data-kill` the validators send each round as REDIRECT_BATCHes (about 1 625 sessions in
+//!   9 messages), the client must move every session, and `failover` prints the slowest
+//!   kill-to-redirect over the sessions that had sent before the kill apart from those that
+//!   started later, whose first round comes when a replica first holds one of their blocks
+//!   (07 §5.7). Where the time goes, measured at 2 000 sessions on a 2-vCPU orb: detection
+//!   50.3 ms, Q DataDowns and every first-round batch sent by 51 ms, all of them at the backup
+//!   by 51–55 ms; the backup then sends its per-entry `DataRedirect`s at about 50 per ms (one
+//!   shard core, 16 per turn, sharing the CPUs), so the last live session's first redirect
+//!   reaches the client at about 82 ms; the client applies each within 2.6 ms. The backup's
+//!   refused redirects are retried since #194 (`redirect_retried`), and `failover` needs
+//!   `redirect_dropped` = 0. Two losses still fail a run on a 2-vCPU orb, both outside this
+//!   rule: an ingest packet meeting the shard ring the redirect burst fills (`hop_full`), and a
+//!   lost first copy at the backup's socket. Either costs the backup a session's address, since
+//!   it learns it from one first copy (07 §5.7 interim reading), so that session never moves;
+//!   CI runs R15 with `continue-on-error`.
+//!   The client opens a `DataRedirect` with the key of the session in its bytes 8..12: trying
+//!   every session's key fell behind a burst of 1 600 redirects and moved half the sessions.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -384,7 +408,8 @@ fn workload(cli: &Cli) -> Result<(Vec<Sess>, Vec<Pkt>), String> {
             Sess {
                 id,
                 lane: p.lane.0,
-                acct: u32::from(slot) + 1,
+                // Account slots 1..NA; with more sessions than that per lane (R15) they share.
+                acct: u32::from(slot) % (NA as u32 - 1) + 1,
                 k_seq,
                 k_out: k_out.first_chunk::<16>().copied().unwrap_or_default(),
             }
@@ -851,7 +876,7 @@ fn relay(
 fn client(
     sock: UdpSocket,
     stop: Arc<AtomicBool>,
-    keys: Vec<[u8; 16]>,
+    keys: BTreeMap<u32, [u8; 16]>,
     redirects: Sender<Redirect>,
 ) -> std::thread::JoinHandle<Vec<(Instant, Vec<u8>)>> {
     std::thread::spawn(move || {
@@ -862,7 +887,15 @@ fn client(
                 let b = buf.get(..k).unwrap_or_default();
                 let r = (k == vyrn_data::redirect::BYTES
                     && b.get(..2) == Some(&vyrn_data::redirect::MAGIC.to_le_bytes()[..]))
-                .then(|| keys.iter().find_map(|key| Redirect::open(b, key).ok()))
+                // The session (bytes 8..12) picks its key: one tag check, not one per session
+                // (R15's 2 000 sessions would fall behind a burst of redirects).
+                .then(|| {
+                    let s = b
+                        .get(8..12)
+                        .and_then(|x| x.try_into().ok())
+                        .map(u32::from_le_bytes);
+                    keys.get(&s?).and_then(|key| Redirect::open(b, key).ok())
+                })
                 .flatten();
                 match r {
                     Some(r) => {
@@ -1679,7 +1712,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let cl_h = client(
         cl_recv,
         Arc::clone(&stop_cl),
-        sessions.iter().map(|x| x.k_seq).collect(),
+        sessions.iter().map(|x| (x.id.0, x.k_seq)).collect(),
         redir_tx,
     );
     let stop_dc = Arc::new(AtomicBool::new(false));
@@ -1721,9 +1754,10 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let mut sent_at: Vec<Instant> = Vec::with_capacity(pkts.len());
     // Packets a redirect asked for that the client had discarded: `lost` were sent to the dead
     // home after the kill, so only a resend reaches a live box; `aged` reached the home box
-    // before it died. And each session's kill-to-redirect time.
+    // before it died. And each session's kill-to-redirect time, split by whether it had sent
+    // before the kill (a session that starts later gets its own rounds, 07 §5.7; R15).
     let (mut lost, mut aged) = (0u64, 0u64);
-    let mut latency: Vec<Duration> = Vec::new();
+    let mut latency: Vec<(Duration, bool)> = Vec::new();
     let mut apply = |sent: &[Pkt],
                      at: &[Instant],
                      kill: Option<(usize, Instant)>,
@@ -1738,7 +1772,10 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
             moved.insert(r.session, r);
             let now = Instant::now();
-            latency.extend(kill.map(|(_, t)| now.saturating_duration_since(t)));
+            latency.extend(kill.map(|(ki, t)| {
+                let live = sent.iter().take(ki).any(|p| p.session == r.session);
+                (now.saturating_duration_since(t), live)
+            }));
             for (k, p) in sent
                 .iter()
                 .enumerate()
@@ -2531,6 +2568,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 .unwrap_or("")
                 .to_owned();
             let admitted = field(&st, "redirects").and_then(|v| v.parse::<u64>().ok());
+            // #194: a redirect a full shard ring refused is retried (`redirect_retried`), and
+            // dropped only past its queue (`redirect_dropped`), which R15's burst must not reach.
+            if field(&st, "redirect_dropped").is_some_and(|v| v != "0") {
+                errs.push(format!("backup redirect_dropped={:?}", field(&st, "redirect_dropped")));
+            }
             if admitted.unwrap_or(0) == 0 || field(&st, "redirect_unknown") != Some("0") {
                 errs.push(format!(
                     "backup redirects={admitted:?} redirect_unknown={:?}: it must admit a sealed REDIRECT and know every session's source",
@@ -2542,7 +2584,16 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
             // 04 DR4: a packet sent to the dead home is recovered only by a resend, so its
             // redirect must arrive while the client still retains it.
-            let worst = latency.iter().max().copied().unwrap_or_default();
+            let worst_by = |live: bool| {
+                latency
+                    .iter()
+                    .filter(|l| l.1 == live)
+                    .map(|l| l.0)
+                    .max()
+                    .unwrap_or_default()
+            };
+            let (worst, worst_late) = (worst_by(true), worst_by(false));
+            let n_live = latency.iter().filter(|l| l.1).count();
             if lost > 0 {
                 errs.push(format!(
                     "{lost} packets sent to the dead home had expired (DR4, {} ms) before their redirect; slowest kill-to-redirect {worst:?}",
@@ -2552,13 +2603,17 @@ fn run(cli: &Cli) -> Result<bool, String> {
             if n_moved != sessions.len() {
                 errs.push(format!("{n_moved} of {} sessions moved copy 2", sessions.len()));
             }
-            let from: Vec<String> = moved
+            let mut from: Vec<String> = moved
                 .values()
+                .take(8)
                 .map(|r| format!("{:#x}@{}", r.session.0, r.resend_from))
                 .collect();
+            if moved.len() > from.len() {
+                from.push(format!("… {} more", moved.len() - from.len()));
+            }
             if errs.is_empty() {
                 Ok(format!(
-                    "home box killed after {} packets; DATA_DOWN {}; validator-0 sent {} sealed REDIRECTs, the backup admitted and sent {}; the client heard {redirects_heard}, moved {n_moved} sessions (resend_from {}) and resent {resent} packets; DR4 ({} ms): slowest kill-to-redirect {worst:?}, 0 lost after the kill, {aged} older ones discarded",
+                    "home box killed after {} packets; DATA_DOWN {}; validator-0 sent {} sealed REDIRECTs, the backup admitted and sent {}; the client heard {redirects_heard}, moved {n_moved} sessions (resend_from {}) and resent {resent} packets; DR4 ({} ms): slowest kill-to-redirect {worst:?} over the {n_live} sessions live at the kill ({worst_late:?} for those that started later), 0 lost after the kill, {aged} older ones discarded",
                     killed.map_or(0, |k| k.0),
                     votes.join(" "),
                     v0_redirects.unwrap_or(0),

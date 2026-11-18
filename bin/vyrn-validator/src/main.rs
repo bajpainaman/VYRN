@@ -1616,6 +1616,17 @@ fn report<const N: usize, D: RxRing>(
             (Verdict::Valid, Some(d)) => {
                 // Its records reference their payloads from now on (07 §5.4 retention).
                 DataRx::<N, D>::join(&mut d.join, &mut d.replay).reference(&b);
+                // After a home move its new sessions are redirected now, not at release (R15).
+                if let Some(fo) = d.failover.as_mut() {
+                    fo.held(b.lanes.iter().filter_map(|r| match r {
+                        LaneRec::Pkt(p)
+                            if p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) == 0 =>
+                        {
+                            Some((p.session, p.pkt_seq))
+                        }
+                        _ => None,
+                    }));
+                }
                 d.pending.push_back((b, None));
             }
             (Verdict::Valid, None) => source.valid(h),

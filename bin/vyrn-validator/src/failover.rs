@@ -210,7 +210,7 @@ pub struct Failover {
     outbox: VecDeque<(SessionId, u32, u8, u8)>,
     next_batch: u64,
     /// Whether the home moved, and the sessions queued a REDIRECT for its last move: a session
-    /// first released after the rounds is queued then (Codex r4612821618), from the home every
+    /// first held after the rounds is queued then (Codex r4612821618), from the home every
     /// session starts on to the current one, since it has followed no move (Codex r4612923593).
     moved: bool,
     redirected: BTreeSet<SessionId>,
@@ -393,25 +393,27 @@ impl Failover {
         out
     }
 
-    /// A released block at `height` with these client records' `(session, pkt_seq)`.
-    pub fn released(&mut self, height: u64, recs: impl IntoIterator<Item = (SessionId, u32)>) {
-        let mut m = SeqSpan::new();
-        for (s, p) in recs {
-            let e = m.entry(s).or_insert((p, p));
-            *e = (e.0.min(p), e.1.max(p));
+    /// A checked block entered the pending queue with these client records' `(session,
+    /// pkt_seq)`, its payloads possibly still missing. After a home move, a session not
+    /// redirected yet gets its rounds now, from its lowest `pkt_seq` in this block, which is not
+    /// final yet (reading t). Not at release: the block may wait on a payload the client sent
+    /// to the dead home, which only the redirect brings back (R15).
+    pub fn held(&mut self, recs: impl IntoIterator<Item = (SessionId, u32)>) {
+        if !self.moved {
+            return;
         }
-        // After a home move, a session not redirected yet gets its rounds now, from its lowest
-        // `pkt_seq` in this block, which is not final yet (reading t).
-        if self.moved {
-            for (s, (lo, _)) in &m {
-                if self.redirected.insert(*s) {
-                    for _ in 0..REDIRECT_ROUNDS {
-                        self.outbox.push_back((*s, *lo, FIRST_HOME, self.home));
-                    }
+        for (s, (lo, _)) in span(recs) {
+            if self.redirected.insert(s) {
+                for _ in 0..REDIRECT_ROUNDS {
+                    self.outbox.push_back((s, lo, FIRST_HOME, self.home));
                 }
             }
         }
-        self.unfinal.push_back((height, m));
+    }
+
+    /// A released block at `height` with these client records' `(session, pkt_seq)`.
+    pub fn released(&mut self, height: u64, recs: impl IntoIterator<Item = (SessionId, u32)>) {
+        self.unfinal.push_back((height, span(recs)));
     }
 
     /// Finality reached `height`: the released blocks up to it are final.
@@ -443,6 +445,16 @@ impl Failover {
         out.extend(low);
         out.into_iter().collect()
     }
+}
+
+/// Each session's lowest and highest `pkt_seq` in `recs`.
+fn span(recs: impl IntoIterator<Item = (SessionId, u32)>) -> SeqSpan {
+    let mut m = SeqSpan::new();
+    for (s, p) in recs {
+        let e = m.entry(s).or_insert((p, p));
+        *e = (e.0.min(p), e.1.max(p));
+    }
+    m
 }
 
 #[cfg(test)]
@@ -609,7 +621,8 @@ mod tests {
             .collect()
     }
 
-    /// Codex r4612821618: a session first released after the home moved is queued then, once.
+    /// Codex r4612821618, R15: a session first held after the home moved is queued then, once,
+    /// before its block is released (it may wait on a payload only the redirect brings back).
     #[test]
     fn a_late_session_is_redirected() {
         let mut f = Failover::new(2, 0, 1, 0, 1);
@@ -617,7 +630,7 @@ mod tests {
         f.silent(&[0], 0);
         assert_eq!(f.step(0).1, vec![(0, 1)]);
         f.queue(0, 1, &f.resend_from(&BTreeMap::new()));
-        f.released(2, [(SessionId(9), 7), (SessionId(9), 6), (SessionId(5), 4)]);
+        f.held([(SessionId(9), 7), (SessionId(9), 6), (SessionId(5), 4)]);
         let sent = flat(&f.batch(0));
         let late: Vec<_> = sent.iter().filter(|r| r.0 == SessionId(9)).collect();
         assert_eq!(late.len(), usize::from(REDIRECT_ROUNDS));
@@ -627,7 +640,8 @@ mod tests {
             1 + usize::from(REDIRECT_ROUNDS),
             "session 5 not again"
         );
-        f.released(3, [(SessionId(9), 8)]);
+        f.released(2, [(SessionId(9), 7), (SessionId(9), 6), (SessionId(5), 4)]);
+        f.held([(SessionId(9), 8)]);
         assert!(f.batch(GOSSIP_EVERY_NS).is_empty(), "queued once");
     }
 
@@ -640,7 +654,7 @@ mod tests {
         assert_eq!(f.step(0).1, vec![(0, 1)]);
         f.silent(&[1], 1);
         assert_eq!(f.step(1).1, vec![(1, 2)]);
-        f.released(1, [(SessionId(9), 4)]);
+        f.held([(SessionId(9), 4)]);
         let sent = flat(&f.batch(0));
         assert!(!sent.is_empty());
         assert!(sent.iter().all(|r| (r.1, r.2, r.3) == (4, 0, 2)));
