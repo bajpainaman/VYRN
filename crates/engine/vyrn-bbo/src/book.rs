@@ -64,6 +64,10 @@ pub(crate) struct State {
     pub rank: [u8; MAX_LANES],
     /// An engine fault (05 §14.3): an arena index out of range or a full buffer.
     pub fault: bool,
+    /// `C*` of the last uncross (05 §8.8 item 6): an auction-only order at or below it ended
+    /// there (`Out { cause: AUCTION }`, sent by its lane), so no later step sees it, even in a
+    /// later auction.
+    pub adead: Cut,
 }
 
 impl State {
@@ -79,6 +83,7 @@ impl State {
             pend: Vec::with_capacity(ENG_PEND_CAP),
             rank,
             fault: false,
+            adead: [LaneSeq(0); MAX_LANES],
         }
     }
 
@@ -296,7 +301,9 @@ impl<S: BookSource> Ctx<'_, S> {
 
     /// 05 §5.1 `live`: visible, not killed, open > 0, and auction-only only in an uncross.
     pub fn live(&self, l: usize, slot: u32, v: &OrderSlot) -> Option<u32> {
-        if v.flags.tif() == Tif::AuctionOnly && !self.auction {
+        if v.flags.tif() == Tif::AuctionOnly
+            && (!self.auction || self.st.adead.get(l).is_some_and(|d| v.ins_seq <= *d))
+        {
             return None;
         }
         if !self.visible(l, slot, v) {

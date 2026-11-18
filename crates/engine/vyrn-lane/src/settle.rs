@@ -3,12 +3,13 @@
 
 use vyrn_bbo::{
     DEP_ENDED, DEP_JOIN, FillEvent, FillKind, INDEX_MAKER, LIQ_AUCTION, LIQ_MAKER, LIQ_TAKER,
-    OUT_FINISHED, Phase, RESTED_DONE, RESTED_IN_FLIGHT, Record,
+    OUT_AUCTION, OUT_FINISHED, Phase, RESTED_DONE, RESTED_IN_FLIGHT, Record, Tif,
 };
 use vyrn_cut::{LaneCutEntry, Snapshot, Visibility};
 use vyrn_risk::{FillKind as RiskFill, Risk, Settle};
 use vyrn_types::{
-    Handle, LaneSeq, PacketFlags, PacketRecord, PktHash, Qty, RejectReason, StepId, Tick,
+    Handle, LaneSeq, MAX_SESSIONS_PER_LANE, PacketFlags, PacketRecord, PktHash, Qty, RejectReason,
+    StepId, Tick,
 };
 use vyrn_wire::PROTO_HANDLE_ALL;
 
@@ -178,9 +179,10 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
                 return;
             }
             FillKind::Uncross => {
-                // The auction ends (05 §8.8); auction-only remainders and histograms are a
-                // follow-up.
+                // The auction ends (05 §8.8); histograms are a follow-up.
                 self.phase = Phase::Continuous;
+                let cstar = LaneSeq(u64::from(ev.handle.0) | (u64::from(ev.vslot) << 32));
+                self.end_auction_only(cstar);
                 return;
             }
             _ => {}
@@ -429,6 +431,59 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
         if let Some(r) = self.root_mut(root) {
             r.ended = true;
             r.end_detail = detail;
+        }
+    }
+
+    /// 05 §8.8 item 6: after the last uncross chunk, every auction-only order visible at `C*[l]`
+    /// with `open > 0` is dead (§2.5 P2). The lane ends each one with an unsolicited
+    /// `Out { cause: AUCTION }` (04 `AUCTION_UNFILLED`) for its open quantity, session by
+    /// session in creation order. The BBO core stops seeing them at the same step (vyrn-bbo
+    /// `State::adead`).
+    fn end_auction_only(&mut self, cstar: LaneSeq) {
+        for si in 0..MAX_SESSIONS_PER_LANE {
+            let Some(s) = u16::try_from(si)
+                .ok()
+                .and_then(|i| self.sess.get(i))
+                .copied()
+            else {
+                continue;
+            };
+            let mut r = s.first;
+            while r != 0 {
+                let Some(rp) = self.root(r).copied() else {
+                    break;
+                };
+                let cur = self.slot(rp.cur).copied().unwrap_or_default();
+                if rp.live
+                    && !rp.ended
+                    && cur.flags.tif() == Tif::AuctionOnly
+                    && cur.ins_seq <= cstar
+                {
+                    let open = self.open_of(r, rp.cur);
+                    if open > 0 {
+                        self.flush_events(Some(rp.cur));
+                        self.release(cur.leg);
+                        if let Some(x) = self.slot_mut(cur.leg) {
+                            x.dead = true;
+                        }
+                        self.end_root(r, PROTO_D_OUT);
+                        let handle = self.handle(r);
+                        self.emit(
+                            rp.cur,
+                            rp.sess,
+                            0,
+                            Record::Out {
+                                index: INDEX_MAKER,
+                                cause: OUT_AUCTION,
+                                handle,
+                                qty: Qty(open),
+                                client_tag: rp.tag,
+                            },
+                        );
+                    }
+                }
+                r = rp.next;
+            }
         }
     }
 

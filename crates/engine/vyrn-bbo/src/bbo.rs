@@ -2390,6 +2390,8 @@ impl Bbo {
                 );
             }
             self.phase = Phase::Continuous;
+            // 05 §8.8 item 6: auction-only remainders at `C*` are dead from here on.
+            self.st.adead = cstar;
             self.frozen = None;
             self.unc = None;
             self.exact_bounds(src, c, Tick(u32::MAX.saturating_sub(1)), Tick(1));
