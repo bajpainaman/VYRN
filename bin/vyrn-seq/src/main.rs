@@ -452,16 +452,25 @@ where
         }
         if failed.is_none() {
             start_line(cfg, n, &addrs);
-            // Control lines on stdin until EOF (crate docs, Control).
-            for line in std::io::stdin().lines() {
-                let Ok(line) = line else { break };
-                if let Err(e) = control_line(&line, control.as_ref()) {
-                    eprintln!("CONTROL_ERR {e}");
-                }
-            }
-            if stdin_stop {
-                stop.store(true, Ordering::Release);
-            }
+            // Control lines on stdin until EOF (crate docs, Control), on a detached thread: the
+            // main thread still joins the workers, so a failure after READY exits the box even
+            // with stdin open. With `--stop-on-stdin-eof`, EOF stops it.
+            let ctl = control.take();
+            let eof = Arc::clone(&stop);
+            std::thread::Builder::new()
+                .name("vyrn-seq/stdin".into())
+                .spawn(move || {
+                    for line in std::io::stdin().lines() {
+                        let Ok(line) = line else { break };
+                        if let Err(e) = control_line(&line, ctl.as_ref()) {
+                            eprintln!("CONTROL_ERR {e}");
+                        }
+                    }
+                    if stdin_stop {
+                        eof.store(true, Ordering::Release);
+                    }
+                })
+                .map_err(|e| e.to_string())?;
         } else {
             stop.store(true, Ordering::Release);
         }
