@@ -38,10 +38,17 @@
 //! **Readings** (the spec does not settle these; PR body):
 //! - R1. The box publishes no output hash. The reference for "replay matches the sequencer" is
 //!   what the box put on the wire: every response the client received, per session, sorted by
-//!   `(resp_seq, bytes)`. *Ruled (reading of "equal" for loopback UDP in DEV):* the client's
-//!   responses must be an in-order, byte-identical subsequence of replay's; when vyrn-seq's
-//!   `tx_unsent` = 0, up to 0.1 % of replay's (at least 1) may be missing, printed as
-//!   `udp_resp_lost`. More missing, any byte mismatch, or an extra response fails. The replay side is every `lane_resp` and every fill `tx` with
+//!   `(resp_seq, bytes)`. *Ruled (reading of "equal" for loopback UDP in DEV):*
+//!   the client's responses must be an in-order, byte-identical subsequence of replay's, and
+//!   the shortfall at most `client_sock_drops`, the kernel's receive-drop count for the client's
+//!   socket (`/proc/net/udp`, read before it closes); if that count cannot be read, strict
+//!   equality. The replay line prints `shortfall=` and `client_sock_drops=` side by side. A
+//!   response missing for any other reason, a byte mismatch, or an extra one fails. Why: a
+//!   client thread starved on a loaded host drops a contiguous burst at its socket, not
+//!   vyrn-seq (a 300 ms client stall drops 281, and the shortfall is 281). In the loaded
+//!   `--dropcopy` run d-28 the same starvation also stopped validator-0 at `REP_E_HASHLAG`
+//!   height 0: it shared CPU 1 with the client, against the validators' 50 ms DEV bound
+//!   (`--dev-hashlag-us 50000`); load, not a fault. The replay side is every `lane_resp` and every fill `tx` with
 //!   `resp_seq ≠ 0` (the box does not send `resp_seq` 0 TX packets yet). Fill TX `step`, `lane`
 //!   and `role`, which `output_hash` covers, are not on the wire, so the per-block output hash
 //!   itself cannot be recomputed from the box's side.
@@ -155,8 +162,8 @@
 //!   session unmovable. The client now sends four (R13), and since #203 the box holds
 //!   redirects while its shard ring has 2 048 or fewer free slots, so ingest wins it.
 //!   *Ruled (R15 gates):* `redirect_unknown` = 0, `redirect_dropped` = 0, the box's `hop_full`
-//!   = 0 (ingest), every session moves by the deadline, and `replay` (with R1's bounded
-//!   `udp_resp_lost`). DR4 timing does not gate here: CI's R15 step passes `--dr4-dev`, which
+//!   = 0 (ingest), every session moves by the deadline, and `replay` (with R1's
+//!   shortfall bounded by `client_sock_drops`). DR4 timing does not gate here: CI's R15 step passes `--dr4-dev`, which
 //!   prints the slowest kill-to-redirect and the packets expired at the dead home as a DEV
 //!   figure. A 2-vCPU host holding 2 000 redirects cannot show the 100 ms bound (on a 2-vCPU
 //!   orb on 733ff96: 87–147 ms, the slow runs those with about 2 500 held redirects); 07 §5.7
@@ -379,6 +386,21 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// The kernel's receive-drop count of the UDP socket bound to 127.0.0.1:`port` (Linux
+/// `/proc/net/udp`, last column), `None` elsewhere or if not found.
+fn udp_drops(port: u16) -> Option<u64> {
+    let t = std::fs::read_to_string("/proc/net/udp").ok()?;
+    let want = format!("0100007F:{port:04X}");
+    t.lines()
+        .skip(1)
+        .map(str::split_whitespace)
+        .find_map(|mut f| {
+            (f.nth(1)? == want)
+                .then(|| f.last()?.parse().ok())
+                .flatten()
+        })
 }
 
 fn hex(b: &[u8]) -> String {
@@ -1703,6 +1725,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
             .to_string(),
     );
     let cl_sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let cl_port = cl_sock.local_addr().map_err(|e| e.to_string())?.port();
     cl_sock
         .set_read_timeout(timeout)
         .map_err(|e| e.to_string())?;
@@ -2036,6 +2059,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
     for &i in &vals {
         val_ok.push(nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
     }
+    // Read while the client's socket is still open (it closes with its thread).
+    let cl_drops = udp_drops(cl_port);
+    let cl_drops_s = cl_drops.map_or_else(|| "n/a".to_owned(), |d| d.to_string());
     stop_tap.store(true, Ordering::Release);
     stop_cl.store(true, Ordering::Release);
     let frames = tap_h.join().map_err(|_| "tap thread")?;
@@ -2259,21 +2285,16 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
             live.sort();
             replayed.sort();
-            // R15 (reading of R1's "equal" for loopback UDP in DEV): the client's responses
-            // must be an in-order, byte-identical subsequence of replay's; with vyrn-seq's
-            // tx_unsent = 0, up to 0.1 % of them (at least 1) may be lost on the way.
-            let lost_ok = replayed.len().div_ceil(1000).max(1);
-            let tx_unsent = field(&stats, "tx_unsent");
+            // R1 (ruled, loopback UDP in DEV): the client's responses must be an in-order,
+            // byte-identical subsequence of replay's, missing at most the kernel's drop count
+            // for the client's socket; without that count, strict equality.
             let mut rest = replayed.iter();
             let subseq = live.iter().all(|a| rest.any(|b| b == a));
-            let udp_resp_lost = replayed.len().saturating_sub(live.len());
-            if subseq
-                && udp_resp_lost > 0
-                && udp_resp_lost <= lost_ok
-                && tx_unsent == Some("0")
-            {
+            let shortfall = replayed.len().saturating_sub(live.len());
+            let lost_ok = cl_drops.is_some_and(|d| shortfall as u64 <= d);
+            if subseq && shortfall > 0 && lost_ok {
                 println!(
-                    "WARN replay udp_resp_lost={udp_resp_lost} of {} (bound {lost_ok}, R15)",
+                    "WARN replay shortfall={shortfall} client_sock_drops={cl_drops_s} of {} responses (R1: lost at the client's socket)",
                     replayed.len()
                 );
             } else if live != replayed {
@@ -2285,7 +2306,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     })
                 };
                 return Err(format!(
-                    "responses differ: box sent {}, replay produced {} (subsequence {subseq}, udp_resp_lost={udp_resp_lost}, bound {lost_ok}, tx_unsent {tx_unsent:?}); first difference at {at:?}: box {:?}, replay {:?}",
+                    "responses differ: box sent {}, replay produced {} (subsequence {subseq}, shortfall={shortfall} client_sock_drops={cl_drops_s}); first difference at {at:?}: box {:?}, replay {:?}",
                     live.len(),
                     replayed.len(),
                     show(&live),
@@ -2303,7 +2324,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 hex(&vyrn_crypto::hash::hash(&b).0)
             };
             Ok(format!(
-                "{} blocks replayed, {} responses equal (udp_resp_lost={udp_resp_lost}), responses digest {}, last output_hash {}",
+                "{} blocks replayed, {} responses equal (shortfall={shortfall} client_sock_drops={cl_drops_s}), responses digest {}, last output_hash {}",
                 ready.len(),
                 live.len(),
                 digest(&live),
