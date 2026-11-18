@@ -1,6 +1,90 @@
-//! The replica: two-path order frames, data fetch, replay engine (Rust or Vx), state roots, votes.
+//! The replica: two-path order frames, data fetch, replay engine (Rust or Vx), state roots, votes
+//! (spec/07-replication.md, spec/11-build.md §1.3, layer 6 of §1.4).
+//!
+//! This crate is the replica's order core (07 §7.2 core 3). It sits on `vyrn-log`'s decoder and
+//! adds the checks a vote needs that a stateless decoder cannot make. Data join, repair, the
+//! Simplex wiring, replay threads and snapshots are follow-ups (see the PR).
+//!
+//! # Contract
+//!
+//! **Writer.** The sequencer's stream cores, through `vyrn-log`'s `StreamEncoder` (07 §3).
+//! Nothing here writes frames.
+//!
+//! **Input.** [`OrderCore::on_frame`] takes the frames of one tenure, one substream at a time, in
+//! `frame_seq` order with no gap, after core 1 has deduplicated the two paths and repaired holes
+//! (07 §4.9, §4.10). A frame out of order is [`FrameErr::OutOfOrder`]: the caller's error, not a
+//! fault, and nothing changes. [`OrderCore::tick`] runs the `REP_E_HASHLAG` timer. `now` is the
+//! replica's monotonic receive clock in nanoseconds. Only the timer reads it, so replay never
+//! depends on it (`INV-DET`).
+//!
+//! **Readers.**
+//! - Replay: [`OrderCore::take_ready`] yields one [`BlockInputs`] per block in height order. Each
+//!   one has passed every check below, and a [`ReplayEngine`] (11 §5.3) consumes it.
+//! - The vote: [`OrderCore::verdict`] answers 07 §6.4 items 2 and 5 for a height range as a
+//!   `vyrn_consensus::Verdict`. Items 3 (payloads, `data_root`) and 4 (CHAIN tags) are not here
+//!   yet, so this verdict is a precondition for a vote, not the whole rule.
+//!
+//! **Ordering.** Sections are applied in frame order, so a step half-record is checked against
+//! the lane records before it on the same substream. A half-cut covers only its own half's lanes,
+//! and those lanes travel on the same substream (07 §3.4, §3.8), so the check never waits on the
+//! other substream. Steps are merged by StepId (`vyrn_log::StepMerger`). A block becomes ready once
+//! four things hold: both halves are closed by their `BlockMark`, its header is held and checked,
+//! every PacketRecord in it has its `pkt_hash`, and every step through its `last_step` is merged.
+//!
+//! **Lane-state rules** ([`lane`], 07 §3.5–§3.7). Each lane of each half keeps:
+//! - L1: the *decoded prefix*, `next_lane_seq − 1`, which only lane records advance;
+//! - L2: the LaneSeq ranges of packets that carry `SHED`;
+//! - L3: the FIFO of PacketRecords that wait for their `pkt_hash` (Advance records and
+//!   `AcctTake`s never wait). A `HashRun` entry must name the FIFO's head.
+//!
+//! **Step rules** ([`check_step`], 07 §3.12). Each step half-record must satisfy:
+//! - S1, `INV-CUT-MONO`: no lane of the half-cut moves back;
+//! - S2: no `cut[l]` above lane `l`'s decoded prefix;
+//! - S3: `src_lane` and payload follow the kind table of 07 §3.8;
+//! - S4: `src_lane_seq` is a decoded op of `src_lane`, so `1 ≤ src_lane_seq ≤ prefix`;
+//! - S5: no step names an op whose packet carries `SHED`, because a shed packet's ops were never
+//!   forwarded.
+//!
+//! **Timer** ([`hashlag`], 07 §3.7 INV-REP-8). A record that waits for its hash for more than
+//! [`REP_HASHLAG_MAX_NS`] (1 ms) raises `REP_E_HASHLAG`.
+//!
+//! **Header rules** (07 §3.10, §6.4 item 1). The header of height `h` must be signed by the
+//! frame's sender under [`EpochView::seq_key`], be in the view's epoch and book, chain from the
+//! previous header (or from the `TenureStart` anchor), cover exactly the steps its two
+//! `BlockMark`s close, and have `order_root` equal to the root of the two halves' ORDER bytes.
+//!
+//! **Reject reasons.** Every rejection is a sequencer fault: [`Fault`] records `(epoch, tenure,
+//! stream, frame_seq)`, the first height that loses its vote, and a [`FaultKind`] with its
+//! `REP_E_*` code ([`FaultKind::code`]). After a fault the core takes no more frames, and
+//! [`OrderCore::verdict`] is `Invalid` for every range that reaches the faulted height (07 §3.12,
+//! §10.1).
+//!
+//! **Boundaries owned here** ([`ports`]). The replay engine and the epoch schedule are crates
+//! that are not merged yet. They reach this crate through two traits it owns: [`ReplayEngine`]
+//! (11 §5.3) and [`EpochView`] (08). `vyrn-engine` and `vyrn-epoch` will implement them.
+//!
+//! **Conformance.** `tests/golden/vyrn_replica_vectors.txt` at the repository root lists frame
+//! sequences and the verdict a conforming replica reaches on each one. `tests/conformance.rs`
+//! runs them.
 #![deny(unsafe_code)]
+#![deny(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+pub mod check;
+pub mod hashlag;
+pub mod lane;
+pub mod order;
+pub mod ports;
 
 // Listed in UNSAFE.toml; the only module of this crate allowed to contain `unsafe`.
 #[allow(unsafe_code)]
 pub mod vx;
+
+pub use check::{StepErr, check_step};
+pub use hashlag::{REP_HASHLAG_MAX_NS, check_hashlag};
+pub use lane::{LaneErr, LaneState};
+pub use order::{Fault, FaultKind, FrameErr, HeaderErr, OrderCore};
+pub use ports::{
+    BlockInputs, BlockOutputs, CanonicalStateWriter, EpochView, ReplayEngine, ReplayError,
+    StateSnapshot,
+};
