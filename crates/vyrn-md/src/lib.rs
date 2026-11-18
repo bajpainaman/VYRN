@@ -8,8 +8,9 @@
 //! ## Roles
 //!
 //! - **Writer of the input:** the observer replica's replay engine (`vyrn-replica --observer`,
-//!   10 §7.1). It hands `vyrn-md` the replayed events of one book through [`ReplayStream`]. The
-//!   replica crate is not a dependency yet; the trait is the seam it will implement.
+//!   10 §7.1). `vyrn_replica::RustReplay` drives a [`SinkStream`], which rebuilds the
+//!   [`ReplayStream`] events from replay's records, responses and fill TX packets and pushes them
+//!   into an [`MboEncoder`] (10 §7.9). Any other source can still hand over a [`ReplayStream`].
 //! - **This crate:** [`MboEncoder`] turns the event stream into `MBO` packets (10 §7.3, §7.4).
 //!   Its output is a pure function of the stream, so the A and B observers emit identical bytes.
 //! - **Readers of the output:** subscribers, the snapshotter (itself a subscriber, 10 §7.6) and
@@ -101,6 +102,7 @@
 //! - [`SnapEncoder`] / [`SnapReader`]: `MD_SNAP_*` from a [`Snapshot`] that
 //!   [`MboSubscriber::take_snapshot`] cuts; [`MboSubscriber::from_snapshot`] joins mid-stream.
 //! - [`RetxStore`]: the retransmit service.
+//! - [`SinkStream`]: `MBO` straight from `RustReplay`'s sink (10 §7.9).
 #![forbid(unsafe_code)]
 
 /// A `u8`-coded enum with `code` and `from_code`.
@@ -133,6 +135,7 @@ mod mboc;
 mod mbow;
 mod packet;
 mod record;
+mod replay;
 mod retx;
 mod snap;
 mod stream;
@@ -145,6 +148,7 @@ pub use mboc::{MboCError, WithMboC, mbo_c_decode, mbo_c_encode};
 pub use mbow::{MD_MBO_W_TICKS, MboWEncoder, MboWindow};
 pub use packet::{Channel, Feed, HEADER_BYTES, Header, NO_WATERMARK, Packet, PacketError};
 pub use record::{AttestKind, BookStatus, DeleteCause, REC_BYTES, Record, RecordError, Side};
+pub use replay::{SinkError, SinkStream};
 pub use retx::{MD_RETX_SECS, RETX_REQ_BYTES, RetxRequest, RetxStore, retx_fetch};
 pub use snap::{
     MD_SNAP_EVERY_BLOCKS, SnapEncoder, SnapError, SnapReader, is_snapshot_height, snapshot_records,

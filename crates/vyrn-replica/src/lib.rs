@@ -105,3 +105,14 @@ pub use ports::{
     StateSnapshot,
 };
 pub use rust::{OUTPUT_DOMAIN, RustReplay, output_hash};
+
+/// What a [`RustReplay`] sink sees, re-exported so a crate above this one (`vyrn-md`, layer 7)
+/// implements `Sink` with this crate as its only replay dependency (11 §1.4).
+pub mod sink {
+    pub use vyrn_bbo::{
+        CutDelta, OUT_STP, ROLE_DEPS, ROLE_MAKER, ROLE_TAKER, Record, StepEntry, TxEntry,
+    };
+    pub use vyrn_engine::{Payloads, Rec, Sink};
+    pub use vyrn_lane::{Gate, RespPkt};
+    pub use vyrn_log::LaneRec;
+}

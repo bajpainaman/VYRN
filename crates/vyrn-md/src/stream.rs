@@ -1,8 +1,8 @@
 //! The replicated record stream that `vyrn-md` consumes: the seam to `vyrn-replica`.
 //!
 //! The observer's replay engine is the only writer. It hands over one book's events in replay
-//! order (crate docs, "Input ordering"). This trait is all `vyrn-md` needs from the replica, so
-//! the replica crate can land, and change, without this crate depending on it.
+//! order (crate docs, "Input ordering"). [`crate::SinkStream`] rebuilds them from
+//! `vyrn_replica::RustReplay`'s sink; the derived encoders take them through this trait.
 
 use vyrn_types::{Epoch, LaneId, Nanos, Qty, StepId, StepKind, Tick};
 

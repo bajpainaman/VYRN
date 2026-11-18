@@ -17,14 +17,24 @@ path = "src/bin/vyrn-dropcopy.rs"
 
 [dependencies]
 vyrn-types = { workspace = true }
-# vyrn-replica (11 §1.4 layer 6) returns when its replay core lands; until then the replica
-# implements `ReplayStream` (src/stream.rs) and nothing here links it.
+# Layer 7 (11 §1.4): vyrn-replica (6) drives `SinkStream` (src/replay.rs) through `RustReplay`.
+vyrn-replica = { workspace = true }
 vyrn-nic = { workspace = true }
 vyrn-wire = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# tests/replay.rs runs the engine's test harness (included by path) live and through the replica.
+vyrn-engine = { workspace = true }
+vyrn-bbo = { workspace = true }
+vyrn-cut = { workspace = true }
+vyrn-lane = { workspace = true }
+vyrn-risk = { workspace = true }
+vyrn-log = { workspace = true }
+vyrn-crypto = { workspace = true }
 
 [lints]
 workspace = true
