@@ -1024,7 +1024,12 @@ the client.
 `vx/build.sh` is the only way a Vx artifact is built, in CI and on a laptop:
 
 1. Check that the `vxc` binary on `PATH` hashes to the value in `vx/TOOLCHAIN` (v0.0.4,
-   `3a89e3c7`). Refuse otherwise.
+   `3a89e3c7`). Refuse otherwise. **[Reading, W-10]** v0.0.4 has no release binary, so the value
+   is per host kind (`vxc_blake3.<arch>-<os>`): the hash of `.agents/setup`'s build, made with
+   the `rust-toolchain.toml` pin by that name and with the registry, toolchain and rust-src paths
+   remapped. vxc still embeds its source and target dirs, so the host kind includes setup's
+   layout under `HOME`. A pin is recorded only once two clean builds on that host kind match,
+   and never for a host kind nobody has built on.
 2. Build `vyrn-vx-oracle` and `vyrn-vx-client` as shared libraries for the host target, with
    optimisation on. On aarch64, pass `-fweak-relaxed-atomics` for the client (DESIGN §8: without
    it, `Relaxed` loads compile as `Acquire`; correct either way, slower without it).

@@ -1,9 +1,12 @@
 # spec/11-build.md §1.2, §5.4. The spec's 3a89e3c7 is the annotated v0.0.4 tag object; it points
 # at commit c6dffec7. vxc_blake3.<uname -m>-<os> is the BLAKE3 of the vxc binary that .agents/setup
-# builds from that commit on that host (rustc 1.100.0, LLVM/MLIR 22). There is no release binary,
-# so each host kind is pinned on its own (FRICTION.md W-10); vx/build.sh skips an unpinned host.
+# builds from that commit on that host kind: the rust-toolchain.toml pin (rustc 1.100.0, by that
+# name), LLVM/MLIR 22, registry and toolchain paths remapped, built in ~/.local/src/vx/target for
+# HOME=/home/user (vxc embeds its source and target dirs). There is no release binary, so each host
+# kind is pinned on its own (FRICTION.md W-10); vx/build.sh skips an unpinned host. A pin is added
+# only once two clean builds of it hash the same, and only from a build on that host kind.
 # VX-WORKAROUND W-10 (issue to file): one vxc_blake3 per host kind.
 vxc_version = "v0.0.4"
 vxc_tag_object = "3a89e3c761b60270f257521277c174c9e9a784c3"
 vxc_commit = "c6dffec704182d98c271c93afefba1c38ba18d21"
-vxc_blake3.x86_64-linux = "855e52441c9baedaf911691ed5ea93ab7ddbeb68483513ecfcc636908b0d6366"
+vxc_blake3.x86_64-linux = "da38286d9be74280dd47b87ebf22294d637df893b466aedc54faefd017f3e48b"
