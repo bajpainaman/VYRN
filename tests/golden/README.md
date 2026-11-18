@@ -9,6 +9,7 @@ enough to regenerate the protocol files.
 | `vyrn_proto_vectors.py`, `.out` | 18 request and response packets that a conforming implementation must build byte for byte and accept (04 §11) | the script is the one printed in 04 §11; `.out` is its output |
 | `vyrn_reject_vectors.py`, `.out` | 45 validly tagged packets whose layout v1 must refuse, each with its verdict (04 §3.1 V1/V9, §3.3 M2/M3, §6.1, §12 VR1/VR3), and 4 `Reject RATE_LIMIT` records with 10's bucket ids 8–11 (04 §9.1) | written for this repository from those tables |
 | `vyrn_admin_vectors.py`, `.out` | 2 BASE-mode admin frames, `OpenSessionReq` and `OpenSessionResp`, that an implementation must build and accept, and 8 it must refuse (04 §4.4) | written for this repository from the §4.4 tables |
+| `vyrn_session_vectors.py`, `.out` | 35 packets, one per session state (04 §4.3) and message type, each with the lane's verdict (04 §3.1 V2/V7), and the final in-stream record of the 6 close causes | written for this repository from the 04 §3.1 and §4.3 tables |
 | `vyrn_replica_vectors.txt` | 14 order-stream frame sequences and the verdict a replica's order core must reach: the step rules of 07 §3.12 (a cut beyond the decoded lane prefix, a source that is not decoded or is in a `SHED` packet), the `REP_E_HASHLAG` timer at and past 1 ms, also when the late hash itself arrives (07 §3.7), the step merge from the `TenureStart` cuts, a `TenureStart` cut beyond its lane bases, a step missing after both marks (07 §3.8, §3.9), and the header rules (07 §3.10). The file's header gives the format | built with `vyrn-log`'s encoder by `crates/vyrn-replica/tests/conformance.rs` (`VYRN_BLESS=1` rewrites it) |
 | `vyrn_data_vectors.py`, `.out` | 5 data frames (07 §5.3) to build and accept and 13 to refuse, 3 fetch requests and 9 refusals, and 5 dedupe-window sequences (07 §5.2 step 3) | written for this repository from the layouts in `crates/vyrn-data/src/lib.rs` |
 | `siphash.txt` | SipHash-2-4, 64 lengths (the packet MAC, 01 §4) | [veorq/SipHash](https://github.com/veorq/SipHash) `vectors.h` at `32d0676`, `vectors_sip64` |
@@ -29,6 +30,7 @@ cd /tmp
 python3 -I "$REPO/tests/golden/vyrn_proto_vectors.py"  | diff - "$REPO/tests/golden/vyrn_proto_vectors.out"
 python3 -I "$REPO/tests/golden/vyrn_reject_vectors.py" | diff - "$REPO/tests/golden/vyrn_reject_vectors.out"
 python3 -I "$REPO/tests/golden/vyrn_admin_vectors.py"  | diff - "$REPO/tests/golden/vyrn_admin_vectors.out"
+python3 -I "$REPO/tests/golden/vyrn_session_vectors.py" | diff - "$REPO/tests/golden/vyrn_session_vectors.out"
 python3 -I "$REPO/tests/golden/vyrn_data_vectors.py"   | diff - "$REPO/tests/golden/vyrn_data_vectors.out"
 ```
 
@@ -79,6 +81,15 @@ implementation builds the same bytes and parses them back to those fields. A `re
 a nonzero reserved byte, an unknown `type`, or a `len` that does not match the body (04 §4.4);
 a receiver refuses it. The keys inside `A02` are test keys only. In this repository,
 `bin/vyrn-admin/tests/admin_vectors.rs` checks `vyrn_admin::codec` against them.
+
+**Session state (`vyrn_session_vectors.out`).** `S` lines are
+`<id> <state> <message> <verdict>`, for a packet that passes every check except the state ones:
+`accept`, `drop` (no response), `oos <REASON> <detail>` (an out-of-stream `Reject`, index 0xFF) or
+`reject <REASON> <detail>` (accepted, in-stream `Reject` at index 0). `C` lines are
+`<id> close <CAUSE> <hex>`: the 16-byte final record (01 §6.4) the lane emits when the session
+enters `CLOSED`. The script's docstring names the one reading it takes (`OPENING` fails V2).
+CHAIN `tag_com` is covered by proto vector V10, and the 01 §6.6 records' 07 encoding by the
+`blk.frame.*` lines of `vyrn_log_vectors.out`.
 
 **Crypto.** Each of `siphash.txt` and `ed25519-edge.txt` explains its columns in its header
 comment. `blake3_test_vectors.json` explains its format in its `_comment` field.

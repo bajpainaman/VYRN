@@ -212,9 +212,9 @@ fn match_on_entry(bk: &mut Book, mut t: Order) {
         let Some(m) = best_maker(bk, &t) else { break };    // best price, then smallest key
         if m.account == t.account && t.stp != Stp::None {
             match t.stp {
-                CancelNewest => { kill(t, Out(STP)); return }
+                CancelNewest => { kill(t, stp_end(&t, m)); return }
                 CancelOldest => { remove(bk, m, Out(STP)); continue }
-                CancelBoth   => { remove(bk, m, Out(STP)); kill(t, Out(STP)); return }
+                CancelBoth   => { remove(bk, m, Out(STP)); kill(t, stp_end(&t, m)); return }
             }
         }
         let q = min(open(&t), open(&m));
@@ -235,6 +235,9 @@ fn match_on_entry(bk: &mut Book, mut t: Order) {
   maker's open qty, skips makers that `CancelOldest` would remove, and stops at the first maker
   that `CancelNewest` or `CancelBoth` would hit. `Stp::None` counts own makers.
 - The taker's STP mode governs. The maker's STP mode is not used.
+- `stp_end(t, m)` is the taker's end on an STP stop (04 §6.8): `Reject(STP)` with detail =
+  `m.handle` when the taker has no fill yet, else `Out(STP)` with qty out = the remaining open
+  qty. A `Reject STP` means the order had no effect on the book (04 §7.3).
 - `fill` adds `q` to both orders' `filled`, records a fill `(StepId = bk.step, ordinal)`, and
   queues one settlement event per side (§2.6). It removes a maker whose `open` reaches 0.
 - A taker gets one `Fill` record per price level and a maker gets one per fill (01 §6.4). The
@@ -1920,9 +1923,9 @@ fn sweep(b: &mut Bbo, t: &mut Taker, C: &Cut, out: &mut StepOut) {
             for m in b.segment_run(&run, t, C) {           // AVX-512 pass, below
                 if m.lane == t.lane && t.stp != Stp::None && b.acct_of(&m) == t.acct_ix {
                     match t.stp {                          // own maker, incl. a Pend dependency
-                        CancelNewest => { b.kill_taker(t, out, STP); return }
+                        CancelNewest => { b.kill_taker(t, out, STP, &m); return }
                         CancelOldest => { b.kill_maker(&m, out, STP); continue }
-                        CancelBoth   => { b.kill_maker(&m, out, STP); b.kill_taker(t, out, STP);
+                        CancelBoth   => { b.kill_maker(&m, out, STP); b.kill_taker(t, out, STP, &m);
                                           return }
                     }
                 }
@@ -1969,8 +1972,12 @@ the taker's lane: one slot-line read per such position. `Pend` leaves are merged
 - `rest` sets `B = max(B, t.tick)` for a buy (`A = min(A, t.tick)` for a sell) and emits
   `Rested { qty: open }`. The position was assigned in pass 1 (D4); a `Pend` entry stands in for
   it until the lane writes it at the boundary that applies this step (§7.4).
-- `kill_*` sets `killed` in `BboSlotState` and emits `Out { cause: STP }` to the owner's lane;
-  the record itself goes out in the step's TX-core packets (§8.10).
+- `kill_*` sets `killed` in `BboSlotState` and emits the end to the owner's lane; the record
+  itself goes out in the step's TX-core packets (§8.10). `kill_maker` emits `Out { cause: STP }`.
+  `kill_taker` follows 04 §6.8 and §2.4's `stp_end`: on the op's first step (not a `CONT` step)
+  with the taker's open qty unchanged since the sweep began, it emits `Reject { reason: STP,
+  detail: m.handle }`. Otherwise (after a fill, on a `CONT` step, or for a `Rescan` batch taker,
+  whose order already rested) it emits `Out { cause: STP, qty: open }`.
 - **`Pend`** holds `{ lane, side, tick, key, slot, root, qty, step }` per explicit resting op or
   Join dependency (`ENG_PEND_CAP` = 256 entries). `retire_pend` drops an entry when its lane's
   half-cut shows `f_lo ≥ step`: the lane has applied that step's events, so the position,
