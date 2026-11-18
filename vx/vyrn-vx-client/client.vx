@@ -230,7 +230,7 @@ struct Route { seq : u64, cross : u64 }
 struct LOp {
   seq : u64, kind : u64, root : u64, vslot : u64, side : u64, tick : u64, total : u64,
   flags : u64, ts : u64, sess_id : u64, acct : u64, tag : u64, ix : u64, cross : u64,
-  resp_seq : u64, pkt_seq : u64,
+  resp_seq : u64, pkt_seq : u64, snap_ver : u64,
 }
 
 struct Ev { step : u64, kind : u64, liq : u64, cause : u64, vslot : u64, handle : u64, tick : u64, qty : u64 }
@@ -255,7 +255,7 @@ struct Lane {
   routes : *mut Route, n_routes : i64, route_hits : i64, classified : u64,
   taker_notional : u128, taker_leg : i64,
   tails : *mut u64, segs_used : *mut u64, segs_base : *mut u64, next_seg : u64,
-  ev_tail : u64, fwd_head : u64, rec_at : u64, pkt_first : u64,
+  ev_tail : u64, fwd_head : u64, rec_at : u64, pkt_first : u64, snap_ver : u64,
 }
 
 struct Bbo {
@@ -264,6 +264,12 @@ struct Bbo {
   has_cont : u64, cont_lane : u64, cont_seq : u64,
   ords : *mut BOrd, book_l : *mut i64, book_r : *mut i64, n_book : i64,
   tx : *mut i8, n_tx : i64, n_fills : u64,
+  // Rust's Bbo bounds and snapshot history (05 §8.6): (B, A), the version, the last published
+  // pair, per-version (id, B, A), each lane's lowest snapshot version, and each lane's
+  // (applied, snapshot version) as its counter line reads before this step.
+  bb : u64, ba : u64, ver : u64, lp_b : u64, lp_a : u64,
+  vh_ver : *mut u64, vh_b : *mut u64, vh_a : *mut u64, lowver : *mut u64,
+  rapp : *mut u64, rver : *mut u64,
 }
 
 struct Ctx {
@@ -274,6 +280,7 @@ struct Ctx {
   lanes : *mut Lane, bbo : *mut Bbo,
   oplog : *mut LOp, fwdq : *mut u64, evlog : *mut Ev,
   hist_id : *mut AtomicU64, hist_cut : *mut u64, hist_bid : *mut u64, hist_ask : *mut u64,
+  hist_ver : *mut u64,
 }
 
 // ---- bytes, memory -------------------------------------------------------------------------
@@ -354,15 +361,18 @@ fn l_tx_head(n : i64) -> i64 { return 3i64 + 4i64 * n; }
 fn l_tx_tail(n : i64) -> i64 { return 4i64 + 4i64 * n; }
 fn ctl_lines(n : i64) -> i64 { return 1i64 + 4i64 * (n + 1i64); }
 
-// Vx-owned sync words. Lane line 2l: 0 applied, 1 fwd_head, 2 ev_tail, 3 fills_applied.
-// BBO line 2l + 1: 0 ev_head, 1 fwd_tail, 2 cut. BBO line 2n: 0 done_step.
+// Vx-owned sync words. Lane line 2l: 0 applied, 1 fwd_head, 2 ev_tail, 3 fills_applied,
+// 4 snapshot version. BBO line 2l + 1: 0 ev_head, 1 fwd_tail, 2 cut, 3 the cut it waits for.
+// BBO line 2n: 0 done_step.
 const Y_APPLIED : i64 = 0;
 const Y_FWD_HEAD : i64 = 1;
 const Y_EV_TAIL : i64 = 2;
 const Y_EV_HEAD : i64 = 0;
 const Y_FWD_TAIL : i64 = 1;
 const Y_CUT : i64 = 2;
-const Y_WAIT : i64 = 3;           // BBO line 2l + 1: the cut it waits for lane l to apply, or 0
+const Y_WAIT : i64 = 3;
+// Lane line 2l word 4: the version of the snapshot it last read (word 3 is fills_applied).
+const Y_SNAP_VER : i64 = 4;
 
 fn stopped(c : *mut Ctx) -> bool { return ld(c, 0i64, 0i64) != 0u64; }
 fn done_step(c : *mut Ctx) -> u64 { unsafe { return sld(c, 2i64 * (*c).n, 0i64); } }
@@ -742,7 +752,7 @@ fn check_tick(c : *mut Ctx, ln : *mut Lane, side : u64, tick : u64, detail : *mu
     return 0u64;
   }
 }
-// The call's snapshot: best bid and ask after step `pkt_first` (the step the call is due at);
+// The op's snapshot: best bid and ask after step `pkt_first`, the lane's latest boundary;
 // an empty ask reads 0, as vyrn-lane's `risk_snap` gives it.
 fn snap_bid(c : *mut Ctx, ln : *mut Lane) -> u64 {
   unsafe { return *offset_mut((*c).hist_bid, (((*ln).pkt_first % HIST)) as i64); }
@@ -1025,6 +1035,10 @@ fn maybe_mid(c : *mut Ctx, l : i64, pass : u64, next : u64) -> void {
     (*ln).next_mid = (*ln).next_mid + 1i64;
     let f = (*m).f;
     boundary(c, l, f, pass, next);
+    (*ln).pkt_first = f;
+    let sv = *offset_mut((*c).hist_ver, ((f % HIST)) as i64);
+    if sv > (*ln).snap_ver { (*ln).snap_ver = sv; }
+    sst(c, 2i64 * l, Y_SNAP_VER, (*ln).snap_ver);
   }
 }
 
@@ -1081,6 +1095,10 @@ fn lane_pkt(c : *mut Ctx, l : i64, r : *mut i8, mids : u64) -> void {
     (*s).expected = ((*s).expected + 1u64) & U32_MAX;
     let prio = max(rx_ts, (*ln).last_prio);
     (*ln).last_prio = prio;
+    // The snapshot at accept: the one its last boundary read (fills_applied), never older.
+    let sv = *offset_mut((*c).hist_ver, (((*ln).pkt_first % HIST)) as i64);
+    if sv > (*ln).snap_ver { (*ln).snap_ver = sv; }
+    sst(c, 2i64 * l, Y_SNAP_VER, (*ln).snap_ver);
     if rd64(r, 32i64) != (*ln).seq + 1u64 { fail_lane(ln, E_MISMATCH); return; }
     (*ln).n_ops = 0i64;
     (*ln).cur_sess = si;
@@ -1165,7 +1183,8 @@ fn answer_busy(c : *mut Ctx, l : i64, si : i64, n : u64, pkt_seq : u64) -> void 
     let r = (*ln).resp;
     resp_open(r, (*s).id, rs, pkt_seq);
     for ix in 0i64..(n as i64) {
-      resp_push(r, rec_lo(R_REJECT, ix as u64, BUSY, 0u64), rec_hi(0u64, 0u64));
+      // detail = the session's `expected` (04 §3.5): a lane shed, not a BBO one (detail 0).
+      resp_push(r, rec_lo(R_REJECT, ix as u64, BUSY, (*s).expected), rec_hi(0u64, 0u64));
     }
     emit_resp(c, l, r);
   }
@@ -1360,6 +1379,7 @@ fn forward(c : *mut Ctx, l : i64, m : *mut i8, op : *mut Op, cross : bool) -> vo
     (*e).root = v; (*e).vslot = v; (*e).side = (*op).side; (*e).tick = (*op).tick;
     (*e).total = (*sp).total; (*e).flags = (*sp).flags; (*e).ts = (*ln).cur_ts;
     (*e).sess_id = (*s).id; (*e).acct = (*acct(ln, (*s).acct)).ix; (*e).tag = rd32(m, 12i64);
+    (*e).snap_ver = (*ln).snap_ver;
     (*e).ix = (*op).ix; (*e).cross = if cross { 1u64 } else { 0u64 };
     (*e).resp_seq = rs; (*e).pkt_seq = (*ln).cur_pkt;
     // The forwarded queue, in LaneSeq order.
@@ -1367,6 +1387,10 @@ fn forward(c : *mut Ctx, l : i64, m : *mut i8, op : *mut Op, cross : bool) -> vo
       let t = sld(c, 2i64 * l + 1i64, Y_FWD_TAIL);
       if (*ln).fwd_head - t < FWDQ_CAP { break; }
       if stopped(c) { return; }
+      // As in put_op: the BBO pops this queue only in a later step, but it waits (on a cut, or
+      // in await_ready with U64_MAX) for this lane to get past this op. More than FWDQ_CAP
+      // forwarded ops before one step is a capacity fault, not a wait.
+      if sld(c, 2i64 * l + 1i64, Y_WAIT) >= (*op).seq { fail_lane(ln, E_FAULT); return; }
       spin();
     }
     *offset_mut((*c).fwdq, l * (FWDQ_CAP as i64) + (((*ln).fwd_head % FWDQ_CAP) as i64)) = (*op).seq;
@@ -1634,7 +1658,6 @@ fn lane_call(c : *mut Ctx, l : i64, k : u64) -> void {
     }
     (*ln).n_mid = 0i64;
     (*ln).next_mid = 0i64;
-    let mut due = rd64(r, 40i64);
     for j in 1u64..k {
       let m = in_slot(c, l, (*ln).tail + j);
       let mp : *mut Mid = offset_mut((*ln).mids, (*ln).n_mid);
@@ -1642,10 +1665,11 @@ fn lane_call(c : *mut Ctx, l : i64, k : u64) -> void {
       (*mp).pass = if (mf & F_PASS2) != 0u64 { 2u64 } else { 1u64 };
       (*mp).next = rd64(m, 32i64);
       (*mp).f = rd64(m, 40i64);
-      due = max(due, (*mp).f);
       (*ln).n_mid = (*ln).n_mid + 1i64;
     }
-    (*ln).pkt_first = due;
+    // Lanes read the snapshot only at boundaries: the packet's ops up to its first MID use the
+    // snapshot after its `fills_applied` step; each MID boundary moves to its own (maybe_mid).
+    (*ln).pkt_first = rd64(r, 40i64);
     (*ln).n_routes = rd8(r, 3i64) as i64;
     (*ln).route_hits = 0i64;
     for i in 0i64..(*ln).n_routes {
@@ -1709,6 +1733,9 @@ pub fn pbv_lane_run(c : *mut Ctx, l : u32) -> void {
         }
         if done_step(c) >= wait {
           lane_call(c, li, k);
+          // Publish the idle state afresh after every call: the BBO reads this lane's counter
+          // (applied, snapshot version) only once the lane says which step it waits for.
+          seen = U64_MAX;
           // A failed call is not replayed: the error is published before the tail could
           // tell the shell the lane is used up.
           if (*ln).err != 0u64 { continue; }
@@ -1926,6 +1953,113 @@ fn lane_stuck(c : *mut Ctx, l : i64, s : u64) -> bool {
   return seen == head && head >= fed && need >= s;
 }
 
+// ---- BBO: bounds (B, A) and the snapshot history, as Rust's Bbo keeps them (05 §8.6) ---------
+// The published snapshot is the bounds, not the exact book: band_env widens them before a step,
+// touch, rest and the idle observation move them, and finish publishes them as a version.
+
+// Max bid and min ask over versions lo..=ver; (tick_max, 0) once a version is gone.
+fn envelope(c : *mut Ctx, lo : u64) -> (u64, u64) {
+  unsafe {
+    let b = (*c).bbo;
+    if (*b).ver - lo >= HIST { return ((*c).tick_max, 0u64); }
+    let mut mb = NO_BID;
+    let mut ma = NO_ASK;
+    for v in lo..((*b).ver + 1u64) {
+      let i = (v % HIST) as i64;
+      if *offset_mut((*b).vh_ver, i) != v { return ((*c).tick_max, 0u64); }
+      mb = max(mb, *offset_mut((*b).vh_b, i));
+      ma = min(ma, *offset_mut((*b).vh_a, i));
+    }
+    return (mb, ma);
+  }
+}
+
+// replay_decide: (B, A) become the envelope of every snapshot an op in (prev, cut] may hold.
+fn band_env(c : *mut Ctx, sp : *mut i8) -> void {
+  unsafe {
+    let b = (*c).bbo;
+    let mut hi = (*b).bb;
+    let mut lo = (*b).ba;
+    for l in 0i64..(*c).n {
+      if rd64(sp, 32i64 + 8i64 * l) > *offset_mut((*b).cut, l) {
+        let (mb, ma) = envelope(c, *offset_mut((*b).lowver, l));
+        hi = max(hi, mb);
+        lo = min(lo, ma);
+      }
+    }
+    (*b).bb = hi;
+    (*b).ba = lo;
+  }
+}
+
+// Bbo::touch (05 §8.5 advance_bound): the best live level of `side` within `limit`, made the
+// bound; with none, the bound moves past the limit. 0 = none.
+fn touch(c : *mut Ctx, side : u64, limit : u64) -> u64 {
+  unsafe {
+    let b = (*c).bbo;
+    if side == 0u64 && (*b).bb == NO_BID { return 0u64; }
+    if side == 1u64 && (*b).ba == NO_ASK { return 0u64; }
+    let lvl = best_level(c, side, limit);
+    if lvl != 0u64 {
+      if side == 0u64 { (*b).bb = lvl; } else { (*b).ba = lvl; }
+    } else if side == 1u64 {
+      (*b).ba = max((*b).ba, if limit >= NO_ASK { NO_ASK } else { limit + 1u64 });
+    } else {
+      (*b).bb = min((*b).bb, sat_sub(limit, 1u64));
+    }
+    return lvl;
+  }
+}
+
+// Bbo::rest_bound: a resting order moves its side's bound toward the spread.
+fn rest_bound(c : *mut Ctx, side : u64, tick : u64) -> void {
+  unsafe {
+    let b = (*c).bbo;
+    if side == 0u64 { (*b).bb = max((*b).bb, tick); } else { (*b).ba = min((*b).ba, tick); }
+  }
+}
+
+// Bbo::exec_idle: a bound with no live order at its tick moves to the next live level, or empty.
+fn idle_bounds(c : *mut Ctx) -> void {
+  unsafe {
+    let b = (*c).bbo;
+    let t = (*b).bb;
+    if t != NO_BID && t != NO_ASK && next_maker(c, 0u64, t) == NONE {
+      (*b).bb = best_level(c, 0u64, 1u64);
+    }
+    let a = (*b).ba;
+    if a != NO_BID && a != NO_ASK && next_maker(c, 1u64, a) == NONE {
+      let x = best_level(c, 1u64, NO_ASK);
+      (*b).ba = if x == 0u64 { NO_ASK } else { x };
+    } else { }
+  }
+}
+
+// Before step s every lane has replayed all its calls due before s (REP_MERGE item 2), so its
+// counter is the one Rust's cut cores publish for the step: the lane waits on a later step, or
+// has used up the block. A lane blocked on op-log room meanwhile is a capacity fault (Y_WAIT).
+fn await_ready(c : *mut Ctx, s : u64) -> bool {
+  unsafe {
+    let b = (*c).bbo;
+    for l in 0i64..(*c).n {
+      sst(c, 2i64 * l + 1i64, Y_WAIT, U64_MAX);
+      loop {
+        let head = ld(c, l_in_head(l), 0i64);
+        let fed = ld(c, l_in_head(l), 1i64);
+        let seen = ld(c, l_in_tail(l), 1i64);
+        let need = ld(c, l_in_tail(l), 2i64);
+        if seen == head && need >= s && (need != U64_MAX || head >= fed) { break; }
+        if stopped(c) { return false; }
+        spin();
+      }
+      sst(c, 2i64 * l + 1i64, Y_WAIT, 0u64);
+      *offset_mut((*b).rapp, l) = sld(c, 2i64 * l, Y_APPLIED);
+      *offset_mut((*b).rver, l) = sld(c, 2i64 * l, Y_SNAP_VER);
+    }
+    return true;
+  }
+}
+
 fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
   unsafe {
     let b = (*c).bbo;
@@ -1941,6 +2075,7 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
       let cl = rd64(sp, 32i64 + 8i64 * l);
       if cl < *offset_mut((*b).cut, l) { fail_bbo(c, E_CUT); return; }
     }
+    band_env(c, sp);
     // REP_MERGE: every op the cut covers is applied first.
     for l in 0i64..n {
       let cl = rd64(sp, 32i64 + 8i64 * l);
@@ -1969,6 +2104,7 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
     } else if kind == K_IDLE || kind == K_DEPLETION {
       // A bounds observation; replay reads its kind from the record (05 §8.7).
       if has_src || (*b).has_cont != 0u64 { fail_bbo(c, E_KIND); return; }
+      idle_bounds(c);
     } else {
       fail_bbo(c, E_UNSUPPORTED);
       return;
@@ -1994,10 +2130,29 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
     let idp : *mut AtomicU64 = offset_mut((*c).hist_id, h);
     (*idp).store(U64_MAX, AtomicOrdering::Release);
     for l in 0i64..n { *offset_mut((*c).hist_cut, h * n + l) = *offset_mut((*b).cut, l); }
-    let bid = best_level(c, 0u64, 1u64);
-    let ask = best_level(c, 1u64, NO_ASK);
-    *offset_mut((*c).hist_bid, h) = bid;
-    *offset_mut((*c).hist_ask, h) = if ask == 0u64 { NO_ASK } else { ask };
+    // finish: the lowest snapshot version each lane's ops in the cut may hold, then (B, A) as
+    // a new version when they changed.
+    if !await_ready(c, s) { return; }
+    for l in 0i64..n {
+      if *offset_mut((*b).cut, l) == *offset_mut((*b).rapp, l) {
+        *offset_mut((*b).lowver, l) = *offset_mut((*b).rver, l);
+      }
+    }
+    if has_src {
+      *offset_mut((*b).lowver, src_l as i64) = (*lop(c, src_l as i64, src_q)).snap_ver;
+    }
+    if (*b).bb != (*b).lp_b || (*b).ba != (*b).lp_a {
+      (*b).ver = (*b).ver + 1u64;
+      (*b).lp_b = (*b).bb;
+      (*b).lp_a = (*b).ba;
+      let vi = ((*b).ver % HIST) as i64;
+      *offset_mut((*b).vh_ver, vi) = (*b).ver;
+      *offset_mut((*b).vh_b, vi) = (*b).bb;
+      *offset_mut((*b).vh_a, vi) = (*b).ba;
+    }
+    *offset_mut((*c).hist_bid, h) = (*b).bb;
+    *offset_mut((*c).hist_ask, h) = (*b).ba;
+    *offset_mut((*c).hist_ver, h) = (*b).ver;
     (*idp).store(s, AtomicOrdering::Release);
     (*b).next = s + 1u64;
     sst(c, 2i64 * n, 0i64, s);
@@ -2055,8 +2210,9 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
     if !cont {
       // entry_checks (05 §2.5 P1, the post-only test and the FOK dry run).
       // The detail is the best opposite tick it would cross (04 §6), as Bbo::entry_checks.
-      let at = best_level(c, opp, (*e).tick);
-      if ((*e).flags & 8u64) != 0u64 && at != 0u64 {
+      let post = ((*e).flags & 8u64) != 0u64;
+      let at = if post { touch(c, opp, (*e).tick) } else { 0u64 };
+      if post && at != 0u64 {
         end_taker(c, l, e, src, EV_REJECT, POST_ONLY_WOULD_CROSS, true, at);
         ended = true;
       } else if tif == 2u64 && fillable(c, l, e) < bopen(c, l, r) {
@@ -2076,6 +2232,7 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
         } else {
           let open = bopen(c, l, r);
           book_add(c, l, r);
+          rest_bound(c, (*e).side, (*e).tick);
           event(c, l, EV_RESTED, LIQ_TAKER, 0u64, (*e).vslot, h, (*e).tick, open);
           tx_push(c, src, rec_lo(R_ACK, (*e).ix, 0u64, h), rec_hi((*e).tick, (*e).tag));
         }
@@ -2187,7 +2344,7 @@ fn sweep(c : *mut Ctx, l : u64, e : *mut LOp, src : i64) -> u64 {
     loop {
       if bopen(c, l, r) == 0u64 { return 0u64; }
       if levels >= 1u64 || work >= STEP_FILLS { return 1u64; }
-      let lvl = best_level(c, side, (*e).tick);
+      let lvl = touch(c, side, (*e).tick);
       if lvl == 0u64 { return 0u64; }
       let mut level_qty = 0u64;
       while work < STEP_FILLS {
@@ -2416,6 +2573,7 @@ pub fn pbv_new(cfg : *const i8, accts : *const i8, n_accts : u32, sp : *const i8
     (*c).hist_cut = zalloc(8i64 * n * (HIST as i64));
     (*c).hist_bid = zalloc(8i64 * (HIST as i64));
     (*c).hist_ask = zalloc(8i64 * (HIST as i64));
+    (*c).hist_ver = zalloc(8i64 * (HIST as i64));
     if is_null_mut((*c).lanes) || is_null_mut((*c).bbo) || is_null_mut((*c).oplog)
        || is_null_mut((*c).evlog) || is_null_mut((*c).hist_cut) {
       return nul;
@@ -2430,6 +2588,21 @@ pub fn pbv_new(cfg : *const i8, accts : *const i8, n_accts : u32, sp : *const i8
     (*b).next = 1u64;
     (*b).cut = zalloc(8i64 * n);
     (*b).prev = zalloc(8i64 * n);
+    (*b).bb = NO_BID; (*b).ba = NO_ASK; (*b).lp_b = NO_BID; (*b).lp_a = NO_ASK;
+    (*b).vh_ver = zalloc(8i64 * (HIST as i64));
+    (*b).vh_b = zalloc(8i64 * (HIST as i64));
+    (*b).vh_a = zalloc(8i64 * (HIST as i64));
+    (*b).lowver = zalloc(8i64 * n);
+    (*b).rapp = zalloc(8i64 * n);
+    (*b).rver = zalloc(8i64 * n);
+    if is_null_mut((*b).vh_ver) || is_null_mut((*b).vh_b) || is_null_mut((*b).vh_a)
+       || is_null_mut((*b).lowver) || is_null_mut((*b).rapp) || is_null_mut((*b).rver)
+       || is_null_mut((*c).hist_ver) {
+      return nul;
+    }
+    // Version 0: an empty book (Bbo::new).
+    for v in 1i64..(HIST as i64) { *offset_mut((*b).vh_ver, v) = U64_MAX; }
+    *offset_mut((*b).vh_a, 0i64) = NO_ASK;
     (*b).fwd_tail = zalloc(8i64 * n);
     (*b).ev_head = zalloc(8i64 * n);
     (*b).ords = zalloc(sizeof<BOrd>() * n * (slot_cap as i64));
@@ -2483,6 +2656,12 @@ pub fn pbv_free(c : *mut Ctx) -> void {
     let q5 : *mut i8 = (*b).book_l; free(q5);
     let q6 : *mut i8 = (*b).book_r; free(q6);
     free((*b).tx);
+    let v0 : *mut i8 = (*b).vh_ver; free(v0);
+    let v1 : *mut i8 = (*b).vh_b; free(v1);
+    let v2 : *mut i8 = (*b).vh_a; free(v2);
+    let v3 : *mut i8 = (*b).lowver; free(v3);
+    let v4 : *mut i8 = (*b).rapp; free(v4);
+    let v5 : *mut i8 = (*b).rver; free(v5);
     let r0 : *mut i8 = (*c).bbo; free(r0);
     let r1 : *mut i8 = (*c).lanes; free(r1);
     let r2 : *mut i8 = (*c).sync; free(r2);
@@ -2492,6 +2671,7 @@ pub fn pbv_free(c : *mut Ctx) -> void {
     let r6 : *mut i8 = (*c).hist_id; free(r6);
     let r7 : *mut i8 = (*c).hist_cut; free(r7);
     let r8 : *mut i8 = (*c).hist_bid; free(r8);
+    let rv : *mut i8 = (*c).hist_ver; free(rv);
     let r9 : *mut i8 = (*c).hist_ask; free(r9);
   }
   let cc : *mut i8 = c;

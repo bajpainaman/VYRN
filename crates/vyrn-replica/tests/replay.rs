@@ -273,7 +273,12 @@ fn lane_pkts(j: &Journal, l: u8) -> Vec<vyrn_types::PacketRecord> {
 /// The live run, framed and decoded by the order core into blocks (a block closes after each
 /// record index in `cuts`).
 fn blocks(cuts: &[usize]) -> (Journal, Store, Vec<BlockInputs<N>>) {
-    let (live_j, store) = live07(&script());
+    blocks_of(&script(), cuts)
+}
+
+/// [`blocks`] of any script.
+fn blocks_of(script: &[Act], cuts: &[usize]) -> (Journal, Store, Vec<BlockInputs<N>>) {
+    let (live_j, store) = live07(script);
     let key = vyrn_crypto::ed25519::public_key(&SEED);
     let layout = Layout::new(N as u8, 1, 0).unwrap();
     let mut core = OrderCore::<N, _>::new(layout, View(key)).unwrap();
@@ -590,8 +595,8 @@ fn vx_config() -> vyrn_replica::VxConfig {
         tick_max: TICK_MAX,
         tick_size: 1,
         band_bps: 10_000,
-        slot_cap: 1024,
-        seg_cap: 1024,
+        slot_cap: SLOT_CAP,
+        seg_cap: SLOT_CAP,
         ..VxConfig::default()
     };
     for l in 0..N {
@@ -727,4 +732,206 @@ fn the_vx_client_matches_rust_replay_split_anywhere() {
         let h: Vec<Hash> = vx.iter().map(|x| x.2).collect();
         assert_eq!(h, rust_hashes, "split after {at}");
     }
+}
+
+/// A script where the price band binds on a stale bound (11 §5.3 band reference): a buy
+/// empties the last ask at 105, and before any later step observes the bounds a buy at 300 is
+/// checked against the published ask. Rust's `Bbo::finish` keeps the conservative bound (ask
+/// 105, edge 210), so that buy is a `BAD_TICK` reject on both engines.
+fn band_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let p = |l, a, rx_ts, now, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts,
+        now,
+        msgs,
+    };
+    vec![
+        p(0, 1, 1_000, 1_000, vec![new(Sell, Day, 105, 1, 1)]),
+        Act::Run,
+        p(1, 1, 2_000, 2_000, vec![new(Buy, Day, 105, 1, 2)]),
+        Act::Step(None),
+        // The buyer applies its fill (an Advance at step 3), then sends a buy far above 105.
+        Act::Poll,
+        p(1, 2, 3_000, 3_000, vec![new(Buy, Day, 300, 1, 3)]),
+        Act::Run,
+    ]
+}
+
+#[test]
+fn the_vx_client_matches_rust_replay_when_the_band_binds() {
+    let (live_j, store, blocks) = blocks_of(&band_script(), &[]);
+    let (rep, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    // The case is reached: a BAD_TICK reject against the stale ask.
+    let bad_tick = live_j.resp.iter().any(|(_, p)| {
+        p.records().iter().any(|r| {
+            matches!(
+                r,
+                vyrn_bbo::Record::Reject {
+                    reason: vyrn_types::RejectReason::BadTick,
+                    ..
+                }
+            )
+        })
+    });
+    assert!(bad_tick, "{:#?}", live_j.resp);
+    let Some(lib) = vx_lib() else { return };
+    let vx = vx_replay(&store, &blocks, &lib).unwrap();
+    let (lanes, tx) = live_bytes(&live_j);
+    for l in 0..N {
+        assert_eq!(vx[0].0[l], lanes[l], "lane {l} responses");
+    }
+    assert_eq!(vx[0].1, tx, "fill TX packets");
+    assert_eq!(vec![vx[0].2], rust_hashes);
+    // The same at every block boundary.
+    let (j, _) = live07(&band_script());
+    for at in 0..j.recs.len() - 1 {
+        let (live_j, store, blocks) = blocks_of(&band_script(), &[at]);
+        let (_, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
+        let vx =
+            vx_replay(&store, &blocks, &lib).unwrap_or_else(|e| panic!("split after {at}: {e}"));
+        let h: Vec<Hash> = vx.iter().map(|x| x.2).collect();
+        assert_eq!(h, rust_hashes, "split after {at}");
+    }
+}
+
+/// Lanes that take Advance boundaries after their last packet while steps move other lanes'
+/// cuts (found by a search over small scripts). Each step's envelope must start at the
+/// snapshot version each lane's ops read, which the Vx client keeps in its own lane word: a
+/// client that read it from the `fills_applied` word (pbv lane word 3) narrows the envelope
+/// and diverges here, while every other test still passes.
+fn version_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let p = |l, a, t: u64, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs,
+    };
+    vec![
+        p(0, 2, 1_000, vec![new(Sell, Day, 400, 1, 1)]),
+        Act::Run,
+        p(1, 3, 2_000, vec![new(Sell, Day, 150, 1, 2)]),
+        Act::Poll,
+        p(0, 3, 3_000, vec![new(Sell, Day, 150, 1, 3)]),
+        Act::Poll,
+        p(1, 2, 4_000, vec![new(Buy, Day, 100, 2, 4)]),
+        Act::Run,
+        p(2, 2, 5_000, vec![new(Sell, Day, 105, 1, 5)]),
+        Act::Step(None),
+        p(2, 4, 6_000, vec![new(Sell, Day, 400, 2, 6)]),
+        Act::Step(None),
+        p(1, 1, 7_000, vec![new(Sell, Day, 400, 1, 7)]),
+        Act::Poll,
+        p(2, 1, 8_000, vec![new(Buy, Day, 400, 1, 8)]),
+        Act::Run,
+        p(2, 3, 9_000, vec![new(Sell, Day, 110, 1, 9)]),
+        Act::Step(None),
+        p(1, 1, 10_000, vec![new(Buy, Day, 300, 2, 10)]),
+        Act::Step(None),
+        p(2, 1, 11_000, vec![new(Sell, Day, 400, 1, 11)]),
+        Act::Poll,
+        Act::Run,
+    ]
+}
+
+#[test]
+fn the_vx_client_keeps_each_lanes_snapshot_version() {
+    let (live_j, store, blocks) = blocks_of(&version_script(), &[]);
+    let (rep, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let rejects = live_j
+        .resp
+        .iter()
+        .flat_map(|(_, p)| p.records())
+        .filter(|r| {
+            matches!(
+                r,
+                vyrn_bbo::Record::Reject {
+                    reason: vyrn_types::RejectReason::BadTick,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(rejects, 2, "{:#?}", live_j.resp);
+    let Some(lib) = vx_lib() else { return };
+    let vx = vx_replay(&store, &blocks, &lib).unwrap();
+    let (lanes, tx) = live_bytes(&live_j);
+    for l in 0..N {
+        assert_eq!(vx[0].0[l], lanes[l], "lane {l} responses");
+    }
+    assert_eq!(vx[0].1, tx, "fill TX packets");
+    assert_eq!(vec![vx[0].2], rust_hashes);
+}
+
+/// More forwarded ops due before one step than the Vx client's forwarded queue holds
+/// (`FWDQ_CAP` = 1024). Live, lane 0 fills Rust's forward ring with 1024 sells, one step lets
+/// the BBO take 10 of them into its lane buffer, and 9 more sells that improve the ask follow
+/// before the lane takes a boundary: 1033 forwarded ops with `fills_applied` 0, all due before
+/// step 1 on replay (the harness's `SLOT_CAP` leaves the lane room for them). Rust replays it;
+/// the Vx client must halt with `PBV_E_FAULT` (a v1 capacity limit, 11 §5.3) instead of
+/// waiting forever on itself (Codex r4610220906).
+fn fwd_overflow_script() -> Vec<Act> {
+    let mut sc = Vec::new();
+    let mut ts = 1_000_000u64;
+    let mut tag = 1u32;
+    let mut pkt = |sc: &mut Vec<Act>, a: u32, n: u32, below: bool| {
+        let msgs = (0..n)
+            .map(|i| {
+                tag += 1;
+                let tick = if below { 190 - i } else { 200 + tag % 300 };
+                new(Side::Sell, Tif::Day, tick, 1, tag)
+            })
+            .collect();
+        sc.push(Act::Pkt {
+            l: 0,
+            a,
+            rx_ts: ts,
+            now: ts,
+            msgs,
+        });
+        ts += 1_000_000;
+    };
+    for i in 0..102u32 {
+        pkt(&mut sc, 1 + i % 15, 10, false);
+    }
+    pkt(&mut sc, 1, 4, false);
+    sc.push(Act::Step(None));
+    pkt(&mut sc, 2, 9, true);
+    for _ in 0..40 {
+        sc.push(Act::Poll);
+        for _ in 0..30 {
+            sc.push(Act::Step(None));
+        }
+    }
+    sc.push(Act::Run);
+    sc
+}
+
+#[test]
+fn the_vx_client_halts_on_a_forwarded_queue_overflow() {
+    let (live_j, store, blocks) = blocks_of(&fwd_overflow_script(), &[]);
+    let pending = lane_pkts(&live_j, 0)
+        .iter()
+        .filter(|p| p.flags == 0 && p.fills_applied.0 == 0)
+        .map(|p| u64::from(p.count))
+        .sum::<u64>();
+    assert_eq!(pending, 1033, "all due before step 1");
+    replay(&live_j, &store, &blocks).unwrap();
+    let Some(lib) = vx_lib() else { return };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(vx_replay(&store, &blocks, &lib).map(|_| ()));
+    });
+    let r = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the Vx client deadlocked on its forwarded queue");
+    let e = r.unwrap_err();
+    assert!(e.0.contains("diverged (fault)"), "{e}");
 }

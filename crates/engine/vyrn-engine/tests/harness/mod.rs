@@ -30,6 +30,9 @@ pub const N: usize = 3;
 pub const NA: usize = 16;
 pub const BOOK: BookId = BookId(7);
 pub const TICK_MAX: u32 = 512;
+/// Order slots and FIFO segments per lane, above `ENG_FWD_RING` + the BBO's lane buffer (as in vyrn-sim's 4096) so
+/// a lane can have more forwarded ops in flight than the forward ring holds.
+pub const SLOT_CAP: u32 = 2048;
 /// `FwdEntry.deadline − rx_ts` used by every lane here.
 pub const FWD_DL: u32 = vyrn_lane::lane::FWD_DEADLINE_NS;
 
@@ -37,8 +40,8 @@ pub fn bbo_cfg() -> vyrn_bbo::Config {
     vyrn_bbo::Config {
         n_lanes: N as u8,
         epoch: Epoch(0),
-        slot_cap: 1024,
-        seg_cap: 1024,
+        slot_cap: SLOT_CAP as usize,
+        seg_cap: SLOT_CAP,
         win_center: Tick(100),
         phase: Phase::Continuous,
         tick_min: Tick(1),
@@ -52,8 +55,8 @@ pub fn bbo_cfg() -> vyrn_bbo::Config {
 
 pub fn arena_cfg() -> ArenaConfig {
     ArenaConfig {
-        slot_cap: 1024,
-        seg_cap: 1024,
+        slot_cap: SLOT_CAP,
+        seg_cap: SLOT_CAP,
         tick_min: Tick(1),
         tick_max: Tick(TICK_MAX),
         accounts: NA as u32,
