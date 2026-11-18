@@ -187,5 +187,18 @@ fn close_causes_emit_the_vector_records() {
             Some(cause),
             "{name}"
         );
+        // A bad tag after the close is dropped with no answer and keeps the first cause
+        // (Codex on #207): V7 still answers with `cause`, not BAD_MAC.
+        let n_resp = x.resp[0].len();
+        let rx = x.send_keyed(0, A, 61_000, &[Msg::Heartbeat], &[0xEE; 16]);
+        assert_eq!(rx, Rx::Dropped, "{name}");
+        assert_eq!(x.resp[0].len(), n_resp, "{name}: nothing sent");
+        x.send(0, A, 62_000, &[Msg::Heartbeat]);
+        let p = x.resp[0].last().unwrap();
+        assert_eq!(
+            p.records().iter().find_map(session_closed).map(|d| d.1),
+            Some(cause),
+            "{name}: the first cause stays"
+        );
     }
 }

@@ -3,6 +3,21 @@
 //! the shard's hop ring), with a lagging replica's KEY-fetch flood behind them. The RX core
 //! paces the burst against the full ring: every redirect reaches the client and none is dropped,
 //! and client copies arriving during the burst still reach the shard: ingest wins the ring.
+//!
+//! *Measured (main 733ff96, release, one thread; turns until that share of the 8,000 redirects
+//! reached the client, with 4,000 client copies arriving during the burst).* The shard drains a
+//! fixed 16 entries a turn, which bounds delivery, so neither knob below buys much; the half-ring
+//! hold (`REDIRECT_HEADROOM` = `HOP_RING` / 2) stays.
+//!
+//! ```text
+//! option                                          p50   p99   ingest drops
+//! hold below HOP_RING/2 free (kept)               290   617   0
+//! hold below HOP_RING/4 free                      269   595   0
+//! hold below HOP_RING/8 free                      258   585   0
+//! ingest first, then <= 16 redirects a turn       290   617   0
+//! ingest first, then <= 8 redirects a turn        300   630   0
+//! ingest first, then <= 4 redirects a turn        292   692   0
+//! ```
 #![allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
