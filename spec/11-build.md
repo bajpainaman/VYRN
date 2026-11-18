@@ -997,6 +997,22 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   dependencies, Rescan, Control, Seal, Uncross, step payloads, snapshot and state bytes) stops
   with `PBV_E_UNSUPPORTED` rather than guess, so a v1 Vx validator halts on it instead of
   diverging silently.
+- *Pooled lanes (`AcctTake`, 05 §6.9, 07 §7.1).* `pbv_config` byte 48 is the pool mask,
+  `pbv_account` byte 6 flags a pool-wide index at byte 44 (`Lane::set_pool_index`), and
+  `pbv_session` byte 10 flags a pooled account at byte 12 (`Engine::pool_session`;
+  `PBV_ABI_VERSION` 3). STP compares that index across pooled lanes. **[Reading]** The shell
+  checks each `AcctTake` sits right before its packet record, as `RustReplay` does, and puts it
+  in that record's slot (byte 416) with its predecessor: the highest lower `ver` of the account
+  fed so far, and its lane. A pooled record is due once the account's reproduced count reaches
+  that predecessor, so the account's takes replay in `ver` order across lane threads; a lane
+  waiting on another lane's take reports that lane's wait step, and only while that lane is idle,
+  so the BBO's merge never reads it as settled early. A take carries with its packet because the
+  record stays in its ring. **[Reading]** Each pooled record's lane call takes the account's
+  next `ver` (gapless from 1, the token's order); a record of a pooled session without a take,
+  a take of another account or `ver`, or a take on a record of an unpooled session is
+  `PBV_E_FAULT` (Rust's `Mismatch`). A misplaced or repeated `(account, ver)` take
+  (`BadRecord`) is refused by the shell before the client sees it. `tests/replay.rs` ports
+  vyrn-engine's take cases and compares at every block split.
 - *Band reference.* Each packet record that classifies (not Advance, not `SHED`) checks the
   price band against snapshot version `base + snap_lag` (05 §6.5, 07 §7.1, ruling (c), which
   supersedes #137's boundary-only rule). `base` is the version the lane's latest boundary step

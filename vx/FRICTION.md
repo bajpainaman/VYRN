@@ -4,7 +4,7 @@ Every Vx workaround and every Vx feature we looked for and did not find, each na
 vx-lang/Vx issue (spec/11-build.md §5.6). Code sites carry `// VX-WORKAROUND W-nn (...)` or
 `# VX-WORKAROUND W-nn (...)`. All entries below were found with vxc v0.0.4 (c6dffec7) on x86_64
 Linux while writing `vyrn-vx-oracle` (W-09 to W-15) and `vyrn-vx-client` (W-01, W-03, W-05,
-W-17 to W-19). Their upstream issues are not filed yet: §5.5 needs a
+W-17 to W-20). Their upstream issues are not filed yet: §5.5 needs a
 maintainer-facing minimal reproduction and a CLA-signed author, so each is `open, issue to file`.
 
 | ID | What we wanted | Workaround | Files with the marker | Cost | Removed when | Status |
@@ -22,3 +22,4 @@ maintainer-facing minimal reproduction and a CLA-signed author, so each is `open
 | W-17 | `overflowing_*` on `u128`, as `core::num` has for `u64` (W-11 for 128-bit ledger amounts). | `add128`/`sub128`/`mul128` check by hand: a sum below an addend wrapped, a product that does not divide back wrapped. | `vx/vyrn-vx-client/client.vx` | not measured | `core::num` covers `u128` | open, issue to file |
 | W-18 | Declaring a host function the shell provides. `emit-obj` resolves each `extern "C"` function in vxc's own process, so `vyrn_vx_spin` (11 §5.5, W-03) fails to compile; only symbols vxc itself links (libc) work. | W-03 calls libc's `sched_yield`. | `vx/vyrn-vx-client/client.vx` | a syscall per wait instead of a pause | `emit-obj` leaves `extern` symbols undefined for the linker | open, issue to file |
 | W-19 | `u128` literals at or above 2^64. `18446744073709551616u128` panics the compiler (src/codegen/lower/expr.rs:5229). | Written as `1u128 << 64u128`. | `vx/vyrn-vx-client/client.vx` | none | the literal lowers | open, issue to file |
+| W-20 | A statement `if` without `else` as the last statement of a block in a `void` function. vxc 0.0.4 reads it as the block's tail value and rejects it (E3048 "this `if` has no `else`"). | End the block with `return;`. | `vx/vyrn-vx-client/client.vx` | none | a `void` block's trailing `if` is a statement | open, issue to file |

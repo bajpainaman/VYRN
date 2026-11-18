@@ -10,7 +10,7 @@ use std::path::Path;
 use std::thread::JoinHandle;
 
 /// `PBV_ABI_VERSION`.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// One 128-byte line of the shared region: 16 words.
 #[repr(C, align(128))]
