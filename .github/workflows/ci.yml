@@ -141,6 +141,11 @@ jobs:
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_admin_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_admin_vectors.out"
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_session_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_session_vectors.out"
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_data_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_data_vectors.out"
+      - name: the drop-copy generators rewrite their vectors unchanged (10 §8)
+        run: |
+          python3 -I crates/vyrn-md/tests/gen_dc_vectors.py crates/vyrn-md/tests
+          python3 -I crates/vyrn-md/tests/gen_dc_noise_vectors.py crates/vyrn-md/tests
+          git diff --exit-code -- crates/vyrn-md/tests/dc_vectors.txt crates/vyrn-md/tests/dc_noise_vectors.txt
       - name: the independent trace decoder rewrites the trace-dump vectors unchanged (11 §8.3)
         run: |
           python3 -I tools/trace-dump/fixtures-src/make.py

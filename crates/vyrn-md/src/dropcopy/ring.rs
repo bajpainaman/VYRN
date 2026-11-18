@@ -704,3 +704,113 @@ impl DcOut for StoreOut {
         self.wake.bump();
     }
 }
+
+/// Why a [`Follower`] stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowError {
+    Ring(RingError),
+    Dc(DcError),
+    /// A frame other than a settlement before the first `Begin`.
+    NoEpoch,
+}
+
+impl std::fmt::Display for FollowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ring follower: {self:?}")
+    }
+}
+
+impl std::error::Error for FollowError {}
+
+/// `vyrn-dropcopy`'s side of the ring (10 §8.6): a [`DropCopy`] per epoch, writing into the
+/// server's store through [`StoreOut`]. The current epoch's drop copy and the ended ones still
+/// in the replay window ([`super::MD_DC_REPLAY_EPOCHS`]) are kept, so a settlement that comes
+/// after the next `Begin` reaches its own epoch's streams (10 §8.4 item 11, §8.6 item 5).
+pub struct Follower {
+    rd: RingReader,
+    cfg: super::DcConfig,
+    out: StoreOut,
+    dcs: std::collections::BTreeMap<Epoch, DropCopy<StoreOut>>,
+    cur: Option<Epoch>,
+}
+
+impl Follower {
+    /// A follower of the ring at `path`, writing to `store` and waking `wake`.
+    pub fn open(
+        path: &Path,
+        cfg: super::DcConfig,
+        store: Arc<RwLock<DcStore>>,
+        wake: Arc<Wake>,
+    ) -> Result<Self, RingError> {
+        Ok(Self {
+            rd: RingReader::open(path)?,
+            cfg,
+            out: StoreOut {
+                store,
+                wake,
+                epoch: Epoch(0),
+            },
+            dcs: std::collections::BTreeMap::new(),
+            cur: None,
+        })
+    }
+
+    /// Applies every frame published since the last call; returns how many. After an error the
+    /// follower is done: the drop copy is rebuilt from the final log (03 §7).
+    pub fn poll(&mut self) -> Result<usize, FollowError> {
+        let mut frames = Vec::new();
+        let n = self
+            .rd
+            .poll(|f| frames.push(f))
+            .map_err(FollowError::Ring)?;
+        for f in frames {
+            self.apply(f)?;
+        }
+        if n > 0 {
+            self.out.wake.bump();
+        }
+        Ok(n)
+    }
+
+    fn apply(&mut self, f: RingFrame) -> Result<(), FollowError> {
+        if let RingFrame::Begin(e) = f {
+            if let Ok(mut s) = self.out.store.write() {
+                s.begin_epoch(e);
+            }
+            let d = DropCopy::new(
+                &self.cfg,
+                StoreOut {
+                    epoch: e,
+                    ..self.out.clone()
+                },
+            );
+            // Every configured stream can subscribe from the epoch's start.
+            if let Ok(mut s) = self.out.store.write() {
+                d.streams().for_each(|id| s.open(id));
+            }
+            self.dcs.insert(e, d);
+            while self.dcs.len() > super::MD_DC_REPLAY_EPOCHS {
+                self.dcs.pop_first();
+            }
+            self.cur = Some(e);
+        }
+        let target = match &f {
+            RingFrame::Settled(e, ..) => Some(*e),
+            _ => self.cur,
+        };
+        let Some(d) = target.and_then(|e| self.dcs.get_mut(&e)) else {
+            return match f {
+                // Its epoch left the replay window; its sessions rebuild from the statement.
+                RingFrame::Settled(..) => Ok(()),
+                _ => Err(FollowError::NoEpoch),
+            };
+        };
+        f.apply(d).map_err(FollowError::Dc)?;
+        if matches!(f, RingFrame::End(_))
+            && let Ok(mut s) = self.out.store.write()
+        {
+            s.end_epoch();
+        }
+        Ok(())
+    }
+}

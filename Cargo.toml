@@ -45,6 +45,10 @@ curve25519-dalek = "=5.0.0"
 ed25519-dalek = { version = "=3.0.0", features = ["digest"] }
 x25519-dalek = { version = "=3.0.0", features = ["static_secrets"] }
 k256 = "=0.14.0"
+# Drop-copy Noise transport (10 §8.5 item 5): ChaCha20-Poly1305 and SHA-512. Both are already in
+# the graph through commonware-cryptography and ed25519-dalek; defaults off (no getrandom/alloc).
+chacha20poly1305 = { version = "=0.11.0", default-features = false }
+sha2 = { version = "=0.11.1", default-features = false }
 # Keccak-256 for L1-facing code only (01 §14.11). keccak 0.2 picks the ARMv8 SHA3 backend at run time
 # (cpufeatures) and falls back to portable code, so no target feature is set. Defaults off: no OID.
 sha3 = { version = "=0.11.0", default-features = false }

@@ -1742,8 +1742,8 @@ Not rebuilt yet: every case `SinkStream` leaves `Unsupported` (§7.9).
 ### 8.5 Session wire, authentication and subscription
 
 Little-endian, fixed-size frames over the §8.3 transport. \[Guessing\] for every field below:
-§8.3 fixes only TCP, the gapless sequence and the replay window. Not built yet: the Noise or
-TLS 1.3 layer. The login is signed inside the stream, so it carries over unchanged inside either.
+§8.3 fixes only TCP, the gapless sequence and the replay window. The frames and the login travel
+inside the Noise transport of item 5, unchanged.
 
 ```
 Frame (server → client, 64 B)
@@ -1786,6 +1786,28 @@ Login (client → server, 128 B)
    drain its stream for `DC_WRITE_TIMEOUT_MS = 1_000` (config) is dropped. A session
    whose epoch leaves the replay window before it caught up gets `REJECT(5)` and is closed; it
    rebuilds from the statement (§10).
+5. **Transport.** §8.3 allows Noise or TLS 1.3; no TLS 1.3 stack is on the 11 §2.2 allowlist
+   (`ring` and `aws-lc-rs` are banned, 01 PQ-12), so the drop copy speaks
+   `Noise_NK_25519_ChaChaPoly_SHA512` (Noise revision 34). \[Guessing\]
+   - **NK.** The client knows the server's static X25519 key from its onboarding and has no
+     Noise static key of its own: the Ed25519 login of item 1 authenticates it, and the
+     handshake authenticates the server and encrypts everything after it. Handshake: `-> e, es`
+     and `<- e, ee`, 48 bytes each, with empty payloads.
+   - **Prologue.** `"vyrn v1 dropcopy noise"` ‖ book (u16 LE), so a handshake made for one book's
+     server fails against another's.
+   - **Framing.** Every message, handshake and transport, is a u16 big-endian length and then
+     that many bytes, at most 65 535. Transport messages carry the item 1–4 session bytes in
+     order; their boundaries mean nothing.
+   - **Keys.** The server's static secret is in its config (`noise_key_file`); it draws a fresh
+     ephemeral key per connection. A low-order public key, a failed tag, or a direction whose
+     nonce would wrap ends the connection.
+   - **Deadline.** The handshake counts against `DC_LOGIN_TIMEOUT_MS`, which runs from the TCP
+     accept, so an unauthenticated client still holds nothing past it.
+   - **Post-quantum.** 01 §14.20 G's hybrid key agreement does not name the drop copy; when it
+     does, the handshake gains an ML-KEM-768 encapsulation as the admin stream's does. Not built.
+
+   `tests/dc_noise_vectors.txt`, written by an independent script, fixes both handshake
+   messages, the handshake hash and the transport messages byte for byte.
 
 ### 8.6 The observer's output ring
 
