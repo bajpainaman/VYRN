@@ -5,7 +5,7 @@ use vyrn_bbo::{
     DEP_ENDED, DEP_JOIN, FillEvent, FillKind, INDEX_MAKER, LIQ_AUCTION, LIQ_MAKER, LIQ_TAKER,
     OUT_FINISHED, Phase, RESTED_DONE, RESTED_IN_FLIGHT, Record,
 };
-use vyrn_cut::{LaneCutEntry, Visibility};
+use vyrn_cut::{LaneCutEntry, Snapshot, Visibility};
 use vyrn_risk::{FillKind as RiskFill, Risk, Settle};
 use vyrn_types::{
     Handle, LaneSeq, PacketFlags, PacketRecord, PktHash, Qty, RejectReason, StepId, Tick,
@@ -44,12 +44,12 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
 
     /// A `LaneCut` newer than `fills_applied` whose step is visible (`done_step ≥` it), work or
     /// not: the catch-up boundary of [`Self::process_packet`].
-    pub(crate) fn catch_up_due(&mut self, vis: &V) -> Option<LaneCutEntry> {
+    /// `snap` is the snapshot line as the caller read it.
+    pub(crate) fn catch_up_due(&mut self, vis: &V, snap: Snapshot) -> Option<LaneCutEntry> {
         let lc = self.io.lane_cut.try_read(vis)?;
         if lc.step <= self.fills_applied {
             return None;
         }
-        let snap = self.io.snapshot.try_read(vis)?;
         (snap.done_step >= lc.step).then_some(lc)
     }
 
@@ -65,7 +65,7 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
 
     /// Runs a boundary between packets if one is due (05 §6.1 main loop; idle polls).
     pub fn poll<C: crate::admit::Clock>(&mut self, vis: &V, _clock: &C) -> bool {
-        self.refresh_snapshot(vis);
+        self.refresh_snapshot(self.io.snapshot.try_read(vis));
         match self.boundary_due(vis) {
             Some(lc) => {
                 self.boundary(vis, lc, None);
