@@ -1155,9 +1155,12 @@ fairness and the window length, not safety. vyrn-sim tests skew up to ±10 s (§
   `SK` the roster also holds (§10.4).
 - **Session keys.** `K_seq(e+1, i)` and `K_out(e+1, i)` come from X25519 between the session's key
   and `XK(i, home(e+1))`, then BLAKE3 `derive_key` with the epoch and i in the input (01 §4; 09
-  §5.3; 04 §4). Clients derive them ahead for both sequencer boxes i of the new home. Each box
-  derives its side for every open session in Preparing: ~2 × 10^5 sessions at ≤ 25 µs each is 5 s
-  of core time, 0.1 s on 49 lanes (budget). A session opened in the last 60 s is derived when the
+  §5.3; 04 §4). For e+1 ≥ `E_pq` the material also holds the ML-KEM-768 secret that the box
+  decapsulates from the session's ciphertext for (e+1, i) (01 §14.20 G, KG1). Clients derive them
+  ahead for both sequencer boxes i of the new home. Each box derives its side for every open session
+  in Preparing: ~2 × 10^5 sessions at ≤ 25 µs each is 5 s of core time, 0.1 s on 49 lanes (budget).
+  From `E_pq`, ≤ 65 µs each with the decapsulation: 13 s of core time, 0.27 s on 49 lanes
+  (budget; 17 µs mean and 38 µs p99 measured off `REF`). A session opened in the last 60 s is derived when the
   replay reaches its open record.
 - **Open cutoff.** The old home accepts no `OpenSession` after `T − EPO_OPEN_CUTOFF_MS` (500 ms);
   it answers "retry at `home(e+1)`", and the new home serves the open after activation. Reason:

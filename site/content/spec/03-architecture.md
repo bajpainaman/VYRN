@@ -1275,7 +1275,8 @@ install is logged, so a replica's session table is replayable. In BASE `tag_com`
 
 Budget: ≤ `ARC_SESSION_OPEN_CHAIN_MS = 20`: finality ≤ 10 ms, then the install and the
 notification. The keys come from X25519 with each validator's static key, then BLAKE3 `derive_key`
-with the context `"vyrn v1 session"` (01 §4). `09-chain.md` owns the transaction format and
+with the context `"vyrn v1 session"` (01 §4); from `E_pq` an ML-KEM-768 secret joins the X25519
+one, ≤ 40 µs per key on the node (01 §14.20 G). `09-chain.md` owns the transaction format and
 the bond.
 
 ### 6.17 Block formation, votes, certificate

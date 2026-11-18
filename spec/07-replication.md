@@ -120,7 +120,8 @@ certificate (§6.6) or is an ancestor of a final block.
 - UDP ports: `REP_UDP_ORDER` = 7400 (frames), `REP_UDP_CTRL` = 7401 (NACK, acks, retransmits,
   unicast), `REP_UDP_DATA` = 7402 (data frames), `REP_UDP_REPAIR` = 7403 (peer repair).
   Consensus, TailReports and state-root votes use `commonware-p2p` (authenticated, encrypted,
-  TCP) on the same VLANs.
+  TCP) on the same VLANs. From `E_pq` its handshake is hybrid X25519 + ML-KEM-768 (01 §14.20 G,
+  PQ-12).
 - MTU 9216 on both VLANs. ORDER frames are ≤ 250 B on the wire (`REP_ORDER_FRAME_MAX`, §4.5),
   because CTPIO write time grows with size and bounds the gate (§4.7). HASH frames are ≤ 9000 B
   and go by DMA.
@@ -1282,8 +1283,16 @@ signs before it knows it will send:
   as today. A crash between signing and sending leaks nothing. [Certain: the one-vote rule counts
   sent votes] The extra CPU is at most one wasted signature per view, when a view nullifies after
   its `RangeFix`.
-- **Dependency.** This needs Simplex to let the application produce a vote's signature
-  asynchronously. Open question PQ-3 (01 §14.20) asks whether `commonware-consensus` allows it.
+- **Mechanism (PQ-3, decided).** Simplex signs through `commonware-cryptography`'s
+  `certificate::Scheme` trait. VYRN's hybrid scheme implements it in `vyrn-crypto`, so no fork or
+  upstream patch is needed. Simplex's voter calls the trait's synchronous `sign(&self, subject)`
+  only when it decides to send a vote. The scheme keeps a cache of the signatures the PQ cores
+  started above, keyed by the subject's encoding (round, vote kind, proposal digest), and returns
+  the cached signature on a hit. On a miss (a proposal that differs from its `RangeFix`), it signs
+  on the PQ cores and blocks the voter task until the signature is done, ≤ `PQ_SIGN_MAX_US`; that
+  is the late signature the one-fault budget already counts. The cache holds the current view only
+  and is zeroed with it (Safety, above). [Likely: from `commonware-cryptography` and
+  `commonware-consensus` 2026.10.0's sources; B-PQ-2 confirms it in `vyrn-sim`]
 
 A **fill is final** when the block holding its step is final. The finality event is the moment
 the local voter has `Q` finalize votes. 02 owns where that is measured. Finality is a different
@@ -2243,9 +2252,9 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | B-REP-3 | Path skew between A and B | ≤ 2 µs |
 | B-REP-4 | Each stream core's load at the peak mix | ≤ 0.50 |
 | B-REP-5 | Sliced Ed25519 sign on core 4: CPU per signature, longest slice | ≤ 12 µs, ≤ 50 ns |
-| B-PQ-1 | Scheme 1 on `REF`: ML-DSA-44 sign with `PQ_HEDGE` = 4 on cores 52–55 and = 2 on a voter, 10⁹ signatures; verify per signature | max ≤ `PQ_SIGN_MAX_US` (400, 750 µs); verify ≤ `PQ_VERIFY_US` |
+| B-PQ-1 | Scheme 1 on `REF`: ML-DSA-44 sign with `PQ_HEDGE` = 4 on cores 52–55 and = 2 on a voter, 10⁹ signatures; verify per signature | max ≤ `PQ_SIGN_MAX_US` (400, 750 µs); verify ≤ `PQ_VERIFY_US`; ML-KEM-768 decapsulation ≤ 40 µs (01 §14.20 G) |
 | B-PQ-2 | Scheme 1 finality: B-REP-1 with hybrid keys and speculative signing (§6.5a); the frame gate (B-REP-13) and stream-core load (B-REP-4) re-run | BASE max ≤ 5.70 ms no fault, ≤ 8.70 ms one fault, with one `RangeFix` dropped as the injected fault; CHAIN ≤ 8.91 ms from block start with one nullified view, and a forged `RangeFix` never makes a voter reject an honest proposal; also measures the extra view for a header that arrives between `RangeFix` and `verify` (PQ-10) and counts honest CHAIN leaders that miss `t_l` (PQ-11); B-REP-13 and B-REP-4 pass values unchanged |
-| B-PQ-3 | The switch at `E_pq` in `vyrn-sim`: scheme-0 votes and headers for epoch ≥ `E_pq` injected; forged scheme-0 `DoubleVote` evidence for epoch `E_pq − 1`, and a forged scheme-0 `CrossHomeVote` carrying a genuine hybrid-signed `NodeCert`, submitted after the switch with and without a pre-switch `EvidenceCommit`; history before it replayed | every injected signature rejected; uncommitted classical evidence moves no bond and no jail, committed evidence slashes; replay from genesis bit for bit (01 §14.20 SG1–SG7) |
+| B-PQ-3 | The switch at `E_pq` in `vyrn-sim`: scheme-0 votes and headers for epoch ≥ `E_pq` injected; forged scheme-0 `DoubleVote` evidence for epoch `E_pq − 1`, and a forged scheme-0 `CrossHomeVote` carrying a genuine hybrid-signed `NodeCert`, submitted after the switch with and without a pre-switch `EvidenceCommit`; a `SessionOpen`, `CommitteeKey` and p2p handshake for an epoch ≥ `E_pq` without their ML-KEM part; history before it replayed | every injected signature and every classical-only key agreement rejected (KG1); uncommitted classical evidence moves no bond and no jail, committed evidence slashes; replay from genesis bit for bit (01 §14.20 SG1–SG7) |
 | B-REP-6 | Sequencer core 50 BLAKE3 load | ≤ 0.60 |
 | B-REP-7 | Replay speed at peak and at average load | ≥ 1.5×, ≥ 10× |
 | B-REP-8 | Promotion time of the standby | ≤ 3 ms |

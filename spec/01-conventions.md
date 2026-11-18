@@ -65,6 +65,7 @@ over the listed integer type, defined in crate `vyrn-types`.
 | `Tag` | u64 | SipHash-2-4 MAC output. |
 | `SigScheme` | u8 | Signature scheme of a key and of every signature it makes (§14.20): 0 Ed25519, 1 hybrid Ed25519 + ML-DSA-44, 2 hybrid Ed25519 + ML-DSA-65. Fixed per key in its certificate and per epoch in `EpoConfig.sig_scheme` (08 §2.3); the wire carries no scheme byte. |
 | `PubKey`, `Sig` | bytes | A public key and a signature of the scheme in force: 32 and 64 B (scheme 0), 1,344 and 2,484 B (scheme 1), 1,984 and 3,373 B (scheme 2). A hybrid value is the Ed25519 part followed by the ML-DSA part. `Ed25519Sig` = `[u8; 64]`. |
+| `KexKey` | bytes | A key-agreement public key of the scheme in force: the X25519 key (32 B) under scheme 0; X25519 ‖ ML-KEM-768 encapsulation key (32 + 1,184 = 1,216 B) under scheme 1 (§14.20 G). Sized by the certificate's `scheme`, like `PubKey`. |
 
 ## 4. Cryptography
 
@@ -75,7 +76,7 @@ over the listed integer type, defined in crate `vyrn-types`.
 | Validator votes, sequencer block signatures, certificates | Ed25519 (scheme 0) until the post-quantum switch, then hybrid Ed25519 + ML-DSA-44 (scheme 1, FIPS 204). A hybrid signature is valid only if both parts verify. `EpoConfig.sig_scheme` selects the scheme per epoch (§14.20). A certificate is a list of (validator index, signature). |
 | Release keys, operator identity keys (cold, long-lived) | Hybrid Ed25519 + ML-DSA-65 (scheme 2, §14.20). |
 | Session open (wallet signature) | Ed25519 or secp256k1 (EVM wallets). Chain mode only. Not post-quantum; 09 §6.8 states the exposure and the migration hook. |
-| Key agreement for session keys | X25519 with each validator's static key, then BLAKE3 `derive_key` with context `"vyrn v1 session"`. |
+| Key agreement for session keys | X25519 with each validator's static key, then BLAKE3 `derive_key` with context `"vyrn v1 session"`. From `E_pq`, hybrid X25519 + ML-KEM-768 (FIPS 203): both shared secrets go into the one `derive_key`, so the key holds if either part does (§14.20 G). The same holds for committee keys, the BASE admin TLS stream and the p2p handshake. |
 | State commitment (chain mode) | A lattice hash (LtHash-style) over the per-second net diff. Details in `09-chain.md`. |
 
 ## 5. Constants
@@ -824,8 +825,8 @@ and the differential tests of 11 §2.5a pass.
   8.65 → 8.70 ms (reserve 1.30 ms). In CHAIN the proposal also carries `excl_root`, known only
   after the leader's `verify`, so the leader signs its proposal then and hop 2 starts up to 0.75 ms
   later (07 §6.5a): CHAIN's worst case moves from 8.11 to 8.91 ms from block start
-  (09 §4.8). [Likely: budgets built from the measured figures; the speculative signing depends on
-  open question PQ-3]
+  (09 §4.8). [Likely: budgets built from the measured figures; the speculative signing is PQ-3's
+  pre-signed cache behind a hybrid `Scheme` (07 §6.5a)]
 - **The finality gate** keeps `FIN_GATE_BLOCKS` = 8: block h is final ≤ 7.70 ms after it closes
   (BASE spare 0.30 ms; CHAIN 0.09 ms, accepted by PQ-9; 07 §6.8, 09 §4.6). [Likely]
 - **The cost of a fixed range.** A header that reaches the leader after it sent its `RangeFix`
@@ -835,10 +836,10 @@ and the differential tests of 11 §2.5a pass.
   leader fixes the range on the arrival of the header it proposes. The 07 §6.6 maxima assume, as
   before, that a header is in the first proposal after it reaches the leader, so they do not yet
   include the extra view; open question PQ-10 holds it until B-PQ-2 measures it. [Likely]
-- **If speculative signing is not possible**, the leader's notarize and each voter's notarize
-  are signed after `verify`, at ≤ 0.75 ms each, and the one-fault maximum becomes ~10.2 ms, above
-  `FINALITY_MAX_MS` = 10. Scheme 1 must then not activate until votes run with `PQ_HEDGE` ≥ 4 on
-  voters too. [Likely]
+- **Why speculative signing is required (PQ-3).** Without it, the leader's notarize and each
+  voter's notarize are signed after `verify`, at ≤ 0.75 ms each, and the one-fault maximum becomes
+  ~10.2 ms, above `FINALITY_MAX_MS` = 10. `PQ_HEDGE` = 4 on voters instead (≤ 0.40 ms each) gives
+  BASE ≈ 9.5 ms and CHAIN ≈ 9.3 ms, past the 9.00 ms gate, for 2 more cores per voter. [Likely]
 
 **E. The switch.** Rules SG1–SG7 follow 04 §12's VR4: the set of accepted schemes changes only at
 an epoch boundary.
@@ -867,10 +868,76 @@ an epoch boundary.
 - **EVM wallet sessions.** An account whose `OwnerKey` is secp256k1 is as safe as that key.
   Hook: a hybrid `OwnerKey` variant and a `SetOwnerKey` item; after a governance cutoff epoch,
   classical owner keys are frozen to their exit address for good, even after a later key change (09 §6.8).
-- **Key agreement.** X25519 for `K_seq`, `K_out`, `K_com` transport and the p2p handshake is also
-  quantum-breakable, and an attacker who recovers a validator's static `XK` derives every
-  session's MAC keys. This section covers signatures only. Open question PQ-6 asks for a hybrid
-  X25519 + ML-KEM-768 change. [Certain that X25519 is not post-quantum]
+
+**G. Key agreement (PQ-6).** X25519 is as quantum-breakable as Ed25519. A quantum attacker who
+recovers a box's static `XK` from its public `NodeCert` derives `K_seq` and `K_out` of every
+session it serves. One who recovers `G(e, s)` derives every `K_com(e, s, ·)`. With both, it
+forges client packets past both tags (09 §5.1), and hybrid signatures do not stop that.
+[Certain] So from `E_pq`, every key agreement that protects a live secret is hybrid X25519 +
+ML-KEM-768 (FIPS 203, category 3): the session keys `K_seq` and `K_out`, the committee keys
+`G(e, s)` and their transport, the BASE admin TLS stream that delivers BASE session keys, and the
+p2p handshake.
+
+- **One switch, at `E_pq`.** A session key is worthless after its epoch, and `K_com` is disclosed
+  anyway (09 §5.10), so traffic recorded now and broken later gains an attacker nothing on the
+  order path; only keys in use at the time of the attack matter. That is why key agreement switches
+  with the signatures and not earlier. [Likely] The QUIC transaction path (09 §4.4) carries only
+  signed items that become public on chain, and it stays as it is.
+- **Combiner.** For an X25519 secret `d` and an ML-KEM secret `k` from ciphertext `ct`, the
+  material of the existing `derive_key` starts with `d ‖ k ‖ BLAKE3(ct)` instead of `d`. Every
+  other input stays (09 §5.3), so the derived key is secure if either part is. [Likely: the
+  X-Wing pattern, with BLAKE3 `derive_key` as the KDF]
+- **Why ML-KEM-768.** ML-KEM-512 saves 320 B per ciphertext and about 3 µs, which matters nowhere
+  off the hot path. ML-KEM-768 is the set TLS's `X25519MLKEM768` group uses, so one parameter set
+  covers every use. [Likely]
+
+Measured 2026-11-18 on the same orb, with the same build flags as B but `lto = "thin"`. Each mean
+is the median of 7 rounds of 2,000 calls, and p99 comes from 20,000 single calls (µs). A scratch
+benchmark produced the numbers; it is not in the repository. [Certain for the numbers on this
+machine]
+
+| Crate, version | Keygen | Encaps | Decaps | Decaps p99 | Note |
+|---|---|---|---|---|---|
+| `x25519-dalek` 3.0.0 (in the workspace) | 16.1 | — | — | — | one X25519 exchange: 60.5 mean, 107 p99 |
+| `libcrux-ml-kem` 0.0.11, ML-KEM-768 | 16.0 | 17.4 | 17.4 | 38 | encapsulation-key check (FIPS 203 §7.2): 1.1 |
+| `ml-kem` 0.3.4 (RustCrypto, pure Rust), ML-KEM-768 | 82.7 | 79.0 | 111.1 | 168 | |
+
+Sizes: encapsulation key 1,184 B, ciphertext 1,088 B, shared secret 32 B; the decapsulation key
+is stored as its 64-byte seed. One hybrid decapsulation adds less than one X25519 exchange.
+
+**Crate.** `libcrux-ml-kem` at tier S, with RustCrypto `ml-kem` at tier T as the differential
+reference (11 §2.2, §2.5a). It is the faster one by 5–6×. It adds one crate beyond the
+`libcrux-ml-dsa` set it shares (`libcrux-sha3`, `-intrinsics`, `-platform`, `-secrets`,
+`-traits`). It has `#![deny(unsafe_code)]` at the root, with `unsafe` only in the AVX2
+instantiation and its dispatch. Its README states hax and F\* verification. RustCrypto's README says
+"never been independently audited". VYRN's cargo-vet audit covers it under PQ-2's terms. `aws-lc-rs`
+stays out (11 §2.2). [Certain for the crates' sources and READMEs at these versions; independent
+audit status not checked]
+
+| Use | Today | From `E_pq` | Bytes | Time |
+|---|---|---|---|---|
+| `K_seq`, `K_out` (CHAIN) | `X25519(x, XK)` | plus ML-KEM to the box's exchange key: one ciphertext per (epoch, s) in `SessionOpen` (09 §5.2) | +5,440 B per session epoch | box: one decaps per session and epoch, in the boundary pre-derivation (08 §9.1) |
+| `K_com` (CHAIN) | `X25519(x, G(e, s))` | plus ML-KEM to `G(e, s)`'s ML-KEM key | +5,440 B per session epoch | member: one decaps per (session, e, s), beside the ~1.5 ms anchor check (09 §5.4) |
+| `G(e, s)` transport | wrap under `X25519` of two exchange keys | plus one ciphertext per member (09 §2.4) | `CommitteeKey` +1,184 B key, +1,152 B per member | 3 encaps per record, 5 records per epoch |
+| BASE session keys | in the admin TLS 1.3 stream (04 §4.4) | TLS group `X25519MLKEM768` only | +2,272 B per handshake | < 0.1 ms of a ≤ 50 ms open |
+| p2p (`commonware-p2p`) | ephemeral X25519 | plus an ephemeral ML-KEM-768 exchange | +2,272 B per connection | ~50 µs per connection |
+
+- **`SessionOpen`** grows by 10,880 B per epoch, at most 32,640 B for 3 epochs. That fits the
+  envelope's 16-bit `body_len`, and 8 of them fit in a chain block's `CHN_MAX_ITEM_BYTES`, which is
+  8,000 opens per second against a few per second of real load (09 §4.4). The client encapsulates 30
+  times, ≈ 0.5 ms. [Certain for the sizes; Likely for the load]
+- **The boundary pre-derivation** of 08 §9.1 grows from ≤ 25 µs to ≤ 65 µs per session and box
+  (budget, decaps at this machine's p99 rounded up), so 2 × 10⁵ sessions cost 13 s of core time,
+  0.27 s on 49 lanes. [Likely]
+- **The hot path is unchanged.** Every key the packet path uses is still a 16-byte SipHash key,
+  installed in the lane as today. Only how it is derived changes, and derivation runs at open time
+  and before the boundary, never per packet (S6). [Certain]
+
+| ID | Rule |
+|---|---|
+| KG1 | For an epoch e with `sig_scheme` ≥ 1, every derivation above uses both parts. A `SessionOpen`, `CommitteeKey` or handshake for such an epoch without its ML-KEM part is invalid. Before `E_pq`, X25519 alone. |
+| KG2 | ML-KEM keys are fresh, never shared between uses, and sit in the `KexKey`s of the scheme-1 `NodeCert` (09 §2.3), so SG4's lead covers them. An encapsulation key passes the FIPS 203 check when the chain includes it. |
+| KG3 | ML-KEM decapsulation has implicit rejection: a bad ciphertext yields a pseudorandom secret, not an error. For `K_seq` only the client suffers. For `K_com`, all 4 members decapsulate the same ciphertext with the same key and get the same secret, so a bad ciphertext cannot split them; the anchor check (09 §5.4) then fails at every member alike. [Certain: ML-KEM.Decaps is deterministic] |
 
 **Decided by the owner (2026-11-18)**
 
@@ -881,16 +948,17 @@ an epoch boundary.
 | PQ-8 | Remove the voter's notarize misprediction with a proposal range fixed before the proposal arrives? | Yes: the leader's `RangeFix` (07 §6.3, §6.5a). BASE maxima 5.70 / 8.70 ms; `FIN_GATE_BLOCKS` stays 8. In CHAIN the leader still signs after `verify` (PQ-9). `RangeFix` is a hint: voters never reject a proposal for differing from it. |
 | — | Codex review of #51: operator identity keys need an ML-DSA-65 transaction scheme | Adopted: `TxEnvelope.scheme` 3 (09 §4.4). |
 | — | Codex review of #51: forged classical evidence after the switch | Adopted: SG7 (09 §8.1 item 2a). |
+| PQ-3 | Can `commonware-consensus::simplex` take a custom hybrid scheme and speculative signing? | Yes, with no upstream patch. `commonware-cryptography` 2026.10.0's `certificate::Scheme` is a public trait, and Simplex's voter calls its synchronous `sign(&self, subject)` only when it decides to send. VYRN's hybrid `Scheme` in `vyrn-crypto` returns a signature the PQ cores made ahead and cached by subject, and signs inline only on a miss (07 §6.5a). `E_pq` waits for B-PQ-2. |
+| PQ-4 | When is `E_pq`? | The first epoch after all of: B-PQ-1 to B-PQ-3 pass on `REF`; the libcrux audits and the differential tests of 11 §2.5a pass (PQ-2); every node's hybrid `NodeCert` and every hybrid `G(e, s)` is on chain `CHN_KEY_LEAD_EPOCHS` ahead (SG4); the release keys' ML-DSA halves exist (PQ-7); and PQ-12's dependencies have landed. CHAIN schedules it by `Upgrade` with the 72 h timelock (SG5). Not a trigger: after an alarm, the fastest switch is 4 epochs of key lead plus the timelock, ≈ 4.3 days of forgeable votes. The cost from then on is D's budgets. |
+| PQ-5 | When does governance deploy the post-quantum bridge and raise `PqAlarm`; is the 10% daily cap acceptable until then? | Deploy the second bridge (09 §6.8 step 3) when Ethereum ships a post-quantum signature precompile. `PqAlarm` is raised at once (tightening) on a published estimate that a cryptographically relevant quantum computer exists or is within the timelock horizon, or on any public demonstration that a secp256k1 or Ed25519 private key was computed from its public key. From `PqAlarm`, `BadPost` evidence moves no bond (09 §8.1 item 2a). The 10% cap is accepted until then. `CHN_PQ_OWNER_CUTOFF` stays open (09 open question 12). |
+| PQ-6 | Make key agreement hybrid (X25519 + ML-KEM-768)? | Yes, in full at `E_pq`: session keys `K_seq` and `K_out`, committee keys and their transport, the BASE admin TLS stream and the p2p handshake (G). `libcrux-ml-kem` at tier S. |
+| PQ-7 | Which token holds the release keys' ML-DSA-65 half? | For now, none: each maintainer's Ed25519 half stays on the current hardware token, and the ML-DSA-65 half is held encrypted on that maintainer's air-gapped Linux machine, still 2 of 3 (11 §9.5). The half moves to a token with FIPS 204 firmware when one is chosen. |
 | PQ-9 | CHAIN's one-fault case under scheme 1 is 8.91 ms from block start, 0.09 ms inside the 9.00 ms gate (07 §6.5a, 09 §4.8). Accept that margin, or raise CHAIN's gate, add PQ cores or lag `excl_root`? | Accept the 0.09 ms margin: `FIN_GATE_BLOCKS` stays 8 in CHAIN. B-CHN-3 and B-PQ-2 on CHAIN re-check it; PQ-10 and PQ-11 can still move the number. |
 
 **Open questions for the owner**
 
 | # | Question | Default if not decided | Settled by |
 |---|---|---|---|
-| PQ-3 | Can `commonware-consensus::simplex` take a custom hybrid scheme and speculative signing (07 §6.5a)? Its schemes are Ed25519, BLS12-381 and secp256r1. | a hybrid `Scheme` implemented in `vyrn-crypto`; a patch upstream if the trait does not allow speculative signing | 07: a `vyrn-sim` run of B-PQ-2 |
-| PQ-4 | When is `E_pq`? It needs a date or a trigger (a published estimate of a cryptographically relevant quantum computer), and an earlier switch costs only the budgets above. | at the first epoch after B-PQ-1 to B-PQ-3 pass on `REF` | owner |
-| PQ-5 | The L1 bridge: when does governance deploy the post-quantum bridge and raise `PqAlarm`, and is a 10% daily cap on the old bridge acceptable until then? | at the first Ethereum post-quantum verifier VYRN can afford (09 §6.8) | owner, 09 |
-| PQ-6 | Make key agreement hybrid (X25519 + ML-KEM-768) for session keys and the p2p handshake? | not in this change | owner, 04, 09 |
-| PQ-7 | Release keys on hardware tokens (11 §9.5): which token holds an ML-DSA-65 key? | an HSM with ML-DSA support for the ML-DSA half, the current tokens for the Ed25519 half | owner, 11 |
 | PQ-10 | A header that reaches the leader between its `RangeFix` and the end of its `verify` waits a whole extra view (07 §6.3), and the 07 §6.6 maxima do not include that view. How large is the extra view at the maximum, and does it break the 5.70 / 8.70 ms (BASE) or 8.91 ms (CHAIN) budgets? | budget it once B-PQ-2 measures it; if it breaks a budget, let the leader extend its range at `verify` time with one late signature | 07: B-PQ-2 |
 | PQ-11 | In CHAIN, a header late in a view plus the data lag, `verify` and the post-verify leader signature (≤ 0.75 ms) can push an honest proposal past `t_l` = 2 ms, so an honest view can nullify (07 §6.5a). Lengthen CHAIN's `t_l` under scheme 1 (and recompute the one-fault budget), add PQ cores for the CHAIN leader, or lag `excl_root`? | unchanged `t_l`; B-PQ-2 on CHAIN counts honest-leader nullifies | 07, 09: B-PQ-2 |
+| PQ-12 | Two key-agreement parts depend on code outside VYRN. `commonware-cryptography`'s SAKE handshake, which `commonware-p2p` runs, hardcodes ephemeral X25519. And no TLS 1.3 stack with `X25519MLKEM768` is on the 11 §2.2 allowlist; `ring` and `aws-lc-rs` are banned. rustls providers built on libcrux or RustCrypto exist (`rustls-provider-libcrux-pq` 0.1.1, `rustls-pure` 0.15.4) but have not been evaluated. | `E_pq` waits for both: an ML-KEM-768 SAKE variant proposed upstream to Commonware, and a TLS provider evaluated and added at tier S | owner, 07, 11 |

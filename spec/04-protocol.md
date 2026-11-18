@@ -641,7 +641,9 @@ each).
 ```
 
 Budget: an open takes ≤ 50 ms, most of it TLS and the finality of the open record. Opens are
-never on the 1 µs path.
+never on the 1 µs path. From `E_pq` (01 §14.20 G) the admin TLS 1.3 stream accepts only the hybrid
+key-exchange group `X25519MLKEM768`, because it carries `k_seq` and `k_out`: +2,272 B and under
+0.1 ms per handshake. Which TLS provider does it is open question PQ-12.
 
 `vyrn-admin` gives each box only the keys of that box. The replicas of the home also receive
 every box's `k_seq`, so they can check `tag_seq` on the data copies they use (§2.4). BASE mode
@@ -657,12 +659,16 @@ go to it.
 
 - The wallet signs an `OpenSession` transaction (Ed25519 or secp256k1, 01 §4). It carries the
   account, an X25519 public key of the client, the source address to bind, the COD option, the
-  timeout, the protocol version, the bond, and the hash-chain commitments for `K_com`.
+  timeout, the protocol version, the bond, and the hash-chain commitments for `K_com`. For each
+  epoch from `E_pq` it also carries ML-KEM-768 ciphertexts to the validators' and committee keys
+  (09 §5.2).
 - When the transaction is final, the state machine assigns the `SessionId` deterministically from
   the account's lane. The client reads it from the receipt.
 - Each validator `v` and the client derive the per-epoch keys from X25519 between the client key
   and `v`'s static key, then BLAKE3 `derive_key` with context `"vyrn v1 session"`, the
-  session and the epoch. That yields `K_seq(e, v)` and `K_out(e, v)`.
+  session and the epoch. That yields `K_seq(e, v)` and `K_out(e, v)`. From `E_pq` the derivation
+  also takes the ML-KEM-768 secret of the session's ciphertext to `v` (01 §14.20 G); the keys keep
+  their 16-byte size, so the packet path does not change.
 - `K_com(e, s)` exists for each validator `s` that can be the sequencer in epoch e. Every
   validator except `s` holds it. A packet uses `K_com(e, s)` for the current sequencer `s`. So
   after a failover to `s'`, the new sequencer does not hold the commit key that its own packets
