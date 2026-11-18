@@ -613,13 +613,17 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             );
         }
         rx.release(k);
-        let dk = data.as_mut().map_or(0, |d| d.poll(now()));
+        // The final height first: payloads polled below are stamped with it on arrival, and a
+        // stale one would expire them early (07 §5.4 retention).
         if let Some(d) = data.as_mut() {
             let f = source.final_height();
             if f > last_final {
                 last_final = f;
                 DataRx::<N, D>::join(&mut d.join, &mut d.replay).finalized(Height(f));
             }
+        }
+        let dk = data.as_mut().map_or(0, |d| d.poll(now()));
+        if let Some(d) = data.as_mut() {
             d.check(source, now());
         }
         // No ORDER frame this turn: the deadlines `on_frame` would have checked (REP_E_HASHLAG),

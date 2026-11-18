@@ -22,7 +22,7 @@
 //! substream's packets in O-order, Advance and `SHED` records excluded (07 §6.1). A `SHED`
 //! record is not joined: its responses come from the record alone (05 §18 Q17).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use vyrn_log::LaneRec;
 use vyrn_log::block::data_root;
@@ -55,7 +55,9 @@ pub enum DataErr {
 /// Payloads by `(session, pkt_seq)`.
 #[derive(Clone, Debug)]
 pub struct DataJoin {
-    by_key: BTreeMap<(SessionId, u32), Vec<Variant>>,
+    /// Each key's variants by `pkt_hash` (a full-hash prefix, so a Vec for colliding ones):
+    /// eviction is logarithmic even when a sender floods one key with variants.
+    by_key: BTreeMap<(SessionId, u32), BTreeMap<PktHash, Vec<Variant>>>,
     /// Variants kept for a bounded window after a release, `(height released, key, hash)`: a
     /// `SHED` record's variant (for its retry), and the unused variants of an accepted packet.
     shed: VecDeque<(Height, (SessionId, u32), PktHash)>,
@@ -65,7 +67,7 @@ pub struct DataJoin {
     /// Unreferenced variants by arrival order: `(final height at arrival, key, hash)`.
     unref: BTreeMap<u64, (u64, (SessionId, u32), PktHash)>,
     /// The arrival numbers of each key's unreferenced variants, to drop them on reference.
-    unref_keys: BTreeMap<(SessionId, u32), Vec<u64>>,
+    unref_keys: BTreeMap<(SessionId, u32), BTreeSet<u64>>,
     next_arrival: u64,
     /// The highest final height reported to [`DataJoin::finalized`].
     final_height: u64,
@@ -161,7 +163,12 @@ impl DataJoin {
     pub fn put(&mut self, session: SessionId, pkt_seq: u32, bytes: Vec<u8>) -> Hash {
         let full = full_hash(&bytes);
         let key = (session, pkt_seq);
-        let vars = self.by_key.entry(key).or_default();
+        let vars = self
+            .by_key
+            .entry(key)
+            .or_default()
+            .entry(prefix(&full))
+            .or_default();
         if !vars.iter().any(|v| v.full == full) {
             vars.push(Variant { full, bytes });
             if !self.refs.contains_key(&key) {
@@ -169,10 +176,10 @@ impl DataJoin {
                 self.next_arrival = n.wrapping_add(1);
                 self.unref
                     .insert(n, (self.final_height, key, prefix(&full)));
-                self.unref_keys.entry(key).or_default().push(n);
+                self.unref_keys.entry(key).or_default().insert(n);
                 while self.unref.len() > self.cap {
-                    if let Some((_, (_, k, h))) = self.unref.pop_first() {
-                        self.drop_unref(k, h);
+                    if let Some((n, (_, k, h))) = self.unref.pop_first() {
+                        self.drop_unref(n, k, h);
                         self.evicted.capped = self.evicted.capped.saturating_add(1);
                     }
                 }
@@ -209,7 +216,7 @@ impl DataJoin {
                 break;
             }
             self.unref.remove(&n);
-            self.drop_unref(k, h);
+            self.drop_unref(n, k, h);
             self.evicted.expired = self.evicted.expired.saturating_add(1);
         }
     }
@@ -219,10 +226,10 @@ impl DataJoin {
         self.evicted
     }
 
-    /// Drops an unreferenced variant whose `unref` entry is already gone.
-    fn drop_unref(&mut self, key: (SessionId, u32), hash: PktHash) {
+    /// Drops unreferenced variant arrival `n`, whose `unref` entry is already gone.
+    fn drop_unref(&mut self, n: u64, key: (SessionId, u32), hash: PktHash) {
         if let Some(ns) = self.unref_keys.get_mut(&key) {
-            ns.retain(|n| self.unref.contains_key(n));
+            ns.remove(&n);
             if ns.is_empty() {
                 self.unref_keys.remove(&key);
             }
@@ -233,8 +240,8 @@ impl DataJoin {
     fn variant(&self, r: &PacketRecord) -> Option<&Variant> {
         self.by_key
             .get(&(r.session, r.pkt_seq))?
-            .iter()
-            .find(|v| prefix(&v.full) == r.pkt_hash)
+            .get(&r.pkt_hash)?
+            .first()
     }
 
     /// The payload and full hash a record names, if held and its `count` fits (07 §5.4).
@@ -308,7 +315,7 @@ impl DataJoin {
                 let rest: Vec<PktHash> = self
                     .by_key
                     .get(&key)
-                    .map(|vs| vs.iter().map(|v| prefix(&v.full)).collect())
+                    .map(|vs| vs.keys().copied().collect())
                     .unwrap_or_default();
                 for h in rest {
                     if !self.shed.iter().any(|&(_, k, x)| k == key && x == h) {
@@ -331,7 +338,7 @@ impl DataJoin {
 
     fn evict(&mut self, key: (SessionId, u32), hash: PktHash) {
         if let Some(vars) = self.by_key.get_mut(&key) {
-            vars.retain(|v| prefix(&v.full) != hash);
+            vars.remove(&hash);
             if vars.is_empty() {
                 self.by_key.remove(&key);
             }
