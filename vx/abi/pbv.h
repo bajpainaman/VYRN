@@ -222,12 +222,13 @@ typedef struct pbv_ctx pbv_ctx;
 #define PBV_E_FAULT       9u /* a ledger overflow, a capacity, an evicted snapshot or an
                                 AcctTake that differs from the take replay makes */
 
-/* v1 subset: New (Day, IOC, FOK, post-only), Cancel, Reduce, Heartbeat and ResendReq (no
+/* v1 subset: New (Day, IOC, FOK, post-only), Cancel, Reduce, CancelAll, Heartbeat and ResendReq (no
  * LaneSeq, no response); SHED records (from the record alone, no payload, 05 §18 Q17); Cross, Improve, Shed,
  * Idle, Depletion, Control (Phase and Band, 07 §3.8; PBV_ABI_VERSION 4), Rescan (its batch
- * taker sweeping at its key, capped, with CONT steps), Uncross and Seal steps. Replace,
- * CancelAll, an STP that would trigger, in-packet dependencies, a Cancel or Reduce after a
- * batch taker's key in its cut, and snapshot/state bytes stop with PBV_E_UNSUPPORTED; a
+ * taker sweeping at its key, capped, with CONT steps), Uncross and Seal steps. Replace, an
+ * STP that would trigger, in-packet dependencies, a Cancel, Reduce or CancelAll after a batch
+ * taker's key in its cut, a CancelAll that enters a cut before a lower forwarded op of its
+ * lane has run, and snapshot/state bytes stop with PBV_E_UNSUPPORTED; a
  * malformed step payload is PBV_E_BAD_RECORD. */
 
 uint32_t pbv_abi_version(void);

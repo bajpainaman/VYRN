@@ -990,7 +990,7 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   argument of `pbv_lane_run` is a `uint32_t`.
 - *Output rings.* One per lane and one for fill TX packets; each slot holds exactly the bytes the
   output hash takes, so the shell hashes without decoding.
-- *Subset.* New (Day, IOC, FOK, post-only, auction-only), Cancel, Reduce, Heartbeat and
+- *Subset.* New (Day, IOC, FOK, post-only, auction-only), Cancel, Reduce, CancelAll, Heartbeat and
   ResendReq (no LaneSeq), `SHED` records (replayed from the record alone, so their slots carry
   no payload, 05 §18 Q17), and Cross, Improve, Shed, Idle, Depletion, Control, Rescan, Uncross and Seal steps.
   Anything else stops with `PBV_E_UNSUPPORTED` rather than guess, so a v1 Vx validator halts on
@@ -1011,6 +1011,24 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   and `Bbo::envelope`. Only a Continuous step other than Rescan widens (B, A) to the envelope
   first. **[Reading, 1a]** A Rescan step replays its logged cut and band. Its batch taker is the
   first in-band New of `(prev, cut]` in key order.
+- *CancelAll (3a).* A CancelAll takes `PROTO_CANCELALL_TOKENS` = 16 from the `MSG` buckets
+  (`RATE_LIMIT` otherwise) and sets the session's `cancel_all`. After that, a Cancel, Reduce or
+  Replace of an order whose current version precedes it is `TOO_LATE` with `D_CANCELED`
+  (`Lane::resolve`). Any unapplied CancelAll before a forwarded op in its packet is a pass
+  barrier (05 §3.7), and so is a Reduce in the op's range. The barrier is applied before the
+  push, as `vyrn-lane` does; an in-range Reduce is no longer `PBV_E_UNSUPPORTED`. In the book, a
+  CancelAll ends every order of its session on its lane at its key, which is the effect of
+  either an `AcctKill` (one session on the account) or per-order tombstones (more than one).
+  At B2 the lane sends a `CancelAck` per order still open, in ascending handle order, then the
+  summary `CancelAck(PROTO_HANDLE_ALL, count)` (`settle_cancel_all`). **[Reading, 3a]** The
+  client stops with `PBV_E_UNSUPPORTED` when a CancelAll enters a cut while a forwarded op of
+  its lane with a lower LaneSeq is still queued, or while that lane's taker is continuing. That
+  op would join the book after the CancelAll that already ends it. A CancelAll in a Rescan
+  batch after the taker's key, or past C\* in an uncross, is `PBV_E_UNSUPPORTED` like a Cancel.
+  **[Reading, 3a]** The test harness opens one session per account per lane, so only the
+  `AcctKill` path is exercised; the client treats both paths the same. A mutant without the pass
+  barrier passes the test: a barrier only changes what a forwarded op's dependencies would be,
+  and dependencies are still outside the subset (item 5).
 - *Rescan batch takers (2).* The batch taker runs as `Bbo::rescan_finish` does. It must be
   live just after its key, or it is skipped with no status event; an auction-only taker is not
   live outside an uncross. A post-only taker that a visible level crosses ends with a batch
@@ -1057,10 +1075,11 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   then the client matches `RustReplay`.
 - *Gap list (the plan, in order).* What `RustReplay` replays and the Vx client does not yet
   (1, Uncross and Seal, and 2, Rescan batch takers that trade, are done):
-  3. Replace (keep and new priority) and CancelAll.
+  3. Replace (keep and new priority); CancelAll (3a) is done.
   4. STP that triggers (currently `PBV_E_UNSUPPORTED` in a forwarded or batch sweep and the FOK
      dry run).
-  5. In-packet dependencies (05 §3.7: Join and Cancel dependencies, Reduce barriers).
+  5. In-packet dependencies (05 §3.7: Join and Cancel dependencies; the CancelAll and Reduce
+     pass barriers are done in 3a).
   6. `engine.client` wiring in `vyrn-validator` (nothing constructs `VxReplay` today).
   7. Then a write-up of what a Vx default (`engine.client = vx`) needs; the default stays `rust`.
 - *Pooled lanes (`AcctTake`, 05 §6.9, 07 §7.1).* `pbv_config` byte 48 is the pool mask,

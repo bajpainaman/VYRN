@@ -2059,3 +2059,69 @@ fn the_vx_client_replays_rescan_batch_takers_that_trade() {
         assert_vx_matches(&script, 0..j.recs.len() - 1);
     }
 }
+
+/// CancelAll (04 §6.6, 05 §4.7). Lane 0's session rests a forwarded ask, a joined ask and a
+/// forwarded bid, then cancels all of them: one `CancelAck` per order in handle order and the
+/// summary. A cancel of one of them is then `TOO_LATE`, and lane 1's sell rests on an empty
+/// book. A second packet sends a CancelAll before a crossing bid in the same packet, a pass
+/// barrier (05 §3.7): the bid is forwarded after the CancelAll is applied and is not canceled.
+/// A Cancel behind a CancelAll in its packet is `TOO_LATE` at once, and a burst of CancelAlls
+/// runs out of `MSG` tokens.
+fn cancel_all_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let p = |l, a, t: u64, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs,
+    };
+    let all = |tag| vyrn_wire::Msg::CancelAll { client_tag: tag };
+    let mut s = vec![
+        p(0, 1, 1_000, vec![new(Sell, Day, 105, 2, 1)]),
+        p(0, 1, 2_000, vec![new(Sell, Day, 106, 1, 2)]),
+        p(0, 1, 3_000, vec![new(Buy, Day, 100, 1, 3)]),
+        Act::Run,
+        p(2, 1, 4_000, vec![new(Buy, Day, 104, 1, 4)]),
+        Act::Run,
+        p(
+            0,
+            1,
+            5_000,
+            vec![all(5), cancel(Handle::new(2, 1).unwrap(), 50)],
+        ),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(0, 1, 6_000, vec![cancel(Handle::new(1, 1).unwrap(), 6)]),
+        p(1, 1, 7_000, vec![new(Sell, Day, 105, 1, 7)]),
+        Act::Run,
+        p(0, 1, 8_000, vec![all(8), new(Buy, Day, 105, 2, 9)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+    ];
+    // CancelAll takes PROTO_CANCELALL_TOKENS = 16 of the 2560-token MSG bucket, so the 161st in
+    // a burst is RATE_LIMIT.
+    for k in 0..17u32 {
+        s.push(p(
+            2,
+            1,
+            9_000,
+            (0..10).map(|i| all(100 + 10 * k + i)).collect(),
+        ));
+    }
+    s.extend([Act::Run, Act::Poll, Act::Run]);
+    s
+}
+
+#[test]
+fn the_vx_client_replays_cancel_all() {
+    let script = cancel_all_script();
+    let (live_j, store, blocks) = blocks_of(&script, &[]);
+    let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let (j, _) = live07(&script);
+    assert_vx_matches(&script, 0..j.recs.len() - 1);
+}
