@@ -121,7 +121,8 @@ pub struct Nic {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cores {
-    /// Pin threads to `engine` and `stream`. Refused today: `vyrn-nic::sys` has no affinity call.
+    /// Pin the engine and stream threads to `engine` and `stream` (`vyrn_nic::sys::pin_current_thread`,
+    /// 11 §3.6); both must be set.
     #[serde(default)]
     pub pin: bool,
     pub engine: Option<u16>,
@@ -248,11 +249,8 @@ impl Config {
         if !matches!(self.nic.backend.as_str(), "kernel_udp" | "sim") {
             return bad("nic.backend", "must be kernel_udp or sim in this release");
         }
-        if self.cores.pin {
-            return bad(
-                "cores.pin",
-                "is not supported yet (no affinity call in vyrn-nic::sys)",
-            );
+        if self.cores.pin && (self.cores.engine.is_none() || self.cores.stream.is_none()) {
+            return bad("cores.pin", "needs both cores.engine and cores.stream");
         }
         if !matches!(self.cores.seal.as_str(), "abort" | "count" | "off") {
             return bad("cores.seal", "must be abort, count or off");
