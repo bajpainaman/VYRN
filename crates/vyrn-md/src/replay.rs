@@ -138,7 +138,7 @@ pub struct SinkStream<K: PacketSink> {
     enc: MboEncoder,
     out: K,
     err: Option<SinkError>,
-    msgs: BTreeMap<(SessionId, u32), VecDeque<Msgs>>,
+    msgs: BTreeMap<(SessionId, u32), Msgs>,
     pkts: BTreeMap<(SessionId, u32), PktOps>,
     /// Lane responses that came before their packet record (immediate rejects).
     /// With the packet's first LaneSeq when the response's gate names it.
@@ -187,17 +187,17 @@ impl<K: PacketSink> SinkStream<K> {
     }
 
     /// One request payload (its signed bytes and tags), before its packet record arrives. A
-    /// `SHED` record needs none; an accepted record uses the newest payload of its key.
+    /// `SHED` record needs none; a later payload of the same key replaces it, and an accepted
+    /// record takes the one held.
     pub fn payload(&mut self, bytes: &[u8]) {
         let Ok(req) = Request::parse(bytes) else {
             return; // V1 rejects it; the lane logs no op for it.
         };
         let h = req.header();
         let msgs = req.msgs().map(Result::ok).collect();
-        self.msgs
-            .entry((h.session(), h.pkt_seq.get()))
-            .or_default()
-            .push_back(msgs);
+        // One payload per key, the newest: an accepted record uses only that one, so repeated
+        // sheds of one `pkt_seq` cannot grow this map.
+        self.msgs.insert((h.session(), h.pkt_seq.get()), msgs);
     }
 
     /// The payloads of one block's packet records, before `replay_block` runs it.
@@ -262,8 +262,7 @@ impl<K: PacketSink> SinkStream<K> {
         let msgs = if shed {
             vec![None; usize::from(p.count)]
         } else {
-            let q = self.msgs.remove(&key).ok_or(SinkError::NoPayload)?;
-            q.into_iter().next_back().ok_or(SinkError::NoPayload)?
+            self.msgs.remove(&key).ok_or(SinkError::NoPayload)?
         };
         let session_only =
             |m: &Option<Msg>| matches!(m, Some(Msg::Heartbeat | Msg::ResendReq { .. }));
