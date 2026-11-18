@@ -40,7 +40,9 @@
 //! `DATA_FAULT height=<h>`. With `[replay]` such a block's `BLOCK` line is printed after it
 //! replays and ends in ` out=<hex>`, its `RustReplay` output hash; the first divergence prints
 //! `REPLAY_FAULT height=<h> <why>` and replay stops (so does a `DATA_FAULT`). `voter` (`consensus.rs`): Simplex, `FINAL ...` per certificate.
-//! main: start, readiness, stop, `STATS frames=<n> blocks=<n> faults=<n>`.
+//! main: start, readiness, stop, `STATS frames=<n> blocks=<n> faults=<n>` and, with `[data]`,
+//! `DATA_EVICT expired=<n> capped=<n>`: unreferenced payloads the join dropped (07 §5.4; expiry
+//! runs only with `[consensus]`, which reports finality).
 //!
 //! **Not wired yet** (PR follow-ups): seals in the voter's source (tail reports, Silence), the chain guardian
 //! (`vyrn_chain::bridge::Guardian` needs a `vyrn_chain::Replica` over finalized `StateCommit`s,
@@ -62,7 +64,7 @@ use serde::Deserialize;
 use vyrn_chain as _;
 use vyrn_data::frame::Fetch;
 use vyrn_replica::feed::Gap;
-use vyrn_replica::{BlockInputs, DataErr, DataFeed, DataJoin};
+use vyrn_replica::{BlockInputs, DataErr, DataFeed, DataJoin, Evictions};
 
 mod consensus;
 mod replay;
@@ -381,7 +383,7 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
         let _ = std::io::stdin().read_to_end(&mut sink);
         stop.store(true, Ordering::Release);
     }
-    order.join().map_err(|_| "order thread panicked")?;
+    let evicted = order.join().map_err(|_| "order thread panicked")?;
     if let Some(v) = voter {
         stop.store(true, Ordering::Release);
         v.join().map_err(|_| "voter thread panicked")??;
@@ -393,6 +395,9 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
         g(&stats.blocks),
         g(&stats.faults)
     );
+    if let Some(e) = evicted {
+        println!("DATA_EVICT expired={} capped={}", e.expired, e.capped);
+    }
     Ok(())
 }
 
@@ -582,7 +587,8 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     source: &consensus::Source,
     stop: &AtomicBool,
     stats: &Stats,
-) {
+) -> Option<Evictions> {
+    let mut last_final = 0;
     let t0 = Instant::now();
     let now = || u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let mut burst = [RxPkt::empty(); RX_BURST];
@@ -607,6 +613,15 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             );
         }
         rx.release(k);
+        // The final height first: payloads polled below are stamped with it on arrival, and a
+        // stale one would expire them early (07 §5.4 retention).
+        if let Some(d) = data.as_mut() {
+            let f = source.final_height();
+            if f > last_final {
+                last_final = f;
+                DataRx::<N, D>::join(&mut d.join, &mut d.replay).finalized(Height(f));
+            }
+        }
         let dk = data.as_mut().map_or(0, |d| d.poll(now()));
         if let Some(d) = data.as_mut() {
             d.check(source, now());
@@ -631,6 +646,8 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             std::thread::park_timeout(IDLE);
         }
     }
+    data.as_mut()
+        .map(|d| DataRx::<N, D>::join(&mut d.join, &mut d.replay).evictions())
 }
 
 fn report<const N: usize, D: RxRing>(
@@ -655,7 +672,11 @@ fn report<const N: usize, D: RxRing>(
         source.header(b.header);
         match (verdict, data.as_deref_mut()) {
             (Verdict::Invalid, _) => source.invalid_from(h),
-            (Verdict::Valid, Some(d)) => d.pending.push_back(b),
+            (Verdict::Valid, Some(d)) => {
+                // Its records reference their payloads from now on (07 §5.4 retention).
+                DataRx::<N, D>::join(&mut d.join, &mut d.replay).reference(&b);
+                d.pending.push_back(b);
+            }
             (Verdict::Valid, None) => source.valid(h),
             (Verdict::Pending, _) => {}
         }

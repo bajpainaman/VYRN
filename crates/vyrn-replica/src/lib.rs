@@ -97,7 +97,7 @@ pub mod vx;
 pub mod vx_replay;
 
 pub use check::{StepErr, check_step};
-pub use data::{DataErr, DataJoin, full_hash};
+pub use data::{DataErr, DataJoin, Evictions, REP_DATA_UNREF_MAX, full_hash};
 pub use epoch::{ActiveEpoch, EpochJournal, JournalErr, ReplicaLocal};
 pub use feed::{DataFeed, Fed, FeedErr, Gap, REP_DATA_SILENCE_NS};
 pub use hashlag::{REP_HASHLAG_MAX_NS, check_hashlag};

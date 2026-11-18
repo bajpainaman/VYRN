@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -77,12 +77,18 @@ struct Held {
 /// The voter's [`BlockSource`]. The order thread writes it; Simplex reads it. `default()` is
 /// the source of a box without `[consensus]`: it keeps nothing.
 #[derive(Clone, Default)]
-pub struct Source(Option<Arc<Mutex<Held>>>);
+pub struct Source(Option<Arc<Mutex<Held>>>, Arc<AtomicU64>);
 
 impl Source {
     /// A source that keeps blocks for a voter, until [`Source::finalized`] drops them.
     pub fn new() -> Self {
-        Self(Some(Arc::default()))
+        Self(Some(Arc::default()), Arc::default())
+    }
+
+    /// The highest height a finality certificate covered; 0 before the first (and without a
+    /// voter). The order thread reads it for the data join's retention (07 §5.4).
+    pub fn final_height(&self) -> u64 {
+        self.1.load(Ordering::Acquire)
     }
 
     fn held(&self) -> Option<std::sync::MutexGuard<'_, Held>> {
@@ -108,6 +114,7 @@ impl Source {
     /// `height` is final: drop what is below it. The final block stays, as the next proposal's
     /// parent tip.
     fn finalized(&self, height: Height) {
+        self.1.fetch_max(height.0, Ordering::AcqRel);
         if let Some(mut held) = self.held() {
             held.headers = held.headers.split_off(&height.0);
             held.valid = held.valid.split_off(&height.0);
