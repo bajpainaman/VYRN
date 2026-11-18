@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """VYRN      04-protocol conformance vectors. Pure Python 3, standard library only."""
 import struct
+import json
+import sys
+
+JSON = sys.argv[1:] == ["--json"]          # the same vectors as JSON (tests/golden/README.md)
+
+
+def say(*a, **k):
+    if not JSON:
+        print(*a, **k)
+
 
 MASK = (1 << 64) - 1
 
@@ -40,7 +50,7 @@ for n, want in [(15, 0xA129CA6149BE45E5), (0, 0x726FDB47DD0E0E31), (8, 0x93F5F57
     got = siphash24(bytes(range(16)), bytes(range(n)))
     if got != want:
         raise SystemExit(f"SipHash-2-4 self-test FAILED for len {n}: {got:#018x}")
-print("siphash24(00..0f, 00..0e) = 0xa129ca6149be45e5  reference vector OK (also len 0, 8)")
+say("siphash24(00..0f, 00..0e) = 0xa129ca6149be45e5  reference vector OK (also len 0, 8)")
 
 K_SEQ = bytes(range(0x00, 0x10))   # test keys only
 K_OUT = bytes(range(0x10, 0x20))
@@ -96,14 +106,22 @@ def verify_request(pkt, key):
     return ok_len and siphash24(key, pkt[:end]) == struct.unpack_from("<Q", pkt, end)[0]
 
 
+DOC = {"source": "tests/golden/vyrn_proto_vectors.py", "vectors": [], "checks": []}
+
+
 def dump(name, pkt, req):
-    print(f"\n{name} ({len(pkt)} B)")
+    v = {"id": name.split()[0], "name": name, "tagging": {True: "request", False: "single", None: "none"}[req],
+         "hex": pkt.hex()}
+    DOC["vectors"].append(v)
+    say(f"\n{name} ({len(pkt)} B)")
     for off in range(0, len(pkt), 16):
-        print(f"  {off:03x}: " + " ".join(f"{x:02x}" for x in pkt[off:off + 16]))
+        say(f"  {off:03x}: " + " ".join(f"{x:02x}" for x in pkt[off:off + 16]))
     if req is None:                                                     # an admin frame: no tag
         return
     tags = struct.unpack_from("<QQ", pkt, len(pkt) - 16) if req else struct.unpack_from("<Q", pkt, len(pkt) - 8)
-    print("  " + "  ".join(f"{n}={t:#018x}" for n, t in zip(("tag_seq", "tag_com") if req else ("tag",), tags)))
+    names = ("tag_seq", "tag_com") if req else ("tag",)
+    v["tags"] = {n: f"{t:#018x}" for n, t in zip(names, tags)}
+    say("  " + "  ".join(f"{n}={t:#018x}" for n, t in zip(names, tags)))
 
 
 E, B = 1000, 1                                   # epoch 1000 (epoch16 0x03e8), book 1
@@ -180,4 +198,7 @@ for what, ok in [("V1 verifies with K_SEQ", verify_request(v1, K_SEQ)),
                           for i in range(2)))]:
     if not ok:
         raise SystemExit(f"FAILED: {what}")
-    print(f"check OK: {what}")
+    say(f"check OK: {what}")
+    DOC["checks"].append(what)
+if JSON:
+    print(json.dumps(DOC, indent=1))

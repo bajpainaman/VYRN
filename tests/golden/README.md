@@ -6,10 +6,10 @@ enough to regenerate the protocol files.
 
 | File | What it checks | Source |
 |---|---|---|
-| `vyrn_proto_vectors.py`, `.out` | 18 request and response packets one `DataRedirect` (V19, 04 §7.6) and one `DataTierStatus` admin frame (V20, 04 §4.4) that a conforming implementation must build byte for byte and accept (04 §11) | the script is the one printed in 04 §11; `.out` is its output |
+| `vyrn_proto_vectors.py`, `.out`, `.json` | 18 request and response packets one `DataRedirect` (V19, 04 §7.6) and one `DataTierStatus` admin frame (V20, 04 §4.4) that a conforming implementation must build byte for byte and accept (04 §11) | the script is the one printed in 04 §11; `.out` is its output |
 | `vyrn_reject_vectors.py`, `.out` | 45 validly tagged packets whose layout v1 must refuse, each with its verdict (04 §3.1 V1/V9, §3.3 M2/M3, §6.1, §12 VR1/VR3), and 4 `Reject RATE_LIMIT` records with 10's bucket ids 8–11 (04 §9.1) | written for this repository from those tables |
 | `vyrn_admin_vectors.py`, `.out` | 2 BASE-mode admin frames, `OpenSessionReq` and `OpenSessionResp`, that an implementation must build and accept, and 8 it must refuse (04 §4.4) | written for this repository from the §4.4 tables |
-| `vyrn_session_vectors.py`, `.out` | 35 packets, one per session state (04 §4.3) and message type, each with the lane's verdict (04 §3.1 V2/V7), and the final in-stream record of the 6 close causes | written for this repository from the 04 §3.1 and §4.3 tables |
+| `vyrn_session_vectors.py`, `.out`, `.json` | 35 packets, one per session state (04 §4.3) and message type, each with the lane's verdict (04 §3.1 V2/V7), and the final in-stream record of the 6 close causes | written for this repository from the 04 §3.1 and §4.3 tables |
 | `vyrn_replica_vectors.txt` | 14 order-stream frame sequences and the verdict a replica's order core must reach: the step rules of 07 §3.12 (a cut beyond the decoded lane prefix, a source that is not decoded or is in a `SHED` packet), the `REP_E_HASHLAG` timer at and past 1 ms, also when the late hash itself arrives (07 §3.7), the step merge from the `TenureStart` cuts, a `TenureStart` cut beyond its lane bases, a step missing after both marks (07 §3.8, §3.9), and the header rules (07 §3.10). The file's header gives the format | built with `vyrn-log`'s encoder by `crates/vyrn-replica/tests/conformance.rs` (`VYRN_BLESS=1` rewrites it) |
 | `vyrn_data_vectors.py`, `.out` | 5 data frames (07 §5.3) to build and accept and 13 to refuse, 3 fetch requests and 9 refusals, and 5 dedupe-window sequences (07 §5.2 step 3) | written for this repository from the layouts in `crates/vyrn-data/src/lib.rs` |
 | `siphash.txt` | SipHash-2-4, 64 lengths (the packet MAC, 01 §4) | [veorq/SipHash](https://github.com/veorq/SipHash) `vectors.h` at `32d0676`, `vectors_sip64` |
@@ -35,6 +35,28 @@ python3 -I "$REPO/tests/golden/vyrn_data_vectors.py"   | diff - "$REPO/tests/gol
 ```
 
 Each command prints nothing when its file matches. CI runs them on every pull request.
+
+**JSON form.** `vyrn_proto_vectors.py`, `vyrn_log_vectors.py` and `vyrn_session_vectors.py` also
+take `--json` and print the same vectors as one JSON document, committed beside the `.out` file,
+so an implementation in another language (Vx, for one) needs no parser for the text format. CI
+diffs both forms:
+
+```sh
+for v in proto log session; do
+  python3 -I "$REPO/tests/golden/vyrn_${v}_vectors.py" --json | diff - "$REPO/tests/golden/vyrn_${v}_vectors.json"
+done
+```
+
+Every document has `source`, the script that wrote it. Bytes are lowercase hex strings.
+- `vyrn_proto_vectors.json`: `vectors`, each `{id, name, tagging, hex, tags}`, where `tagging`
+  is `request` (`tag_seq` and `tag_com`), `single` (`tag`) or `none` (an admin frame), and
+  `tags` holds the trailing tags as `0x`-prefixed 16-digit hex; `checks`, the checks the script
+  ran and passed.
+- `vyrn_log_vectors.json`: `entries` in file order, each `{name, hex}` (`rec.len` is
+  `{name, value}`), the same names as the `.out` lines.
+- `vyrn_session_vectors.json`: `states`, each `{id, state, message, verdict}` plus `reason` and
+  `detail` for `oos` and `reject`; `close`, each `{id, cause, hex}`; and `closed_cause`, the
+  cause the `CLOSED` rows were closed by.
 
 ## Check an independent implementation
 

@@ -1,0 +1,266 @@
+{
+ "source": "tests/golden/vyrn_session_vectors.py",
+ "closed_cause": 4,
+ "states": [
+  {
+   "id": "S01",
+   "state": "OPENING",
+   "message": "New",
+   "verdict": "drop"
+  },
+  {
+   "id": "S02",
+   "state": "OPENING",
+   "message": "Cancel",
+   "verdict": "drop"
+  },
+  {
+   "id": "S03",
+   "state": "OPENING",
+   "message": "Reduce",
+   "verdict": "drop"
+  },
+  {
+   "id": "S04",
+   "state": "OPENING",
+   "message": "Replace",
+   "verdict": "drop"
+  },
+  {
+   "id": "S05",
+   "state": "OPENING",
+   "message": "Heartbeat",
+   "verdict": "drop"
+  },
+  {
+   "id": "S06",
+   "state": "OPENING",
+   "message": "ResendReq",
+   "verdict": "drop"
+  },
+  {
+   "id": "S07",
+   "state": "OPENING",
+   "message": "CancelAll",
+   "verdict": "drop"
+  },
+  {
+   "id": "S08",
+   "state": "ACTIVE",
+   "message": "New",
+   "verdict": "accept"
+  },
+  {
+   "id": "S09",
+   "state": "ACTIVE",
+   "message": "Cancel",
+   "verdict": "accept"
+  },
+  {
+   "id": "S10",
+   "state": "ACTIVE",
+   "message": "Reduce",
+   "verdict": "accept"
+  },
+  {
+   "id": "S11",
+   "state": "ACTIVE",
+   "message": "Replace",
+   "verdict": "accept"
+  },
+  {
+   "id": "S12",
+   "state": "ACTIVE",
+   "message": "Heartbeat",
+   "verdict": "accept"
+  },
+  {
+   "id": "S13",
+   "state": "ACTIVE",
+   "message": "ResendReq",
+   "verdict": "accept"
+  },
+  {
+   "id": "S14",
+   "state": "ACTIVE",
+   "message": "CancelAll",
+   "verdict": "accept"
+  },
+  {
+   "id": "S15",
+   "state": "DRAINING",
+   "message": "New",
+   "verdict": "reject",
+   "reason": "SESSION_CLOSED",
+   "detail": 7
+  },
+  {
+   "id": "S16",
+   "state": "DRAINING",
+   "message": "Cancel",
+   "verdict": "accept"
+  },
+  {
+   "id": "S17",
+   "state": "DRAINING",
+   "message": "Reduce",
+   "verdict": "accept"
+  },
+  {
+   "id": "S18",
+   "state": "DRAINING",
+   "message": "Replace",
+   "verdict": "reject",
+   "reason": "SESSION_CLOSED",
+   "detail": 7
+  },
+  {
+   "id": "S19",
+   "state": "DRAINING",
+   "message": "Heartbeat",
+   "verdict": "accept"
+  },
+  {
+   "id": "S20",
+   "state": "DRAINING",
+   "message": "ResendReq",
+   "verdict": "accept"
+  },
+  {
+   "id": "S21",
+   "state": "DRAINING",
+   "message": "CancelAll",
+   "verdict": "accept"
+  },
+  {
+   "id": "S22",
+   "state": "CLOSED",
+   "message": "New",
+   "verdict": "oos",
+   "reason": "SESSION_CLOSED",
+   "detail": 4
+  },
+  {
+   "id": "S23",
+   "state": "CLOSED",
+   "message": "Cancel",
+   "verdict": "oos",
+   "reason": "SESSION_CLOSED",
+   "detail": 4
+  },
+  {
+   "id": "S24",
+   "state": "CLOSED",
+   "message": "Reduce",
+   "verdict": "oos",
+   "reason": "SESSION_CLOSED",
+   "detail": 4
+  },
+  {
+   "id": "S25",
+   "state": "CLOSED",
+   "message": "Replace",
+   "verdict": "oos",
+   "reason": "SESSION_CLOSED",
+   "detail": 4
+  },
+  {
+   "id": "S26",
+   "state": "CLOSED",
+   "message": "Heartbeat",
+   "verdict": "oos",
+   "reason": "SESSION_CLOSED",
+   "detail": 4
+  },
+  {
+   "id": "S27",
+   "state": "CLOSED",
+   "message": "ResendReq",
+   "verdict": "oos",
+   "reason": "SESSION_CLOSED",
+   "detail": 4
+  },
+  {
+   "id": "S28",
+   "state": "CLOSED",
+   "message": "CancelAll",
+   "verdict": "oos",
+   "reason": "SESSION_CLOSED",
+   "detail": 4
+  },
+  {
+   "id": "S29",
+   "state": "FREE",
+   "message": "New",
+   "verdict": "drop"
+  },
+  {
+   "id": "S30",
+   "state": "FREE",
+   "message": "Cancel",
+   "verdict": "drop"
+  },
+  {
+   "id": "S31",
+   "state": "FREE",
+   "message": "Reduce",
+   "verdict": "drop"
+  },
+  {
+   "id": "S32",
+   "state": "FREE",
+   "message": "Replace",
+   "verdict": "drop"
+  },
+  {
+   "id": "S33",
+   "state": "FREE",
+   "message": "Heartbeat",
+   "verdict": "drop"
+  },
+  {
+   "id": "S34",
+   "state": "FREE",
+   "message": "ResendReq",
+   "verdict": "drop"
+  },
+  {
+   "id": "S35",
+   "state": "FREE",
+   "message": "CancelAll",
+   "verdict": "drop"
+  }
+ ],
+ "close": [
+  {
+   "id": "C01",
+   "cause": "LOGOUT",
+   "hex": "83ff1200010000000000000000000000"
+  },
+  {
+   "id": "C02",
+   "cause": "BAD_MAC",
+   "hex": "83ff01002a0000000000000000000000"
+  },
+  {
+   "id": "C03",
+   "cause": "EQUIVOCATION",
+   "hex": "83ff1200030000000000000000000000"
+  },
+  {
+   "id": "C04",
+   "cause": "ADMIN_KILL",
+   "hex": "83ff1200040000000000000000000000"
+  },
+  {
+   "id": "C05",
+   "cause": "LANE_MOVED",
+   "hex": "83ff1200050000000000000000000000"
+  },
+  {
+   "id": "C06",
+   "cause": "BOND",
+   "hex": "83ff1200060000000000000000000000"
+  }
+ ]
+}
