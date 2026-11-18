@@ -155,7 +155,7 @@ isolated, pinned core after `seal()`.
 | `vyrn-seq` | `bin/vyrn-seq` | `vyrn-engine` (live), `vyrn-nic`, `vyrn-log`, `vyrn-consensus` (as a proposer; it never votes, 01 §14.4), `vyrn-epoch`, `vyrn-data` (its frame and fetch codec only, for `SeqDataReq`, 07 §5.5). The warm standby in F2 is the same binary. |
 | `vyrn-replica` | `crates/vyrn-replica` | `vyrn-engine` (replay), `vyrn-log`, `vyrn-consensus`, `vyrn-epoch`, `libvyrn_vx_client` |
 | `vyrn-validator` | `bin/vyrn-validator` | everything in `vyrn-replica`, plus `vyrn-chain`; in observer mode (03 §4.5) also `vyrn-md`'s `SinkStream` and `dropcopy::ring::RingTap`, which write the output ring (10 §8.6 item 6) |
-| `vyrn-data` | `bin/vyrn-data-box` | `vyrn-data`, `vyrn-nic`, `vyrn-log`, `vyrn-epoch` (the roster codec, to derive `K_fetch`, 08 §9.6). The library `vyrn-data` stays in layer 4. |
+| `vyrn-data` | `bin/vyrn-data-box` | `vyrn-data`, `vyrn-nic`, `vyrn-log`, `vyrn-cut` (the rings between its cores, 07 §5.2), `vyrn-epoch` (the roster codec, to derive `K_fetch`, 08 §9.6). The library `vyrn-data` stays in layer 4. |
 | `vyrn-md` | `crates/vyrn-md` | `vyrn-md`, `vyrn-replica` (replay core), `vyrn-nic` |
 | `vyrn-dropcopy` | `crates/vyrn-md` | `vyrn-md::dropcopy`, `vyrn-replica` |
 | `vyrn-admin` | `bin/vyrn-admin` | config check, deploy, keys, epoch control, trace dump, release verify |
@@ -194,7 +194,7 @@ an engine crate depends on a crate outside `crates/engine/`, other than the allo
             vyrn-lane ──► vyrn-wire, vyrn-cut, vyrn-risk, vyrn-bbo
   layer 4   vyrn-engine ──► vyrn-lane, vyrn-bbo, vyrn-cut, vyrn-wire
             vyrn-consensus ──► vyrn-log, Commonware (consensus, p2p, runtime, cryptography, storage, codec)
-            vyrn-data ──► vyrn-log, vyrn-nic
+            vyrn-data ──► vyrn-log, vyrn-nic, vyrn-cut (the sharded box's hop rings, 07 §5.2)
   layer 5   vyrn-epoch ──► vyrn-consensus
   layer 6   vyrn-replica ──► vyrn-engine, vyrn-consensus, vyrn-epoch, vyrn-data (frame codec,
                              03 F7), libvyrn_vx_client (Vx, C ABI)

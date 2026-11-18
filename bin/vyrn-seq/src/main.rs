@@ -15,7 +15,7 @@
 //! | `role = "seq"`, `mode = "BASE"`, `home`, `book`, `epoch` | the box's book and epoch |
 //! | `[engine] dedicated, pooled = 0, tick_min, tick_max, win_center, slot_cap` | lanes and book window |
 //! | `[nic] backend, ip, port_base` | `kernel_udp` or `sim`; lane `l` listens on `port_base + l` (0: ephemeral) |
-//! | `[cores] pin = false, engine, stream, seal` | pinning is refused until `vyrn-nic::sys` has an affinity call; `seal` is `abort`, `count` or `off` |
+//! | `[cores] pin = false, engine, stream, seal` | `pin = true` pins the engine and stream threads to `engine` and `stream` (both required); a failed pin fail-stops before `READY`; `seal` is `abort`, `count` or `off` |
 //! | `[replication] order = ["ip:port", ...], block_ms` | where ORDER, HASH and HEADER frames go; block period |
 //! | `[keys] seq` | the `seq_key` handle (Ed25519 seed) |
 //! | `[epoch_boundary] next, t_ns, to_home, seq_index` | optional: per-lane `EpochNotice` triggers (08 §2.4) |
@@ -342,10 +342,13 @@ where
             let (stream_done, engine_done) = (&stream_done, &engine_done);
             let replicas = cfg.replication.order.clone();
             let epoch16 = Epoch(cfg.epoch).low16();
+            let (pin, stream_core) = (cfg.cores.pin, cfg.cores.stream);
             std::thread::Builder::new()
                 .name("vyrn-seq/stream".into())
                 .spawn_scoped(sc, move || {
-                    let _ = ready.send(Ok(()));
+                    // A failed pin stops the box before READY; this thread still drains the
+                    // ring until the engine is done.
+                    let _ = ready.send(pin_to(pin, stream_core, "stream"));
                     let mut s = StreamCore {
                         writer,
                         order_tx,
@@ -373,9 +376,15 @@ where
         let engine = {
             let (stats, stop) = (Arc::clone(&stats), Arc::clone(&stop));
             let stream_done = &stream_done;
+            let (pin, engine_core) = (cfg.cores.pin, cfg.cores.engine);
             std::thread::Builder::new()
                 .name("vyrn-seq/engine".into())
                 .spawn_scoped(sc, move || {
+                    if let Err(e) = pin_to(pin, engine_core, "engine") {
+                        let _ = ready_tx.send(Err(e.clone()));
+                        stop.store(true, Ordering::Release);
+                        return Err(e);
+                    }
                     let h = Handoff {
                         tx,
                         stream_done,
@@ -467,6 +476,15 @@ impl Drop for Done<'_> {
         for f in self.0 {
             f.store(true, Ordering::Release);
         }
+    }
+}
+
+/// Pins the calling thread to `core` when `[cores] pin` is set.
+fn pin_to(pin: bool, core: Option<u16>, name: &str) -> Result<(), String> {
+    match core.filter(|_| pin) {
+        Some(c) => vyrn_nic::sys::pin_current_thread(usize::from(c))
+            .map_err(|e| format!("cores.pin: {name} to cpu {c}: {e}")),
+        None => Ok(()),
     }
 }
 

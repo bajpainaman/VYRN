@@ -15,7 +15,7 @@
     clippy::panic
 )]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read as _};
 use std::net::{SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -107,6 +107,24 @@ fn spawn_with(
     tag: &str,
     extra: &str,
 ) -> (Child, PathBuf) {
+    spawn_cores(
+        replica,
+        seal,
+        block_ms,
+        tag,
+        extra,
+        "engine = 2\nstream = 4",
+    )
+}
+
+fn spawn_cores(
+    replica: &UdpSocket,
+    seal: &str,
+    block_ms: u64,
+    tag: &str,
+    extra: &str,
+    cores: &str,
+) -> (Child, PathBuf) {
     let dir = std::env::temp_dir().join(format!("vyrn-seq-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = dir.join("seq.toml");
@@ -132,8 +150,7 @@ ip = "127.0.0.1"
 port_base = 0
 
 [cores]
-engine = 2
-stream = 4
+{cores}
 seal = "{seal}"
 
 [replication]
@@ -236,6 +253,47 @@ fn orders(
 }
 
 /// Closes stdin, reads stdout to EOF and returns the `STATS` line and whether the box exited 0.
+/// `[cores] pin = true`: pinned to a CPU this test may use, the box starts and stops cleanly;
+/// pinned past `CPU_SETSIZE`, it fail-stops before `READY` with the reason on stderr.
+#[test]
+fn pinned_cores_start_and_a_bad_pin_fail_stops() {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let cpu = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .and_then(|l| l.trim().split([',', '-']).next().map(str::to_owned))
+        .unwrap_or_else(|| "0".into());
+    let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let ok = format!("pin = true\nengine = {cpu}\nstream = {cpu}");
+    let (mut child, dir) = spawn_cores(&replica, "count", 2, "pin-ok", "", &ok);
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(out.read_line(&mut line).unwrap() > 0, "exited before READY");
+        if line.starts_with("READY vyrn-seq ") {
+            break;
+        }
+    }
+    let (_, clean) = stop(&mut child, out);
+    assert!(clean);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let bad = "pin = true\nengine = 65535\nstream = 65535";
+    let (mut child, dir) = spawn_cores(&replica, "count", 2, "pin-bad", "", bad);
+    drop(child.stdin.take());
+    let mut text = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut text)
+        .unwrap();
+    assert!(!exits(&mut child).success());
+    assert!(!text.contains("READY"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn stop(child: &mut Child, out: BufReader<ChildStdout>) -> (String, bool) {
     drop(child.stdin.take());
     let mut stats = String::new();

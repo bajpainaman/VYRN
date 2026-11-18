@@ -262,7 +262,7 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
     let mut base = 0.0;
     for n in [1usize, 2] {
         let mut mpps = Vec::new();
-        let (mut allocs, mut drops) = (0u64, 0u64);
+        let (mut allocs, mut rx_drops, mut shard_drops) = (0u64, 0u64, 0u64);
         for _ in 0..ROUNDS {
             let mut ncfg = NicConfig::new(
                 BackendKind::Sim,
@@ -326,7 +326,7 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
                     }
                 }
             };
-            let (secs, a, stored, dropped) = std::thread::scope(|sc| {
+            let (secs, a, stored, dropped, lost) = std::thread::scope(|sc| {
                 let (go, store, rx_done, shards_done) = (&go, &store, &rx_done, &shards_done);
                 let h_rx = sc.spawn(move || {
                     go.wait();
@@ -359,12 +359,13 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
                             let a = violations() - before;
                             unseal();
                             shards_done.fetch_add(1, Ordering::AcqRel);
-                            (a, core.counters().stored)
+                            (a, core.counters().stored, core.counters().hop_full)
                         })
                     })
                     .collect();
-                go.wait();
+                // Taken before the barrier releases anyone, so the interval holds every core's work.
                 let t = Instant::now();
+                go.wait();
                 seal_counting();
                 let before = violations();
                 drain(&|| shards_done.load(Ordering::Acquire) == n, &mut || {
@@ -375,22 +376,26 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
                 unseal();
                 let (ra, dropped) = h_rx.join().unwrap();
                 a += ra;
-                let mut stored = 0;
+                let (mut stored, mut lost) = (0, 0);
                 for h in hs {
-                    let (x, s) = h.join().unwrap();
+                    let (x, s, l) = h.join().unwrap();
                     a += x;
                     stored += s;
+                    lost += l;
                 }
-                // A full shard ring drops at the RX core (shards.rs reading), as a full NIC queue would.
+                // A full shard ring drops at the RX core (shards.rs reading), as a full NIC queue
+                // would; a full sender ring drops a stored packet at its shard (`lost`), reported
+                // apart so a sender bottleneck shows.
                 assert_eq!(
                     stored + dropped,
                     PIPE as u64,
                     "every packet stored or counted"
                 );
-                (secs, a, stored, dropped)
+                (secs, a, stored, dropped, lost)
             });
             allocs += a;
-            drops += dropped;
+            rx_drops += dropped;
+            shard_drops += lost;
             mpps.push(stored as f64 / secs / 1e6);
         }
         let m = median(mpps);
@@ -398,10 +403,11 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
             base = m;
         }
         println!(
-            "pipeline {n}  {m:>7.2} Mpps stored  ({:.2}x n = 1, {} threads, median of {ROUNDS}, {PIPE} pkts)  hop_full {}  allocs {allocs}",
+            "pipeline {n}  {m:>7.2} Mpps stored  ({:.2}x n = 1, {} threads, median of {ROUNDS}, {PIPE} pkts)  hop_full rx {} shard {}  allocs {allocs}",
             m / base,
             n + 2,
-            drops / ROUNDS as u64
+            rx_drops / ROUNDS as u64,
+            shard_drops / ROUNDS as u64
         );
     }
 }
