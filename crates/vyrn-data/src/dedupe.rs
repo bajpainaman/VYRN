@@ -73,7 +73,15 @@ pub struct Dedupe {
 }
 
 impl Dedupe {
-    /// Marks `pkt_seq` (≥ 1) of `session`.
+    /// A window for each of `sessions`. [`Dedupe::mark`] on one of them never allocates.
+    pub fn with_sessions(sessions: impl IntoIterator<Item = SessionId>) -> Self {
+        Self {
+            wins: sessions.into_iter().map(|s| (s, Win::default())).collect(),
+        }
+    }
+
+    /// Marks `pkt_seq` (≥ 1) of `session`. A session without a window gets one, which
+    /// allocates.
     pub fn mark(&mut self, session: SessionId, pkt_seq: u32) -> Seen {
         self.wins.entry(session).or_default().mark(pkt_seq)
     }

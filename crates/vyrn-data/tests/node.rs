@@ -90,6 +90,7 @@ fn rig(store: MemStore) -> Rig {
         books: vec![BOOK],
         keys: BTreeMap::from([(SessionId(5), K), (SessionId(6), K)]),
         ring_slots: 64,
+        index_key: [0x42; 16],
     };
     let node = DataNode::new(
         NodeConfig::new(home, 1, me_ingest, dests),
@@ -401,6 +402,7 @@ fn kernel_udp_loopback_serves_a_replica() {
         books: vec![BOOK],
         keys: BTreeMap::from([(SessionId(5), K)]),
         ring_slots: 8,
+        index_key: [0x42; 16],
     };
     let mut node = DataNode::new(
         NodeConfig::new(home, 0, lo(in_addr), vec![lo(raddr)]),

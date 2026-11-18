@@ -3544,6 +3544,7 @@ dependencies = [
  "vyrn-bbo",
  "vyrn-crypto",
  "vyrn-cut",
+ "vyrn-data",
  "vyrn-engine",
  "vyrn-lane",
  "vyrn-log",
