@@ -1837,8 +1837,10 @@ fn boundary(c : *mut Ctx, l : i64, f : u64, pass : u64, next : u64) -> void {
       if (*ln).pend_n == 0i64 { break; }
       let p : *mut Pend = offset_mut((*ln).pend, (*ln).pend_head);
       if (*p).seq > cc { break; }
-      // Rule B: an Ack waits while its version is a batch taker in flight.
-      if (*p).k == PK_ACK && (*slot(ln, (*p).v)).inflt != 0u64 { break; }
+      // Rule B: an Ack or ReplaceAck waits while its version is a batch taker in flight
+      // (vyrn-lane in_flight).
+      if ((*p).k == PK_ACK && (*slot(ln, (*p).v)).inflt != 0u64)
+         || ((*p).k == PK_REPLACE && (*slot(ln, (*p).w)).inflt != 0u64) { break; }
       (*ln).pend_head = ((*ln).pend_head + 1i64) % PEND_CAP;
       (*ln).pend_n = (*ln).pend_n - 1i64;
       settle(c, ln, p);
@@ -3155,8 +3157,8 @@ fn klevel(c : *mut Ctx, side : u64, from : u64, limit : u64) -> u64 {
 }
 
 // Bbo::exec_rescan in replay (05 §8.6): the logged cut is taken as is. The batch taker is the
-// first in-band New of (prev, cut] in key order; it sweeps at its key. A Cancel or Reduce of
-// the batch after the key (the taker still sees the order it ends, the replayer's book does
+// first in-band New or new-priority Replace of (prev, cut] in key order; it sweeps at its key.
+// A Cancel, Reduce or Replace of the batch after the key (the taker still sees the order it ends, the replayer's book does
 // not) stops with PBV_E_UNSUPPORTED rather than guess.
 fn exec_rescan(c : *mut Ctx, lo : u64, hi : u64) -> void {
   unsafe {
@@ -3168,7 +3170,8 @@ fn exec_rescan(c : *mut Ctx, lo : u64, hi : u64) -> void {
       let cl = *offset_mut((*b).cut, l);
       for q in (pv + 1u64)..(cl + 1u64) {
         let e = lop(c, l, q);
-        if (*e).kind != OP_JOIN || (*e).tick < lo || (*e).tick > hi { continue; }
+        // Bbo::rescan: the first in-band New or new-priority Replace (JKind::New | NewPrio).
+        if ((*e).kind != OP_JOIN && (*e).kind != OP_REPLACE) || (*e).tick < lo || (*e).tick > hi { continue; }
         if sl == NONE {
           sl = l; sq = q;
         } else {
@@ -3188,7 +3191,7 @@ fn exec_rescan(c : *mut Ctx, lo : u64, hi : u64) -> void {
     for l in 0i64..(*c).n {
       for q in (*offset_mut((*b).prev, l) + 1u64)..(*offset_mut((*b).cut, l) + 1u64) {
         let k = (*lop(c, l, q)).kind;
-        if (k == OP_CANCEL || k == OP_REDUCE || k == OP_KILLALL) && after_key(c, l, q) {
+        if (k == OP_CANCEL || k == OP_REDUCE || k == OP_KILLALL || k == OP_REPLACE) && after_key(c, l, q) {
           fail_bbo(c, E_UNSUPPORTED);
           return;
         }

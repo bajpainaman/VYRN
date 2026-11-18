@@ -1042,7 +1042,11 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   (`revert_replace`). When the new version takes effect the old version's leg is released and
   the new leg is trued up by the predecessor's fills (`end_replaced`, `true_up`). A Replace
   that moves an order out of a forwarded op's range is a pass barrier, and an in-range one is a
-  dependency. Per #210, a Replace admitted after C\* of an order that was auction-only at C\*
+  dependency. A local new-priority Replace is a Rescan batch-taker candidate, as `JKind::NewPrio`
+  is in `Bbo::rescan`, and its `ReplaceAck` waits while it is in flight (rule B, vyrn-lane
+  `in_flight`). **[Reading, 3b]** A Replace of the batch after the taker's key stops with
+  `PBV_E_UNSUPPORTED`, like a Cancel: the taker still sees the old version there, the
+  replayer's book does not. Per #210, a Replace admitted after C\* of an order that was auction-only at C\*
   settles `TOO_LATE` with the `Out AUCTION` detail and never trades, while a Replace of an order
   that left auction-only before the freeze is accepted. **[Reading, 3b]** The BBO stages a
   Replace admitted after C\* while frozen and applies it when the uncross ends, decided against
