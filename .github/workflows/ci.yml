@@ -105,6 +105,7 @@ jobs:
           echo "$HOME/.local/bin" >>"$GITHUB_PATH"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: .github/scripts/vxc.sh toolchain
+      - run: .github/scripts/vxc.sh llvm
       - id: vxc
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

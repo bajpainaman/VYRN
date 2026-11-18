@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # CI's vx job, with .agents/setup's own functions so the reproducible vxc build (W-10: path
 # remaps, sorted build scripts) has one source. `toolchain`: rustup and the pinned rustc.
+# `llvm`: LLVM/MLIR 22, which vxc needs at run time too.
 # `vxc`: the pinned vxc (vx/TOOLCHAIN, 11 §5.4), run only on a cache miss. The job runs in
 # debian:trixie with HOME=/home/user, the host kind vxc_blake3.x86_64-linux was pinned on; vx/build.sh
 # then checks the hash.
@@ -23,15 +24,18 @@ case "${1:-}" in
     rustup toolchain install
     rustup default "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >/dev/null
     ;;
+  llvm)
+    # vxc links LLVM/MLIR 22 and runs its llvm-config at compile time, so every run needs them.
+    step "apt base packages" apt_base
+    step "LLVM/MLIR $VX_LLVM for vxc" llvm_for_vx
+    ;;
   vxc)
     # shellcheck disable=SC1091
     source "$HOME/.cargo/env"
-    step "apt base packages" apt_base
-    step "LLVM/MLIR $VX_LLVM for vxc" llvm_for_vx
     step "vxc $VX_TAG" vxc_build
     ;;
   *)
-    echo "usage: $0 toolchain|vxc" >&2
+    echo "usage: $0 toolchain|llvm|vxc" >&2
     exit 2
     ;;
 esac

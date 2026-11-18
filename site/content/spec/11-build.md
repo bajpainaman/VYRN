@@ -1166,7 +1166,8 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   `HOME=/home/user`, the host kind `vxc_blake3.x86_64-linux` was pinned on. It builds vxc with
   `.agents/setup`'s own `llvm_for_vx` and `vxc_build` (`.github/scripts/vxc.sh`) and caches the
   binary with the files vxc reads at run time (its `stdlib/` and three `.so` files, W-10) by
-  `vx/TOOLCHAIN` and `rust-toolchain.toml`. `vx/build.sh` checks its hash either way.
+  `vx/TOOLCHAIN` and `rust-toolchain.toml`. LLVM/MLIR 22 is installed on every run, since vxc
+  runs its `llvm-config` and links against it. `vx/build.sh` checks its hash either way.
   A cold run takes about 7.5 min (vxc 4.2 min), within S1's 15. On aarch64 there is no pin, so
   the job is x86-64 only.
 
