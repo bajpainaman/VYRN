@@ -1071,7 +1071,9 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   `vyrn-lane` does. The FOK dry run (`Bbo::fillable`) skips a cancel-oldest maker and stops at
   any other. A Join dependency whose sweep only ended by STP still ends the step (`join_dep`).
   `tests/replay.rs` (`the_vx_client_replays_stp_that_triggers`) covers each mode, the FOK dry
-  run, `Reject` versus `Out`, and a later Cancel of the ended order. Mutation check: no trigger,
+  run, `Reject` versus `Out`, and a later Cancel of the ended order; a CancelAll after a maker or
+  a Rescan batch taker STP ended checks that both leave the book (an ended entry left in it
+  would hang `kill_session`). Mutation check: no trigger,
   and each wrong mode (cancel-oldest or cancel-both as cancel-newest, cancel-newest as
   cancel-both), fail it, as do always-`Reject`, always-`Out`, either wrong dry run, a missing
   level record and the lane's detail. Four survive, recorded as #211 did: cancel-oldest's maker

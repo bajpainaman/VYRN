@@ -3729,7 +3729,9 @@ fn end_taker(c : *mut Ctx, l : u64, e : *mut LOp, src : i64, kind : u64, code : 
     if (*e).np != 0u64 && (*bord(c, l, r)).seq != (*e).seq { book_drop(c, l, r); } else { }
     let o = bord(c, l, r);
     (*o).killed = 1u64;
-    (*o).state = 3u64;
+    // book_drop ends it, and removes it when it rests (a Rescan batch taker): setting the state
+    // first would leave a dead book entry that kill_session never gets past.
+    book_drop(c, l, r);
     let h = handle(r);
     event(c, l, kind, LIQ_TAKER, code, (*e).vslot, h, (*e).tick, open);
     // A batch taker (src NONE) has no TX record: its lane sends it (05 §8.10 rule 4).

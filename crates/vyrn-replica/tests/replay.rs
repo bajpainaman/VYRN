@@ -2250,7 +2250,10 @@ fn post(side: Side, tick: u32, qty: u32, tag: u32) -> vyrn_wire::Msg {
 /// record held by the lane, its Ack held until a CONT Rescan ends the sweep (rule B). `rep`
 /// makes lane 2's sell at 104 a local new-priority Replace of a resting sell at 110 (gap item
 /// 3b): the batch taker is then the Replace's version, as `JKind::NewPrio` is in `Bbo::rescan`.
-fn batch_script(post_only: bool, rep: bool) -> Vec<Act> {
+/// `stp` sends that sell from lane 1's account 1 with cancel-newest STP (gap item 4): the batch
+/// taker meets its own buy at 105 and ends `Out STP`, then a CancelAll of the session cancels
+/// its two resting buys, which needs the ended taker gone from the book.
+fn batch_script(post_only: bool, rep: bool, stp: bool) -> Vec<Act> {
     use Side::{Buy, Sell};
     use Tif::{Day, Ioc};
     let p = |l, a, t: u64, m| Act::Pkt {
@@ -2297,19 +2300,40 @@ fn batch_script(post_only: bool, rep: bool) -> Vec<Act> {
                     9_000,
                     replace(Handle::new(2, 1).unwrap(), Sell, Day, 104, 3),
                 )
+            } else if stp {
+                p(
+                    1,
+                    1,
+                    9_000,
+                    stp_new(Sell, Day, 104, 3, 9, vyrn_bbo::Stp::CancelNewest),
+                )
             } else {
                 p(2, 2, 9_000, new(Sell, Day, 104, 3, 9))
             },
         ]
     };
     s.extend([Act::Run, Act::Poll, Act::Run]);
+    if stp {
+        s.push(p(
+            1,
+            1,
+            10_000,
+            vyrn_wire::Msg::CancelAll { client_tag: 11 },
+        ));
+        s.extend([Act::Run, Act::Poll, Act::Run]);
+    }
     s
 }
 
 #[test]
 fn the_vx_client_replays_rescan_batch_takers_that_trade() {
-    for (post_only, by_replace) in [(false, false), (true, false), (false, true)] {
-        let script = batch_script(post_only, by_replace);
+    for (post_only, by_replace, stp) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let script = batch_script(post_only, by_replace, stp);
         let (live_j, store, blocks) = blocks_of(&script, &[]);
         let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
         check_same(&live_j, &rep);
@@ -2326,7 +2350,7 @@ fn the_vx_client_replays_rescan_batch_takers_that_trade() {
         let traded = j.recs.iter().any(|r| {
             matches!(r, OwnedRec::Step(e, _) if e.kind == StepKind::Rescan.code() && e.n_fills > 0)
         });
-        assert!(post_only || traded, "a batch taker trades");
+        assert!(post_only || stp || traded, "a batch taker trades");
         assert_vx_matches(&script, 0..j.recs.len() - 1);
     }
 }
