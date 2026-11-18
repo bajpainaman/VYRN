@@ -8,6 +8,26 @@
 #[cfg(target_os = "linux")]
 pub(crate) use linux::*;
 
+/// Pins the calling thread to CPU `cpu` (`sched_setaffinity`, 11 §3.6); refused off Linux.
+pub fn pin_current_thread(cpu: usize) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if cpu < libc::CPU_SETSIZE as usize {
+        // SAFETY: zeroed is the empty set; CPU_SET writes bit cpu < CPU_SETSIZE of the live set.
+        let rc = unsafe {
+            let mut set: libc::cpu_set_t = core::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            libc::sched_setaffinity(0, core::mem::size_of::<libc::cpu_set_t>(), &set)
+        };
+        return (rc == 0)
+            .then_some(())
+            .ok_or_else(std::io::Error::last_os_error);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no such cpu here",
+    ))
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use core::mem;

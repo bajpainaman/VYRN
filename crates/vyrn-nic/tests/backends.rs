@@ -413,3 +413,22 @@ fn kernel_udp_wildcard_bind_frames_carry_each_datagrams_destination() {
     }
     assert_eq!(ExtCounters::get(&rx.counters().rx_discard), 0);
 }
+
+/// `sys::pin_current_thread` moves the thread to the CPU it names and refuses one past
+/// `CPU_SETSIZE`. Runs on a thread of its own, so the test harness thread keeps its mask.
+#[cfg(target_os = "linux")]
+#[test]
+fn pin_current_thread_sets_the_affinity_mask() {
+    std::thread::spawn(|| {
+        vyrn_nic::sys::pin_current_thread(0).expect("cpu 0");
+        let mask = std::fs::read_to_string("/proc/thread-self/status").expect("status");
+        let line = mask
+            .lines()
+            .find(|l| l.starts_with("Cpus_allowed_list:"))
+            .expect("Cpus_allowed_list");
+        assert_eq!(line.split_whitespace().nth(1), Some("0"), "{line}");
+        assert!(vyrn_nic::sys::pin_current_thread(1 << 20).is_err());
+    })
+    .join()
+    .expect("pin thread");
+}
