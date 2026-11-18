@@ -1254,17 +1254,23 @@ same for a list.
 **Replica side (readings, `bin/vyrn-validator` `failover.rs`).** `DataDown{d}` is 24 bytes,
 little-endian: magic 0x4444, version 1, `d` u8, `voter` u8, 3 zero bytes, `epoch` u32, 4 zero
 bytes, then a SipHash-2-4 tag over bytes 0..16 under the sender's peer `K_fetch` toward the
-receiver. It goes to each `[[data.peer]]`'s data port, as a peer fetch does, and is checked as one.
-An unkeyed (DEV) sender's tag is 0. A keyed DEV replica also takes tag 0 from a configured peer
+receiver. It goes to each `[[data.peer]]`'s data port, as a peer fetch does. It counts only as the vote of
+the voter it names: the tag must verify under that voter's peer key, from its `repl_addr` IPv4, so
+one replica cannot cast another's vote. An unkeyed (DEV) sender's tag is 0, and the voter must be
+a configured peer at the source IPv4. A keyed DEV replica also takes tag 0 from a configured peer
 whose roster key is unusable, because it sends that peer unsealed fetches. A replica regossips
-every 10 ms while `d` is not effective. It counts distinct voters, itself included, and keeps each
+every 10 ms while `d` stays silent, even once `d` is effective, so a peer that lost a message
+still reaches Q. It counts distinct voters, itself included, and keeps each
 vote for the run: 07 names no withdrawal. A `DataDown` tagged `e − 1`, `e` or `e + 1` counts,
 because peers cross an epoch boundary one at a time (the peer-key window, §5.5). Until a session's
 `KeyBundle` reaches the replica, every session's `KeyBundle.data` list is the replica's `[data]
 boxes` in order, with its home at entry 0 (DEV). The replica sends one REDIRECT per session to
 every live box, sealed under that box's `K_fetch`, in 3 rounds 10 ms apart, because UDP can lose
-any one. `resend_from` is the replica's lowest unresolved `pkt_seq` of the session in the blocks
-it holds; if it holds none, it is one past the highest `pkt_seq` it released. `REP_DATA_SILENCE_MS`
+any one. The rounds queue and leave at most 128 per box every 10 ms, oldest first, under a box's
+fetch bucket (`vyrn-data` defaults: burst 256, 20 000/s). `resend_from` is the session's lowest
+`pkt_seq` in any block the replica holds that is not final yet, resolved there or not, because a
+payload one replica repaired before finality may be held by no other; if it holds none, it is one
+past the highest `pkt_seq` in a final block. `REP_DATA_SILENCE_MS`
 is 1 ms. A DEV validator may raise it (`[data] silence_us`) for an unpinned host.
 
 **Backup addresses (interim reading).** Step 3 needs every live box to know the affected

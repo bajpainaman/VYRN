@@ -199,14 +199,14 @@ impl Keyring {
     }
 
     /// The keys this voter serves peer fetches under in epoch `e`: `K_fetch(e, i,
-    /// VOTER_TARGET + me)` of every requester `i` with a usable key (08 §9.6), by its
+    /// VOTER_TARGET + me)` of every requester `i` with a usable key (08 §9.6), with `i` and its
     /// `repl_addr` IPv4. A keyed server with none serves nothing. An `Err` when the roster
     /// gives this voter a usable `xchg_key` and `secret` is not its private half.
     pub fn peer_keys(
         &self,
         e: Epoch,
         secret: &[u8; 32],
-    ) -> Result<Vec<(std::net::Ipv4Addr, [u8; 16])>, String> {
+    ) -> Result<Vec<(u8, std::net::Ipv4Addr, [u8; 16])>, String> {
         let Some(d) = u8::try_from(self.me)
             .ok()
             .and_then(|m| vyrn_epoch::VOTER_TARGET.checked_add(m))
@@ -233,7 +233,7 @@ impl Keyring {
         Ok(keys
             .into_iter()
             .filter(|(i, _, _)| usize::from(*i) != self.me)
-            .filter_map(|(_, a, k)| Some((a.ipv4()?, k)))
+            .filter_map(|(i, a, k)| Some((i, a.ipv4()?, k)))
             .collect())
     }
 }

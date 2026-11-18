@@ -269,24 +269,6 @@ impl PeerServer {
         }
     }
 
-    /// Whether a peer message from `from` with this `body` and SipHash `tag` is authentic: keyed,
-    /// under a requester's key at `from`; unkeyed (DEV), from a configured peer IP with tag 0.
-    /// `dev_open`: a keyed DEV replica with peers whose roster keys are unusable (it sends them
-    /// unsealed) also takes tag 0 from a configured peer IP.
-    pub fn authentic(&self, from: Ipv4Addr, body: &[u8], tag: u64, dev_open: bool) -> bool {
-        let open = tag == 0 && self.peers.contains(&from);
-        match &self.keys {
-            None => open,
-            Some(keys) => {
-                (dev_open && open)
-                    || keys
-                        .iter()
-                        .filter(|(ip, _)| *ip == from)
-                        .any(|(_, k)| vyrn_crypto::siphash::verify(k, body, vyrn_types::Tag(tag)))
-            }
-        }
-    }
-
     fn open(&self, from: Ipv4Addr, req: &[u8]) -> Option<(SessionId, u32)> {
         let q = match &self.keys {
             None => self

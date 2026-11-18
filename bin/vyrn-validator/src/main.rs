@@ -516,10 +516,12 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
             let sources = fetch::Sources::new(boxes, peers, seq);
             let peer_addrs: Vec<SocketAddrV4> = d.peer.iter().map(|p| p.addr).collect();
             let keys = ks.as_ref().map_or_else(Vec::new, |k| k.boxes.clone());
-            let open_down = ks
-                .as_ref()
-                .is_some_and(|k| k.peers.iter().any(Option::is_none));
-            let peer = fetch::PeerServer::new(&peer_addrs, ks.map(|k| k.serve));
+            let mut down_auth =
+                failover::DownAuth::new(d.peer.iter().map(|p| (p.voter, *p.addr.ip())).collect());
+            if let Some(k) = &ks {
+                down_auth.set_keys(k.serve.clone(), &k.peers);
+            }
+            let peer = fetch::PeerServer::new(&peer_addrs, ks.map(|k| serve_keys(&k.serve)));
             if let Some((kr, _)) = ring {
                 let (tx, rx) = std::sync::mpsc::channel();
                 rekey = Some(rx);
@@ -559,7 +561,7 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                         d.silence_us.saturating_mul(1000),
                     )
                 }),
-                open_down,
+                down_auth,
             })
         }
         None => None,
@@ -761,8 +763,8 @@ struct DataRx<const N: usize, R> {
     replayed: Option<Height>,
     /// With `[consensus]`: data box failure, 07 §5.7 steps 1–3 (`failover.rs`).
     failover: Option<failover::Failover>,
-    /// DEV, keyed: some peer has no usable roster key, so its `DataDown`s come with tag 0.
-    open_down: bool,
+    /// Who a peer's `DataDown` may come from, under which keys (`failover.rs`).
+    down_auth: failover::DownAuth,
     /// Keyed: the key sets `EPOCH <e>` derived, applied at the next poll.
     rekey: Option<std::sync::mpsc::Receiver<(u32, KeySet)>>,
     /// Observer: the block waiting for both paths' frames, and since when (`u64::MAX`: reported).
@@ -775,8 +777,15 @@ struct KeySet {
     boxes: Vec<[u8; 16]>,
     peers: Vec<Option<[u8; 16]>>,
     seq: Option<[u8; 16]>,
-    /// Peer fetches served under epochs `e - 1`, `e` and `e + 1`: peers move one at a time.
-    serve: Vec<(Ipv4Addr, [u8; 16])>,
+    /// Peer keys of epochs `e - 1`, `e` and `e + 1` (peers move one at a time), with each
+    /// requester's voter index: peer fetches are served under them, and a `DataDown` counts only
+    /// under its claimed voter's.
+    serve: Vec<(u8, Ipv4Addr, [u8; 16])>,
+}
+
+/// The `(IPv4, key)` pairs a peer fetch is served under.
+fn serve_keys(serve: &[(u8, Ipv4Addr, [u8; 16])]) -> Vec<(Ipv4Addr, [u8; 16])> {
+    serve.iter().map(|(_, ip, k)| (*ip, *k)).collect()
 }
 
 /// Derives epoch `e`'s [`KeySet`] (cold path). A box without a key, or a peer or seq box
@@ -914,8 +923,8 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             let mut acks = Vec::new();
             for (e, ks) in rekeyed {
                 self.sources.set_keys(&ks.boxes, &ks.peers, ks.seq);
-                self.open_down = ks.peers.iter().any(Option::is_none);
-                self.peer.set_keys(ks.serve);
+                self.down_auth.set_keys(ks.serve.clone(), &ks.peers);
+                self.peer.set_keys(serve_keys(&ks.serve));
                 self.keys = ks.boxes;
                 if let Some(f) = self.failover.as_mut() {
                     f.epoch = e;
@@ -952,9 +961,7 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 if let Some(fo) = self.failover.as_mut() {
                     match failover::DataDown::parse(f.payload) {
                         Some((m, body, tag))
-                            if self
-                                .peer
-                                .authentic(f.hdr.src.ip, &body, tag, self.open_down) =>
+                            if self.down_auth.authentic(f.hdr.src.ip, m.voter, &body, tag) =>
                         {
                             fo.heard(m);
                         }
@@ -1037,43 +1044,43 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
         for (d, votes) in newly {
             println!("DATA_DOWN box={d} votes={votes} quorum={}", fo.quorum());
         }
-        if due.is_empty() {
-            return;
-        }
-        let join = Self::join(&mut self.join, &mut self.replay);
-        let mut unresolved = std::collections::BTreeMap::new();
-        for (b, _) in &self.pending {
-            for r in &b.lanes {
-                let LaneRec::Pkt(p) = r else { continue };
-                if p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) != 0
-                    || join.resolve(p).is_ok()
-                {
-                    continue;
-                }
-                let e = unresolved.entry(p.session).or_insert(p.pkt_seq);
-                *e = (*e).min(p.pkt_seq);
-            }
-        }
-        let list = fo.resend_from(&unresolved);
         let live: Vec<usize> = (0..self.boxes.len()).filter(|&b| fo.live(b)).collect();
-        for (down, to) in due {
-            for &b in &live {
-                for &(session, resend_from) in &list {
-                    let q = Fetch::Redirect {
-                        session,
-                        resend_from,
-                        down,
-                        to,
-                    };
-                    send(&self.repair, &self.boxes, &self.keys, &q, b);
-                    fo.counts.redirects = fo.counts.redirects.saturating_add(1);
+        if !due.is_empty() {
+            // Every client record of a pending block counts, resolved here or not: a block
+            // that is not final may hold a payload only this replica has (reading t).
+            let mut pending = std::collections::BTreeMap::new();
+            for (b, _) in &self.pending {
+                for r in &b.lanes {
+                    let LaneRec::Pkt(p) = r else { continue };
+                    if p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) != 0 {
+                        continue;
+                    }
+                    let e = pending.entry(p.session).or_insert(p.pkt_seq);
+                    *e = (*e).min(p.pkt_seq);
                 }
             }
-            println!(
-                "REDIRECT_SENT down={down} to={to} sessions={} boxes={}",
-                list.len(),
-                live.len()
-            );
+            let list = fo.resend_from(&pending);
+            for (down, to) in due {
+                fo.queue(down, to, &list);
+                println!(
+                    "REDIRECT_SENT down={down} to={to} sessions={} boxes={}",
+                    list.len(),
+                    live.len()
+                );
+            }
+        }
+        // Paced under the boxes' fetch bucket (`failover::REDIRECT_BATCH`).
+        for (session, resend_from, down, to) in fo.batch(now) {
+            let q = Fetch::Redirect {
+                session,
+                resend_from,
+                down,
+                to,
+            };
+            for &b in &live {
+                send(&self.repair, &self.boxes, &self.keys, &q, b);
+                fo.counts.redirects = fo.counts.redirects.saturating_add(1);
+            }
         }
     }
 

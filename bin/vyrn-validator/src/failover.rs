@@ -3,7 +3,7 @@
 //! **Step 1.** A replica marks data box `d` down when its feed has heard from it once and then
 //! nothing for `REP_DATA_SILENCE_MS` (1 ms; `[data] silence_us`, DEV only, for unpinned hosts),
 //! and gossips `DataDown{d}` to its `[[data.peer]]`s, again every [`GOSSIP_EVERY_NS`] while `d`
-//! is not effective (UDP). `d` is effective once [`Failover::quorum`] distinct voters, this one
+//! stays silent, effective or not (UDP: a peer that lost one must still reach Q). `d` is effective once [`Failover::quorum`] distinct voters, this one
 //! included, sent it. A vote is kept for the run (reading: 07 names no withdrawal), and one tagged
 //! `e - 1`, `e` or `e + 1` counts (reading: peers cross an epoch boundary one at a time).
 //!
@@ -15,7 +15,9 @@
 //! **Step 3.** For each such session the replica sends every live box one REDIRECT fetch
 //! (`vyrn-data` kind 4) with its `resend_from`, sealed under that box's `K_fetch` like any fetch,
 //! [`REDIRECT_ROUNDS`] times [`GOSSIP_EVERY_NS`] apart (UDP; boxes act on each, clients drop the
-//! repeats by DR2). *Reading:* `resend_from` is the session's lowest `pkt_seq` in a block this
+//! repeats by DR2). The rounds queue up and leave [`REDIRECT_BATCH`] per [`GOSSIP_EVERY_NS`],
+//! oldest first, under a box's fetch bucket (`vyrn-data` defaults: burst 256, 20 000/s), so no
+//! session is starved by a long list. *Reading:* `resend_from` is the session's lowest `pkt_seq` in a block this
 //! replica holds that is not final yet, resolved here or not, else one past the highest in a
 //! final block. A replica sees only its own joins: a final block's payloads were resolved by Q
 //! replicas (vote-rule item 3), so the rest fetch them from peers, but one this replica got by
@@ -33,10 +35,13 @@
 //!          0 from an unkeyed (DEV) sender
 //! ```
 //!
-//! A keyed replica takes it only under a key of a requester at the source IPv4 (as a peer fetch,
-//! `fetch::PeerServer`); an unkeyed one only from a configured peer IP with a zero tag.
+//! It counts only as the vote of the voter it names ([`DownAuth`]): keyed, the tag must verify
+//! under that voter's peer key, from its `repl_addr` IPv4; unkeyed (DEV), the voter must be a
+//! `[[data.peer]]` at the source IPv4 and the tag 0. A keyed DEV replica also takes tag 0 from a
+//! configured peer whose roster key is unusable, as it sends that peer unsealed fetches.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::net::Ipv4Addr;
 
 use vyrn_types::SessionId;
 
@@ -47,6 +52,58 @@ pub const BYTES: usize = 24;
 pub const GOSSIP_EVERY_NS: u64 = 10_000_000;
 /// How many times each redirect round goes out (reading).
 pub const REDIRECT_ROUNDS: u8 = 3;
+/// REDIRECTs sent per [`GOSSIP_EVERY_NS`] to each live box (reading): 12 800/s with bursts of
+/// 128, under `vyrn-data`'s default fetch bucket.
+pub const REDIRECT_BATCH: usize = 128;
+
+/// Who a peer's `DataDown` may come from (module docs).
+pub struct DownAuth {
+    /// `[[data.peer]]`: voter index and IPv4.
+    peers: Vec<(u8, Ipv4Addr)>,
+    /// Keyed: every peer key of the window, by voter index and IPv4; `None` unkeyed (DEV).
+    keys: Option<Vec<(u8, Ipv4Addr, [u8; 16])>>,
+    /// Keyed DEV: the configured peers with no usable roster key.
+    open: Vec<u8>,
+}
+
+impl DownAuth {
+    pub fn new(peers: Vec<(u8, Ipv4Addr)>) -> Self {
+        Self {
+            peers,
+            keys: None,
+            open: Vec::new(),
+        }
+    }
+
+    /// A keyed replica's keys; `sealed[i]` is the key it seals to `peers[i]` with, `None` for a
+    /// peer whose roster key is unusable.
+    pub fn set_keys(&mut self, keys: Vec<(u8, Ipv4Addr, [u8; 16])>, sealed: &[Option<[u8; 16]>]) {
+        self.open = self
+            .peers
+            .iter()
+            .zip(sealed)
+            .filter(|(_, k)| k.is_none())
+            .map(|((v, _), _)| *v)
+            .collect();
+        self.keys = Some(keys);
+    }
+
+    /// Whether `voter` sent this `body` and `tag` from `from`.
+    pub fn authentic(&self, from: Ipv4Addr, voter: u8, body: &[u8], tag: u64) -> bool {
+        let configured = self.peers.contains(&(voter, from));
+        match &self.keys {
+            None => configured && tag == 0,
+            Some(keys) => {
+                (configured && tag == 0 && self.open.contains(&voter))
+                    || keys.iter().any(|(v, ip, k)| {
+                        *v == voter
+                            && *ip == from
+                            && vyrn_crypto::siphash::verify(k, body, vyrn_types::Tag(tag))
+                    })
+            }
+        }
+    }
+}
 
 /// `DataDown{d}` from voter `voter` in `epoch`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +186,9 @@ pub struct Failover {
     home: u8,
     /// Redirect rounds still to send: `(down, to, rounds left, next at)`.
     rounds: Vec<(u8, u8, u8, u64)>,
+    /// Queued REDIRECTs `(session, resend_from, down, to)`, and when the next batch may leave.
+    outbox: VecDeque<(SessionId, u32, u8, u8)>,
+    next_batch: u64,
     /// The highest `pkt_seq` per session in a final block.
     final_max: BTreeMap<SessionId, u32>,
     /// Released blocks not final yet: height and each session's lowest and highest `pkt_seq`.
@@ -149,6 +209,8 @@ impl Failover {
             gossiped: vec![None; n],
             home: 0,
             rounds: Vec::new(),
+            outbox: VecDeque::new(),
+            next_batch: 0,
             final_max: BTreeMap::new(),
             unfinal: VecDeque::new(),
             counts: Counts::default(),
@@ -170,7 +232,7 @@ impl Failover {
         let mut out = Vec::new();
         for &d in silent {
             let i = usize::from(d);
-            if self.effective.get(i).copied().unwrap_or(true) {
+            if i >= self.effective.len() {
                 continue;
             }
             if let Some(v) = self.votes.get_mut(i) {
@@ -196,7 +258,7 @@ impl Failover {
         out
     }
 
-    /// A peer's authenticated `DataDown`. *Reading:* one of epoch `e - 1`, `e` or `e + 1` counts,
+    /// A peer's authenticated `DataDown` ([`DownAuth`]); the caller checked `m.voter`. *Reading:* one of epoch `e - 1`, `e` or `e + 1` counts,
     /// as peers cross a boundary one at a time (the peer-key window, 07 §5.5 (l)); one of
     /// another epoch or an unknown box counts as bad.
     pub fn heard(&mut self, m: DataDown) {
@@ -241,6 +303,22 @@ impl Failover {
         }
         self.rounds.retain(|r| r.2 > 0);
         (newly, due)
+    }
+
+    /// Queues one round of REDIRECTs for `list`.
+    pub fn queue(&mut self, down: u8, to: u8, list: &[(SessionId, u32)]) {
+        self.outbox
+            .extend(list.iter().map(|&(s, r)| (s, r, down, to)));
+    }
+
+    /// The REDIRECTs to send now: at most [`REDIRECT_BATCH`] per [`GOSSIP_EVERY_NS`].
+    pub fn batch(&mut self, now: u64) -> Vec<(SessionId, u32, u8, u8)> {
+        if self.outbox.is_empty() || now < self.next_batch {
+            return Vec::new();
+        }
+        self.next_batch = now.saturating_add(GOSSIP_EVERY_NS);
+        let n = self.outbox.len().min(REDIRECT_BATCH);
+        self.outbox.drain(..n).collect()
     }
 
     /// A released block at `height` with these client records' `(session, pkt_seq)`.
@@ -320,6 +398,15 @@ mod tests {
         let dd = |d, voter| DataDown { d, voter, epoch: 0 };
         assert_eq!(f.silent(&[0], 0).len(), 1);
         assert!(f.silent(&[0], 1).is_empty(), "gossip waits a period");
+        // Codex r4612686942: gossip goes on after the box is effective, for peers short of Q.
+        let mut g = Failover::new(1, 0, 1, 0, 1);
+        assert_eq!(g.silent(&[0], 0).len(), 1);
+        assert_eq!(g.step(0).0, vec![(0, 1)]);
+        assert_eq!(
+            g.silent(&[0], GOSSIP_EVERY_NS).len(),
+            1,
+            "still gossiped when effective"
+        );
         f.heard(dd(0, 1));
         assert_eq!(f.step(2), (vec![], vec![]), "two of three");
         f.heard(dd(0, 1));
@@ -349,6 +436,65 @@ mod tests {
         assert_eq!(newly, vec![(2, 3)]);
         assert!(due.is_empty());
         assert_eq!(f.counts.down_bad, 1);
+    }
+
+    /// Codex r4612686917: a DataDown counts only as the voter whose key, IP and peer entry match.
+    #[test]
+    fn data_down_is_bound_to_its_voter() {
+        let (a, b) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2));
+        let (ka, kb) = ([1u8; 16], [2u8; 16]);
+        let m = |voter| DataDown {
+            d: 0,
+            voter,
+            epoch: 0,
+        };
+        let tagged = |voter, k: &[u8; 16]| {
+            let (_, body, tag) = DataDown::parse(&m(voter).encode(Some(k))).unwrap();
+            (body, tag)
+        };
+        let mut auth = DownAuth::new(vec![(1, a), (2, b), (3, a)]);
+        // Unkeyed (DEV): a configured (voter, IP) with tag 0 only.
+        let (body, _) = tagged(1, &ka);
+        assert!(auth.authentic(a, 1, &body, 0));
+        assert!(!auth.authentic(b, 1, &body, 0), "voter 1 is not at b");
+        assert!(!auth.authentic(a, 4, &body, 0), "voter 4 is not a peer");
+        // Keyed: voter 1's key at a; voter 3 has no usable key (DEV open).
+        auth.set_keys(vec![(1, a, ka), (2, b, kb)], &[Some(ka), Some(kb), None]);
+        let (body, tag) = tagged(1, &ka);
+        assert!(auth.authentic(a, 1, &body, tag));
+        let (body2, tag2) = tagged(2, &ka);
+        assert!(
+            !auth.authentic(a, 2, &body2, tag2),
+            "voter 1 claiming voter 2"
+        );
+        assert!(!auth.authentic(a, 1, &body, 0), "a keyed peer's tag 0");
+        let (body3, _) = tagged(3, &ka);
+        assert!(
+            auth.authentic(a, 3, &body3, 0),
+            "an unusable-key peer in DEV"
+        );
+    }
+
+    /// Codex r4612686954: rounds queue; each period sends at most a batch, oldest first, so a
+    /// later round never restarts ahead of sessions not yet sent.
+    #[test]
+    fn redirects_leave_in_paced_batches() {
+        let mut f = Failover::new(2, 0, 1, 0, 1);
+        let list: Vec<(SessionId, u32)> = (0..300).map(|i| (SessionId(i), 1)).collect();
+        f.queue(0, 1, &list);
+        f.queue(0, 1, &list);
+        let b1 = f.batch(5);
+        assert_eq!(b1.len(), REDIRECT_BATCH);
+        assert!(f.batch(6).is_empty(), "the next batch waits a period");
+        let b2 = f.batch(5 + GOSSIP_EVERY_NS);
+        let b3 = f.batch(5 + 2 * GOSSIP_EVERY_NS);
+        assert_eq!(b2.first().map(|r| r.0), Some(SessionId(128)));
+        assert_eq!(b3.first().map(|r| r.0), Some(SessionId(256)));
+        assert_eq!(
+            b3.get(44).map(|r| r.0),
+            Some(SessionId(0)),
+            "round 2 after round 1"
+        );
     }
 
     /// Session 5 is final through 9, so past it; 6 has a released block not final yet below
