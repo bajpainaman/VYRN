@@ -35,6 +35,7 @@
 //! `DC_REVERT`; the last `DC_EOD` carries the BLAKE3 hash of its canonical records before it.
 //! Closing balances come from the shell ([`Balances`]).
 
+pub mod noise;
 mod record;
 pub mod ring;
 pub mod server;

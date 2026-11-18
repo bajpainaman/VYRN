@@ -639,7 +639,7 @@ fn ring_path(name: &str) -> std::path::PathBuf {
 
 /// The observer's side of `vyrn-dropcopy` (10 §8.6): `RustReplay` over `blocks` into a
 /// `SinkStream` whose tap is a [`RingTap`], each block final right after it replays. `poll`
-/// runs after each block and once at the end; it returns the reader's error, if any.
+/// runs after each block and once at the end. Returns the writer, for frames after the epoch.
 fn replay_ring(
     live_j: &Journal,
     store: &Store,
@@ -647,7 +647,7 @@ fn replay_ring(
     path: &std::path::Path,
     cap: u64,
     mut poll: impl FnMut(u64),
-) {
+) -> RingTap {
     let mut data = DataJoin::default();
     for ((_, s, q, _), b) in &store.0 {
         data.put(*s, *q, b.clone());
@@ -673,6 +673,7 @@ fn replay_ring(
     ring.end_epoch(Vec::new());
     assert_eq!(ring.error(), None);
     poll(ring.head());
+    ring
 }
 
 /// Applies every ring frame to a fresh `DropCopy`, as `vyrn-dropcopy` does.
@@ -837,5 +838,71 @@ fn shell_frames_round_trip_through_the_ring() {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "the ring is owner-only");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 10 §8.4 item 11 and §8.6 item 5: a settlement of epoch 0 that comes after epoch 1 begins
+/// reaches epoch 0's streams in `vyrn-dropcopy`'s store, through `Follower`, the code the
+/// binary runs. The reference is one `DropCopy` that gets the same settlement before any new
+/// epoch.
+#[test]
+fn a_late_settlement_reaches_its_ended_epoch_in_the_follower() {
+    use std::sync::{Arc, RwLock};
+    use vyrn_md::dropcopy::ring::Follower;
+    use vyrn_md::dropcopy::server::{DcStore, Wake};
+    let (j, store, _) = live(&script());
+    let bs = blocks(&j, &store, &[j.recs.len() / 2]);
+    let last = bs.last().unwrap().header;
+    let path = ring_path("late-settle");
+    let mut w = replay_ring(&j, &store, &bs, &path, RING_CAP, |_| {});
+    w.begin_epoch(Epoch(1));
+    w.settled(Epoch(0), last.height, last.last_step);
+    assert_eq!(w.error(), None);
+
+    // Reference: every frame into one DropCopy, epoch 1's Begin skipped.
+    let mut rd = RingReader::open(&path).unwrap();
+    let mut dc = DropCopy::new(&dc_config(), Vec::new());
+    rd.poll(|f| {
+        if !matches!(f, RingFrame::Begin(_)) {
+            f.apply(&mut dc).unwrap();
+        }
+    })
+    .unwrap();
+    let want = dc.into_out().unwrap();
+    let settled: Vec<StreamId> = want
+        .iter()
+        .filter(|(_, _, r)| r.kind() == DcType::Settled)
+        .map(|(s, _, _)| *s)
+        .collect();
+    assert!(!settled.is_empty(), "the settlement covers final records");
+
+    let ds = Arc::new(RwLock::new(DcStore::new()));
+    let wake = Arc::new(Wake::new());
+    let mut f = Follower::open(&path, dc_config(), Arc::clone(&ds), Arc::clone(&wake)).unwrap();
+    assert!(f.poll().unwrap() > 0);
+    let ds = ds.read().unwrap();
+    assert_eq!(ds.current(), Some(Epoch(1)));
+    let mut by: BTreeMap<StreamId, Vec<DcRecord>> = BTreeMap::new();
+    for (s, q, r) in &want {
+        let v = by.entry(*s).or_default();
+        assert_eq!(*q, v.len() as u64 + 1);
+        v.push(*r);
+    }
+    for (s, v) in &by {
+        assert_eq!(
+            ds.records(Epoch(0), *s),
+            &v[..],
+            "{s:?}: epoch 0, byte for byte"
+        );
+        assert!(
+            ds.records(Epoch(1), *s).is_empty(),
+            "{s:?}: nothing in epoch 1"
+        );
+    }
+    for s in &settled {
+        let r = ds.records(Epoch(0), *s).last().unwrap();
+        assert_eq!(r.kind(), DcType::Settled, "{s:?}: after DC_EOD");
+        assert_eq!(r.step(), last.last_step.0);
+    }
     let _ = std::fs::remove_file(&path);
 }

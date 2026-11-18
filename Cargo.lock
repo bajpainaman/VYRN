@@ -3711,8 +3711,10 @@ name = "vyrn-md"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "chacha20poly1305",
  "clap",
  "serde",
+ "sha2",
  "toml",
  "tracing",
  "tracing-subscriber",
