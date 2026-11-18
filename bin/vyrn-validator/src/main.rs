@@ -68,7 +68,8 @@
 //! the `[[data.peer]]`s; at Q votes it prints `DATA_DOWN box=<d> votes=<n> quorum=<q>`, and if it
 //! is the sessions' home every live box gets a sealed REDIRECT per session
 //! (`REDIRECT_SENT down=<d> to=<d'> sessions=<n> boxes=<n>`). Exit prints `FAILOVER down_sent=
-//! down_heard= down_bad= effective= redirects=`.
+//! down_heard= down_bad= effective= redirects= redirect_msgs=` (sessions and messages sent, summed
+//! over the boxes).
 //! **Control** (stdin, one line each; *reading*: 07 and 08 name no transport for it yet).
 //! `EPOCH <e>` re-derives every `K_fetch` of a keyed `[data]` for epoch `e` (07 §5.5 Epoch
 //! boundary); once the order thread has installed the keys it prints `FETCH_EPOCH <e>`. A
@@ -1069,17 +1070,25 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 );
             }
         }
-        // Paced under the boxes' fetch bucket (`failover::REDIRECT_BATCH`).
-        for (session, resend_from, down, to) in fo.batch(now) {
-            let q = Fetch::Redirect {
-                session,
-                resend_from,
-                down,
-                to,
-            };
+        // Paced under the boxes' fetch bucket (`failover::REDIRECT_MSGS`): one message of up to
+        // MAX_BATCH sessions is one token; a single session stays kind 4.
+        for m in fo.batch(now) {
             for &b in &live {
-                send(&self.repair, &self.boxes, &self.keys, &q, b);
-                fo.counts.redirects = fo.counts.redirects.saturating_add(1);
+                match m.entries.as_slice() {
+                    &[(session, resend_from)] => {
+                        let q = Fetch::Redirect {
+                            session,
+                            resend_from,
+                            down: m.down,
+                            to: m.to,
+                        };
+                        send(&self.repair, &self.boxes, &self.keys, &q, b);
+                    }
+                    es => send_batch(&self.repair, &self.boxes, &self.keys, &m, es, b),
+                }
+                fo.counts.redirect_msgs = fo.counts.redirect_msgs.saturating_add(1);
+                let n = u64::try_from(m.entries.len()).unwrap_or(u64::MAX);
+                fo.counts.redirects = fo.counts.redirects.saturating_add(n);
             }
         }
     }
@@ -1272,6 +1281,29 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
 }
 
 /// Sends `q` to box `d`: the 40-byte form under its `K_fetch` when keyed, else the 32 bytes.
+/// A REDIRECT_BATCH (kind 5) to box `d`, sealed under its `K_fetch` when keyed (07 §5.7).
+fn send_batch(
+    repair: &UdpSocket,
+    boxes: &[SocketAddrV4],
+    keys: &[[u8; 16]],
+    m: &failover::Msg,
+    entries: &[(vyrn_types::SessionId, u32)],
+    d: usize,
+) {
+    use vyrn_data::frame::RedirectBatch;
+    let Some(to) = boxes.get(d) else {
+        return;
+    };
+    let b = match keys.get(d) {
+        Some(k) => RedirectBatch::seal(k, m.down, m.to, entries),
+        None => RedirectBatch::encode(m.down, m.to, entries),
+    };
+    // `Msg` keeps the batch rules (positions, 1 ..= MAX_BATCH, ascending), so encoding holds.
+    if let Ok(b) = b {
+        let _ = repair.send_to(&b, to);
+    }
+}
+
 fn send(repair: &UdpSocket, boxes: &[SocketAddrV4], keys: &[[u8; 16]], q: &Fetch, d: usize) {
     let Some(to) = boxes.get(d) else {
         return;
@@ -1408,8 +1440,8 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         if let Some(f) = d.failover.as_ref() {
             let c = f.counts;
             println!(
-                "FAILOVER down_sent={} down_heard={} down_bad={} effective={} redirects={}",
-                c.down_sent, c.down_heard, c.down_bad, c.effective, c.redirects
+                "FAILOVER down_sent={} down_heard={} down_bad={} effective={} redirects={} redirect_msgs={}",
+                c.down_sent, c.down_heard, c.down_bad, c.effective, c.redirects, c.redirect_msgs
             );
         }
     }

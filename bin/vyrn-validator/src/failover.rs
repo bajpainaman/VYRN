@@ -12,12 +12,13 @@
 //! `[data] boxes` in order and its home is entry 0, so positions are box indices, and an
 //! effective `d` that is the current home moves every session the replica knows.
 //!
-//! **Step 3.** For each such session the replica sends every live box one REDIRECT fetch
-//! (`vyrn-data` kind 4) with its `resend_from`, sealed under that box's `K_fetch` like any fetch,
+//! **Step 3.** For each such session the replica sends every live box its `resend_from` in a
+//! REDIRECT_BATCH fetch (`vyrn-data` kind 5, up to `MAX_BATCH` = 181 sessions of one move per
+//! message; a message of one session is kind 4), sealed under that box's `K_fetch` like any fetch,
 //! [`REDIRECT_ROUNDS`] times [`GOSSIP_EVERY_NS`] apart (UDP; boxes act on each, clients drop the
-//! repeats by DR2). The rounds queue up and leave [`REDIRECT_BATCH`] per [`GOSSIP_EVERY_NS`],
-//! oldest first, under a box's fetch bucket (`vyrn-data` defaults: burst 256, 20 000/s), so no
-//! session is starved by a long list. *Reading:* `resend_from` is the session's lowest `pkt_seq` in a block this
+//! repeats by DR2). The rounds queue up and leave at most [`REDIRECT_MSGS`] messages per box per
+//! [`GOSSIP_EVERY_NS`], oldest first, each one token of a box's fetch bucket (`vyrn-data`
+//! defaults: burst 256, 20 000/s). *Reading:* `resend_from` is the session's lowest `pkt_seq` in a block this
 //! replica holds that is not final yet, resolved here or not, else one past the highest in a
 //! final block. A replica sees only its own joins: a final block's payloads were resolved by Q
 //! replicas (vote-rule item 3), so the rest fetch them from peers, but one this replica got by
@@ -54,11 +55,22 @@ pub const GOSSIP_EVERY_NS: u64 = 10_000_000;
 pub const REDIRECT_ROUNDS: u8 = 3;
 /// Every session's home before any move: entry 0 of its `KeyBundle.data` (reading s).
 const FIRST_HOME: u8 = 0;
-/// REDIRECTs sent per [`GOSSIP_EVERY_NS`] to each live box (reading): 12 800/s with bursts of
-/// 128, under `vyrn-data`'s default fetch bucket.
-/// Limit (07 §5.7, open): the first round of `n` sessions takes `n / 12 800` s, so above about
-/// 1 200 sessions per home box it can outlast the clients' 100 ms retention (04 DR4).
-pub const REDIRECT_BATCH: usize = 128;
+/// REDIRECT messages sent per [`GOSSIP_EVERY_NS`] to each live box (reading): 6 400/s with
+/// bursts of 64, a quarter of `vyrn-data`'s default fetch bucket, so the 3 rounds fit one burst.
+/// At `MAX_BATCH` sessions each that is about 1.16 million sessions/s: a home box's every session
+/// gets its first round in the first period, well inside the clients' 100 ms retention (04 DR4).
+pub const REDIRECT_MSGS: usize = 64;
+/// The most sessions in one REDIRECT message.
+pub use vyrn_data::frame::MAX_BATCH;
+
+/// One REDIRECT message: sessions of one `down → to` move, strictly ascending, 1 ..=
+/// [`MAX_BATCH`] of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Msg {
+    pub down: u8,
+    pub to: u8,
+    pub entries: Vec<(SessionId, u32)>,
+}
 
 /// Who a peer's `DataDown` may come from (module docs).
 pub struct DownAuth {
@@ -171,6 +183,7 @@ pub struct Counts {
     pub down_bad: u64,
     pub effective: u64,
     pub redirects: u64,
+    pub redirect_msgs: u64,
 }
 
 /// [`Failover::step`]'s result: boxes newly effective with their vote counts, and redirect
@@ -328,14 +341,56 @@ impl Failover {
             .extend(list.iter().map(|&(s, r)| (s, r, down, to)));
     }
 
-    /// The REDIRECTs to send now: at most [`REDIRECT_BATCH`] per [`GOSSIP_EVERY_NS`].
-    pub fn batch(&mut self, now: u64) -> Vec<(SessionId, u32, u8, u8)> {
+    /// The REDIRECT messages to send now: at most [`REDIRECT_MSGS`] per [`GOSSIP_EVERY_NS`],
+    /// oldest entries first. A session queued twice (two rounds in one drain) goes in two
+    /// messages, as a message's sessions are strictly ascending.
+    pub fn batch(&mut self, now: u64) -> Vec<Msg> {
         if self.outbox.is_empty() || now < self.next_batch {
             return Vec::new();
         }
         self.next_batch = now.saturating_add(GOSSIP_EVERY_NS);
-        let n = self.outbox.len().min(REDIRECT_BATCH);
-        self.outbox.drain(..n).collect()
+        let n = self.outbox.len().min(REDIRECT_MSGS * MAX_BATCH);
+        let mut groups: BTreeMap<(u8, u8), Vec<(SessionId, u32)>> = BTreeMap::new();
+        for (s, r, d, t) in self.outbox.drain(..n) {
+            groups.entry((d, t)).or_default().push((s, r));
+        }
+        let mut out = Vec::new();
+        for ((down, to), mut es) in groups {
+            // Layer k holds each session's k-th entry, so every layer is strictly ascending.
+            es.sort_by_key(|e| e.0);
+            let mut layers: Vec<Vec<(SessionId, u32)>> = Vec::new();
+            let mut i = 0;
+            while i < es.len() {
+                let mut j = i;
+                while es.get(j).is_some_and(|e| e.0 == es[i].0) {
+                    let k = j - i;
+                    if layers.len() <= k {
+                        layers.push(Vec::new());
+                    }
+                    if let (Some(l), Some(e)) = (layers.get_mut(k), es.get(j)) {
+                        l.push(*e);
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+            for l in layers {
+                out.extend(l.chunks(MAX_BATCH).map(|c| Msg {
+                    down,
+                    to,
+                    entries: c.to_vec(),
+                }));
+            }
+        }
+        // Over the message budget (several moves or repeats in one drain): the rest waits.
+        if out.len() > REDIRECT_MSGS {
+            for m in out.drain(REDIRECT_MSGS..).rev() {
+                for &(s, r) in m.entries.iter().rev() {
+                    self.outbox.push_front((s, r, m.down, m.to));
+                }
+            }
+        }
+        out
     }
 
     /// A released block at `height` with these client records' `(session, pkt_seq)`.
@@ -516,21 +571,42 @@ mod tests {
     #[test]
     fn redirects_leave_in_paced_batches() {
         let mut f = Failover::new(2, 0, 1, 0, 1);
-        let list: Vec<(SessionId, u32)> = (0..300).map(|i| (SessionId(i), 1)).collect();
+        let list: Vec<(SessionId, u32)> = (0..300).rev().map(|i| (SessionId(i), i)).collect();
         f.queue(0, 1, &list);
         f.queue(0, 1, &list);
-        let b1 = f.batch(5);
-        assert_eq!(b1.len(), REDIRECT_BATCH);
-        assert!(f.batch(6).is_empty(), "the next batch waits a period");
-        let b2 = f.batch(5 + GOSSIP_EVERY_NS);
-        let b3 = f.batch(5 + 2 * GOSSIP_EVERY_NS);
-        assert_eq!(b2.first().map(|r| r.0), Some(SessionId(128)));
-        assert_eq!(b3.first().map(|r| r.0), Some(SessionId(256)));
-        assert_eq!(
-            b3.get(44).map(|r| r.0),
-            Some(SessionId(0)),
-            "round 2 after round 1"
+        let ms = f.batch(5);
+        // Two rounds in one drain: each session twice, so 2 × ⌈300 / 181⌉ messages.
+        assert_eq!(ms.len(), 4);
+        for m in &ms {
+            assert!(m.entries.len() <= MAX_BATCH && (m.down, m.to) == (0, 1));
+            assert!(
+                m.entries.windows(2).all(|w| w[0].0 < w[1].0),
+                "strictly ascending"
+            );
+            assert!(m.entries.iter().all(|(s, r)| s.0 == *r), "resend_from kept");
+        }
+        assert_eq!(flat(&ms).len(), 600);
+        assert!(
+            f.batch(6).is_empty(),
+            "drained; the next batch waits a period anyway"
         );
+        // Over the message budget, the rest waits a period, oldest first.
+        let many: Vec<(SessionId, u32)> = (0..20_000).map(|i| (SessionId(i), 1)).collect();
+        f.queue(0, 1, &many);
+        let b = f.batch(5 + GOSSIP_EVERY_NS);
+        assert_eq!(b.len(), REDIRECT_MSGS);
+        assert_eq!(flat(&b).len(), REDIRECT_MSGS * MAX_BATCH);
+        let next = f.batch(5 + 2 * GOSSIP_EVERY_NS);
+        assert_eq!(
+            next.first().and_then(|m| m.entries.first()).map(|e| e.0),
+            Some(SessionId(u32::try_from(REDIRECT_MSGS * MAX_BATCH).unwrap()))
+        );
+    }
+
+    fn flat(ms: &[Msg]) -> Vec<(SessionId, u32, u8, u8)> {
+        ms.iter()
+            .flat_map(|m| m.entries.iter().map(|&(s, r)| (s, r, m.down, m.to)))
+            .collect()
     }
 
     /// Codex r4612821618: a session first released after the home moved is queued then, once.
@@ -542,7 +618,7 @@ mod tests {
         assert_eq!(f.step(0).1, vec![(0, 1)]);
         f.queue(0, 1, &f.resend_from(&BTreeMap::new()));
         f.released(2, [(SessionId(9), 7), (SessionId(9), 6), (SessionId(5), 4)]);
-        let sent = f.batch(0);
+        let sent = flat(&f.batch(0));
         let late: Vec<_> = sent.iter().filter(|r| r.0 == SessionId(9)).collect();
         assert_eq!(late.len(), usize::from(REDIRECT_ROUNDS));
         assert!(late.iter().all(|r| (r.1, r.2, r.3) == (6, 0, 1)));
@@ -565,17 +641,16 @@ mod tests {
         f.silent(&[1], 1);
         assert_eq!(f.step(1).1, vec![(1, 2)]);
         f.released(1, [(SessionId(9), 4)]);
-        let sent = f.batch(0);
+        let sent = flat(&f.batch(0));
         assert!(!sent.is_empty());
         assert!(sent.iter().all(|r| (r.1, r.2, r.3) == (4, 0, 2)));
     }
 
-    /// The bound 07 §5.7 records (open; the batched REDIRECT lifts it): 2 000 sessions of one
+    /// 07 §5.7's former bound, lifted by REDIRECT_BATCH (#184 pinned it): 2 000 sessions of one
     /// home queued at once, 2 ms after the failure. Clients keep sent packets for 100 ms (04
-    /// DR4), so a session's first REDIRECT must leave by 98 ms; at [`REDIRECT_BATCH`] per
-    /// [`GOSSIP_EVERY_NS`] only 10 batches do. The batch PR flips the last assertion.
+    /// DR4), so a session's first REDIRECT must leave by 98 ms; now all do, in the first period.
     #[test]
-    fn first_round_outlasts_dr4_above_the_bound() {
+    fn first_round_fits_dr4_at_scale() {
         const RETAIN_NS: u64 = 100_000_000;
         const DETECT_NS: u64 = 2_000_000;
         let mut f = Failover::new(2, 0, 1, 0, 1);
@@ -584,18 +659,14 @@ mod tests {
         let mut in_time = 0usize;
         let mut t = 0;
         while t + DETECT_NS <= RETAIN_NS {
-            in_time += f.batch(t).len();
+            let ms = f.batch(t);
+            if t == 0 {
+                assert_eq!(ms.len(), 2000usize.div_ceil(MAX_BATCH), "one period");
+            }
+            in_time += flat(&ms).len();
             t += GOSSIP_EVERY_NS;
         }
-        assert_eq!(
-            in_time,
-            10 * REDIRECT_BATCH,
-            "about 1 200 sessions fit DR4's window"
-        );
-        assert!(
-            in_time < list.len(),
-            "2 000 sessions do not (07 §5.7 limit)"
-        );
+        assert_eq!(in_time, list.len(), "every session inside DR4's window");
     }
 
     /// Session 5 is final through 9, so past it; 6 has a released block not final yet below

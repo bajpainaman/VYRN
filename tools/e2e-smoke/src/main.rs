@@ -91,9 +91,10 @@
 //!   `redirects > 0` and `redirect_unknown = 0`, and a verified `DataRedirect` (DR1, under the
 //!   session's `K_seq`) for every session. On its first one per session (DR2) the client moves
 //!   copy 2 to the backup and resends its retained bytes from `resend_from` (DR3). `data` checks
-//!   the backup's `STATS` without `stored` (the killed box's are gone; R11's `fetch_unauth = 0`
-//!   still holds: the unkeyed validators' plain REDIRECTs are malformed to a keyed box, not
-//!   forged), and `replay` still needs every packet in the tap's join, now fed by both boxes'
+//!   the backup's `STATS` without `stored` (the killed box's are gone). R11's `fetch_unauth`
+//!   may count the unkeyed validators' plain REDIRECT_BATCHes (kind 5), which a keyed box reads
+//!   as bad tags, and nothing else: at most their `FAILOVER redirect_msgs` summed (a plain kind-4
+//!   REDIRECT is malformed to a keyed box instead), and `replay` still needs every packet in the tap's join, now fed by both boxes'
 //!   frames. The client paces its DR3 resends (20 µs apart): one burst of every retained packet
 //!   overflows the backup's ingest socket on a 2-vCPU host. The client keeps each sent packet
 //!   for `CLIENT_RETAIN` (100 ms, 04 DR4) and resends only those; `failover` fails if a packet
@@ -2181,11 +2182,21 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 errs.push(format!("--data-shards {shards}: STATS shards/hop_full wrong: {st}"));
             }
             // R7: validator 0 lost frames, and only sealed fetches are served. R11: under its
-            // epoch-1 keys, so the box refused none of them.
-            if relay_dropped.is_some() && field(&st, "fetch_unauth") != Some("0") {
+            // epoch-1 keys, so the box refused none of them. R13: the unkeyed validators' plain
+            // REDIRECT_BATCHes reach the keyed backup as bad tags; at most those are refused.
+            let unkeyed_batches: u64 = if backup.is_some() {
+                vals.iter()
+                    .skip(1)
+                    .filter_map(|&i| nodes.0.get(i).and_then(|n| line(n, "FAILOVER ")))
+                    .filter_map(|l| field(l, "redirect_msgs")?.parse::<u64>().ok())
+                    .sum()
+            } else {
+                0
+            };
+            let unauth = field(&st, "fetch_unauth").and_then(|v| v.parse::<u64>().ok());
+            if relay_dropped.is_some() && unauth.is_none_or(|u| u > unkeyed_batches) {
                 errs.push(format!(
-                    "--keyed: fetch_unauth is {:?}, not 0 (R11: validator 0's re-derived K_fetch)",
-                    field(&st, "fetch_unauth")
+                    "--keyed: fetch_unauth is {unauth:?}, above the {unkeyed_batches} plain REDIRECT_BATCHes of the unkeyed validators (R11: validator 0's re-derived K_fetch; R13)"
                 ));
             }
             if let Some(dropped) = relay_dropped {
