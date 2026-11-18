@@ -590,6 +590,10 @@ impl Sink for EngineSink<'_> {
                 self.stats.steps.fetch_add(1, Ordering::Relaxed);
                 self.send(Out::Step(*e, e.n_delta, ds));
             }
+            // Follow-up: the stream core does not encode 07 route records (§3.6) yet. Before
+            // the engine journalled them they were dropped in the lane drain, so this keeps
+            // the stream unchanged.
+            Rec::Route(_) => {}
         }
     }
     fn lane_resp(&mut self, lane: LaneId, p: &RespPkt) {

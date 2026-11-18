@@ -14,7 +14,7 @@ use harness::*;
 use vyrn_bbo::admit::{FixedClock, NeverLate};
 use vyrn_bbo::{Bbo, ControlCmd, OrderFlags, Phase, Record, Side, Stp, Tif, TxEntry};
 use vyrn_cut::{Hw, PoolTok};
-use vyrn_engine::{Engine, Fault, OwnedRec, Rec, Shared, Sink};
+use vyrn_engine::{Engine, Fault, NoResponses, OwnedRec, Rec, Shared, Sink};
 use vyrn_lane::{RespPkt, RxIn};
 use vyrn_risk::AcctSlot;
 use vyrn_types::{AccountId, AcctTake, Epoch, LaneId, MAX_REQ_PAYLOAD, Nanos, Qty, StepKind, Tick};
@@ -161,7 +161,10 @@ fn a_pooled_session_logs_one_take_before_each_of_its_records() {
     let mut rsh = box_shared();
     let mut r = pooled_engine(&mut rsh, &rtok, true);
     let mut rs = Takes::default();
-    assert_eq!(r.replay(&s.j.recs, &store, &mut rs), Ok(()));
+    assert_eq!(
+        r.replay(&s.j.recs, &store, &mut NoResponses, &mut rs),
+        Ok(())
+    );
     assert_eq!(rs.takes, s.takes);
 }
 
@@ -270,7 +273,7 @@ fn an_auction_runs_through_control_steps_and_replays() {
         .iter()
         .filter_map(|r| match r {
             OwnedRec::Step(s, _) => StepKind::from_code(s.kind),
-            OwnedRec::Packet(_) => None,
+            OwnedRec::Packet(_) | OwnedRec::Route(_) => None,
         })
         .filter(|k| matches!(k, StepKind::Control | StepKind::Uncross))
         .collect();
@@ -299,7 +302,7 @@ fn an_auction_runs_through_control_steps_and_replays() {
         assert!(r.command(c));
     }
     let mut rj = Journal::default();
-    assert_eq!(r.replay(&j.recs, &store, &mut rj), Ok(()));
+    assert_eq!(r.replay(&j.recs, &store, &mut NoResponses, &mut rj), Ok(()));
     assert_eq!(rj.tx, j.tx);
     assert_eq!(rj.resp, j.resp);
 }

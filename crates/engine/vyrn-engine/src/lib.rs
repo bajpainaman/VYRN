@@ -13,7 +13,7 @@
 //! | half-cuts A and B | engine, cut-core role ([`Engine::step`]) | BBO core | each lane's `CounterLine` is read (Acquire), then both halves are published through `CutWriter` (`INV-CUT-MONO`; a backwards entry is [`Fault::CutNotMonotone`]) before every BBO poll | 05 §4.13, §7.1 |
 //! | `LaneCut[l]` | engine, stream-core role | lane `l` | written after the step's `StepEntry` and every `CutDelta` line were read from the `StepLog` (frame first, `INV-FRAME-FIRST`) | 05 §4.15 |
 //! | each lane's `SnapshotLine` | engine, snapshot fan-out | lane `l` | copied from the BBO's line before every BBO poll and before every lane poll | 05 §4.14 |
-//! | order stream ([`Rec`]) | engine, in call order | [`Sink`], [`Engine::replay`] | lane records in each lane's production order; a step's [`Rec::Step`] after its last lane record that the step's cut covers | 01 §6.6, 05 §6.2 |
+//! | order stream ([`Rec`]) | engine, in call order | [`Sink`], [`Engine::replay`] | lane records ([`Rec::Packet`], and [`Rec::Route`] for an op the lane classified and then rejected itself) in each lane's production order; a step's [`Rec::Step`] after its last lane record that the step's cut covers | 01 §6.6, 05 §6.2, 07 §3.6 |
 //! | pool account tokens (`vyrn_cut::PoolTok`) and their [`AcctTake`](vyrn_types::AcctTake) records | engine, pool-core role ([`Engine::pool_session`]) | pool cores, [`Sink::take`] | per record of a pooled session: take (CAS), [`Sink::take`], release, then the record; `ver` is gapless across the pool | 01 §14.17.4, 05 §6.9 |
 //! | control commands | caller, control role ([`Engine::command`]) | BBO core | one per step, before ring heads; replay queues the same commands before the stream | 05 §4.1, §8.8 |
 //! | responses | lanes ([`Sink::lane_resp`]) and the fill TX role ([`Sink::tx`]) | gateway | lane packets carry their `Gate`; TX packets go out after their `StepEntry` | 05 §8.10 |
@@ -33,16 +33,36 @@
 //!   `vyrn_lane::Lane::replay_packet`: its `MID` Advance records become `Mid` boundaries at
 //!   `(f, C_f[l])`, with `C_f` from the replayed step `f`'s cut (kept for the last
 //!   `ENG_STEP_LOG` steps), and op `(l, q)` is forwarded iff a later `StepRecord` has
-//!   `src = (l, q)`, never by the lane's snapshot (05 §10 rows 1–3, 7). A non-`MID` Advance
-//!   record is replayed as the lane's idle poll, which reads the `LaneCut` that the replayed
-//!   step wrote. Every call's output records are checked against the log.
+//!   `src = (l, q)`, never by the lane's snapshot (05 §10 rows 1–3, 7). Its route is that
+//!   step's `STEP_CROSS` bit, or, for an op the lane classified and rejected itself, its
+//!   [`Rec::Route`] record (07 §3.6); every other op is a `Join`. A non-`MID` Advance
+//!   record is replayed as the lane boundary it logs, at `(fills_applied, C_f[l])` like a `MID`
+//!   record, not as an idle poll on the newest `LaneCut`: live, the poll may have read an older
+//!   one. Every call's output records are checked against the log.
+//!
+//! - **Replay from 07** ([`Engine::replay_wire`]): the replica's entry point. Input is 07's wire
+//!   records only: every lane's `PacketRecord`s in O-order, the block's `RouteRecord`s
+//!   (`vyrn_log::LaneRec::Route`, any order; each is matched to its packet by `(lane,
+//!   lane_seq)`), and the merged steps as [`WireStep`] (kind, source, `CROSS` bit, full cut,
+//!   kind payload; build one with [`WireStep::of`] from a `vyrn-log` `MergedStep`). They are merged by 07 §7.1 `REP_MERGE`: before step `s`, each lane
+//!   in lane id order replays its records due at `f < s`, where `f` is a packet's
+//!   `fills_applied` raised to that of its `MID` records. `n_tx`, `n_fills`, `fill_lanes`,
+//!   `flags`, `pub_a/b` and `CONT` are derived, not compared; the `Rescan` band is the payload
+//!   (8 B, or empty for all ticks). Call it once per block on the same engine: records a block
+//!   does not settle carry to the next call ([`Engine::carried`], `REP_MERGE` item 3). Errors are [`WireDiverged`] at a lane record index, a step,
+//!   or the end.
+//! - **Response log** ([`Responses`]): both entry points check every lane response (per lane, in
+//!   order) and fill TX packet (in order) against a log when one is given ([`Why::Response`]).
+//!   [`Engine::replay`] also checks that the log is used up at the end; after
+//!   [`Engine::replay_wire`] the caller checks [`Responses::finished`] after its last block. [`NoResponses`] checks nothing.
 //!
 //! **Replay rejects** ([`Diverged`]): a record the replayed engine does not reproduce byte for
 //! byte ([`Why::Mismatch`]), a packet record without payload ([`Why::NoPayload`]), a step
 //! record that does not decode ([`Why::BadStep`]), a step the BBO core refuses as its next one
 //! ([`Why::Step`] with `vyrn_bbo::Diverge`), a `MID` record older than the cut history
 //! ([`Why::StepTooOld`]), a record with no lane work behind it
-//! ([`Why::BadRecord`]), a step the BBO core does not publish ([`Why::NoStep`]), and any lane
+//! ([`Why::BadRecord`]), a response that differs from the log ([`Why::Response`]), inputs
+//! `REP_MERGE` cannot order ([`Why::Order`], `REP_E_ORDER`), a step the BBO core does not publish ([`Why::NoStep`]), and any lane
 //! or BBO fault ([`Why::Fault`]).
 //!
 //! **Scope of this version** (each is a PR follow-up):
@@ -63,8 +83,7 @@
 //!   publishes it. The stream role reads step `s` once the BBO snapshot shows `done_step ≥ s`
 //!   (published after the step's other lines) and polls the BBO core again only after that, so
 //!   a step is never read in part. [`Engine::run`] is quiet when no visible line has work.
-//!   Replay runs a non-`MID` Advance record as the lane's idle poll on the newest `LaneCut`; a
-//!   live poll that read an older `LaneCut` replays as a mismatch (follow-up).
+//!   Replay is exact under the same delays (`tests/sim.rs`).
 //!
 //! Determinism (`INV-DET`): the engine's own choices are the call order and nothing else. It
 //! reads no clock, no ring fill level for a decision, no hash-map order and no float.
@@ -87,4 +106,6 @@ mod replay;
 pub mod role;
 
 pub use engine::{Engine, Fault, Rec, Shared, Sink};
-pub use replay::{Diverged, OwnedRec, Payloads, Why};
+pub use replay::{
+    Diverged, NoResponses, OwnedRec, Payloads, Responses, Why, WireAt, WireDiverged, WireStep,
+};

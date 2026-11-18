@@ -17,10 +17,14 @@ use vyrn_lane::{
     Ports, RespPkt, Rx, RxIn,
 };
 use vyrn_risk::Route;
-use vyrn_types::{AccountId, AcctTake, LaneId, LaneSeq, PacketRecord, SessionId, StepId};
+use vyrn_types::{
+    AccountId, AcctTake, LaneId, LaneSeq, PacketRecord, RouteRecord, SessionId, StepId,
+};
 
 /// Steps whose cut replay keeps for `MID` boundaries (`ENG_STEP_LOG`).
 pub(crate) const STEP_HIST: usize = ENG_STEP_LOG;
+/// Lane records 07 replay can carry from one block to the next (`ENG_FWD_RING` × 4).
+pub(crate) const CARRY_CAP: usize = 4 * vyrn_cut::ENG_FWD_RING;
 /// Records one fill TX packet can carry (`TxEntry.n_rec` is a `u8`).
 const TX_RECS: usize = 256;
 /// Polls per step before the engine reports no step (`Bbo::poll` may return `Idle` while it
@@ -34,6 +38,10 @@ pub enum Rec<'d> {
     Packet(PacketRecord),
     /// A step with its changed cut entries (05 §4.15).
     Step(StepEntry, &'d [CutDelta]),
+    /// The route of an op its lane classified `Cross` or `Improve` and then rejected itself
+    /// (07 §3.6 `RouteRecord`, G9). The lane writes it in pass 1, so it comes before its
+    /// packet's `PacketRecord` in the lane's output.
+    Route(RouteRecord),
 }
 
 /// Where the engine's outputs go. Called on the engine's thread, in output order.
@@ -121,7 +129,7 @@ type StepLogCons<'a, V> = Consumer<'a, Line64, ENG_STEP_LOG, STEP_LOG_READERS, V
 pub struct Engine<'a, V: Visibility, const NA: usize> {
     pub(crate) vis: &'a V,
     pub(crate) lanes: Vec<Lane<'a, V, NA>>,
-    views: Vec<ArenaView<'a>>,
+    pub(crate) views: Vec<ArenaView<'a>>,
     fwd_c: Vec<FwdCons<'a, V>>,
     fill_p: Vec<FillProd<'a, V>>,
     ctl_p: Producer<'a, Line64, ENG_CONTROL_RING, 1, V>,
@@ -153,6 +161,13 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     unread: Option<StepId>,
     /// Per lane: `(session, account, token)` of each pooled session ([`Engine::pool_session`]).
     pool: Vec<Vec<(SessionId, AccountId, &'a PoolTok)>>,
+    /// 07 replay: lane records carried to the next block (07 §7.1 `REP_MERGE` item 3), and the
+    /// buffer the next carry is built in. Both hold [`CARRY_CAP`] records.
+    pub(crate) carry: Vec<PacketRecord>,
+    pub(crate) carry_next: Vec<PacketRecord>,
+    /// The route records of the carried packets, and the buffer the next one is built in.
+    pub(crate) carry_routes: Vec<RouteRecord>,
+    pub(crate) carry_routes_next: Vec<RouteRecord>,
 }
 
 impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
@@ -252,6 +267,10 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             scratch: Vec::with_capacity(32),
             unread: None,
             pool: (0..n).map(|_| Vec::new()).collect(),
+            carry: Vec::with_capacity(CARRY_CAP),
+            carry_next: Vec::with_capacity(CARRY_CAP),
+            carry_routes: Vec::with_capacity(CARRY_CAP),
+            carry_routes_next: Vec::with_capacity(CARRY_CAP),
         })
     }
 
@@ -427,6 +446,20 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
         Ok(ran)
     }
 
+    /// Replay of lane `l`'s non-`MID` Advance record: the boundary at `at = (f, C_f[l])` that
+    /// the record names, not an idle poll on the newest `LaneCut`. Live, a poll may have read an
+    /// older `LaneCut` (a delayed backend), and the record logs which one (F3a).
+    pub(crate) fn replay_advance<S: Sink>(
+        &mut self,
+        l: usize,
+        at: LaneCutEntry,
+        sink: &mut S,
+    ) -> Result<(), Fault> {
+        let lane = self.lanes.get_mut(l).ok_or(Fault::NoLane)?;
+        lane.boundary(self.vis, at, None);
+        self.drain(l, sink)
+    }
+
     /// Steps and lane polls until neither has work, at most `rounds` rounds. `true` if quiet.
     pub fn run<C: Clock, S: Sink>(
         &mut self,
@@ -452,9 +485,14 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
         }
         let pool = self.pool.get(l).map_or(&[][..], Vec::as_slice);
         for r in lane.drain_log() {
-            // A `RouteRecord` (G9) is not in this crate's journal yet; replay wiring is the
-            // engine's follow-up (`routes_of`).
-            let LogRec::Packet(p) = r else { continue };
+            let p = match r {
+                LogRec::Packet(p) => p,
+                // An op's route (07 §3.6) covers no account write, so it takes no token.
+                LogRec::Route(x) => {
+                    sink.record(&Rec::Route(x));
+                    continue;
+                }
+            };
             if let Some((_, account, tok)) = pool.iter().find(|(s, _, _)| *s == p.session) {
                 // Spec gap (PR body): the engine plays every pool core on one thread, so the
                 // lane's work for this record is already done and no other core can have

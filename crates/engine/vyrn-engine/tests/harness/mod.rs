@@ -6,7 +6,8 @@
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
-    clippy::as_conversions
+    clippy::as_conversions,
+    clippy::type_complexity
 )]
 
 use std::fmt::Write as _;
@@ -14,7 +15,9 @@ use std::fmt::Write as _;
 use vyrn_bbo::admit::{FixedClock, NeverLate};
 use vyrn_bbo::{Bbo, OrderFlags, Phase, Record, Side, Stp, Tif, TxEntry};
 use vyrn_cut::Hw;
-use vyrn_engine::{Engine, OwnedRec, Payloads, Rec, Shared, Sink};
+use vyrn_engine::{
+    Engine, NoResponses, OwnedRec, Payloads, Rec, Responses, Shared, Sink, WireStep,
+};
 use vyrn_lane::{ArenaConfig, Config, Lane, PathTable, RespPkt, Rx, RxIn, SessionSpec};
 use vyrn_risk::{AcctRisk, AcctSlot, BookSpec, SessionBuckets};
 use vyrn_types::{
@@ -278,8 +281,158 @@ pub fn replay(recs: &[OwnedRec], store: &Store) -> (Result<(), vyrn_engine::Dive
     let (bbo, mut sh) = new_box();
     let mut e = engine(bbo, &mut sh);
     let mut j = Journal::default();
-    let r = e.replay(recs, store, &mut j);
+    let r = e.replay(recs, store, &mut NoResponses, &mut j);
     (r, j)
+}
+
+/// Replays `recs` on a fresh box, checking responses against `log`.
+pub fn replay_checked(
+    recs: &[OwnedRec],
+    store: &Store,
+    log: &Journal,
+) -> (Result<(), vyrn_engine::Diverged>, Journal) {
+    let (bbo, mut sh) = new_box();
+    let mut e = engine(bbo, &mut sh);
+    let mut j = Journal::default();
+    let mut rl = RespLog::of(log);
+    let r = e.replay(recs, store, &mut rl, &mut j);
+    (r, j)
+}
+
+/// A response log built from a live journal: lane packets per lane in order, TX packets in
+/// order.
+pub struct RespLog {
+    pub lane: Vec<std::collections::VecDeque<RespPkt>>,
+    pub tx: std::collections::VecDeque<(TxEntry, Vec<Record>)>,
+}
+
+impl RespLog {
+    pub fn of(j: &Journal) -> Self {
+        let mut lane = vec![std::collections::VecDeque::new(); N];
+        for (l, p) in &j.resp {
+            lane[usize::from(l.0)].push_back(*p);
+        }
+        Self {
+            lane,
+            tx: j.tx.iter().cloned().collect(),
+        }
+    }
+}
+
+impl Responses for RespLog {
+    fn lane(&mut self, lane: LaneId, p: &RespPkt) -> bool {
+        self.lane[usize::from(lane.0)].pop_front().as_ref() == Some(p)
+    }
+    fn tx(&mut self, h: &TxEntry, recs: &[Record]) -> bool {
+        self.tx
+            .pop_front()
+            .is_some_and(|(a, b)| a == *h && b == recs)
+    }
+    fn finished(&self) -> bool {
+        self.tx.is_empty() && self.lane.iter().all(|q| q.is_empty())
+    }
+}
+
+/// The 07 view of a journal (07 §7.1): packet records in journal order, the route records
+/// (07 §3.6), and each step reduced to what 07's `StepRecord` carries (kind, source, `CROSS`
+/// bit, full cut, Rescan band payload).
+pub fn to_wire(recs: &[OwnedRec]) -> (Vec<PacketRecord>, Vec<vyrn_types::RouteRecord>, Vec<Wire>) {
+    let mut lanes = Vec::new();
+    let mut routes = Vec::new();
+    let mut steps = Vec::new();
+    let mut cut = vec![vyrn_types::LaneSeq(0); N];
+    for r in recs {
+        match r {
+            OwnedRec::Packet(p) => lanes.push(*p),
+            OwnedRec::Route(x) => routes.push(*x),
+            OwnedRec::Step(e, d) => {
+                for x in &d[..usize::from(e.n_delta)] {
+                    cut[usize::from(x.lane.0)] = x.seq;
+                }
+                let kind = vyrn_types::StepKind::from_code(e.kind).unwrap();
+                let mut payload = Vec::new();
+                if kind == vyrn_types::StepKind::Rescan {
+                    payload.extend_from_slice(&e.band_lo.0.to_le_bytes());
+                    payload.extend_from_slice(&e.band_hi.0.to_le_bytes());
+                }
+                let src = (e.src_lane_seq.0 != 0).then_some((e.src_lane, e.src_lane_seq));
+                let cross = e.flags & vyrn_bbo::STEP_CROSS != 0;
+                steps.push((e.step, kind, src, cross, cut.clone(), payload));
+            }
+        }
+    }
+    (lanes, routes, steps)
+}
+
+/// One step as `to_wire` gives it: step, kind, source, `CROSS`, cut, payload.
+pub type Wire = (
+    vyrn_types::StepId,
+    vyrn_types::StepKind,
+    Option<(LaneId, vyrn_types::LaneSeq)>,
+    bool,
+    Vec<vyrn_types::LaneSeq>,
+    Vec<u8>,
+);
+
+/// One block of 07 inputs: packet records, route records, steps.
+pub type Block<'a> = (
+    &'a [PacketRecord],
+    &'a [vyrn_types::RouteRecord],
+    &'a [Wire],
+);
+
+/// Replays 07-only inputs on a fresh box (`Engine::replay_wire`).
+pub fn replay_wire(
+    lanes: &[PacketRecord],
+    routes: &[vyrn_types::RouteRecord],
+    steps: &[Wire],
+    store: &Store,
+    log: Option<&Journal>,
+) -> (Result<(), vyrn_engine::WireDiverged>, Journal) {
+    let (r, j, _) = replay_blocks(&[(lanes, routes, steps)], store, log);
+    (r, j)
+}
+
+/// Replays blocks of 07-only inputs, one `replay_wire` call each, on one fresh box. Returns the
+/// first error (or `Ok`), the outputs, and how many records the last call carried.
+pub fn replay_blocks(
+    blocks: &[Block<'_>],
+    store: &Store,
+    log: Option<&Journal>,
+) -> (Result<(), vyrn_engine::WireDiverged>, Journal, usize) {
+    let (bbo, mut sh) = new_box();
+    let mut e = engine(bbo, &mut sh);
+    let mut j = Journal::default();
+    let mut rl = log.map(RespLog::of);
+    for (lanes, routes, steps) in blocks {
+        let ws: Vec<WireStep<'_>> = steps
+            .iter()
+            .map(|(step, kind, src, cross, cut, payload)| WireStep {
+                step: *step,
+                kind: *kind,
+                src: *src,
+                cross: *cross,
+                cut,
+                payload,
+            })
+            .collect();
+        let r = match &mut rl {
+            Some(l) => e.replay_wire(lanes, routes, &ws, store, l, &mut j),
+            None => e.replay_wire(lanes, routes, &ws, store, &mut NoResponses, &mut j),
+        };
+        if r.is_err() {
+            return (r, j, e.carried().len());
+        }
+    }
+    let n = e.carried().len();
+    if rl.is_some_and(|l| !l.finished()) {
+        let end = vyrn_engine::WireDiverged {
+            at: vyrn_engine::WireAt::End,
+            why: vyrn_engine::Why::Response,
+        };
+        return (Err(end), j, n);
+    }
+    (Ok(()), j, n)
 }
 
 pub fn hex(b: &[u8]) -> String {
@@ -300,6 +453,10 @@ pub fn rec_line(r: &OwnedRec) -> String {
             p.pkt_hash.0,
             p.first_lane_seq.0,
             p.fills_applied.0
+        ),
+        OwnedRec::Route(x) => format!(
+            "R lane={} lane_seq={} cross={}",
+            x.lane.0, x.lane_seq.0, x.cross as u8
         ),
         OwnedRec::Step(e, d) => {
             let ds: Vec<String> = d[..usize::from(e.n_delta)]

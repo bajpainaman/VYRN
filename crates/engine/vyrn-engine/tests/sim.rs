@@ -15,10 +15,10 @@ use harness::*;
 use vyrn_bbo::admit::NeverLate;
 use vyrn_bbo::{Bbo, Side, StepEntry, Tif};
 use vyrn_cut::{Sim, Visibility};
-use vyrn_engine::{Engine, OwnedRec, Shared, Why};
+use vyrn_engine::{Engine, OwnedRec, Shared};
 use vyrn_lane::{Lane, RxIn, SessionSpec};
 use vyrn_risk::{AcctRisk, AcctSlot, SessionBuckets};
-use vyrn_types::{AccountId, Epoch, LaneId, MAX_REQ_PAYLOAD, Nanos, PacketFlags};
+use vyrn_types::{AccountId, Epoch, LaneId, MAX_REQ_PAYLOAD, Nanos};
 use vyrn_wire::{Msg, ReqHeader, encode_request};
 
 /// [`harness::engine`] on any backend.
@@ -138,24 +138,20 @@ fn sim_with_delays_trades_the_same_without_a_fault() {
         f.sort_by_key(|r| format!("{r:?}"));
         f
     };
-    let (mut changed, mut stale_polls) = (0, 0);
+    let mut changed = 0;
     for seed in 0..32 {
         let sim = Sim::new(seed, 150);
         let (s, store) = run_on(&sim, |t| sim.advance_to(t));
         assert!(fills(&s) == fills(&hw), "seed {seed}: fills");
         changed += usize::from(logical(&s.recs) != logical(&hw.recs));
-        // Known gap (PR follow-up): replay runs a non-`MID` Advance record as the lane's idle
-        // poll, which reads the newest `LaneCut`; live, the poll may have read an older one.
-        // Replay must then stop at that record and nowhere else.
-        if let Err(d) = replay(&s.recs, &store).0 {
-            assert_eq!(d.why, Why::Mismatch, "seed {seed}");
-            let OwnedRec::Packet(p) = s.recs[d.index] else {
-                panic!("seed {seed}: replay stopped at a step");
-            };
-            assert_eq!(p.flags, PacketFlags::ADVANCE, "seed {seed}: {p:?}");
-            stale_polls += 1;
-        }
+        // F3a: a non-`MID` Advance record replays as the boundary at the `(f, C_f[l])` it
+        // logs, so a live idle poll that read an older `LaneCut` replays exactly too.
+        let (r, rep) = replay(&s.recs, &store);
+        assert_eq!(r, Ok(()), "seed {seed}");
+        assert!(
+            logical(&rep.recs) == logical(&s.recs),
+            "seed {seed}: records"
+        );
     }
     assert!(changed > 0, "the delays change some schedule");
-    assert!(stale_polls < 32, "most schedules replay");
 }

@@ -14,7 +14,7 @@ mod harness;
 
 use harness::*;
 use vyrn_bbo::{Side, Tif};
-use vyrn_engine::{Diverged, OwnedRec, Why};
+use vyrn_engine::{Diverged, OwnedRec, Why, WireAt, WireDiverged};
 use vyrn_lane::Rx;
 use vyrn_types::{Handle, LaneSeq, PacketFlags, StepKind};
 
@@ -68,7 +68,7 @@ fn script() -> Vec<Act> {
 fn packets(recs: &[OwnedRec]) -> impl Iterator<Item = &vyrn_types::PacketRecord> {
     recs.iter().filter_map(|r| match r {
         OwnedRec::Packet(p) => Some(p),
-        OwnedRec::Step(..) => None,
+        OwnedRec::Step(..) | OwnedRec::Route(_) => None,
     })
 }
 
@@ -92,7 +92,7 @@ fn logical(recs: &[OwnedRec]) -> Vec<OwnedRec> {
 fn steps(recs: &[OwnedRec]) -> impl Iterator<Item = &vyrn_bbo::StepEntry> {
     recs.iter().filter_map(|r| match r {
         OwnedRec::Step(e, _) => Some(e),
-        OwnedRec::Packet(_) => None,
+        OwnedRec::Packet(_) | OwnedRec::Route(_) => None,
     })
 }
 
@@ -211,6 +211,335 @@ fn replay_takes_kind_and_source_from_the_record() {
 }
 
 #[test]
+fn replay_checks_responses_against_a_response_log() {
+    // 07 §7.1: replay outputs every response record. With a log, a changed response is caught
+    // instead of passing silently (the G9 interim check).
+    let (j, store, _, _) = live(&script());
+    assert_eq!(replay_checked(&j.recs, &store, &j).0, Ok(()));
+    // One lane response changed.
+    let mut bad = Journal {
+        recs: j.recs.clone(),
+        resp: j.resp.clone(),
+        tx: j.tx.clone(),
+    };
+    bad.resp[0].1.resp_seq += 1;
+    assert!(matches!(
+        replay_checked(&j.recs, &store, &bad).0,
+        Err(Diverged {
+            why: Why::Response,
+            ..
+        })
+    ));
+    // One fill TX packet changed.
+    let mut bad = Journal {
+        recs: j.recs.clone(),
+        resp: j.resp.clone(),
+        tx: j.tx.clone(),
+    };
+    bad.tx[0].0.resp_seq += 1;
+    assert!(matches!(
+        replay_checked(&j.recs, &store, &bad).0,
+        Err(Diverged {
+            why: Why::Response,
+            ..
+        })
+    ));
+    // A logged response replay never produces: caught at the end.
+    let mut extra = Journal {
+        recs: j.recs.clone(),
+        resp: j.resp.clone(),
+        tx: j.tx.clone(),
+    };
+    extra.resp.push(extra.resp[0]);
+    assert_eq!(
+        replay_checked(&j.recs, &store, &extra).0,
+        Err(Diverged {
+            index: j.recs.len(),
+            why: Why::Response
+        })
+    );
+}
+
+#[test]
+fn replay_from_07_fields_only_in_canonical_order() {
+    // 07 §7.1 REP_MERGE: lane records and steps reduced to what 07 carries (kind, source, cut,
+    // Rescan band), merged by fills_applied. Every lane record, response and fill TX packet of
+    // the live run must come out again.
+    let (j, store, _, _) = live(&script());
+    let (lanes, routes, steps) = to_wire(&j.recs);
+    let (r, rep) = replay_wire(&lanes, &routes, &steps, &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    // REP_MERGE is not the live interleaving across lanes (07 §7.1); each lane's records match.
+    for l in 0..N as u8 {
+        let pk = |x: &[OwnedRec]| {
+            packets(x)
+                .filter(|p| p.lane.0 == l)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pk(&rep.recs), pk(&j.recs), "lane {l}");
+    }
+    let resp = |x: &Journal, l: u8| {
+        x.resp
+            .iter()
+            .filter(|r| r.0.0 == l)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    for l in 0..N as u8 {
+        assert_eq!(resp(&rep, l), resp(&j, l), "lane {l} responses");
+    }
+    assert_eq!(rep.tx, j.tx);
+    // The derived StepEntry fields (n_tx, n_fills, fill_lanes, flags, band) match live.
+    assert_eq!(
+        logical(&rep.recs)
+            .iter()
+            .filter(|r| matches!(r, OwnedRec::Step(..)))
+            .collect::<Vec<_>>(),
+        logical(&j.recs)
+            .iter()
+            .filter(|r| matches!(r, OwnedRec::Step(..)))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn replay_from_07_derives_cont_for_a_capped_sweep() {
+    // 05 §8.5, D14: a sweep stops after ENG_STEP_FILLS = 8 maker fills and continues in a CONT
+    // step. 07 carries no CONT bit, so replay takes it from the BBO core (Bbo::continuing).
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let mut s: Vec<Act> = (1..=9u32)
+        .map(|a| Act::Pkt {
+            l: 0,
+            a,
+            rx_ts: 1_000 * u64::from(a),
+            now: 1_000 * u64::from(a),
+            msgs: vec![new(Sell, Day, 105, 1, a)],
+        })
+        .collect();
+    s.push(Act::Run);
+    s.push(Act::Pkt {
+        l: 1,
+        a: 1,
+        rx_ts: 20_000,
+        now: 20_000,
+        msgs: vec![new(Buy, Day, 105, 9, 99)],
+    });
+    s.push(Act::Run);
+    let (j, store, _, _) = live(&s);
+    let n_cont = steps(&j.recs)
+        .filter(|e| e.flags & vyrn_bbo::STEP_CONT != 0)
+        .count();
+    assert_eq!(n_cont, 1, "9 makers: 8 fills, then one CONT step");
+    let (lanes, routes, ws) = to_wire(&j.recs);
+    let (r, rep) = replay_wire(&lanes, &routes, &ws, &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    assert_eq!(
+        steps(&rep.recs).map(|e| e.flags).collect::<Vec<_>>(),
+        steps(&j.recs).map(|e| e.flags).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn replay_from_07_rejects_what_07_carries() {
+    let (j, store, _, _) = live(&script());
+    let (lanes, routes, steps) = to_wire(&j.recs);
+    // A changed source is refused by the BBO core at that step.
+    let k = steps.iter().position(|s| s.1 == StepKind::Shed).unwrap();
+    let mut bad = steps.clone();
+    bad[k].2 = Some((vyrn_types::LaneId(2), LaneSeq(2)));
+    assert_eq!(
+        replay_wire(&lanes, &routes, &bad, &store, None).0,
+        Err(WireDiverged {
+            at: WireAt::Step(steps[k].0),
+            why: Why::Step(vyrn_bbo::Diverge::Source)
+        })
+    );
+    // A cut above what its lane has replayed cannot be ordered (REP_E_ORDER).
+    let mut bad = steps.clone();
+    bad[0].4[1] = LaneSeq(99);
+    assert_eq!(
+        replay_wire(&lanes, &routes, &bad, &store, None).0,
+        Err(WireDiverged {
+            at: WireAt::Step(steps[0].0),
+            why: Why::Order
+        })
+    );
+    // A lane record due at a step the block lacks is carried, not replayed (REP_MERGE item 3).
+    let k = steps.len() - 1;
+    let (r, _, carried) = replay_blocks(&[(&lanes, &routes, &steps[..k])], &store, None);
+    assert_eq!(r, Ok(()));
+    assert!(carried > 0);
+}
+
+#[test]
+fn replay_from_07_carries_unsettled_records_across_blocks() {
+    // 07 §7.1 REP_MERGE item 3: split the run into two blocks at every step. A packet whose op is
+    // stepped in the second block (forwarded, then Cross/Improve/Shed later) must carry, not be
+    // replayed as local at the end of the first. Each split must reproduce the one-block replay.
+    let (j, store, _, _) = live(&script());
+    let (lanes, routes, steps) = to_wire(&j.recs);
+    let (r, one) = replay_wire(&lanes, &routes, &steps, &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    // Lane records before each step in journal order: block 1 holds exactly what 07 would.
+    let mut before = Vec::new();
+    let (mut n, mut nr) = (0, 0);
+    for x in &j.recs {
+        match x {
+            OwnedRec::Packet(_) => n += 1,
+            OwnedRec::Route(_) => nr += 1,
+            OwnedRec::Step(..) => before.push((n, nr)),
+        }
+    }
+    let mut carried_any = false;
+    for k in 1..steps.len() {
+        let (n, nr) = before[k];
+        let b1 = (&lanes[..n], &routes[..nr], &steps[..k]);
+        let b2 = (&lanes[n..], &routes[nr..], &steps[k..]);
+        let (r, rep, left) = replay_blocks(&[b1, b2], &store, Some(&j));
+        assert_eq!(r, Ok(()), "split at step {k}");
+        assert_eq!(left, 0, "split at step {k}");
+        // Carrying moves records relative to other lanes, never within a lane (07 §7.1).
+        for l in 0..N as u8 {
+            let pk = |x: &[OwnedRec]| {
+                packets(x)
+                    .filter(|p| p.lane.0 == l)
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                pk(&rep.recs) == pk(&one.recs),
+                "split at step {k}, lane {l}"
+            );
+        }
+        let st = |x: &[OwnedRec]| {
+            logical(x)
+                .into_iter()
+                .filter(|r| matches!(r, OwnedRec::Step(..)))
+                .collect::<Vec<_>>()
+        };
+        assert!(st(&rep.recs) == st(&one.recs), "split at step {k}: steps");
+        assert!(rep.tx == one.tx, "split at step {k}: fill TX");
+        let (_, _, c) = replay_blocks(&[b1], &store, None);
+        carried_any |= c > 0;
+    }
+    assert!(carried_any, "some split must carry a record");
+}
+
+#[test]
+fn replay_routes_a_locally_rejected_cross_from_its_route_record() {
+    // G9 (07 §3.6): a post-only buy @ 105 against ask 105 is a Cross that lane risk rejects
+    // (POST_ONLY_WOULD_CROSS), so no step names it and only its RouteRecord carries the route.
+    // Both entry points must replay it from that record; without it the op replays as a Join,
+    // which the lane accepts: the divergence must be detected, not pass silently.
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let po = vyrn_wire::Msg::New {
+        flags: vyrn_wire::OrderFlags::from_byte(
+            vyrn_bbo::OrderFlags::new(Buy, Day, true, vyrn_bbo::Stp::None).0,
+        )
+        .unwrap(),
+        tick: vyrn_types::Tick(105),
+        qty: vyrn_types::Qty(1),
+        client_tag: 22,
+    };
+    let s = vec![
+        Act::Pkt {
+            l: 0,
+            a: 1,
+            rx_ts: 1_000,
+            now: 1_000,
+            msgs: vec![new(Sell, Day, 105, 1, 11)],
+        },
+        Act::Run,
+        // A heartbeat-only packet takes no LaneSeq, so its record shares the next packet's
+        // first_lane_seq; the route records belong to the next packet only.
+        Act::Pkt {
+            l: 0,
+            a: 2,
+            rx_ts: 1_500,
+            now: 1_500,
+            msgs: vec![vyrn_wire::Msg::Heartbeat],
+        },
+        Act::Pkt {
+            l: 0,
+            a: 2,
+            rx_ts: 2_000,
+            now: 2_000,
+            msgs: vec![po, new(Buy, Day, 100, 1, 23), po],
+        },
+        Act::Run,
+    ];
+    let (j, store, _, _) = live(&s);
+    let routes: Vec<_> = j
+        .recs
+        .iter()
+        .filter_map(|r| match r {
+            OwnedRec::Route(x) => Some(*x),
+            _ => None,
+        })
+        .collect();
+    let route = |q| vyrn_types::RouteRecord {
+        lane: vyrn_types::LaneId(0),
+        lane_seq: LaneSeq(q),
+        cross: true,
+    };
+    assert_eq!(routes, [route(2), route(4)]);
+    // Journal replay reproduces it, route record included.
+    let (r, rep) = replay(&j.recs, &store);
+    assert_eq!(r, Ok(()));
+    assert!(logical(&rep.recs) == logical(&j.recs));
+    let no_route: Vec<_> = j
+        .recs
+        .iter()
+        .filter(|r| !matches!(r, OwnedRec::Route(_)))
+        .copied()
+        .collect();
+    // Without it the op replays as a Join: the lane accepts it, so its responses differ.
+    let r = replay_checked(&no_route, &store, &j).0;
+    assert!(
+        matches!(
+            r,
+            Err(Diverged {
+                why: Why::Response,
+                ..
+            })
+        ),
+        "{r:?}"
+    );
+    // 07 replay reproduces it from the RouteRecord, and detects its absence.
+    let (lanes, wr, steps) = to_wire(&j.recs);
+    let (r, rep) = replay_wire(&lanes, &wr, &steps, &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    assert_eq!(rep.resp, j.resp);
+    // Route records may come in any order (07 §3.6): they match their ops by lane_seq.
+    let rev: Vec<_> = wr.iter().rev().copied().collect();
+    assert_eq!(
+        replay_wire(&lanes, &rev, &steps, &store, Some(&j)).0,
+        Ok(())
+    );
+    let (r, _) = replay_wire(&lanes, &[], &steps, &store, Some(&j));
+    assert!(r.is_err(), "{r:?}");
+    // A missing, repeated or conflicting route record is refused.
+    for bad in [
+        vec![route(2)],
+        vec![route(2), route(4), route(4)],
+        vec![
+            route(2),
+            route(4),
+            vyrn_types::RouteRecord {
+                cross: false,
+                ..route(4)
+            },
+        ],
+    ] {
+        let (r, _) = replay_wire(&lanes, &bad, &steps, &store, Some(&j));
+        assert!(r.is_err(), "{bad:?}: {r:?}");
+    }
+}
+
+#[test]
 fn replay_routes_a_forwarded_op_by_its_cross_bit_not_its_step_kind() {
     // #69: the live BBO copies the lane's route into StepEntry.flags (STEP_CROSS) and
     // replay_step compares it. Lanes 1 and 2 both see ask 105 in their snapshot and classify a
@@ -255,6 +584,75 @@ fn replay_routes_a_forwarded_op_by_its_cross_bit_not_its_step_kind() {
     let (r, rep) = replay(&j.recs, &store);
     assert_eq!(r, Ok(()));
     assert_eq!(logical(&rep.recs), logical(&j.recs));
+}
+
+#[test]
+fn replay_takes_the_logged_route_not_a_newer_snapshot() {
+    // Found by #84: Sell 97 rests on lane 1, then one lane-0 packet holds Buy 98 and Buy 99.
+    // The lane classifies both as Cross against its snapshot; Buy 98 takes the ask, so Buy 99
+    // logs as an Improve step with STEP_CROSS. Replay must take that logged route (before
+    // #86 it re-derived Improve and failed with Step(Kind)).
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let s = vec![
+        Act::Pkt {
+            l: 1,
+            a: 1,
+            rx_ts: 1_000,
+            now: 1_000,
+            msgs: vec![new(Sell, Day, 97, 1, 11)],
+        },
+        Act::Run,
+        Act::Pkt {
+            l: 0,
+            a: 1,
+            rx_ts: 2_000,
+            now: 2_000,
+            msgs: vec![new(Buy, Day, 98, 1, 21), new(Buy, Day, 99, 1, 22)],
+        },
+        Act::Run,
+    ];
+    let (j, store, _, _) = live(&s);
+    let (r, rep) = replay_checked(&j.recs, &store, &j);
+    assert_eq!(r, Ok(()));
+    assert!(logical(&rep.recs) == logical(&j.recs));
+    let (lanes, routes, steps) = to_wire(&j.recs);
+    assert_eq!(
+        replay_wire(&lanes, &routes, &steps, &store, Some(&j)).0,
+        Ok(())
+    );
+}
+
+#[test]
+fn replay_from_07_does_not_count_session_only_messages_as_ops() {
+    // Codex P1 on #66: a packet's `count` includes Heartbeat/ResendReq, which take no LaneSeq.
+    // [Heartbeat, Sell @ 110] takes one LaneSeq and no step names it, so the block settles it;
+    // counting two ops held it back and the step covering its one op failed with Order.
+    use Side::Sell;
+    use Tif::Day;
+    let s = vec![
+        Act::Pkt {
+            l: 0,
+            a: 1,
+            rx_ts: 1_000,
+            now: 1_000,
+            msgs: vec![new(Sell, Day, 105, 1, 11)],
+        },
+        Act::Run,
+        Act::Pkt {
+            l: 1,
+            a: 1,
+            rx_ts: 2_000,
+            now: 2_000,
+            msgs: vec![vyrn_wire::Msg::Heartbeat, new(Sell, Day, 110, 1, 21)],
+        },
+        Act::Run,
+    ];
+    let (j, store, _, _) = live(&s);
+    let (lanes, routes, steps) = to_wire(&j.recs);
+    let (r, _, carried) = replay_blocks(&[(&lanes, &routes, &steps)], &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    assert_eq!(carried, 0);
 }
 
 #[test]

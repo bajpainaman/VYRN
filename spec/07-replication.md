@@ -376,7 +376,7 @@ with any other flag bit (`REP_E_KIND`). It costs no byte. The clamped step-cut r
 |---|---|---|---|
 | Cross, Improve | the forwarded op | — | 05 §8.1 |
 | Depletion, Idle | 0xFF | — | Idle logs a cut that no other step logs (it releases acks, §4.11) |
-| Rescan | 0xFF | band | 05 §8.6 |
+| Rescan | 0xFF | band: `band_lo` u32 LE, `band_hi` u32 LE (`plen` 8; 0 = all ticks, §7.1) | 05 §8.6 |
 | Shed | the shed op | — | the BBO core's deadline test failed (01 §14.1); its lane answers `BUSY` |
 | Control | 0xFF | code, argument | phase, band, halt, resume (§6.8), and uncross request (05 §8.8) |
 | Seal | 0xFF | — | the book's last step of an epoch (08) |
@@ -1394,6 +1394,47 @@ The schedule is owned by 05. It must respect two dependencies:
   steps `≤ p.fills_applied`.
 - The BBO core executes step `s` only after every lane `l` has applied its ops `≤ cut_s[l]`.
 
+**Canonical merge order (`REP_MERGE`).** A block's inputs reach the engine as each lane's
+records in O-order (§3.6) and the merged steps in StepId order (§3.8). Every replica merges them
+into one sequence by this rule, so the Rust and Vx clients run the same schedule:
+
+1. A lane record `r` of lane `l` is *due at* `f(r)`: its `fills_applied`, raised to the largest
+   `fills_applied` of the `MID` Advance records that follow it in the same lane's O-order, up to
+   the lane's next PacketRecord or non-`MID` Advance record (05 §6.2). Those `MID` records, and
+   any lane record of the same packet between them (such as a route record), are replayed with
+   `r`, as one lane call.
+2. Before step `s`, every lane in increasing lane id replays, in O-order, each of its remaining
+   records with `f(r) < s`. Then step `s` is replayed.
+3. After the block's last step, every lane in increasing lane id replays its remaining records
+   with `f(r)` at most the last step, in O-order, and stops at the first record that is not
+   settled. A record is *not settled* when `f(r)` is greater than the last step, or when it is a
+   packet (not `SHED`) with an op above the block's last cut that no step of the block names as
+   its source: a step of a later block may still name that op, so the lane cannot classify it
+   yet. That record and every later record of its lane **carry** into the next block, where they
+   come before the next block's records. A record carried past a cut that covers one of its ops
+   is `REP_E_ORDER`.
+
+`REP_MERGE` respects both dependencies above: a lane reads a step's fill events only after the
+step, and a step's cut covers only ops that its lane applied before the step was published, so
+their records were due before it. It is not the live interleaving. The live engine may run a lane
+further ahead or behind. The outputs are the same because of 05 §9, where a step's outcome depends
+only on its logged cut and source and a lane's only on its records and the fill events of
+`≤ f(r)`. A live sequencer's own journal can be checked against this order by replaying both and
+comparing their outputs. One case needs 05's op-level scheduler (05 §10) and is not covered by
+`REP_MERGE`: a packet whose `MID` boundary at step `f` follows an op of the same packet that
+`cut_f` already covers. A lane call cannot stop mid-packet for a step, so a replica rejects such a
+record with `REP_E_ORDER` until 05 defines a split lane call.
+
+**Fields replay derives.** 07's `StepRecord` carries the kind, the source with its `CROSS`
+route bit (§3.8), the cut and the kind payload; the lane's route records (§3.6) carry the route
+of each op it classified and rejected itself. Everything else in 05's `StepEntry` is an output of the replayed step, not an input:
+`n_tx`, `n_fills`, `fill_lanes`, the half-cut publication ids `pub_a`/`pub_b`, and the `CONT`
+flag. The replay BBO core knows whether a continuation is pending, and when it is, the next step
+must be that continuation (05 §8.5, §8.6). The `Rescan` band is the kind payload (§3.8):
+`band_lo` u32 LE, then `band_hi` u32 LE, so `plen = 8`. `plen = 0` means all ticks (05 §10, the
+superset corollary of Lemma 9.7). A continuation's band is not read, because the first step of
+the sweep fixed it.
+
 The live engine classifies an op against a snapshot version. Replay does not need that version:
 the snapshot is only a routing hint (`INV-ENG-1`, 01 §14.11), so draft 0.1's `SNAP` bit is gone.
 
@@ -2249,7 +2290,7 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | `REP_NVME_PER_REPLICA` | 12 × 61.44 TB | budget | §8.1 (06 §2.2) |
 | tenure | u8 | type | §2.2 |
 | `REP_Proposal`, `REP_SealExt`, `REP_FinalityCert`, `REP_RootCert`, `REP_DurableMark`, `REP_RspEntry`, `REP_Membership`, `REP_BlockRecord`, `REP_Snapshot`, `REP_WanBlock`, `TailReport`, `Silence`, `RepAck`, `Nack`, `SeqEquivocation`, `TailConflict` | — | type | defined where first used |
-| `REP_E_*` | `TAG, COUNT, TS, KIND, CUT, TENURE, HASHLAG` | error | decoder and stream errors; each is a sequencer fault |
+| `REP_E_*` | `TAG, COUNT, TS, KIND, CUT, TENURE, HASHLAG, ORDER` | error | decoder and stream errors; each is a sequencer fault |
 | `REP_A_*` | `PATH, PEER, DIVERGE, ARCHIVE, WANLAG, STANDBY` | alarm | §4.9, §10.2, §7.4, §8.3, §12, §9.5 |
 | `DUR_PATHS`, `DUR_QUORUM`, `FINAL` | — | attestation | three separate facts, never merged (§6.9) |
 | INV-REP-1 … INV-REP-11 | §4.3, §4.3, §3.2, §6.4, §9.2, §4.8, §7.4, §3.7, §7.4, §6.8, §4.3 | invariant | the gate, drain-before-step, frame identity, vote rule, tenure fence, self-fence, root gate, hash lag, divergence halt, finality gate, lane-response gate |
