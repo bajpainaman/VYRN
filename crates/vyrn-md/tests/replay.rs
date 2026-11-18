@@ -1,4 +1,5 @@
-//! `MBO` from replay equals `MBO` from the live run, byte for byte. A live `vyrn-engine` run
+//! `MBO` from replay equals `MBO` from the live run, byte for byte, for this crate's script
+//! and for the engine's whole conformance script (`MID`, `SHED` and its resend). A live `vyrn-engine` run
 //! drives a [`SinkStream`]; the same run, framed by `vyrn_log::SeqWriter`, checked by
 //! `OrderCore` and replayed by `RustReplay`, drives another. Both must emit the same packets,
 //! for every block split, and the packets must rebuild the expected book.
@@ -228,10 +229,13 @@ fn live(script: &[Act]) -> (Journal, Store, Result<Vec<Vec<u8>>, SinkError>) {
                     pkt_hash: prefix(&full_hash(&bytes)),
                 };
                 let r = e.ingest(*l, rx, &FixedClock(*now), &mut s).unwrap();
-                assert_ne!(r, Rx::Shed, "this script sheds nothing");
+                let seq = pkt[*l][ai];
+                if r == Rx::Shed {
+                    pkt[*l][ai] -= 1; // the client resends this pkt_seq (05 §6.8)
+                }
                 store
                     .0
-                    .push(((LaneId(*l as u8), sid(*l, *a), pkt[*l][ai], *rx_ts), bytes));
+                    .push(((LaneId(*l as u8), sid(*l, *a), seq, *rx_ts), bytes));
             }
             Act::Step(now) => {
                 match now {
@@ -311,9 +315,11 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
                 out.extend(w.step(e.step, kind, src, flags, payload, &cut).unwrap());
             }
         }
-        // A packet's routes stay in its block (07 §3.6), as vyrn-seq frames them: a cut right
-        // after a packet moves past its routes.
-        let route_next = matches!(j.recs.get(i + 1), Some(OwnedRec::Route(_)));
+        // A packet's routes and `MID` records stay in its block (07 §3.6, §7.1), as vyrn-seq
+        // frames them: a cut right after a packet moves past them.
+        let route_next = matches!(j.recs.get(i + 1), Some(OwnedRec::Route(_)))
+            || matches!(j.recs.get(i + 1),
+                Some(OwnedRec::Packet(p)) if p.flags & PacketFlags::MID != 0);
         pending |= cuts.contains(&i);
         if (pending && !route_next) || i + 1 == j.recs.len() {
             pending = false;
@@ -445,11 +451,79 @@ fn the_md_rebuilds_the_book() {
     );
 }
 
-/// The engine's full conformance cases that 07 replay skips today: a `MID` boundary and a
-/// `SHED` packet with its resend. The engine thread is fixing replay for both; this case runs
-/// once it can, and `SinkStream` reports both as `Unsupported` until then.
+/// The engine's conformance script whole, as `vyrn-replica`'s replay test runs it since #106:
+/// a forwarded improve whose step runs before lane 0's next packet (a `MID` Advance record), a
+/// packet shed at the lane and its resend (its LaneSeqs kept, 07 §3.5), a `Shed` step, a cancel
+/// and an idle poll.
+fn engine_script() -> Vec<Act> {
+    use BSide::{Buy, Sell};
+    use Tif::{Day, Ioc};
+    let p = |l, a, rx_ts, now, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts,
+        now,
+        msgs,
+    };
+    vec![
+        p(0, 1, 1_000, 1_000, vec![new(Sell, Day, 105, 5, 11)]),
+        Act::Run,
+        p(1, 1, 2_000, 2_000, vec![new(Buy, Day, 105, 2, 1)]),
+        Act::Step(None),
+        p(
+            0,
+            2,
+            3_000,
+            3_000,
+            vec![new(Sell, Day, 110, 1, 2), new(Sell, Day, 111, 1, 3)],
+        ),
+        Act::Run,
+        p(2, 1, 5_000, 5_000, vec![new(Buy, Ioc, 105, 1, 7)]),
+        Act::Step(Some(5_000 + u64::from(FWD_DL) + 1)),
+        Act::Run,
+        // 05 §6.8: one New, age 462 at dequeue is late (path 519 + 462 > 980); then its resend.
+        p(0, 3, 10_000, 10_462, vec![new(Sell, Day, 300, 1, 9)]),
+        p(0, 3, 20_000, 20_461, vec![new(Sell, Day, 300, 1, 9)]),
+        Act::Run,
+        p(
+            0,
+            1,
+            30_000,
+            30_000,
+            vec![cancel(Handle::new(1, 1).unwrap(), 12)],
+        ),
+        Act::Poll,
+        Act::Run,
+    ]
+}
+
 #[test]
-#[ignore = "replay skips MID Advance and SHED resend (engine thread)"]
 fn mid_and_shed_resend_replay_to_the_live_md() {
-    unimplemented!("needs 07 replay of MID Advance records and SHED resends");
+    let (j, store, live_md) = live(&engine_script());
+    let flags: Vec<u8> = j
+        .recs
+        .iter()
+        .filter_map(|r| match r {
+            OwnedRec::Packet(p) => Some(p.flags),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        flags.iter().any(|f| f & PacketFlags::MID != 0),
+        "a MID record"
+    );
+    assert!(flags.contains(&PacketFlags::SHED), "a shed packet");
+    let live_md = live_md.unwrap();
+    // The resend rests: lane 0's sell 300 of 1, the shed copy never does.
+    let adds = records(&live_md)
+        .iter()
+        .filter(|r| matches!(r, Record::Add { tick, .. } if tick.0 == 300))
+        .count();
+    assert_eq!(adds, 1);
+    for at in std::iter::once(None).chain((0..j.recs.len() - 1).map(Some)) {
+        let cuts: Vec<usize> = at.into_iter().collect();
+        let rep_md = replay_md(&j, &store, &blocks(&j, &store, &cuts))
+            .unwrap_or_else(|e| panic!("split {at:?}: {e}"));
+        assert_eq!(rep_md, live_md, "split {at:?}");
+    }
 }

@@ -43,8 +43,9 @@
 //! **Not covered yet** ([`SinkError::Unsupported`]): `Replace` (local or forwarded) and any step
 //! source other than `New`, `CancelAll`, dependency TX
 //! packets (`ROLE_DEPS`), unsolicited lane records (expiry, kills), steps without a source that
-//! fill (Rescan, Uncross), STP causes other than STP, and the cases replay skips today (`MID`
-//! Advance records, `SHED` resends).
+//! fill (Rescan, Uncross) and STP causes other than STP. A `SHED` packet keeps its LaneSeqs
+//! (07 §3.5) and its ops resolve by their `BUSY` rejects; `MID` and other Advance records change
+//! nothing.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -54,8 +55,8 @@ use vyrn_replica::sink::{
     RespPkt, Sink, StepEntry, TxEntry,
 };
 use vyrn_types::{
-    BookId, Epoch, Handle, LaneId, LaneSeq, Nanos, PacketFlags, PacketRecord, Qty, RejectReason,
-    SessionId, StepId, StepKind, Tick,
+    BookId, Epoch, Handle, LaneId, LaneSeq, Nanos, PacketFlags, PacketRecord, Qty, SessionId,
+    StepId, StepKind, Tick,
 };
 use vyrn_wire::{Msg, Request};
 
@@ -78,7 +79,8 @@ pub enum SinkError {
     Unresolved,
 }
 
-/// What a request's messages were, by `(session, pkt_seq)`.
+/// What a request's messages were. A `(session, pkt_seq)` can hold a shed packet and its
+/// resend; their records take them in lane order.
 type Msgs = Vec<Option<Msg>>;
 
 /// One numbered lane op.
@@ -86,6 +88,7 @@ type Msgs = Vec<Option<Msg>>;
 struct Op {
     /// Its packet, and whether it is the packet's last numbered op.
     pkt: (SessionId, u32),
+    pkt_first: u64,
     last: bool,
     msg: Option<Msg>,
     prio_ts: u64,
@@ -135,7 +138,7 @@ pub struct SinkStream<K: PacketSink> {
     enc: MboEncoder,
     out: K,
     err: Option<SinkError>,
-    msgs: BTreeMap<(SessionId, u32), Msgs>,
+    msgs: BTreeMap<(SessionId, u32), VecDeque<Msgs>>,
     pkts: BTreeMap<(SessionId, u32), PktOps>,
     /// Lane responses that came before their packet record (immediate rejects).
     early: Vec<(SessionId, u32, Resp)>,
@@ -189,14 +192,17 @@ impl<K: PacketSink> SinkStream<K> {
         };
         let h = req.header();
         let msgs = req.msgs().map(Result::ok).collect();
-        self.msgs.insert((h.session(), h.pkt_seq.get()), msgs);
+        self.msgs
+            .entry((h.session(), h.pkt_seq.get()))
+            .or_default()
+            .push_back(msgs);
     }
 
     /// The payloads of one block's packet records, before `replay_block` runs it.
     pub fn prepare<const N: usize>(&mut self, blk: &BlockInputs<N>, p: &impl Payloads) {
         for r in &blk.lanes {
             if let LaneRec::Pkt(r) = r
-                && r.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) == 0
+                && r.flags & PacketFlags::ADVANCE == 0
                 && let Some(b) = p.get(r)
             {
                 self.payload(b);
@@ -241,18 +247,18 @@ impl<K: PacketSink> SinkStream<K> {
     }
 
     fn on_packet(&mut self, p: &PacketRecord) -> Result<(), SinkError> {
-        if p.flags & PacketFlags::SHED != 0 {
-            return Err(SinkError::Unsupported("SHED record"));
-        }
-        if p.flags & PacketFlags::MID != 0 {
-            return Err(SinkError::Unsupported("MID Advance record"));
-        }
+        // Advance records (`MID` and `PASS2` included) are lane boundaries: no book change.
         if p.flags & PacketFlags::ADVANCE != 0 || p.count == 0 {
             return Ok(());
         }
+        let shed = p.flags & PacketFlags::SHED != 0;
         let l = usize::from(p.lane.0);
         let key = (p.session, p.pkt_seq);
-        let msgs = self.msgs.remove(&key).ok_or(SinkError::NoPayload)?;
+        let q = self.msgs.get_mut(&key).ok_or(SinkError::NoPayload)?;
+        let msgs = q.pop_front().ok_or(SinkError::NoPayload)?;
+        if q.is_empty() {
+            self.msgs.remove(&key);
+        }
         let session_only =
             |m: &Option<Msg>| matches!(m, Some(Msg::Heartbeat | Msg::ResendReq { .. }));
         // A session-only message takes a LaneSeq only when the header is rejected (`vyrn-lane`
@@ -263,8 +269,12 @@ impl<K: PacketSink> SinkStream<K> {
                 && matches!(r, Resp::Reject { index, .. }
                     if msgs.get(usize::from(index)).is_some_and(session_only))
         });
+        // A shed packet is not accepted, so it leaves the lane's priority clock alone; its ops
+        // only take the BUSY rejects (05 §6.8).
         let prio = p.rx_ts.0.max(*self.prio.get(l).ok_or(SinkError::Book)?);
-        self.prio[l] = prio;
+        if !shed {
+            self.prio[l] = prio;
+        }
         let lane = &mut self.ops[l];
         if self.base[l] + lane.len() as u64 != p.first_lane_seq.0 {
             return Err(SinkError::Book);
@@ -278,6 +288,7 @@ impl<K: PacketSink> SinkStream<K> {
                 n += 1;
                 lane.push_back(Op {
                     pkt: key,
+                    pkt_first: p.first_lane_seq.0,
                     last: false,
                     msg: *m,
                     prio_ts: prio,
@@ -346,15 +357,6 @@ impl<K: PacketSink> SinkStream<K> {
             return Err(SinkError::Unsupported("unsolicited lane record"));
         }
         for r in p.records() {
-            if matches!(
-                r,
-                Resp::Reject {
-                    reason: RejectReason::Busy,
-                    ..
-                }
-            ) {
-                return Err(SinkError::Unsupported("SHED answer"));
-            }
             self.resolve(p.session, p.echo_pkt, *r)?;
         }
         Ok(())
@@ -458,7 +460,13 @@ impl<K: PacketSink> SinkStream<K> {
                 let seq = self.base[l];
                 let op = self.ops[l].pop_front().ok_or(SinkError::Book)?;
                 self.base[l] += 1;
-                if op.last {
+                // A resend may already own the key: drop only this packet's entry.
+                if op.last
+                    && self
+                        .pkts
+                        .get(&op.pkt)
+                        .is_some_and(|k| k.first == op.pkt_first)
+                {
                     self.pkts.remove(&op.pkt);
                 }
                 if op.fwd {

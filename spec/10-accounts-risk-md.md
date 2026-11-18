@@ -1590,7 +1590,9 @@ interleave in (07 §7.1 fixes only each lane's order). The rules below are readi
 Not rebuilt yet (`SinkError::Unsupported`): `Replace` (local or forwarded) and any step source
 other than `New`, `CancelAll`, dependency TX packets,
 unsolicited lane records (expiry, kills), steps without a source that fill (Rescan, Uncross),
-pooled lanes, and the two cases 07 replay skips today (`MID` Advance records, `SHED` resends).
+and pooled lanes. A lane-shed packet keeps its LaneSeqs (07 §3.5): its ops resolve by their
+`BUSY` rejects and change nothing, and it leaves the lane's priority clock alone, as it is not
+accepted. `MID` and other Advance records change nothing.
 
 ## 8. Drop copy (`vyrn-dropcopy`)
 
