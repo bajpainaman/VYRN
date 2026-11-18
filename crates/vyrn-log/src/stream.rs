@@ -53,7 +53,7 @@
 //! ```text
 //! byte 0   bits 0–3 wire kind: 0 Cross, 1 Improve, 2 Depletion, 3 Rescan, 4 Idle, 5 Shed,
 //!                   6 Control, 7 Seal, 8 Uncross (9–15: RepErr::Kind)
-//!          bit 4 HOME, bits 5–6 mode (0 SAME, 1 DENSE, 2 SPARSE, 3: RepErr::Cut), bit 7 OTHER
+//!          bit 4 HOME, bits 5–6 mode (0 SAME, 1 DENSE, 2 SPARSE, 3 LOWVER), bit 7 OTHER
 //! gap      LEB  step − prev_step − 1
 //! [HOME]   src u8: 0xFF = none, else bits 0–5 src_lane, bit 6 0, bit 7 CROSS
 //!          (`StepRecord.flags` bit 1, `StepFlags::CROSS`); [src ≠ 0xFF] ZZ (src_lane_seq − cut[src_lane]), where
@@ -61,11 +61,15 @@
 //! [DENSE]  |H| × LEB (cut[l] − prev_cut[l])
 //! [SPARSE] bitmap ceil(|H|/8) bytes (bit i of byte i/8, LSB first = lane H.start + 8·(i/8) + i%8),
 //!          then LEB (cut[l] − prev_cut[l]) ≥ 1 for each set bit, in lane order
+//! [LOWVER] SPARSE's bitmap, then a second bitmap ceil(|H|/8) bytes of the changed lanes that took
+//!          their `lowver` from the half-cut entry (05 §8.6), then SPARSE's deltas
 //! ```
 //!
-//! The wire kind numbering is 07's, not `StepKind::code()` (05 §8.1). The mode is SAME when the
-//! half-cut did not move, else SPARSE when it is strictly shorter than DENSE, else DENSE; any
-//! other choice is `RepErr::Cut`, as are unused bitmap bits that are set. Cross, Improve and
+//! The wire kind numbering is 07's, not `StepKind::code()` (05 §8.1). The mode is LOWVER when a
+//! lane of the half took its `lowver` at the step, else SAME when the half-cut did not move, else
+//! SPARSE when it is strictly shorter than DENSE, else DENSE; any other choice is `RepErr::Cut`,
+//! as are unused bitmap bits that are set and a LOWVER bitmap that is empty or names an unchanged
+//! lane. A step that takes no `lowver` costs no byte for it. Cross, Improve and
 //! Shed have a source lane in this half; the other kinds have `0xFF`, and their home is
 //! substream A (`RepErr::Kind`, `RepErr::Cut`). A cut-only record (HOME = 0) has OTHER = 1 and a
 //! mode other than SAME. Steps on a substream increase and are above the last `BlockMark`'s
@@ -138,6 +142,8 @@ const S_OTHER: u8 = 0x80;
 const MODE_SAME: u8 = 0;
 const MODE_DENSE: u8 = 1;
 const MODE_SPARSE: u8 = 2;
+/// SPARSE with a second bitmap: the changed lanes that took their `lowver` (07 §3.8).
+const MODE_LOWVER: u8 = 3;
 const NO_SRC: u8 = 0xFF;
 /// The home record's `src` byte, bit 7: `StepFlags::CROSS` (07 §3.8). Lanes are < 64.
 const SRC_CROSS: u8 = 0x80;
@@ -238,6 +244,9 @@ pub struct StepHalf {
     pub home: Option<Home>,
     /// This half's cut after the step, absolute, one entry per lane of the half.
     pub cut: Vec<LaneSeq>,
+    /// Bit `i` (lane `H.start + i`): the step set the lane's `lowver` from its half-cut entry
+    /// (05 §8.6). Only on lanes whose cut moved; nonzero only in mode `LOWVER`.
+    pub lowver: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1144,9 +1153,6 @@ impl SubstreamState {
         let is_home = b0 & S_HOME != 0;
         let mode = (b0 >> 5) & 0x03;
         let other = b0 & S_OTHER != 0;
-        if mode > MODE_SPARSE {
-            return Err(RepErr::Cut);
-        }
         let step = self.step_after(r.leb_u64()?)?;
         let mut home = None;
         let mut src_delta = 0i64;
@@ -1178,15 +1184,28 @@ impl SubstreamState {
         }
         let n = self.lanes.len();
         let mut deltas = vec![0u64; n];
+        let mut lowver = 0u64;
         match mode {
             MODE_DENSE => {
                 for d in &mut deltas {
                     *d = r.leb_u64()?;
                 }
             }
-            MODE_SPARSE => {
+            MODE_SPARSE | MODE_LOWVER => {
                 let map = r.bytes(self.bitmap_len())?.to_vec();
                 check_bitmap_padding(&map, n)?;
+                if mode == MODE_LOWVER {
+                    let low = r.bytes(self.bitmap_len())?.to_vec();
+                    check_bitmap_padding(&low, n)?;
+                    // A nonempty subset of the changed lanes (else the record uses mode 0–2).
+                    if low.iter().all(|&b| b == 0) || (0..n).any(|i| bit(&low, i) && !bit(&map, i))
+                    {
+                        return Err(RepErr::Cut);
+                    }
+                    lowver = (0..n)
+                        .filter(|&i| bit(&low, i))
+                        .fold(0u64, |m, i| m | 1u64 << i);
+                }
                 for (i, d) in deltas.iter_mut().enumerate() {
                     if bit(&map, i) {
                         *d = r.leb_u64()?;
@@ -1198,7 +1217,7 @@ impl SubstreamState {
             }
             _ => {}
         }
-        if pick_mode(&deltas, self.bitmap_len()) != mode {
+        if mode != MODE_LOWVER && pick_mode(&deltas, self.bitmap_len()) != mode {
             return Err(RepErr::Cut);
         }
         let mut cut = Vec::with_capacity(n);
@@ -1224,6 +1243,7 @@ impl SubstreamState {
             other,
             home,
             cut: cut.into_iter().map(LaneSeq).collect(),
+            lowver,
         })
     }
 
@@ -1236,7 +1256,17 @@ impl SubstreamState {
         for (c, p) in s.cut.iter().zip(&self.prev_cut) {
             deltas.push(c.0.checked_sub(*p).ok_or(RepErr::Cut)?);
         }
-        let mode = pick_mode(&deltas, self.bitmap_len());
+        // A `lowver` bit names a lane of the half whose cut moved (07 §3.8).
+        if (n..64).any(|i| s.lowver & (1u64 << i) != 0)
+            || (0..n).any(|i| s.lowver & (1u64 << i) != 0 && deltas.get(i) == Some(&0))
+        {
+            return Err(RepErr::Cut);
+        }
+        let mode = if s.lowver != 0 {
+            MODE_LOWVER
+        } else {
+            pick_mode(&deltas, self.bitmap_len())
+        };
         self.check_step_shape(s.kind, s.home.as_ref().map(|h| h.src_lane.0), s.other, mode)?;
         if s.step.0 <= self.prev_step {
             return Err(RepErr::Range);
@@ -1284,8 +1314,12 @@ impl SubstreamState {
         }
         match mode {
             MODE_DENSE => deltas.iter().for_each(|&d| leb::put_u64(out, d)),
-            MODE_SPARSE => {
+            MODE_SPARSE | MODE_LOWVER => {
                 out.extend_from_slice(&bitmap(&deltas, self.bitmap_len()));
+                if mode == MODE_LOWVER {
+                    let low: Vec<u64> = (0..n).map(|i| (s.lowver >> i) & 1).collect();
+                    out.extend_from_slice(&bitmap(&low, self.bitmap_len()));
+                }
                 deltas
                     .iter()
                     .filter(|&&d| d != 0)

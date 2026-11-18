@@ -73,6 +73,9 @@ pub struct StepRecord<const N: usize> {
     /// [`StepFlags`]; 0 without a source.
     pub flags: u8,
     pub cut: [LaneSeq; N],
+    /// Bit `l`: the step set lane `l`'s `lowver` from its half-cut entry (05 §8.6, 07 §3.8
+    /// `LOWVER`); only on lanes whose cut moved.
+    pub lowver: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

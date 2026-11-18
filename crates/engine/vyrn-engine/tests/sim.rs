@@ -12,7 +12,7 @@
 mod harness;
 
 use harness::*;
-use vyrn_bbo::admit::NeverLate;
+use vyrn_bbo::admit::{FixedClock, NeverLate};
 use vyrn_bbo::{Bbo, Side, StepEntry, Tif};
 use vyrn_cut::{Sim, Visibility};
 use vyrn_engine::{Engine, OwnedRec, Shared};
@@ -154,4 +154,71 @@ fn sim_with_delays_trades_the_same_without_a_fault() {
         );
     }
     assert!(changed > 0, "the delays change some schedule");
+}
+
+/// Seeded packets on all three lanes on a `Sim` box whose lines lag up to `delay` ns, the engine
+/// run in short bursts between them, then until quiet.
+fn interleaved_on_sim(seed: u64, delay: u64) -> (Journal, Store) {
+    let sim = Sim::new(seed, delay);
+    let bbo = Bbo::new(bbo_cfg());
+    let mut sh = Shared::new(&sim, N, arena_cfg(), &bbo.initial_snapshot()).unwrap();
+    let mut e = engine_on(&sim, bbo, &mut sh);
+    let (mut j, mut store) = (Journal::default(), Store::default());
+    let mut r = Rng::new(seed);
+    let (mut seq, mut t, mut tag) = ([0u32; N], 1_000u64, 0u32);
+    for _ in 0..10 + r.below(30) {
+        let l = r.below(N as u64) as usize;
+        let msgs = r.orders(&mut tag, 96);
+        seq[l] += 1;
+        let b = packet(l, 1, seq[l], &msgs);
+        t += 50 + r.below(200);
+        sim.advance_to(t);
+        let p = RxIn {
+            bytes: &b,
+            rx_ts: Nanos(t),
+            pkt_hash: fake_hash(&b),
+        };
+        e.ingest(l, p, &FixedClock(t), &mut j).unwrap();
+        store.0.push(((LaneId(l as u8), sid(l, 1), seq[l], t), b));
+        for _ in 0..r.below(6) {
+            t += 20 + r.below(80);
+            sim.advance_to(t);
+            e.run(&NeverLate, &mut j, 1).unwrap();
+        }
+    }
+    for _ in 0..400 {
+        t += 100;
+        sim.advance_to(t);
+        e.run(&NeverLate, &mut j, 1).unwrap();
+    }
+    (j, store)
+}
+
+#[test]
+fn replay_takes_the_lowver_lanes_the_live_step_logged() {
+    // The WL-SMOKE replay flake: a step sets a lane's `lowver` (05 §8.6) when its cut lands on
+    // the lane's half-cut entry. A lagging half-cut put live's entry at the cut while replay's
+    // lanes, which replay every record due before the step, were already past it, so replay
+    // kept an older `lowver` (live step 4: lane 1's became 1, replay's stayed 0), a wider band
+    // envelope and different bounds. Each step now logs the lanes it updated (07 §3.8
+    // `LOWVER`) and replay derives their versions from its own packet records (07 §7.1).
+    // Before the fix seeds 7, 9, 10 and 14 replayed other `lowver` lanes than live logged.
+    let mut taken = 0;
+    for seed in 1..=16 {
+        let (j, store) = interleaved_on_sim(seed, 150);
+        let (lanes, routes, steps) = to_wire(&j.recs);
+        let (r, rep) = replay_wire(&lanes, &routes, &steps, &store, Some(&j));
+        assert_eq!(r, Ok(()), "seed {seed}");
+        let low = |recs: &[OwnedRec]| -> Vec<(u64, u64)> {
+            recs.iter()
+                .filter_map(|r| match r {
+                    OwnedRec::Step(e, _) => Some((e.step.0, e.lowver)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(low(&rep.recs), low(&j.recs), "seed {seed}: lowver lanes");
+        taken += low(&j.recs).iter().filter(|(_, m)| *m != 0).count();
+    }
+    assert!(taken > 0, "some steps take a lowver");
 }

@@ -380,7 +380,7 @@ byte 0:  bits 0–3  kind        0 Cross, 1 Improve, 2 Depletion, 3 Rescan, 4 Id
                                6 Control, 7 Seal, 8 Uncross; 9–15 → REP_E_KIND (01 §14.10);
                                a cut-only record repeats the home record's kind
          bit 4     HOME        1 home record, 0 cut-only record
-         bits 5–6  mode        this half's cut delta: 0 SAME, 1 DENSE, 2 SPARSE, 3 → REP_E_CUT
+         bits 5–6  mode        this half's cut delta: 0 SAME, 1 DENSE, 2 SPARSE, 3 LOWVER
          bit 7     OTHER       the other substream carries a record of this step too
 gap      LEB128 (step − prev_step − 1)                      // steps this substream does not carry
 [HOME]   src u8: 0xFF = none, else bits 0–5 src_lane, bit 6 0, bit 7 CROSS (StepRecord.flags bit 1);
@@ -390,6 +390,8 @@ gap      LEB128 (step − prev_step − 1)                      // steps this su
 [DENSE]  |H| × LEB128 (cut[l] − prev_cut[l])                 // ≥ 0 by INV-CUT-MONO per half
 [SPARSE] bitmap ceil(|H|/8) bytes (bit i = lane H.first + i changed),
          then LEB128 (cut[l] − prev_cut[l]) for each set bit, in lane order; each value ≥ 1
+[LOWVER] SPARSE's bitmap, then a lowver bitmap ceil(|H|/8) bytes (bit i = lane H.first + i took
+         its lowver at this step), then SPARSE's deltas
 ```
 
 `step` is `prev_step + 1 + gap` on that substream; StepId stays gapless per epoch across the two,
@@ -397,10 +399,12 @@ and `TenureStart` sets each substream's base. **The step's cut is the union of t
 (01 §14.3): half A from cut core A (core 1) and half B from cut core B (core 6). A half with no
 record at step `s` keeps its previous half-cut. The replica merges the two StepRuns by StepId:
 step `s` is complete when its home record and, if OTHER is set, its cut-only record are decoded.
-`INV-CUT-MONO` holds per half, so it holds for the union. For each record the encoder picks SAME
-when the half is unchanged, and otherwise the shorter of DENSE and SPARSE. Both clients must decode
+`INV-CUT-MONO` holds per half, so it holds for the union. For each record the encoder picks LOWVER
+when a lane of the half took its `lowver` at the step, else SAME when the half is unchanged, and
+otherwise the shorter of DENSE and SPARSE. Both clients must decode
 every form. The choice does not affect replay, because replay consumes the decoded cut. A decoder
-rejects a SPARSE delta of 0, any decrease, a cut-only record with mode SAME, and a home record whose
+rejects a SPARSE or LOWVER delta of 0, any decrease, a LOWVER bitmap that is empty or names a lane
+whose cut did not move, a cut-only record with mode SAME, and a home record whose
 `src_lane` is not in its substream's half (`REP_E_CUT`). A `src` byte with bit 6 set names no lane
 (lanes are < 64) and is `REP_E_CUT` too.
 
@@ -410,6 +414,15 @@ rejects a SPARSE delta of 0, any decrease, a cut-only record with mode SAME, and
 reads it (05 §10). It is only on a record with a source; an encoder refuses it on `src` 0xFF or
 with any other flag bit (`REP_E_KIND`). It costs no byte. The clamped step-cut rule of 05 (01
 §14.11) is applied before encoding, so the logged cut is the clamped one.
+
+**`LOWVER`** logs a decision live reads from physical state, as `snap_lag` does (§3.6). The band
+test (05 §8.6) widens by each advanced lane's `lowver`, and a step sets lane `l`'s `lowver` from
+the lane's half-cut entry when its cut lands on that entry. Which entry the BBO core saw at the
+step depends on timing, so the step logs the lanes it updated (`StepRecord.lowver`, bit `l`; only
+lanes whose cut moved, and only when the value changed). The entry's `snap_ver` is the version
+its op `cut[l]` was classified against (05 §6.5), so replay derives the value from its own packet
+records (§7.1). A step that takes no `lowver` costs no byte; one that does costs the second
+bitmap, and the SPARSE form if DENSE was shorter (≤ 2 B for `|H|` ≤ 8).
 
 | Kind | `src_lane` | Payload | Meaning in the stream |
 |---|---|---|---|
@@ -1739,15 +1752,16 @@ into one sequence by this rule, so the Rust and Vx clients run the same schedule
    greater than the last step. That record and every later record of its lane, with their route
    records, **carry** into the next block, where they come before the next block's records. A
    packet's routes are its route records (§3.6), and its `AcctTake` sits right before it, so
-   both travel with it and no record waits for a later block's steps. A record carried past a cut that covers one of its ops is
+   both travel with it and no record waits for a later block's steps. A block boundary never
+   falls between a take and its packet (05 §6.9). A record carried past a cut that covers one of its ops is
    `REP_E_ORDER`.
 
 `REP_MERGE` respects both dependencies above: a lane reads a step's fill events only after the
 step, and a step's cut covers only ops that its lane applied before the step was published, so
 their records were due before it. It is not the live interleaving. The live engine may run a lane
 further ahead or behind. The outputs are the same because of 05 §9, where a step's outcome depends
-only on its logged cut and source and a lane's only on its records and the fill events of
-`≤ f(r)`. A live sequencer's own journal can be checked against this order by replaying both and
+only on its logged cut, source and `LOWVER` lanes (§3.8) and a lane's only on its records and the
+fill events of `≤ f(r)`. A live sequencer's own journal can be checked against this order by replaying both and
 comparing their outputs. One case needs 05's op-level scheduler (05 §10) and is not covered by
 `REP_MERGE`: a packet whose `MID` boundary at step `f` follows an op of the same packet that
 `cut_f` already covers. A lane call cannot stop mid-packet for a step, so a replica rejects such a
@@ -1783,6 +1797,16 @@ must be that continuation (05 §8.5, §8.6). The `Rescan` band is the kind paylo
 `band_lo` u32 LE, then `band_hi` u32 LE, so `plen = 8`. `plen = 0` means all ticks (05 §10, the
 superset corollary of Lemma 9.7). A continuation's band is not read, because the first step of
 the sweep fixed it.
+
+**`lowver` (§3.8 `LOWVER`).** For each lane `l` a step's `StepRecord.lowver` names, replay sets
+`lowver[l]` to `base + snap_lag` of its own packet record holding op `cut[l]`: the version that
+op was classified against, which the live lane's half-cut entry at `cut[l]` carried (05 §6.5,
+§8.6). A bit on a lane whose `cut[l]` is not an op of a non-Advance packet record replay has
+applied is `Why::BadRecord`. Between `LOWVER` steps, `lowver` changes only by a source's
+`FwdEntry.snap_ver` (05 §8.6). Live takes no other `lowver` update, so the band test and the
+bounds replay resets (05 §8.6) agree with live at every step. Before this rule, a replica's
+lanes ran further ahead than the live BBO core's view of them, took different `lowver`s, and
+diverged under load (`Step(Kind)`, `Step(Source)`, `REP_E_ORDER`).
 
 The live engine classifies an op against a snapshot version. Replay does not need that version:
 the snapshot is only a routing hint (`INV-ENG-1`, 01 §14.11), so draft 0.1's `SNAP` bit is gone.

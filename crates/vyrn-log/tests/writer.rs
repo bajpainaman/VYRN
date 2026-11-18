@@ -100,6 +100,7 @@ fn frames_decode_and_headers_chain() {
             StepFlags::CROSS,
             Vec::new(),
             &cut,
+            0,
         )
         .unwrap(),
     );
@@ -121,7 +122,7 @@ fn frames_decode_and_headers_chain() {
     // Block 1: lane 0's route, then one step, no packets.
     frames.extend(w.route(r0).unwrap());
     frames.extend(
-        w.step(StepId(2), StepKind::Idle, None, 0, Vec::new(), &cut)
+        w.step(StepId(2), StepKind::Idle, None, 0, Vec::new(), &cut, 0)
             .unwrap(),
     );
     let (f1, h1) = w.close_block().unwrap();
@@ -252,7 +253,7 @@ fn frames_stay_within_the_limit() {
     );
     let cut: Vec<LaneSeq> = (0..n).map(|_| LaneSeq(u64::from(u32::MAX))).collect();
     frames.extend(
-        w.step(StepId(1), StepKind::Idle, None, 0, Vec::new(), &cut)
+        w.step(StepId(1), StepKind::Idle, None, 0, Vec::new(), &cut, 0)
             .unwrap(),
     );
     assert_eq!(w.framed_step(), StepId(0), "the step is not framed yet");
@@ -279,8 +280,16 @@ fn a_step_too_long_for_any_frame_is_refused() {
     let mut w = SeqWriter::new(Layout::new(3, 1, 0).unwrap(), ident, ts(), SEED, 1472).unwrap();
     let cut = [LaneSeq(0); 3];
     assert!(
-        w.step(StepId(1), StepKind::Control, None, 0, vec![0; 1500], &cut)
-            .is_err()
+        w.step(
+            StepId(1),
+            StepKind::Control,
+            None,
+            0,
+            vec![0; 1500],
+            &cut,
+            0
+        )
+        .is_err()
     );
 }
 

@@ -195,6 +195,8 @@ fn cut_of(v: &[u64]) -> Cut {
 
 fn fwd(kind: StepKind, lane: u8, q: u64, cont: bool, cut: &[u64]) -> ReplayStep {
     ReplayStep {
+        lowver: 0,
+        lowver_ver: [0; vyrn_bbo::MAX_LANES],
         kind,
         src: Some((LaneId(lane), LaneSeq(q))),
         cont,
@@ -378,6 +380,8 @@ fn replay_refuses_records_that_cannot_come_next() {
         Diverge::Source,
     );
     let none = |kind| ReplayStep {
+        lowver: 0,
+        lowver_ver: [0; vyrn_bbo::MAX_LANES],
         kind,
         src: None,
         cont: false,

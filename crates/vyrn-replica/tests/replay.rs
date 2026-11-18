@@ -262,7 +262,7 @@ fn frames_on(layout: Layout, j: &Journal, store: &Store, cuts: &[usize]) -> Vec<
                     0
                 };
                 out.extend(
-                    w.step(e.step, kind, src, flags, payload, &cut)
+                    w.step(e.step, kind, src, flags, payload, &cut, e.lowver)
                         .unwrap_or_else(|x| panic!("{x:?} at {}", rec_line(r))),
                 );
             }

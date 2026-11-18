@@ -110,9 +110,12 @@ impl<const N: usize> StepMerger<N> {
         if other_rec.as_ref().is_some_and(|c| c.kind != home_rec.kind) {
             return Err(RepErr::Kind);
         }
+        let mut lowver = 0u64;
         for (stream, rec) in [(h, Some(&home_rec)), (o, other_rec.as_ref())] {
             let Some(rec) = rec else { continue };
             let half = self.layout.half(u8::try_from(stream).unwrap_or(0));
+            let start = half.start;
+            lowver |= rec.lowver.checked_shl(u32::from(start)).unwrap_or(0);
             for (lane, c) in half.zip(&rec.cut) {
                 if let Some(slot) = self.cut.get_mut(usize::from(lane)) {
                     *slot = *c;
@@ -134,6 +137,7 @@ impl<const N: usize> StepMerger<N> {
                 src_lane_seq: home.src_lane_seq,
                 flags: home.flags,
                 cut: self.cut,
+                lowver,
             },
             payload: home.payload,
         }))
@@ -149,6 +153,7 @@ mod tests {
 
     fn half(step: u64, home: bool, other: bool, cut: [u64; 2]) -> StepHalf {
         StepHalf {
+            lowver: 0,
             step: StepId(step),
             kind: StepKind::Idle,
             other,

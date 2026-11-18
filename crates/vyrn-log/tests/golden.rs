@@ -130,6 +130,7 @@ fn worked_example_07_3_11() {
             })],
         },
         Section::StepRun(vec![StepHalf {
+            lowver: 0,
             step: StepId(1),
             kind: StepKind::Cross,
             other: false,
@@ -173,6 +174,33 @@ fn worked_example_07_3_11() {
     assert_eq!(
         bound().decode_sections(&enc, BodyKind::Order).unwrap(),
         cross
+    );
+    // The step took lane 7's lowver (07 §3.8 LOWVER): a second bitmap, 4 more bytes.
+    let mut low = sections.clone();
+    if let Section::StepRun(hs) = &mut low[1] {
+        hs[0].lowver = 1 << 7;
+    }
+    let enc = bound().encode_sections(&low, BodyKind::Order).unwrap();
+    assert_eq!(enc, bytes(&g, "ex311.lowver.sections"));
+    assert_eq!(enc.len(), 25);
+    assert_eq!(bound().decode_sections(&enc, BodyKind::Order).unwrap(), low);
+    for bad in [
+        "ex311.bad_lowver_empty.sections",
+        "ex311.bad_lowver_unchanged.sections",
+    ] {
+        assert_eq!(
+            bound().decode_sections(&bytes(&g, bad), BodyKind::Order),
+            Err(RepErr::Cut),
+            "{bad}"
+        );
+    }
+    // An encoder refuses a lowver lane whose cut did not move.
+    if let Section::StepRun(hs) = &mut low[1] {
+        hs[0].lowver = 1 << 4;
+    }
+    assert_eq!(
+        bound().encode_sections(&low, BodyKind::Order),
+        Err(RepErr::Cut)
     );
     assert_eq!(
         bound().decode_sections(&bytes(&g, "ex311.bad_src_bit6.sections"), BodyKind::Order),
@@ -395,6 +423,7 @@ fn bodies(g: &BTreeMap<String, String>) -> (Vec<Body>, Vec<Body>, BlockHeader) {
             },
             Section::StepRun(vec![
                 StepHalf {
+                    lowver: 0,
                     step: StepId(1),
                     kind: StepKind::Improve,
                     other: false,
@@ -407,6 +436,7 @@ fn bodies(g: &BTreeMap<String, String>) -> (Vec<Body>, Vec<Body>, BlockHeader) {
                     cut: vec![LaneSeq(4), LaneSeq(0)],
                 },
                 StepHalf {
+                    lowver: 0,
                     step: StepId(2),
                     kind: StepKind::Control,
                     other: true,
@@ -463,6 +493,7 @@ fn bodies(g: &BTreeMap<String, String>) -> (Vec<Body>, Vec<Body>, BlockHeader) {
                 ],
             },
             Section::StepRun(vec![StepHalf {
+                lowver: 0,
                 step: StepId(2),
                 kind: StepKind::Control,
                 other: true,
@@ -700,6 +731,7 @@ fn a_failed_encode_poisons_the_encoder() {
     let big = Body::Order {
         tenure_start: None,
         sections: vec![Section::StepRun(vec![StepHalf {
+            lowver: 0,
             step: StepId(3),
             kind: StepKind::Control,
             other: false,

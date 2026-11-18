@@ -164,6 +164,7 @@ fn step_entry_and_deltas() {
     let all = cases();
     let c = &all["step_entry"];
     let e = StepEntry {
+        lowver: 0,
         step: StepId(num(c, "step")),
         kind: num(c, "kind") as u8,
         src_lane: LaneId(num(c, "src_lane") as u8),

@@ -1236,7 +1236,7 @@ impl<T: TxRing> StreamCore<T> {
                     0
                 };
                 self.writer
-                    .step(e.step, kind, src, flags, payload, &self.cut)
+                    .step(e.step, kind, src, flags, payload, &self.cut, e.lowver)
             }
             Out::Resp(l, ep, p) => {
                 self.pending.push((l, ep, p));

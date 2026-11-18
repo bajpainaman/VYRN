@@ -1313,8 +1313,10 @@ A `Forward` from the IOC/FOK line or a `// cross` line sets `op.cross`; one from
 order on that side is an improve. A Halted-phase snapshot never reaches `classify` for a `New`,
 because `admit` rejects it with `BOOK_HALTED`.
 
-The lane records `l.snap.version` in `CounterLine.snap_ver` at every refresh. Every later op uses
-that version or a newer one. The BBO core needs only this lower bound (§8.6).
+`CounterLine.snap_ver` is the version op `CounterLine.seq` was classified against: its packet's
+snapshot, set when pass 2 applies the op and unchanged by a boundary. Every later op uses that
+version or a newer one. The BBO core needs only this lower bound (§8.6). Because the value is a
+function of `seq` alone, replay derives it from the op's packet record (07 §7.1).
 
 **Which snapshot a packet uses, and `snap_lag` (ruling (c), after #137).** The lane reads the
 snapshot when it accepts a packet (read-at-accept), so its classification and price band use the
@@ -2109,8 +2111,15 @@ fn band_test(b: &Bbo, C: &Cut) -> Band {
   snapshot's spread narrower than the true spread: the safe direction.
 
 `lowver[l]` is updated by `finish_step`: it becomes `P.entry[l].snap_ver` when `C[l] =
-P.entry[l].seq`, it becomes `e.snap_ver` for the source lane, and it is unchanged when the clamp
-held `C[l]` below `P.entry[l].seq` (the older value is still a valid lower bound).
+P.entry[l].seq ≥ 1`, it becomes `e.snap_ver` for the source lane, and it is unchanged when the clamp
+held `C[l]` below `P.entry[l].seq` (the older value is still a valid lower bound). Whether
+`P.entry[l]` sat at `C[l]` when the core read it depends on timing, so a step logs each lane whose
+`lowver` that first rule changed (`StepEntry.lowver`, 07 §3.8 `LOWVER`), and replay applies
+exactly those, with the version of its own op at `C[l]` (07 §7.1).
+
+A pending continuation is the next step (D14, §8.5): when its cut fails the band test, the
+step's cut stays at `C_{s−1}` instead of a `Rescan` running first, so replay, which takes the
+step after a capped sweep to be its continuation, follows it.
 
 **The `Rescan` step.** It executes `B_s` restricted to the band, in key order:
 

@@ -262,6 +262,11 @@ pub struct Lane<'a, V: Visibility, const NA: usize> {
     pub(crate) next_slot: u32,
     pub(crate) seq: LaneSeq,
     pub(crate) applied: LaneSeq,
+    /// The snapshot version op `applied` was classified against: its packet's version (07 §7.1
+    /// `snap_base + snap_lag`), 0 before the first op. `CounterLine.snap_ver` publishes it, so the
+    /// value a half-cut entry carries is a function of its `seq` alone and replay can derive it
+    /// (05 §8.6 `lowver`, 07 §3.8 `LOWVER`).
+    pub(crate) applied_ver: u64,
     pub(crate) last_prio_ts: Nanos,
     pub(crate) fills_applied: StepId,
     pub(crate) phase: Phase,
@@ -396,6 +401,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             next_slot: 1,
             seq: LaneSeq(0),
             applied: LaneSeq(0),
+            applied_ver: 0,
             last_prio_ts: Nanos(0),
             fills_applied: StepId(0),
             phase: cfg.phase,
@@ -465,6 +471,10 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
     pub fn fills_applied(&self) -> StepId {
         self.fills_applied
     }
+    /// The snapshot version op [`Self::applied`] was classified against (`CounterLine.snap_ver`).
+    pub fn applied_ver(&self) -> u64 {
+        self.applied_ver
+    }
     /// `CounterLine.fwd_pend` as last published (contract rule F).
     pub fn fwd_pend(&self) -> LaneSeq {
         self.fwd.iter().map(|f| f.floor).min().unwrap_or(LaneSeq(0))
@@ -498,7 +508,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
     pub(crate) fn publish_counter(&self, vis: &V) {
         let c = Counter {
             seq: self.applied,
-            snap_ver: lo32(self.snap.version),
+            snap_ver: lo32(self.applied_ver),
             f_lo: lo32(self.fills_applied.0),
             fwd_pend: self.fwd_pend(),
             n_ev: self.n_ev,
@@ -1126,6 +1136,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                 o.applied = true;
             }
             self.applied = op.seq;
+            self.applied_ver = self.snap.version;
             self.publish_counter(vis);
         }
     }
