@@ -1305,24 +1305,26 @@ still reaches Q. It counts distinct voters, itself included, and keeps each
 vote for the run: 07 names no withdrawal. A `DataDown` tagged `e − 1`, `e` or `e + 1` counts,
 because peers cross an epoch boundary one at a time (the peer-key window, §5.5). Until a session's
 `KeyBundle` reaches the replica, every session's `KeyBundle.data` list is the replica's `[data]
-boxes` in order, with its home at entry 0 (DEV). The replica sends one REDIRECT per session to
-every live box, sealed under that box's `K_fetch`, in 3 rounds 10 ms apart, because UDP can lose
-any one. The rounds queue and leave at most 128 per box every 10 ms, oldest first, under a box's
-fetch bucket (`vyrn-data` defaults: burst 256, 20 000/s). `resend_from` is the session's lowest
+boxes` in order, with its home at entry 0 (DEV). The replica sends every live box each affected
+session's `resend_from` as REDIRECT_BATCH (kind 5) messages, sealed under that box's `K_fetch`,
+in 3 rounds 10 ms apart, because UDP can lose any one; a message of one session is kind 4. The
+rounds queue and leave at most 64 messages per box every 10 ms, oldest first: 6 400 tokens/s of
+a box's fetch bucket (`vyrn-data` defaults: burst 256, 20 000/s), and with 181 sessions a message
+about 1.16 million sessions/s. A session queued twice in one drain goes in two messages, as a
+message's sessions are strictly ascending. `resend_from` is the session's lowest
 `pkt_seq` in any block the replica holds that is not final yet, resolved there or not, because a
 payload one replica repaired before finality may be held by no other; if it holds none, it is one
 past the highest `pkt_seq` in a final block. Shed records count toward neither. A session the replica first
 releases after the home moved gets its own rounds then, from its lowest `pkt_seq` in that block,
 with `down` its first home and `to` the current one, since it has followed no move.
-*Limit (open):* one REDIRECT carries one session, so the first round of `n` sessions takes
-`n / 12 800` s at this pace, and at most `n / 20 000` s at the box's whole fetch bucket. Clients
-keep sent packets for `REP_CLIENT_RETAIN_MS` = 100 ms (04 DR4), so with about 2 ms of detection a
-home box with more than about 1 200 sessions can have clients drop packets sent when it failed
-before their redirect arrives. Lifting it needs a decision this reading does not make: a
-multi-session REDIRECT, a REDIRECT budget separate from the fetch bucket, or a longer DR4 window. The
-bound is pinned by `bin/vyrn-validator` `failover.rs` (`first_round_outlasts_dr4_above_the_bound`),
-and e2e R13 runs a client that discards each packet after 100 ms and fails if a packet it sent to
-the dead home expired before its redirect. `REP_DATA_SILENCE_MS`
+*Former limit (lifted by REDIRECT_BATCH):* with one session per message at 128 per 10 ms, a
+home box with more than about 1 200 sessions could have clients drop packets sent when it failed
+(04 DR4, 100 ms) before their redirect arrived. Batched, a home box's every session gets its first
+round in the first 10 ms period. `bin/vyrn-validator` `failover.rs`
+(`first_round_fits_dr4_at_scale`, 2 000 sessions) checks it, and e2e R13 runs a client that
+discards each packet after 100 ms and fails if a packet it sent to the dead home expired before
+its redirect. Packets sent before the kill reached the home box; the client may discard them, and
+the data check, which needs every payload resolved on the backup, guards them. `REP_DATA_SILENCE_MS`
 is 1 ms. A DEV validator may raise it (`[data] silence_us`) for an unpinned host.
 
 **Backup addresses (interim reading).** Step 3 needs every live box to know the affected
