@@ -94,6 +94,18 @@ impl BridgeSignerTable {
         self.sets.get(&rotation_no)
     }
 
+    /// The set with rotation number `rotation_no` that is in force at `epoch` or will be once
+    /// `epoch` activates: an activated set, or one scheduled to activate at or before `epoch`.
+    /// The next epoch's roster is checked before its boundary (08 §2.6), when its set is pending.
+    pub fn for_epoch(&self, rotation_no: u64, epoch: Epoch) -> Option<&BridgeSigners> {
+        self.get(rotation_no).or_else(|| {
+            self.pending
+                .get(&rotation_no)
+                .filter(|(from, _)| *from <= epoch)
+                .map(|(_, set)| set)
+        })
+    }
+
     /// The newest active set.
     pub fn current(&self) -> &BridgeSigners {
         // `genesis` inserts rotation 0 and nothing removes a set.

@@ -334,10 +334,11 @@ impl Roster {
         Ok(())
     }
 
-    /// CHAIN: the roster's bridge set must be the table's set of that rotation number (08 §9.5).
-    pub fn check_bridge(&self, table: &BridgeSignerTable) -> Result<(), RosterErr> {
+    /// CHAIN: the roster's bridge set must be the table's set of that rotation number, activated
+    /// or scheduled to activate by `epoch` (08 §9.5).
+    pub fn check_bridge(&self, table: &BridgeSignerTable, epoch: Epoch) -> Result<(), RosterErr> {
         match &self.bridge {
-            Some(set) if table.get(set.rotation_no) == Some(set) => Ok(()),
+            Some(set) if table.for_epoch(set.rotation_no, epoch) == Some(set) => Ok(()),
             _ => Err(RosterErr::Bridge),
         }
     }
@@ -366,7 +367,7 @@ impl Membership {
         }
         let roster = Roster::decode(domain.mode, bytes)?;
         if domain.mode == Mode::Chain {
-            roster.check_bridge(bridge.ok_or(RosterErr::Bridge)?)?;
+            roster.check_bridge(bridge.ok_or(RosterErr::Bridge)?, cfg.epoch)?;
         }
         if roster.sig_scheme != cfg.sig_scheme {
             return Err(RosterErr::Scheme {
@@ -512,11 +513,22 @@ mod tests {
         other.bridge_keys[4] = [0xEE; 20];
         let other = BridgeSignerTable::genesis(other).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(from(Some(&other)), Err(RosterErr::Bridge));
-        // A rotation the table never activated.
+        // Rotation 1, scheduled for epoch 8 and not yet activated: the roster of epoch 8 is
+        // accepted before the boundary, the same roster for epoch 7 is not, nor an unknown one.
         let mut later = roster.clone();
-        if let Some(set) = later.bridge.as_mut() {
-            set.rotation_no = 1;
-        }
-        assert_eq!(later.check_bridge(&other), Err(RosterErr::Bridge));
+        let mut set1 = roster.bridge.unwrap_or_else(|| panic!("chain roster"));
+        set1.rotation_no = 1;
+        set1.guardian_keys[0] = [0xEF; 20];
+        later.bridge = Some(set1);
+        let mut pending = table.clone().unwrap_or_else(|| panic!("chain table"));
+        pending
+            .schedule(set1, Epoch(8))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(later.check_bridge(&pending, Epoch(8)), Ok(()));
+        assert_eq!(
+            later.check_bridge(&pending, Epoch(7)),
+            Err(RosterErr::Bridge)
+        );
+        assert_eq!(later.check_bridge(&other, Epoch(8)), Err(RosterErr::Bridge));
     }
 }

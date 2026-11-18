@@ -1283,7 +1283,7 @@ order addresses, the recovery address) are in the endpoint table (§11.1), not h
 | R4 | Per home: `client` ∈ {0, 1}, every `facility` ≥ 1, and neither client holds Q voters (`CLIENT_SPLIT`) |
 | R5 | Per home: no key repeats among the `vote_key`s and `seq_key`s (07 §13.1) |
 | R6 | Per home: `recovery` names a Rust voter; `n_seq` as above |
-| R7 | CHAIN: no bridge or guardian key is zero or repeats within its list, and the set equals the bridge signer table's set of `rotation_no` (§9.5) |
+| R7 | CHAIN: no bridge or guardian key is zero or repeats within its list, and the set equals the bridge signer table's set of `rotation_no`, activated or scheduled to activate at or before e (§9.5), so `R_{e+1}` is checked before its boundary |
 | R8 | `EpoConfig(e).seq_order` names two distinct boxes of `home(e)`: BASE the primary in F1 and the standby in F2; CHAIN in two different facilities |
 
 **The view.** `REP_Membership(e)` (07 §13.1) is not a separate record: it is `home(e)`'s part of
