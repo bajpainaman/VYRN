@@ -326,6 +326,15 @@ impl Nodes {
         Ok(())
     }
 
+    /// Takes every line already queued, without waiting.
+    fn drain(&mut self, rx: &Lines) {
+        while let Ok((i, l)) = rx.try_recv() {
+            if let Some(n) = self.0.get_mut(i) {
+                n.lines.push(l);
+            }
+        }
+    }
+
     /// Closes stdin (`--stop-on-stdin-eof`) and waits for the child to exit and its `STATS`.
     fn stop(&mut self, i: usize, rx: &Lines, deadline: Instant) -> Result<bool, String> {
         let n = self.0.get_mut(i).ok_or("node")?;
@@ -961,9 +970,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
         std::thread::park_timeout(d);
     }
     // --finality: with the box still up (its listener prints FINAL), wait until the box and
-    // every validator that did not stop finalize through the box's last block so far.
-    // The target is the box's last BLOCK so far, read inside the wait, so lines still queued
-    // from the run count.
+    // every validator that did not stop finalize through the box's last block so far. Every
+    // line queued during the run is taken first, so the target is the box's last block
+    // before its stop, not an early prefix; the block its stop closes is checked against the
+    // validators below.
+    nodes.drain(&rx);
     let last = |ns: &[Node]| ns.get(seq).and_then(|n| blocks(n).last().map(|b| b.0.0));
     let fin_wait = if cli.finality {
         nodes.wait(
@@ -1000,6 +1011,26 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 .is_some_and(|n| stopped(n).is_some() || blocks(n).last().map(|b| b.0.0) >= top)
         })
     });
+    // --finality: the block the box's stop closed is not in its own FINAL target, so the
+    // validators still running finalize through it too, unless HASHLAG stops left no quorum
+    // (R6, checked below).
+    let q = vals.len() - (vals.len().saturating_sub(1)) / 3;
+    let fin_tail = if cli.finality {
+        nodes.wait(
+            &rx,
+            Instant::now() + wait,
+            "validator FINAL through the last block",
+            |ns| {
+                let up: Vec<&Node> = vals.iter().filter_map(|&i| ns.get(i)).collect();
+                up.iter().filter(|n| stopped(n).is_none()).count() < q
+                    || up
+                        .iter()
+                        .all(|n| stopped(n).is_some() || finals(n).last().copied() >= top)
+            },
+        )
+    } else {
+        Ok(())
+    };
     let mut val_ok = Vec::new();
     for &i in &vals {
         val_ok.push(nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
@@ -1325,10 +1356,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
     if cli.finality {
         rep.check("finality", {
             let n = vals.len();
-            let q = n - (n - 1) / 3;
             let target = fin_target.unwrap_or(0);
+            let val_target = top.unwrap_or(0).max(target);
             let seq_final = nodes.0.get(seq).and_then(|x| finals(x).last().copied());
             let mut errs = Vec::new();
+            let mut short = Vec::new();
             let mut lagged = 0usize;
             let mut lag_at: Vec<u64> = Vec::new();
             for &i in &vals {
@@ -1340,7 +1372,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     }
                     // Any other stop already fails `validators`.
                     Some(_) => {}
-                    None if finals(v).last().copied() < Some(target) => errs.push(format!(
+                    None if finals(v).last().copied() < Some(val_target) => short.push(format!(
                         "{} final {:?}",
                         v.name,
                         finals(v).last()
@@ -1356,27 +1388,34 @@ fn run(cli: &Cli) -> Result<bool, String> {
             // path cannot pass.
             lag_at.sort_unstable();
             let quorum_until = lag_at.get(n - q).copied().unwrap_or(target);
-            if seq_final < Some(target) && !no_quorum {
-                errs.push(format!("vyrn-seq final {seq_final:?}"));
+            // R6: without quorum the survivors cannot finalize the rest either.
+            if !no_quorum {
+                errs.append(&mut short);
+                if seq_final < Some(target) {
+                    errs.push(format!("vyrn-seq final {seq_final:?}"));
+                }
             }
             if no_quorum && quorum_until >= 2 && seq_final.is_none() {
                 errs.push(format!(
                     "vyrn-seq finalized nothing, though Q validators ran through height {quorum_until}"
                 ));
             }
-            if let Err(e) = &fin_wait
-                && !no_quorum
-            {
-                errs.push(e.clone());
+            if !no_quorum {
+                errs.extend(fin_wait.as_ref().err().cloned());
+                errs.extend(fin_tail.as_ref().err().cloned());
             }
             if no_quorum && errs.is_empty() {
                 println!(
                     "WARN {lagged} of {n} validators stopped at REP_E_HASHLAG, below Q = {q}; vyrn-seq finalized through {seq_final:?} of {target} (R6)"
                 );
             }
-            if errs.is_empty() {
+            if errs.is_empty() && no_quorum {
                 Ok(format!(
-                    "vyrn-seq and {} running validators finalized through {target} (Q = {q} of {n}); seq final {seq_final:?}",
+                    "no quorum after HASHLAG stops (R6); vyrn-seq finalized through {seq_final:?} while Q validators ran through {quorum_until}"
+                ))
+            } else if errs.is_empty() {
+                Ok(format!(
+                    "vyrn-seq through {target} and {} running validators through {val_target} finalized (Q = {q} of {n})",
                     n - lagged
                 ))
             } else {
