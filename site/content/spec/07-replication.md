@@ -1146,7 +1146,12 @@ IPv4, so a requester sends its fetches from that address (*reading*). Across an 
 the box holds the keys of both epochs (08 §4.6) and serves a fetch under either; moving to the
 next pair drops the older epoch's keys (*reading*). It rate-limits each requester with a token bucket
 (03 §1: "rate-limit by source address") and drops forged, unkeyed and over-rate fetches before
-any work. Replies are not tagged (next paragraph).
+any work. After a fetch passes its requester's bucket, a KEY, BLOCK or RANGE fetch (kinds 1 to
+3) is also charged to one box-wide bucket (`[fetch] box_rate`, `box_burst`; DEV 100,000/s and
+1,024) and is shed over it (`fetch_shed`), so a flood is refused at the gate instead of
+overflowing a queue behind it (*reading*, DEV policy). REDIRECTs (kinds 4 and 5) are never
+charged to the box's bucket; a full queue paces them instead (§5.7 step 3). Replies are not
+tagged (next paragraph).
 
 Every fetched packet is checked like a pushed one. Source 3 is the only source of the bytes the
 sequencer actually matched, so it settles every conflict (§5.6).
@@ -1303,6 +1308,20 @@ exactly as a kind-4 REDIRECT: the owning shard sends that session's `DataRedirec
 batched failover takes effect only once the replicas send kind 5; until then they send kind 4 and
 the per-message limit above still applies. The box's operator line (`REDIRECT <down> <to> <session>:<resend_from>,…`, DEV) does the
 same for a list.
+
+**Redirect queue policy (*reading*, DEV policy; 07 names none).** No fetch repairs a lost
+`DataRedirect`, so a box does not drop one a full queue refuses (its TX queue, or on a sharded
+box the RX core's hop ring to the owning shard):
+
+1. The refused redirect waits in a fixed queue of `RX_BURST` × 181 = 2,896 entries, allocated
+   once, and is retried first on the core's next turn, oldest first; a new redirect queues
+   behind any that wait, so each session's leave in order. It is dropped and counted
+   (`redirect_dropped`) only past 2,896 waiting, which takes an operator list that long.
+2. While any redirect waits, the core takes no new fetch datagrams of any kind: they wait in the
+   NIC's fetch queue, which drops them (`rx_discard`) if it fills. A failover burst therefore
+   drains at the owning shard's pace.
+3. A sharded box keeps one such queue on its RX core for the whole box, so a full shard holds
+   back the other shards' redirects until it drains.
 
 **Replica side (readings, `bin/vyrn-validator` `failover.rs`).** `DataDown{d}` is 24 bytes,
 little-endian: magic 0x4444, version 1, `d` u8, `voter` u8, 3 zero bytes, `epoch` u32, 4 zero

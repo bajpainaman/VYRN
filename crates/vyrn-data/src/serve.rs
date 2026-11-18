@@ -13,7 +13,7 @@ use vyrn_nic::frame::{self as nic_frame, Endpoint, FrameHdr, MAX_FRAME_BYTES};
 use vyrn_types::{BookId, Height, Nanos, SessionId};
 use vyrn_wire::TxRing;
 
-use crate::frame::{DataHdr, FetchMsg, FrameBuf, FrameErr, Kind, key_seq};
+use crate::frame::{DataHdr, Fetch, FetchMsg, FrameBuf, FrameErr, Kind, key_seq};
 use crate::ingest::DataHome;
 use crate::node::{Counters, FetchKeysErr, NodeConfig, bump, pkt_key, split_payloads};
 use crate::redirect::Redirect;
@@ -64,6 +64,10 @@ pub(crate) struct Gate {
     open: Bucket,
     rate: u64,
     burst: u64,
+    /// The box's budget for kinds 1 to 3 ([`NodeConfig::fetch_box_rate`]).
+    boxed: Bucket,
+    box_rate: u64,
+    box_burst: u64,
 }
 
 impl Gate {
@@ -82,6 +86,9 @@ impl Gate {
             open: Bucket::full(cfg.fetch_burst),
             rate: cfg.fetch_rate,
             burst: cfg.fetch_burst,
+            boxed: Bucket::full(cfg.fetch_box_burst),
+            box_rate: cfg.fetch_box_rate,
+            box_burst: cfg.fetch_box_burst,
         }
     }
 
@@ -126,12 +133,21 @@ impl Gate {
             Some(b) => b,
             None => &mut self.open,
         };
-        if b.take(now, self.rate, self.burst) {
-            Some(q)
-        } else {
+        if !b.take(now, self.rate, self.burst) {
             bump(&mut c.fetch_limited);
-            None
+            return None;
         }
+        // The box's budget, after the source's: a flooding source spends its own tokens first.
+        // REDIRECTs are exempt; a full queue paces them (`Pending`).
+        let redirect = matches!(
+            q,
+            FetchMsg::Batch(_) | FetchMsg::One(Fetch::Redirect { .. })
+        );
+        if !redirect && !self.boxed.take(now, self.box_rate, self.box_burst) {
+            bump(&mut c.fetch_shed);
+            return None;
+        }
+        Some(q)
     }
 
     /// See [`DataNode::set_fetch_keys`](crate::DataNode::set_fetch_keys).
@@ -614,6 +630,10 @@ impl Pending {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
     }
 
     /// Hands queued redirects to `send`, oldest first, until it refuses one (returns false),

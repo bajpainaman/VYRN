@@ -22,6 +22,7 @@
 //! | `[[session]] id, key` | a session's MAC key handle (the session gateway is not wired) |
 //! | `[roster] file, roster_hash, genesis_hash, epoch, box, xchg_secret` | `K_fetch(e, i, d)` of every requester of `home` from the roster (08 §9.6); omitted is refused unless `dev` |
 //! | `[fetch] rate, burst` | per-source fetch limit (defaults 20,000/s, 256) |
+//! | `[fetch] box_rate, box_burst` | box-wide budget for KEY, BLOCK and RANGE fetches, after the source's limit (defaults 100,000/s, 1,024; over it: `fetch_shed`) |
 //! | `[store] dirs = [..]` | `FileStore` drives read as the log source; none: an empty `MemStore` |
 //! | `[metrics] listen` | Prometheus text on this address, default `127.0.0.1:9464` (11 §8.4) |
 //! | `[shards] n, cpus` | ingest shards (default 1, at most 64; 07 §5.2 RSS by session); `cpus` empty (no pinning) or `n + 2` CPUs: RX core, sender, shard 0, … |
@@ -42,7 +43,8 @@
 //! loop (a full queue drops and counts the line), and at exit `STATS stored=<n> data_frames=<n>
 //! heartbeats=<n> duplicate=<n> fetch_unauth=<n> fetch_limited=<n> bad_mac=<n> events_dropped=<n>
 //! events_unprinted=<n> fetch_ring_hit=<n> fetch_log_hit=<n> fetch_miss=<n> fetch_resent=<n>
-//! hop_full=<n> redirects=<n> redirect_unknown=<n> shards=<n>`, every counter summed over the
+//! hop_full=<n> redirects=<n> redirect_unknown=<n> redirect_retried=<n> redirect_dropped=<n>
+//! fetch_shed=<n> shards=<n>`, every counter summed over the
 //! cores.
 //! A stop waits up to 1 s for queued events to print and counts the rest
 //! in `events_unprinted`, so `EVENT` lines + `events_unprinted` + `events_dropped` = `bad_mac` +
@@ -115,7 +117,7 @@ macro_rules! fields {
         $m! {
             rx_pkts, bad_frame, header, book, unknown_session, epoch, bad_mac, duplicate, late, stored,
             conflicts, data_frames, heartbeats, tx_full, events_dropped, fetch_bad, fetch_unauth,
-            fetch_limited, fetch_ring_hit, fetch_log_hit, fetch_miss, fetch_resent, log_bad, hop_full, redirects,
+            fetch_limited, fetch_shed, fetch_ring_hit, fetch_log_hit, fetch_miss, fetch_resent, log_bad, hop_full, redirects,
             redirect_unknown, redirect_retried, redirect_dropped
         }
     };
@@ -556,6 +558,7 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
     ncfg.fetch_keys = fetch_keys;
     ncfg.fetch_epoch = fetch_epoch;
     (ncfg.fetch_rate, ncfg.fetch_burst) = (cfg.fetch.rate, cfg.fetch.burst);
+    (ncfg.fetch_box_rate, ncfg.fetch_box_burst) = (cfg.fetch.box_rate, cfg.fetch.box_burst);
     let (mut rx, cores, mut sender) = shards::split(&ncfg, ingest, fetch, shard_tx, tx);
     if let Some(k) = &keys {
         k.install(&mut rx, fetch_epoch)?;
@@ -812,7 +815,7 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
     // A closed stdout (the supervisor went away) is not a reason to fail the stop.
     let _ = writeln!(
         std::io::stdout(),
-        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} bad_mac={} events_dropped={} events_unprinted={unprinted} fetch_ring_hit={} fetch_log_hit={} fetch_miss={} fetch_resent={} hop_full={} redirects={} redirect_unknown={} shards={n}",
+        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} bad_mac={} events_dropped={} events_unprinted={unprinted} fetch_ring_hit={} fetch_log_hit={} fetch_miss={} fetch_resent={} hop_full={} redirects={} redirect_unknown={} redirect_retried={} redirect_dropped={} fetch_shed={} shards={n}",
         c.stored,
         c.data_frames,
         c.heartbeats,
@@ -827,7 +830,10 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
         c.fetch_resent,
         c.hop_full,
         c.redirects,
-        c.redirect_unknown
+        c.redirect_unknown,
+        c.redirect_retried,
+        c.redirect_dropped,
+        c.fetch_shed
     );
     Ok(())
 }

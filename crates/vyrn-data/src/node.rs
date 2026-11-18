@@ -50,6 +50,12 @@ pub struct NodeConfig {
     pub fetch_rate: u64,
     /// The most fetches a source may send at once after being idle.
     pub fetch_burst: u64,
+    /// The box-wide budget for KEY, BLOCK and RANGE fetches (kinds 1 to 3), per second, charged
+    /// after the source's own bucket; a fetch over it is shed (`fetch_shed`). REDIRECTs (kinds 4
+    /// and 5) are not charged: a full queue paces them instead.
+    pub fetch_box_rate: u64,
+    /// The most such fetches the box takes at once after being idle.
+    pub fetch_box_burst: u64,
 }
 
 impl NodeConfig {
@@ -70,6 +76,8 @@ impl NodeConfig {
             fetch_epoch: 0,
             fetch_rate: 20_000,
             fetch_burst: 256,
+            fetch_box_rate: 100_000,
+            fetch_box_burst: 1024,
         }
     }
 }
@@ -100,6 +108,9 @@ pub struct Counters {
     pub fetch_unauth: u64,
     /// A fetch over its source's rate limit.
     pub fetch_limited: u64,
+    /// A KEY, BLOCK or RANGE fetch within its source's limit but over the box's budget
+    /// ([`NodeConfig::fetch_box_rate`]): dropped before it reaches a queue.
+    pub fetch_shed: u64,
     pub fetch_ring_hit: u64,
     pub fetch_log_hit: u64,
     pub fetch_miss: u64,

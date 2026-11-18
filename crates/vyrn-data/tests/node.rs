@@ -759,3 +759,61 @@ fn redirects_a_full_tx_queue_refuses_are_retried_next_turn_in_order() {
     assert_eq!(drain_rx(&mut c).len(), 1);
     assert_eq!(r.node.counters().redirect_retried, cap);
 }
+
+/// (4) The box's fetch budget: a KEY, BLOCK or RANGE fetch is charged to its source's bucket
+/// first, then the box's, and shed over the box's (`fetch_shed`); REDIRECTs are never shed.
+#[test]
+fn the_box_budget_sheds_data_fetches_after_the_source_limit_but_never_redirects() {
+    let mut r = rig_with(MemStore::default(), |c| {
+        (c.fetch_rate, c.fetch_burst) = (1, 5);
+        (c.fetch_box_rate, c.fetch_box_burst) = (1, 2);
+    });
+    let mut c = client_rx(&mut r);
+    r.send(&req(5, 1, &[Msg::Heartbeat], &K), 0);
+    r.node.poll(Nanos(0));
+    for q in 0..6 {
+        r.fetch(Fetch::Key {
+            session: SessionId(5),
+            pkt_seq: 100 + q,
+        });
+    }
+    r.node.poll(Nanos(1));
+    let k = *r.node.counters();
+    // Source: 5 of 6 pass; box: 2 of those 5.
+    assert_eq!((k.fetch_limited, k.fetch_shed), (1, 3));
+    assert_eq!(k.fetch_ring_hit + k.fetch_log_hit + k.fetch_miss, 2);
+    drain_rx(&mut c);
+    // A REDIRECT with the box's budget spent still goes out (on a fresh source token).
+    let mut r = rig_with(MemStore::default(), |c| {
+        (c.fetch_rate, c.fetch_burst) = (1, 5);
+        (c.fetch_box_rate, c.fetch_box_burst) = (1, 1);
+    });
+    let mut c = client_rx(&mut r);
+    r.send(&req(5, 1, &[Msg::Heartbeat], &K), 0);
+    r.node.poll(Nanos(0));
+    r.fetch(Fetch::Key {
+        session: SessionId(5),
+        pkt_seq: 9,
+    });
+    r.fetch(Fetch::Redirect {
+        session: SessionId(5),
+        resend_from: 2,
+        down: 0,
+        to: 2,
+    });
+    r.node.poll(Nanos(1));
+    let k = *r.node.counters();
+    assert_eq!((k.fetch_shed, k.redirects), (0, 1));
+    let got = drain_rx(&mut c);
+    assert_eq!(
+        got.iter().filter(|b| Redirect::open(b, &K).is_ok()).count(),
+        1
+    );
+    // A second KEY fetch has no box token left.
+    r.fetch(Fetch::Key {
+        session: SessionId(5),
+        pkt_seq: 10,
+    });
+    r.node.poll(Nanos(2));
+    assert_eq!(r.node.counters().fetch_shed, 1);
+}
