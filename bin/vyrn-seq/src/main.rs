@@ -79,9 +79,9 @@ use vyrn_bbo::admit::FixedClock;
 use vyrn_bbo::{Bbo, CutDelta, Phase, Record, StepEntry, TxEntry};
 use vyrn_cut::{Consumer, Hw, Producer, Ring};
 use vyrn_engine::alloc::SealingAlloc;
-use vyrn_engine::{Engine, Rec, Shared, Sink};
+use vyrn_engine::{Engine, Fault, Rec, Shared, Sink};
 use vyrn_epoch::{Boundary, EpochNotice, Notifier};
-use vyrn_lane::{ArenaConfig, Gate, Lane, PathTable, RespPkt, RxIn, SessionSpec};
+use vyrn_lane::{ArenaConfig, Gate, Lane, PathTable, RespPkt, Rx, RxIn, SessionSpec};
 use vyrn_log::stream::has_src;
 use vyrn_log::{Ident, LaneBase, Layout, SeqWriter, TenureStart};
 use vyrn_nic::frame::{self, Endpoint, FrameHdr};
@@ -258,6 +258,9 @@ where
     let block = Duration::from_millis(cfg.replication.block_ms);
     let plan = EnginePlan::from(cfg)?;
     std::thread::scope(|sc| {
+        // However this closure exits, a panic included (stdout closed before `READY` makes
+        // `println!` panic), both threads are told to finish, so the scope's join cannot hang.
+        let _stop = Done([&*stop, &engine_done]);
         let stream = {
             let (stats, stop, ready) = (Arc::clone(&stats), Arc::clone(&stop), ready_tx.clone());
             let (stream_done, engine_done) = (&stream_done, &engine_done);
@@ -549,13 +552,17 @@ struct Handoff<'a> {
     dead: bool,
 }
 
+/// The source endpoint of each session's last accepted packet.
+type Peers = Vec<(SessionId, Endpoint)>;
+
 /// The engine's outputs, forwarded to the stream thread without allocating.
 struct EngineSink<'a> {
     tx: Handoff<'a>,
     /// `(pkt_hash, full hash)` of recently received packets, oldest first.
     recent: std::collections::VecDeque<(PktHash, Hash)>,
-    /// The source endpoint of each session's last packet.
-    peers: Vec<(SessionId, Endpoint)>,
+    peers: Peers,
+    /// `(session, pkt_seq, source)` of the packet being ingested, not yet authenticated.
+    from: Option<(SessionId, u32, Endpoint)>,
     notifiers: Vec<Notifier>,
     stats: Arc<Stats>,
     /// The newest packet, held until the records after it are known to be other than its
@@ -641,10 +648,19 @@ impl Sink for EngineSink<'_> {
             }
         }
     }
+    /// The answer to the packet being ingested goes to its source, accepted or not; every other
+    /// response goes to the session's last accepted source.
     fn lane_resp(&mut self, lane: LaneId, p: &RespPkt) {
         self.flush();
-        if let Some((_, ep)) = self.peers.iter().find(|(s, _)| *s == p.session) {
-            let ep = *ep;
+        let ep = match self.from {
+            Some((s, seq, ep)) if s == p.session && seq == p.echo_pkt => Some(ep),
+            _ => self
+                .peers
+                .iter()
+                .find(|(s, _)| *s == p.session)
+                .map(|x| x.1),
+        };
+        if let Some(ep) = ep {
             self.send(Out::Resp(lane, ep, *p));
         }
     }
@@ -702,8 +718,81 @@ fn engine_loop<R: RxRing>(
     let n = plan.lanes.len();
     let mut shared =
         Shared::new(&vis, n, plan.arena, &bbo.initial_snapshot()).ok_or("engine shape")?;
+    let (mut engine, peers) = open_engine(&vis, &mut shared, bbo, &plan)?;
+    let mut sink = EngineSink {
+        tx,
+        recent: std::collections::VecDeque::with_capacity(RECENT),
+        peers,
+        from: None,
+        notifiers: plan.notifier.map_or_else(Vec::new, |x| vec![x; n]),
+        stats: Arc::clone(stats),
+        held: None,
+    };
+    // Deadline admission needs a class A or C clock (06 §6.8); DEV backends run without it.
+    if !matches!(class, LatencyClass::E | LatencyClass::S) {
+        return Err(
+            "only class E and S backends are wired; deadline clocks are a follow-up".into(),
+        );
+    }
+    let mut burst = [RxPkt::empty(); RX_BURST];
+    let mut newest = Nanos(0);
+    match plan.seal.as_str() {
+        "abort" => vyrn_engine::alloc::seal(),
+        "count" => vyrn_engine::alloc::seal_counting(),
+        _ => {}
+    }
+    let _ = ready.send(Ok(()));
+    // A fault stays a `Copy` value until the allocator is unsealed: formatting it here would
+    // allocate, and under `seal = "abort"` turn the fail-stop into an abort.
+    let mut fault: Option<Fault> = None;
+    while !stop.load(Ordering::Acquire) && !sink.tx.dead {
+        let mut got = 0usize;
+        for (l, rx) in rxs.iter_mut().enumerate() {
+            let k = rx.poll(&mut burst);
+            got = got.saturating_add(k);
+            for p in burst.iter().take(k) {
+                newest = newest.max(p.rx_ts());
+                let clock = dev_clock(newest);
+                if let Err(f) = ingest(&mut engine, &mut sink, l, rx.bytes(p), p.rx_ts(), &clock) {
+                    fault = Some(f);
+                }
+            }
+            rx.release(k);
+        }
+        if let Err(f) = engine.run(&dev_clock(newest), &mut sink, 64) {
+            fault = Some(f);
+        }
+        sink.flush();
+        if fault.is_some() {
+            break;
+        }
+        if got == 0 {
+            std::thread::yield_now();
+        }
+    }
+    stats
+        .seal_violations
+        .store(vyrn_engine::alloc::violations(), Ordering::Release);
+    vyrn_engine::alloc::unseal();
+    if let Some(f) = fault {
+        return Err(format!("engine fault {f:?}"));
+    }
+    if sink.tx.dead && !stop.load(Ordering::Acquire) {
+        return Err("stream core stopped".into());
+    }
+    Ok(())
+}
+
+/// The engine with every DEV session open, and each session's response endpoint, unknown until
+/// the session's first accepted packet.
+fn open_engine<'a>(
+    vis: &'a Hw,
+    shared: &'a mut Shared<Hw>,
+    bbo: Bbo,
+    plan: &EnginePlan,
+) -> Result<(Engine<'a, Hw, NA>, Peers), String> {
     let mut engine: Engine<'_, Hw, NA> =
-        Engine::new(&vis, &mut shared, bbo, &plan.lanes, |cfg, aw, ports| {
+        Engine::new(vis, shared, bbo, &plan.lanes, |cfg, aw, ports| {
             let mut acct = AcctRisk::new(AccountId(1), AccountId(1));
             acct.max_open_orders = 1000;
             Lane::<Hw, NA>::new(cfg, aw, ports, acct)
@@ -727,61 +816,7 @@ fn engine_loop<R: RxRing>(
             },
         ));
     }
-    let mut sink = EngineSink {
-        tx,
-        recent: std::collections::VecDeque::with_capacity(RECENT),
-        peers,
-        notifiers: plan.notifier.map_or_else(Vec::new, |x| vec![x; n]),
-        stats: Arc::clone(stats),
-        held: None,
-    };
-    // Deadline admission needs a class A or C clock (06 §6.8); DEV backends run without it.
-    if !matches!(class, LatencyClass::E | LatencyClass::S) {
-        return Err(
-            "only class E and S backends are wired; deadline clocks are a follow-up".into(),
-        );
-    }
-    let mut burst = [RxPkt::empty(); RX_BURST];
-    let mut newest = Nanos(0);
-    match plan.seal.as_str() {
-        "abort" => vyrn_engine::alloc::seal(),
-        "count" => vyrn_engine::alloc::seal_counting(),
-        _ => {}
-    }
-    let _ = ready.send(Ok(()));
-    let mut out = Ok(());
-    while !stop.load(Ordering::Acquire) && !sink.tx.dead {
-        let mut got = 0usize;
-        for (l, rx) in rxs.iter_mut().enumerate() {
-            let k = rx.poll(&mut burst);
-            got = got.saturating_add(k);
-            for p in burst.iter().take(k) {
-                newest = newest.max(p.rx_ts());
-                if let Err(e) = ingest(&mut engine, &mut sink, l, rx, p, &dev_clock(newest)) {
-                    out = Err(e);
-                }
-            }
-            rx.release(k);
-        }
-        if let Err(f) = engine.run(&dev_clock(newest), &mut sink, 64) {
-            out = Err(format!("engine fault {f:?}"));
-        }
-        sink.flush();
-        if out.is_err() {
-            break;
-        }
-        if got == 0 {
-            std::thread::yield_now();
-        }
-    }
-    stats
-        .seal_violations
-        .store(vyrn_engine::alloc::violations(), Ordering::Release);
-    vyrn_engine::alloc::unseal();
-    if sink.tx.dead && out.is_ok() && !stop.load(Ordering::Acquire) {
-        out = Err("stream core stopped".into());
-    }
-    out
+    Ok((engine, peers))
 }
 
 /// The deadline clock of class-E and S backends: 1 s behind the newest `rx_ts`, so the low-32
@@ -795,15 +830,15 @@ fn dev_clock(newest: Nanos) -> FixedClock {
 const DEV_SLACK_NS: u64 = 1_000_000_000;
 
 /// One received frame into lane `l`.
-fn ingest<R: RxRing>(
+fn ingest(
     engine: &mut Engine<'_, Hw, NA>,
     sink: &mut EngineSink<'_>,
     l: usize,
-    rx: &R,
-    p: &RxPkt,
+    bytes: &[u8],
+    rx_ts: Nanos,
     clock: &FixedClock,
-) -> Result<(), String> {
-    let Ok(f) = frame::parse(rx.bytes(p)) else {
+) -> Result<(), Fault> {
+    let Ok(f) = frame::parse(bytes) else {
         return Ok(()); // not a fast-path frame: the NIC counters already saw it
     };
     let body = f.payload;
@@ -817,23 +852,23 @@ fn ingest<R: RxRing>(
         sink.recent.pop_front();
     }
     sink.recent.push_back((pkt_hash, full));
-    if let Ok(req) = vyrn_wire::Request::parse(body)
-        && let Some(peer) = sink
-            .peers
-            .iter_mut()
-            .find(|(s, _)| *s == req.header().session())
-    {
-        peer.1 = f.hdr.src;
-    }
+    sink.from = vyrn_wire::Request::parse(body)
+        .ok()
+        .map(|r| (r.header().session(), r.header().pkt_seq.get(), f.hdr.src));
     let input = RxIn {
         bytes: body,
-        rx_ts: p.rx_ts(),
+        rx_ts,
         pkt_hash,
     };
-    engine
-        .ingest(l, input, clock, sink)
-        .map(|_| ())
-        .map_err(|f| format!("engine fault {f:?}"))
+    let r = engine.ingest(l, input, clock, sink);
+    // Only a packet the lane authenticated and accepted moves the session's endpoint: a spoofed
+    // or replayed one must not redirect its responses.
+    if let (Ok(Rx::Accepted), Some((s, _, src))) = (&r, sink.from.take())
+        && let Some(peer) = sink.peers.iter_mut().find(|(p, _)| *p == s)
+    {
+        peer.1 = src;
+    }
+    r.map(|_| ())
 }
 
 /// The stream core: frames, blocks, and the responses those frames release.
@@ -1073,6 +1108,183 @@ mod tests {
         let c = super::Config::load(&f).unwrap();
         assert_eq!(c.cores.seal, "count");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A packet moves its session's response endpoint only once the lane accepts it: a replay
+    /// of an accepted packet, or a packet with a bad tag, from another address leaves it alone
+    /// (#49 Codex P2).
+    #[test]
+    fn only_accepted_packets_move_the_endpoint() {
+        use std::net::Ipv4Addr;
+        use std::sync::atomic::AtomicBool;
+        use vyrn_cut::{Hw, Ring};
+        use vyrn_nic::frame::{self, Endpoint, FrameHdr};
+        use vyrn_types::{BookId, Epoch, LaneId, Nanos};
+        use vyrn_wire::{Msg, ReqHeader, encode_request};
+
+        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/dev.toml");
+        let c = super::Config::load(std::path::Path::new(p)).unwrap();
+        let plan = super::EnginePlan::from(&c).unwrap();
+        let bbo = vyrn_bbo::Bbo::new(plan.bbo);
+        let init = bbo.initial_snapshot();
+        let mut shared = super::Shared::new(&Hw, plan.lanes.len(), plan.arena, &init).unwrap();
+        let (mut engine, peers) = super::open_engine(&Hw, &mut shared, bbo, &plan).unwrap();
+        let mut ring = Ring::<super::Out, { super::HANDOFF }, 1, Hw>::new(&Hw);
+        let (tx, [mut rx]) = ring.split().unwrap();
+        let done = AtomicBool::new(false);
+        let mut sink = super::EngineSink {
+            tx: super::Handoff {
+                tx,
+                stream_done: &done,
+                dead: false,
+            },
+            recent: std::collections::VecDeque::new(),
+            peers,
+            from: None,
+            notifiers: Vec::new(),
+            stats: std::sync::Arc::default(),
+            held: None,
+        };
+        let ep = |port| Endpoint {
+            mac: [0; 6],
+            ip: Ipv4Addr::LOCALHOST,
+            port,
+        };
+        let (client, spoof) = (ep(5001), ep(6666));
+        let session = vyrn_wire::session_id(1, LaneId(0), 1).unwrap();
+        // A resting buy: the lane answers it with an Ack.
+        let new = Msg::New {
+            flags: vyrn_wire::OrderFlags::from_byte(
+                vyrn_bbo::OrderFlags::new(
+                    vyrn_bbo::Side::Buy,
+                    vyrn_bbo::Tif::Day,
+                    false,
+                    vyrn_bbo::Stp::None,
+                )
+                .0,
+            )
+            .unwrap(),
+            tick: vyrn_types::Tick(100),
+            qty: vyrn_types::Qty(1),
+            client_tag: 1,
+        };
+        let req = |pkt_seq, key: &[u8; 16]| {
+            let hdr = ReqHeader::new(session, pkt_seq, Epoch(0).low16(), BookId(7), false);
+            let mut b = [0u8; vyrn_types::MAX_REQ_PAYLOAD];
+            let n = encode_request(&mut b, hdr, &[new], key, None).unwrap();
+            b[..n].to_vec()
+        };
+        let mut send = |src, body: &[u8]| {
+            let hdr = FrameHdr { src, dst: ep(7000) };
+            let mut f = [0u8; frame::MAX_FRAME_BYTES];
+            let n = frame::build(&hdr, body, &mut f).unwrap();
+            let clock = super::dev_clock(Nanos(1));
+            super::ingest(&mut engine, &mut sink, 0, &f[..n], Nanos(1), &clock).unwrap();
+            engine.run(&clock, &mut sink, 64).unwrap();
+            sink.peers.iter().find(|(s, _)| *s == session).unwrap().1
+        };
+        let good = req(1, &[0x11; 16]);
+        assert_eq!(send(client, &good), client, "accepted");
+        assert_eq!(send(spoof, &good), client, "replayed from another address");
+        assert_eq!(send(spoof, &req(2, &[0x99; 16])), client, "bad tag");
+        // The accepted order's Ack (a TX packet) went to the client; the bad-tag packet's
+        // `BAD_MAC` answer went to its own source and moved nothing.
+        let (mut acks, mut bad_mac) = (0, 0);
+        while let Some(o) = rx.pop(&Hw) {
+            match o {
+                super::Out::Tx(e, ..) => {
+                    assert_eq!(e, client);
+                    acks += 1;
+                }
+                super::Out::Resp(_, e, r) if r.echo_pkt == 2 => {
+                    assert_eq!(e, spoof);
+                    bad_mac += 1;
+                }
+                super::Out::Resp(_, e, _) => assert_eq!(e, client),
+                _ => {}
+            }
+        }
+        assert_eq!((acks, bad_mac), (1, 1));
+    }
+
+    /// An RX queue holding one frame, delivered on the first poll.
+    struct OneFrame(Vec<u8>, bool, vyrn_wire::NicCounters);
+
+    impl vyrn_wire::RxRing for OneFrame {
+        fn poll(&mut self, out: &mut [vyrn_wire::RxPkt; vyrn_wire::RX_BURST]) -> usize {
+            if self.1 || self.0.is_empty() {
+                return 0;
+            }
+            self.1 = true;
+            let len = u16::try_from(self.0.len()).unwrap();
+            let data = std::ptr::NonNull::new(self.0.as_mut_ptr()).unwrap();
+            let ts = vyrn_types::Nanos(1);
+            out[0] = vyrn_wire::RxPkt::new(data, len, vyrn_wire::RxFlags(0), 0, ts);
+            1
+        }
+        fn release(&mut self, _n: usize) {}
+        fn bytes<'a>(&'a self, _p: &'a vyrn_wire::RxPkt) -> &'a [u8] {
+            &self.0
+        }
+        fn ts_source(&self) -> vyrn_wire::TsSource {
+            vyrn_wire::TsSource::Virtual
+        }
+        fn counters(&self) -> &vyrn_wire::NicCounters {
+            &self.2
+        }
+    }
+
+    /// An engine fault on a sealed engine thread fail-stops without allocating: a frame on an
+    /// RX queue past the last lane is `Fault::NoLane`, reported after the thread unseals. Under
+    /// `seal = "count"` the old `format!` in the loop showed as a seal violation; under
+    /// `seal = "abort"` it aborted the process instead of returning the fault.
+    #[test]
+    fn sealed_engine_fault_does_not_allocate() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use vyrn_cut::{Hw, Ring};
+        use vyrn_nic::frame::{self, Endpoint, FrameHdr};
+
+        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/dev.toml");
+        let c = super::Config::load(std::path::Path::new(p)).unwrap();
+        let ep = Endpoint {
+            mac: [0; 6],
+            ip: std::net::Ipv4Addr::LOCALHOST,
+            port: 1,
+        };
+        let mut f = vec![0u8; frame::MAX_FRAME_BYTES];
+        let n = frame::build(&FrameHdr { src: ep, dst: ep }, &[0; 32], &mut f).unwrap();
+        f.truncate(n);
+        for seal in ["count", "abort"] {
+            let mut plan = super::EnginePlan::from(&c).unwrap();
+            plan.seal = seal.to_owned();
+            let counters = || vyrn_wire::NicCounters::default();
+            let rxs = vec![
+                OneFrame(Vec::new(), false, counters()),
+                OneFrame(Vec::new(), false, counters()),
+                OneFrame(f.clone(), false, counters()),
+            ];
+            let mut ring = Ring::<super::Out, { super::HANDOFF }, 1, Hw>::new(&Hw);
+            let (tx, _rx) = ring.split().unwrap();
+            let (done, stop) = (AtomicBool::new(false), AtomicBool::new(false));
+            let stats = std::sync::Arc::<super::Stats>::default();
+            let (ready, _ready_rx) = std::sync::mpsc::sync_channel(4);
+            let h = super::Handoff {
+                tx,
+                stream_done: &done,
+                dead: false,
+            };
+            let r = std::thread::scope(|sc| {
+                sc.spawn(|| {
+                    let class = vyrn_nic::LatencyClass::E;
+                    super::engine_thread(plan, rxs, h, &ready, &stop, &stats, class)
+                })
+                .join()
+                .unwrap()
+            });
+            assert_eq!(r, Err("engine fault NoLane".to_owned()), "{seal}");
+            let v = stats.seal_violations.load(Ordering::Acquire);
+            assert_eq!(v, 0, "{seal}: allocations on the sealed fault path");
+        }
     }
 
     /// A response gated on a packet or step opens only once a returned frame carries it.

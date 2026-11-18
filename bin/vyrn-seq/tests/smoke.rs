@@ -60,6 +60,21 @@ fn start(
     block_ms: u64,
     tag: &str,
 ) -> (Child, BufReader<ChildStdout>, SocketAddrV4, PathBuf) {
+    let (mut child, dir) = spawn(replica, seal, block_ms, tag);
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    let lane0: SocketAddrV4 = loop {
+        line.clear();
+        assert!(out.read_line(&mut line).unwrap() > 0, "exited before READY");
+        if let Some(rest) = line.trim().strip_prefix("READY vyrn-seq lanes=2 rx=") {
+            break rest.split(',').next().unwrap().parse().unwrap();
+        }
+    };
+    (child, out, lane0, dir)
+}
+
+/// Writes the DEV config and spawns the box with piped stdin and stdout.
+fn spawn(replica: &UdpSocket, seal: &str, block_ms: u64, tag: &str) -> (Child, PathBuf) {
     let dir = std::env::temp_dir().join(format!("vyrn-seq-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = dir.join("seq.toml");
@@ -112,7 +127,7 @@ base = 1000000000
     )
     .unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_vyrn-seq"))
+    let child = Command::new(env!("CARGO_BIN_EXE_vyrn-seq"))
         .arg("--config")
         .arg(&cfg)
         .arg("--stop-on-stdin-eof")
@@ -121,16 +136,35 @@ base = 1000000000
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut out = BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    let lane0: SocketAddrV4 = loop {
-        line.clear();
-        assert!(out.read_line(&mut line).unwrap() > 0, "exited before READY");
-        if let Some(rest) = line.trim().strip_prefix("READY vyrn-seq lanes=2 rx=") {
-            break rest.split(',').next().unwrap().parse().unwrap();
+    (child, dir)
+}
+
+/// Waits up to 20 s for the box to exit; kills it and fails if it does not.
+fn exits(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            return st;
         }
-    };
-    (child, out, lane0, dir)
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("the box did not exit");
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// Stdout closed before `READY`: printing it fails and the control thread unwinds, which must
+/// still stop the engine and stream threads, so the box exits (not 0) instead of hanging in its
+/// thread scope. Stdin stays open, so nothing else stops the box.
+#[test]
+fn closed_stdout_before_ready_exits() {
+    let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut child, dir) = spawn(&replica, "abort", 2, "no-stdout");
+    drop(child.stdout.take());
+    let status = exits(&mut child);
+    assert!(!status.success(), "{status}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// One signed `New` at tick 100 from the DEV session (lane 0, slot 1, generation 1).
@@ -366,17 +400,7 @@ fn stream_panic_stops_the_box() {
     stall_and_fill(lane0);
     drop(out);
     drop(child.stdin.take());
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        if let Some(st) = child.try_wait().unwrap() {
-            break st;
-        }
-        if Instant::now() > deadline {
-            child.kill().unwrap();
-            panic!("the box did not exit");
-        }
-        std::thread::yield_now();
-    };
+    let status = exits(&mut child);
     // The stream thread's panic is the box's failure (and STATS cannot print).
     assert!(!status.success(), "{status}");
     let _ = std::fs::remove_dir_all(&dir);
