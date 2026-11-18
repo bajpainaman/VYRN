@@ -1211,7 +1211,15 @@ REP_FinalityCert
    20  85  proposal    REP_Proposal
   105   1  count       u8          ≥ Q_BASE or Q_CHAIN
   106  65·count entries  { index u8, sig [u8; 64] }   ascending index, distinct (01 §4)
+  106+65·count  seal_ext  REP_SealExt (§9.4), present exactly when proposal.kind = 1:
+                22 + 8·n_unavail bytes
 ```
+
+A kind-1 (seal) certificate carries its `REP_SealExt` after the entries, and its signatures
+cover the seal digest (§9.4), so anyone holding the certificate verifies it on its own with
+`REP_Membership`. A kind-0 certificate ends after its entries; a decoder refuses trailing bytes,
+and refuses a kind-1 certificate without a complete `REP_SealExt`. A seal certificate is
+106 + 65·count + 22 + 8·n_unavail B under scheme 0 (BASE, Q = 3, no unavailable packets: 323 B).
 
 Each `sig` is the participant's Ed25519 finalize signature as produced by
 `simplex::scheme::ed25519` over `Proposal{ round: (epoch, view), parent: parent_view, payload:
@@ -1826,8 +1834,9 @@ seal header  { height: Hs, epoch, book, first_step: last_step(H*) + 1,
 
 - The seal's digest extends the §6.3 rule with the encoded `REP_SealExt` (LE: `end_frame_seq`
   16 B, `next_seq` 1, `next_tenure` 1, `n_unavail` 4, then `n_unavail` × (`SessionId` u32,
-  `pkt_seq` u32) in ascending order). It is not `digest(REP_Proposal)`, so the signatures of a
-  kind-1 `REP_FinalityCert` verify only together with its `REP_SealExt` (open question 14).
+  `pkt_seq` u32) in ascending order). It is not `digest(REP_Proposal)`, so a kind-1
+  `REP_FinalityCert` carries its `REP_SealExt` after the signature entries (§6.5) and verifies on
+  its own. A `REP_FinalizeVote` for a seal carries it the same way.
 - A kind-1 range may hold up to `REP_MAX_SEAL_RANGE` = 64 heights: the signed headers
   `(parent.last, H*]` plus the seal header.
 - The seal block's `lane_bounds` are the last `lane_seq` of each lane in frames `≤ F*` of its
@@ -2374,4 +2383,5 @@ Resolved by 01 and removed: `PacketRecord.flags` (§6.6: `SHED`, `ADVANCE`), INV
 | 11 | Replay order of a pooled account across pool lanes: does `AcctTake.ver` alone order every cross-lane dependency, including fills settled on the account while another pool core holds its token? | 05 | T-REP-1 with pooled accounts; B4 |
 | 12 | Do both ports of an X2542, each with its own CTPIO writer, keep the wire lead of B-REP-2W, and does a spanning step stay ≤ 142 ns? | 06 | B-REP-2W, B-REP-13 |
 | 13 | Under scheme 1 (01 §14.20), does data RX on 5 cores (50, 52–55) keep up with 155 Gbps of data frames at peak, now that core 63 signs votes? If not, voters need a larger box or `PQ_HEDGE` = 1 with the 1.35 ms tail budgeted. | 06 | B-REP-9 data mix plus B-PQ-1 on one voter |
-| 14 | How does a seal's `REP_FinalityCert` carry or commit to its `REP_SealExt`, so that an offline verifier can check a kind-1 certificate (§9.4)? | 07 / 08 | review; then `verify_finality_cert` and its vectors |
+
+Resolved and removed: 14 (a seal `REP_FinalityCert` carries its `REP_SealExt` after the entries; §6.5, §9.4).
