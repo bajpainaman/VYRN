@@ -40,7 +40,7 @@ pub struct BridgeSigners {
 }
 
 impl BridgeSigners {
-    fn well_formed(&self) -> bool {
+    pub(crate) fn well_formed(&self) -> bool {
         let ok = |keys: &[EvmAddress; BRIDGE_SIGNERS]| {
             keys.iter()
                 .enumerate()

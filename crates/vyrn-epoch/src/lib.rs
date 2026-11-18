@@ -28,6 +28,7 @@
 //! | The role state machines, force seal, halt and reassignment | [`OldSeq`], [`OldReplica`], [`NewReplica`], [`NewSeq`], [`EpoForceSeal`], [`ForceSealPool`], [`EpoReassign`] | each role; voters of `R_e` (force seal); Q operators (reassign) | the role itself; 09 (slashing evidence); the target home | events in log order; timing predicates over logged PTP times | [`RoleErr`], [`SealErr`] | 08 §4.2–4.5, §10.1, §10.3 |
 //! | The log tail over the WAN | [`TailFollow`], [`EpoTailReq`], [`TailPull`] | 2 relays and every voter of `R_e`, the old data tier; the requester | the new and third homes | state is final only to the last finalized block; a pull goes to the old and third homes at once, the first answer wins | [`TailErr`] | 08 §5.5, §10.6 |
 //! | The membership hand-off | [`Membership`], [`Activation`], [`Membership::hand_off`] | `EpoConfig(e+1)` (roster) | `vyrn-consensus` (the next [`vyrn_consensus::Committee`]), `vyrn-replica`, `vyrn-chain` | only with a verified cert(e, S) | [`MembershipErr`], [`HandoffErr`] | 08 §9, 07 §13.1 |
+//! | The roster and `roster_hash` | [`Roster`], [`Membership::from_roster`] | the control path, with `EpoConfig` | every node, light clients | bytes checked against `roster_hash` before decoding; `epoch_from ≤ epoch` | [`RosterErr`] | 08 §9.6 |
 //!
 //! # Domain separation
 //!
@@ -39,7 +40,8 @@
 //! # Conformance
 //!
 //! `vectors/handoff.txt` (record bytes, signing messages, certificates and verdicts) and
-//! `vectors/schedule.txt` (timetables and notice sequences) are plain `key = value` lines that an
+//! `vectors/schedule.txt` (timetables and notice sequences) and `vectors/roster.txt` (roster
+//! bytes, `roster_hash` and verdicts) are plain `key = value` lines that an
 //! implementation in any language can check. The `conformance` tests rebuild both files from
 //! first principles and fail on any difference; `VYRN_BLESS=1` rewrites them.
 //!
@@ -58,6 +60,7 @@ mod membership;
 mod notice;
 mod ready;
 mod roles;
+mod roster;
 mod schedule;
 mod tail;
 
@@ -83,6 +86,10 @@ pub use roles::{
     NewSeqPhase, OldReplica, OldReplicaEv, OldSeq, OldSeqEv, REASSIGN_CONTEXT, RoleErr, SealErr,
     WinHead, activate_alarm_due, failover_kind, force_seal_due, halt_due, idle_lane_seals,
     lane_seals, may_sign_reassign, reassign_open, win_head,
+};
+pub use roster::{
+    Addr, DataBox, HOMES, Home, ROSTER_CONTEXT, ROSTER_VERSION, Roster, RosterErr, SeqEntry, Voter,
+    key_len, xchg_len,
 };
 pub use schedule::{
     Boundary, EpoConfig, ScheduleErr, ScheduleRecord, Timetable, default_home, slot_start,

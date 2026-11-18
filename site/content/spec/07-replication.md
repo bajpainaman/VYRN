@@ -2207,21 +2207,24 @@ then stops new order finality at once, and the gate stops it within 5000 blocks 
 ### 13.1 Membership record
 
 ```
-REP_Membership { epoch_from: Epoch, home: HomeCode, mode: u8, n: u8, q: u8,
-  sig_scheme: SigScheme (01 §3; every key below is of this scheme),
-  voters: n × { index u8, vote_key PubKey, client u8 (0 Rust, 1 Vx), facility u8,
-                data_addr [18] (IPv6 or v4-mapped, plus port), repl_addr [18] },
-  seq_order: [{ index u8, role u8 (0 primary, 1 standby, 2 spare), seq_key PubKey, facility u8,
-                client_addr [18], repl_addr [18] }],
-  recovery: u8 (voter index of the recovery service, §8.5),
-  data_boxes: [{ index u8, facility u8, addr [18] }],
-  cert: Q signatures of the current set over BLAKE3("vyrn      v1 membership" ‖ body) }
+REP_Membership(e) { home: home(e), mode, sig_scheme (01 §3; every key below is of this scheme),
+  voters: n × { node_key, vote_key, xchg_key, client (0 Rust, 1 Vx), facility, data_addr, repl_addr },
+  seq_order: [primary, standby, spares…] × { node_key, seq_key, xchg_key, facility, client_addr, repl_addr },
+  recovery (voter index of the recovery service, §8.5),
+  data_boxes: [{ facility, addr }] }
 ```
+
+`REP_Membership(e)` is a view, not a record of its own: `home(e)`'s part of the roster that
+`EpoConfig(e).roster_hash` names, with `seq_order` starting at `EpoConfig(e).seq_order` (08 §9.6
+gives the bytes, the hash and the order). A voter index is the voter's position; a sequencer
+index is the box's position in `seq_order`. `HandoffCert(e − 1)` certifies it through
+`EpoConfig(e)`, so it carries no signature of its own.
 
 The rules are these:
 
 - Membership changes **only at epoch boundaries**, at `epoch_from`.
-- A record must be certified ≥ `REP_MEMBERSHIP_LEAD_S` = 3600 s before its boundary.
+- The `EpoConfig` that names it must be final ≥ `REP_MEMBERSHIP_LEAD_S` = `EPO_CONFIG_LEAD_S` =
+  3600 s before its boundary.
 - Validation rejects any record in which one client's voter count reaches Q (`CLIENT_SPLIT`),
   `q ≠ Q_BASE` or `Q_CHAIN` for the mode, `seq_order` names a Vx box, any key appears both as a
   `vote_key` and a `seq_key`, the standby is not in F2, or `recovery` names a Vx voter.

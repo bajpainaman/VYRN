@@ -90,12 +90,12 @@ struct EpoConfig {            // control record in the log of epoch e (07 contro
     epoch: Epoch,             // the epoch it configures, > e
     home: HomeCode,           // home(epoch) after any HomeOverride
     t_start: Nanos,           // nominal start (TAI); T of the epoch before it
-    roster_hash: Hash,        // R_epoch: member indices, vote keys, seq keys, xchg keys (09 NodeCert)
-    seq_order: [u8; 2],       // the home's vyrn-seq boxes: [primary F1, warm standby F2] (01 §14.4)
+    roster_hash: Hash,        // the roster of all three homes: keys and replica addresses (§9.6)
+    seq_order: [u8; 2],       // roster indices of home(epoch)'s vyrn-seq boxes: [primary F1, warm standby F2] (01 §14.4)
     lane_map_hash: Hash,      // lane_map(epoch) with each account's class, by replicas (10 §1.3)
-    n_lanes: u8,              // lane count of home(epoch)'s boxes: n_ded + n_pool (REF 42 + 7)
+    n_lanes: [u8; 3],         // lane count of each home's boxes, TYO, LDN, NYC: n_ded + n_pool (REF 42 + 7)
     version: u32,             // engine semantics version in force for the epoch (§9.4)
-    endpoint_hash: Hash,      // the endpoint table of home(epoch) (§11.1)
+    endpoint_hash: Hash,      // the endpoint table of all three homes (§11.1)
     flags: u16,               // bit0 skip (the epoch is empty), bit1 date roll, bit2 leap second
     sig_scheme: SigScheme,    // scheme of every live key and signature of `epoch` (01 §3, §14.20)
 }
@@ -106,12 +106,14 @@ Rules:
 - The `EpoConfig` for e+1 must be final at least `EPO_CONFIG_LEAD_S` (3,600 s) before T. If it is
   not, the replicas carry the previous epoch's configuration forward with `home`, `t_start` and
   `seq_order` recomputed from the schedule. Reason: a missing record must never block a handoff.
+  `roster_hash`, `n_lanes` and `endpoint_hash` cover all three homes, so carrying them forward
+  stays right when `home` changes; `home(epoch)`'s part is read at use.
 - 10 publishes the full `lane_map(e+1)` with the same lead (10 §1.4, `ACC_MAP_PUBLISH_LEAD_S`).
 - The `HandoffRecord` covers `EpoConfig` through `log_hash`, so the certificate certifies the next
   epoch's configuration as well as the final state.
 - **`sig_scheme`** follows 01 §14.20 SG1–SG7, the signature form of 04 §12's VR4: it changes only
   here, at a boundary, never decreases, and `roster_hash` of an epoch with `sig_scheme` ≥ 1 names
-  hybrid keys only. A carried-forward configuration (first rule) keeps the previous
+  hybrid keys only (the roster's `sig_scheme` equals the config's, §9.6). A carried-forward configuration (first rule) keeps the previous
   `sig_scheme`, so a missing record cannot downgrade it. `HandoffCert(e)` is signed under
   `EpoConfig(e).sig_scheme` and certifies `EpoConfig(e+1)`, so the last scheme-0 certificate
   certifies the first hybrid roster.
@@ -1196,7 +1198,7 @@ move. 04 binds a session to its lane for life, so for a moved account:
 
 ### 9.3 Replica sets
 
-`R_{e+1}` is fixed in `EpoConfig(e+1)` and changes only at a boundary: in CHAIN by 09's governance
+`R_{e+1}` is fixed in `EpoConfig(e+1)` through its roster (§9.6) and changes only at a boundary: in CHAIN by 09's governance
 (`NodeCert.valid_from`), in BASE by an admin record. A new box follows for at least one epoch before
 it is listed, so it passes `EpoReady`'s lag and B4 checks. A box leaves after its home's last epoch.
 
@@ -1213,6 +1215,9 @@ changes only at a boundary (E9):
   list (the contract's `_writeSet` check).
 - Every activated set stays readable by rotation number, because posts accepted under an earlier
   set stay claimable on L1 (09 §6.7 step 4). L1's own 72 h queue is separate from this table.
+- The set in force for epoch e is the one the roster of `EpoConfig(e)` names (§9.6), and it must
+  equal the table's set of that rotation number. A carried-forward configuration keeps the set,
+  so a rotation activates only at a boundary whose configuration names it.
 
 ### 9.4 Software upgrades
 
@@ -1224,6 +1229,73 @@ changes only at a boundary (E9):
 | U4 | At most one client kind (Rust or Vx) changes binary per boundary. | `CLIENT_SPLIT_BASE` (2 + 2) and `CLIENT_SPLIT_CHAIN` (3 + 2) mean neither kind reaches Q alone, so a bug in the changed kind halts finality and the unchanged kind stays the reference. |
 | U5 | A semantic change activates by `EpoConfig.version` at a boundary only after both kinds ship it under U1–U4. | Both implementations then agree before the change counts. |
 | U6 | Both sequencer boxes always run Rust (01 §14.4). They change binary under U4 as part of the Rust kind, and the standby changes with the primary. | They never vote, in either mode, so the split counts voters only. Both client kinds' replays check them. |
+
+### 9.6 The roster and `roster_hash`
+
+The roster is every key and replica-plane address of the three homes. `EpoConfig(e)` carries
+only its hash; the control path publishes the bytes with the record (BASE: the admin record; CHAIN:
+built from the `NodeCert`s in force for e, 09 §2.3, and the bridge signer table, §9.5). One roster
+covers all three homes, so a carried-forward `roster_hash` (§2.3) names the right keys whatever
+`home(e)` becomes, and a carried `sig_scheme` and a carried roster stay in step (01 §14.20 SG4).
+
+```
+Roster {                      // little-endian (01 §3)
+    version:    u8,           // 1; a decoder rejects any other value and any trailing byte
+    sig_scheme: SigScheme,    // 0 or 1: the scheme of every NK, VK and SK below
+    epoch_from: Epoch,        // the first epoch it may configure
+    homes:      [Home; 3],    // TYO, LDN, NYC (HomeCode order)
+    bridge:     BridgeSet,    // CHAIN only; BASE has no bridge section
+}
+Home {
+    voters:   [Voter; n],     // n = N_BASE or N_CHAIN; voter index = position
+    n_seq:    u8,             // BASE ≥ 2; CHAIN = N_CHAIN, box j is operator j's
+    seq:      [SeqBox; n_seq],// roster index = n + position
+    recovery: u8,             // voter index of the recovery service (07 §8.5)
+    n_data:   u8,
+    data:     [DataBox; n_data],
+}
+Voter   { client: u8 (0 Rust, 1 Vx), facility: u8 (k for Fk), node_key: [K], vote_key: [K],
+          xchg_key: [X] (GXK, 09 §2.4), data_addr: Addr, repl_addr: Addr }
+SeqBox  { facility: u8, node_key: [K], seq_key: [K], xchg_key: [X] (XK), client_addr: Addr,
+          repl_addr: Addr }
+DataBox { facility: u8, addr: Addr }
+Addr    { ip: [u8; 16] (IPv6; IPv4 as ::ffff:a.b.c.d), port: u16 }
+BridgeSet { rotation_no: u64, bridge_keys: [[u8; 20]; 5], guardian_keys: [[u8; 20]; 5] }   // 09 §6.7
+
+roster_hash = derive_key("vyrn      v1 roster", genesis_hash ‖ mode ‖ Roster)
+```
+
+`K` is the `PubKey` length of `sig_scheme` (01 §3: 32 or 1,344 B). `X` is the `KexKey` length of
+`sig_scheme` (01 §3, PQ-6(a): X25519, 32 B, or X25519 ‖ ML-KEM-768, 1,216 B). `mode` is one byte, 0 BASE and 1 CHAIN, as in every
+`genesis_hash ‖ mode` prefix of this chapter; it also fixes `n` and `Q`, so the roster stores
+neither. CHAIN: voter i and box j = i are operator i's validator and sequencer boxes, from
+`NodeCert(i, home)`, so they share `node_key`; the voter's `xchg_key` is the `NodeCert`'s GXK and
+the box's is its XK. BASE voters carry a GXK that nothing reads. Client-facing addresses (per-lane
+order addresses, the recovery address) are in the endpoint table (§11.1), not here.
+
+**Decode rules.** A node rejects roster bytes, before it uses any key, unless all of these hold:
+
+| # | Rule |
+|---|---|
+| R1 | `derive_key` of the bytes equals `EpoConfig(e).roster_hash`, checked before decoding |
+| R2 | `version` = 1; `sig_scheme` ∈ {0, 1} and equals `EpoConfig(e).sig_scheme`; no trailing byte |
+| R3 | `epoch_from` ≤ e |
+| R4 | Per home: `client` ∈ {0, 1}, every `facility` ≥ 1, and neither client holds Q voters (`CLIENT_SPLIT`) |
+| R5 | Per home: no key repeats among the `vote_key`s and `seq_key`s (07 §13.1) |
+| R6 | Per home: `recovery` names a Rust voter; `n_seq` as above |
+| R7 | CHAIN: no bridge or guardian key is zero or repeats within its list, and the set equals the bridge signer table's set of `rotation_no` (§9.5) |
+| R8 | `EpoConfig(e).seq_order` names two distinct boxes of `home(e)`: BASE the primary in F1 and the standby in F2; CHAIN in two different facilities |
+
+**The view.** `REP_Membership(e)` (07 §13.1) is not a separate record: it is `home(e)`'s part of
+the roster, with `seq_order` = `[EpoConfig(e).seq_order[0], seq_order[1]]` and then the other
+boxes in roster order. `HandoffCert(e − 1)` certifies it through `EpoConfig(e)`.
+
+**Size.** A scheme-0 BASE roster with 2 boxes and 4 data boxes per home is 2,649 B; a scheme-0
+CHAIN roster is 4,513 B and a scheme-1 one 118,753 B (computed, `vyrn-epoch` `vectors/roster.txt`).
+A node hashes it once per `EpoConfig`, off every hot path: 119 KB of BLAKE3 is ≤ 0.1 ms (budget).
+
+**Vectors.** `crates/vyrn-epoch/vectors/roster.txt` holds the bytes and `roster_hash` of a BASE and
+a CHAIN scheme-0 roster, the hash and length of a scheme-1 one, and one reject per rule R1–R8.
 
 ## 10. Failure cases
 
@@ -1502,7 +1574,7 @@ Constants (all budgets). The timeouts and periods are in §4.9.
 | `EPO_NOTICE_OFFSETS_S` | 3,600, 600, 60, 10, 1 | `EpochNotice` offsets |
 | `EPO_D_LANE_MOVED` | detail code of `SESSION_CLOSED` | the account moved lane at the boundary |
 
-Types: `EpoConfig`, `EpoReady`, `EpoGo`, `EpoHold`, `EpoHalt`, `EpoForceSeal`, `EpoReassign`,
+Types: `EpoConfig`, `Roster` (§9.6), `EpoReady`, `EpoGo`, `EpoHold`, `EpoHalt`, `EpoForceSeal`, `EpoReassign`,
 `HandoffSig`, `HandoffCert`, `EpoArmed`, `EpoTailReq`/`EpoTailResp`, `EpoActivated`, `WinBlock`,
 `UncrossRecord`, `PrioKey`, `AuctionCfg`, `CollectBuf`, trait `EpochEngine`. Invariants:
 

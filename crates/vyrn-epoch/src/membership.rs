@@ -10,9 +10,9 @@
 //! returns the [`Activation`] that `vyrn-replica` hands to `vyrn-consensus`: the next committee,
 //! the block key it accepts, and the [`Fence`] for epoch e.
 //!
-//! Spec gap: `EpoConfig.roster_hash` has no byte encoding in 08 or 09, so this crate cannot check
-//! a bundle against it. The caller builds the bundle from a roster it already trusts; checking
-//! `roster_hash` is a follow-up.
+//! [`Membership::from_roster`] (in `roster.rs`) builds the bundle from the roster bytes that
+//! `EpoConfig.roster_hash` names (08 §9.6); [`Membership::new`] builds one from keys the caller
+//! already trusts, for tests and tools.
 
 use crate::Domain;
 use crate::fence::Fence;
@@ -48,6 +48,7 @@ pub struct Membership {
     home: HomeCode,
     committee: Committee,
     seq: [SeqBox; 2],
+    spares: Vec<SeqBox>,
 }
 
 /// What `vyrn-consensus` and `vyrn-replica` need to start epoch e+1.
@@ -91,7 +92,14 @@ impl Membership {
             home,
             committee,
             seq,
+            spares: Vec::new(),
         })
+    }
+
+    /// The other `vyrn-seq` boxes of the home, after the standby in `REP_Membership.seq_order`.
+    pub(crate) fn with_spares(mut self, spares: Vec<SeqBox>) -> Self {
+        self.spares = spares;
+        self
     }
 
     pub fn epoch(&self) -> Epoch {
@@ -109,6 +117,11 @@ impl Membership {
     /// `[primary F1, standby F2]`.
     pub fn seq(&self) -> &[SeqBox; 2] {
         &self.seq
+    }
+
+    /// The spares, in roster order: `REP_Membership.seq_order` after `[primary, standby]`.
+    pub fn spares(&self) -> &[SeqBox] {
+        &self.spares
     }
 
     /// The hand-off from this epoch (`R_e`) to `next` (`R_{e+1}`) on cert(e, S).

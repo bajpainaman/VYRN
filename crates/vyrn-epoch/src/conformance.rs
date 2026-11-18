@@ -200,6 +200,160 @@ fn schedule() -> String {
     s
 }
 
+fn roster_verdict(r: Result<(), crate::RosterErr>) -> String {
+    use crate::RosterErr as E;
+    match r {
+        Ok(()) => "ok".into(),
+        Err(e) => match e {
+            E::Hash => "hash",
+            E::Version(_) => "version",
+            E::NotLive(_) => "not_live",
+            E::Scheme { .. } => "scheme",
+            E::Short => "short",
+            E::Trailing(_) => "trailing",
+            E::Early { .. } => "early",
+            E::Field(_) => "field",
+            E::ClientSplit(_) => "client_split",
+            E::DuplicateKey(_) => "duplicate_key",
+            E::Recovery(_) => "recovery",
+            E::SeqCount(_) => "seq_count",
+            E::Bridge => "bridge",
+            E::SeqOrder(_) => "seq_order",
+            E::Unsupported(_) => "unsupported",
+            E::Membership(_) => "membership",
+        }
+        .into(),
+    }
+}
+
+fn roster() -> String {
+    use crate::{EpoConfig, Membership, Roster};
+    let mut s = String::from(
+        "# vyrn-epoch roster vectors (spec/08-epochs.md §9.6).\n\
+         # roster_hash = derive_key(\"vyrn      v1 roster\", genesis_hash || mode || roster).\n\
+         # Fixture: testkit::roster. LDN voter i has vote seed [0x41+i; 32] and GXK seed [2, i, 0xC7 x 30];\n\
+         # LDN vyrn-seq box j has seq seed [0x90+j; 32] and XK seed [0x98+j; 32].\n\
+         # EpoConfig(8) is LDN with seq_order [n, n+1].\n\
+         # verdict is Membership::from_roster. A reject_ case edits the fixture as its name says;\n\
+         # its roster_hash is the hash of the edited bytes unless the case edits the hash itself.\n\n",
+    );
+    for (mode, scheme) in [(Mode::Base, 0u8), (Mode::Chain, 0), (Mode::Chain, 1)] {
+        let domain = testkit::domain(mode);
+        let r = testkit::roster(mode, scheme);
+        let bytes = r.encode();
+        assert_eq!(Roster::decode(mode, &bytes).as_ref(), Ok(&r), "round trip");
+        let cfg = testkit::config(&domain, &r);
+        let name = format!("{}_scheme{scheme}", mode_name(mode));
+        let _ = writeln!(s, "case = {name}");
+        let _ = writeln!(s, "mode = {}", mode_name(mode));
+        let _ = writeln!(s, "genesis_hash = {}", hex(&domain.genesis_hash.0));
+        let _ = writeln!(s, "len = {}", bytes.len());
+        if scheme == 0 {
+            let _ = writeln!(s, "roster = {}", hex(&bytes));
+        }
+        let _ = writeln!(s, "roster_hash = {}", hex(&cfg.roster_hash.0));
+        let got = Membership::from_roster(&cfg, &bytes, &domain);
+        let _ = writeln!(
+            s,
+            "verdict = {}",
+            roster_verdict(got.as_ref().map(|_| ()).map_err(|e| *e))
+        );
+        if let Ok((m, _)) = &got {
+            for i in 0..m.committee().n() {
+                let k = m
+                    .committee()
+                    .voter(u8::try_from(i).unwrap_or(0))
+                    .copied()
+                    .unwrap_or_default();
+                let _ = writeln!(s, "voter{i} = {}", hex(&k));
+            }
+            for b in m.seq().iter().chain(m.spares()) {
+                let _ = writeln!(
+                    s,
+                    "seq{} = {} {}",
+                    b.index,
+                    hex(&b.seq_key),
+                    hex(&b.xchg_key)
+                );
+            }
+        }
+        s.push('\n');
+    }
+
+    // Rejects on the BASE scheme-0 fixture. Each case edits the roster, then its bytes, then the
+    // config; the config names the hash of the edited bytes unless the config edit changes it.
+    let mode = Mode::Base;
+    let domain = testkit::domain(mode);
+    let none_r: fn(&mut Roster) = |_| {};
+    let none_b: fn(&mut Vec<u8>) = |_| {};
+    let none_c: fn(&mut EpoConfig) = |_| {};
+    type Case = (
+        &'static str,
+        fn(&mut Roster),
+        fn(&mut Vec<u8>),
+        fn(&mut EpoConfig),
+    );
+    let cases: [Case; 11] = [
+        ("wrong_hash", none_r, none_b, |c| c.roster_hash.0[0] ^= 1),
+        ("cfg_scheme_1", none_r, none_b, |c| c.sig_scheme = 1),
+        (
+            "epoch_before_from",
+            |r| r.epoch_from = Epoch(9),
+            none_b,
+            none_c,
+        ),
+        ("seq_order_same_box", none_r, none_b, |c| {
+            c.seq_order = [4, 4]
+        }),
+        ("seq_order_swapped_facilities", none_r, none_b, |c| {
+            c.seq_order = [5, 4]
+        }),
+        ("seq_order_voter", none_r, none_b, |c| c.seq_order = [3, 4]),
+        (
+            "rust_quorum",
+            |r| r.homes[1].voters[1].client = 0,
+            none_b,
+            none_c,
+        ),
+        (
+            "vote_key_is_seq_key",
+            |r| r.homes[2].seq[0].seq_key = r.homes[2].voters[3].vote_key.clone(),
+            none_b,
+            none_c,
+        ),
+        (
+            "recovery_on_vx",
+            |r| r.homes[0].recovery = 1,
+            none_b,
+            none_c,
+        ),
+        ("trailing_byte", none_r, |b| b.push(0), none_c),
+        ("version_2", none_r, |b| b[0] = 2, none_c),
+    ];
+    for (name, edit_r, edit_b, edit_c) in cases {
+        let mut r = testkit::roster(mode, 0);
+        edit_r(&mut r);
+        let mut bytes = r.encode();
+        edit_b(&mut bytes);
+        let mut cfg = testkit::config(&domain, &r);
+        cfg.roster_hash = Roster::hash_bytes(&domain, &bytes);
+        edit_c(&mut cfg);
+        let _ = writeln!(s, "case = reject_{name}");
+        let _ = writeln!(s, "mode = base");
+        let _ = writeln!(s, "roster_hash = {}", hex(&cfg.roster_hash.0));
+        let _ = writeln!(s, "seq_order = {} {}", cfg.seq_order[0], cfg.seq_order[1]);
+        let _ = writeln!(s, "sig_scheme = {}", cfg.sig_scheme);
+        let got = Membership::from_roster(&cfg, &bytes, &domain).map(|_| ());
+        let _ = writeln!(s, "verdict = {}\n", roster_verdict(got));
+    }
+    s
+}
+
+#[test]
+fn roster_vectors_match() {
+    check("roster.txt", &roster());
+}
+
 #[test]
 fn handoff_vectors_match() {
     check("handoff.txt", &handoff());

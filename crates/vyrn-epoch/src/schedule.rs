@@ -254,22 +254,37 @@ pub struct EpoConfig {
     pub home: HomeCode,
     /// Nominal start (TAI): T of the epoch before it.
     pub t_start: Nanos,
-    /// `R_epoch`: member indices, vote, seq and exchange keys (09 `NodeCert`).
+    /// The roster of all three homes (08 §9.6); [`crate::Membership::from_roster`] checks it.
     pub roster_hash: Hash,
-    /// The home's `vyrn-seq` boxes: `[primary F1, warm standby F2]` (01 §14.4).
+    /// Roster indices of the home's `vyrn-seq` boxes: `[primary F1, warm standby F2]` (01 §14.4).
     pub seq_order: [u8; 2],
     pub lane_map_hash: Hash,
-    pub n_lanes: u8,
+    /// Lane count of each home's boxes, in [`crate::HOMES`] order (REF 49). All three homes, so a
+    /// carried-forward configuration stays right when `home` changes (08 §2.3).
+    pub n_lanes: [u8; 3],
     /// Engine semantics version in force for the epoch (§9.4).
     pub version: u32,
+    /// The endpoint table of all three homes (08 §11.1).
     pub endpoint_hash: Hash,
     pub flags: u16,
+    /// Scheme of every live key and signature of `epoch` (01 §3, §14.20); the roster's keys are
+    /// of this scheme.
+    pub sig_scheme: u8,
 }
 
 impl EpoConfig {
     pub const FLAG_SKIP: u16 = 1 << 0;
     pub const FLAG_DATE_ROLL: u16 = 1 << 1;
     pub const FLAG_LEAP: u16 = 1 << 2;
+
+    /// Lane count of `home(epoch)`'s boxes.
+    pub fn lanes(&self) -> u8 {
+        let i = crate::HOMES
+            .iter()
+            .position(|h| *h == self.home)
+            .unwrap_or(0);
+        self.n_lanes[i]
+    }
 
     /// The configuration in force for `boundary.to` (08 §2.3): `published` if it names that
     /// epoch and was final at least `EPO_CONFIG_LEAD_S` before T, else `prev` carried forward
@@ -441,10 +456,11 @@ mod tests {
             roster_hash: Hash([1; 32]),
             seq_order: [4, 5],
             lane_map_hash: Hash([2; 32]),
-            n_lanes: 49,
+            n_lanes: [49, 49, 11],
             version: 3,
             endpoint_hash: Hash([3; 32]),
             flags: EpoConfig::FLAG_SKIP,
+            sig_scheme: 0,
         };
         let next = EpoConfig {
             epoch: Epoch(1),
