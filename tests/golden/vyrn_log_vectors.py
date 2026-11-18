@@ -13,6 +13,16 @@ decodes it back, and compares the result byte for byte with the .out file.
 import json
 import os
 import struct
+import json
+import sys
+
+JSON = sys.argv[1:] == ["--json"]          # the same vectors as JSON (tests/golden/README.md)
+
+
+def say(*a, **k):
+    if not JSON:
+        print(*a, **k)
+
 
 # ---------------------------------------------------------------- BLAKE3 (hash mode, 32 bytes)
 IV = [0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -75,16 +85,20 @@ for case in cases:
     data = bytes(i % 251 for i in range(case["input_len"]))
     if blake3(data).hex() != case["hash"][:64]:
         raise SystemExit(f"BLAKE3 self-test FAILED at input_len {case['input_len']}")
-print(f"# BLAKE3 self-test: {len(cases)} official vectors OK")
-print()
+say(f"# BLAKE3 self-test: {len(cases)} official vectors OK")
+say()
 
 
 def hx(s: str) -> bytes:
     return bytes.fromhex(s)
 
 
+DOC = {"source": "tests/golden/vyrn_log_vectors.py", "entries": []}
+
+
 def out(name: str, b: bytes) -> None:
-    print(f"{name}: {b.hex()}")
+    DOC["entries"].append({"name": name, "hex": b.hex()})
+    say(f"{name}: {b.hex()}")
 
 
 # ---------------------------------------------------------------- LEB128 and ZigZag (07 §3.4)
@@ -103,17 +117,17 @@ def zz(v: int) -> int:
 
 
 assert leb(300) == hx("ac02") and leb(zz(512)) == hx("8008")   # 07 §3.11's own bytes
-print("# leb.<decimal>: canonical unsigned LEB128")
+say("# leb.<decimal>: canonical unsigned LEB128")
 for v in [0, 1, 127, 128, 300, 16383, 16384, 4096, 4097, 2**32 - 1, 2**32, 2**63, 2**64 - 1]:
     out(f"leb.{v}", leb(v))
-print("# zigzag.<decimal>: LEB128 of ZigZag(i64)")
+say("# zigzag.<decimal>: LEB128 of ZigZag(i64)")
 for v in [0, -1, 1, -2, 2, 512, -100, 700, 2**63 - 1, -2**63]:
     out(f"zigzag.{v}", leb(zz(v)))
-print("# leb_bad.<n>: inputs a decoder must reject (overlong, above u64::MAX, unterminated)")
+say("# leb_bad.<n>: inputs a decoder must reject (overlong, above u64::MAX, unterminated)")
 for i, b in enumerate(["8000", "ff00", "8080808080808080808000",
                        "ffffffffffffffffff02", "ffffffffffffffffff7f", "80", ""]):
-    print(f"leb_bad.{i}: {b}")
-print()
+    out(f"leb_bad.{i}", bytes.fromhex(b))
+say()
 
 # ---------------------------------------------------------------- 07 §3.11 worked example
 # REF layout, substream A. Lane 7: slot 300 bound with the expected pkt_seq, rx_ts +512.
@@ -158,7 +172,7 @@ out("ex311.snap_lag.sections", hx("07 01 0a ac02 8008 ac02"))
 out("ex311.bad_snap_lag.sections", hx("07 01 0a ac02 8008 808004"))
 # src byte bit 6 set (0x47): no lane of the half, REP_E_CUT.
 out("ex311.bad_src_bit6.sections", hx("07 01 0a ac02 8008 00 40 01 51 00 47 00 88100000 02 0a 01"))
-print()
+say()
 
 # ---------------------------------------------------------------- one block on two substreams
 # Layout: 4 lanes, 2 substreams (A = lanes 0-1, B = lanes 2-3), lane 3 pooled.
@@ -223,7 +237,7 @@ out("blk.data_root", data_root)
 out("blk.header", header)
 out("blk.header_hash", blake3(b"vyrn v1 header" + signed))
 out("blk.seq_sig_message", b"vyrn      v1 block" + signed)
-print()
+say()
 
 # ---------------------------------------------------------------- REP_BlockRecord (07 §8.2)
 body = order_a + order_b + b"".join(pkt8) + b"".join(payloads)
@@ -235,5 +249,8 @@ rec = bytearray(head + body)
 rec += bytes(-len(rec) % 4096)
 rec[234:250] = blake3(bytes(rec))[:16]
 out("rec.head", bytes(rec[:256]))
-print(f"rec.len: {len(rec)}")
+DOC["entries"].append({"name": "rec.len", "value": len(rec)})
+say(f"rec.len: {len(rec)}")
 out("rec.blake3", blake3(bytes(rec)))
+if JSON:
+    print(json.dumps(DOC, indent=1))

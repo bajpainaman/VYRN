@@ -1,0 +1,222 @@
+{
+ "source": "tests/golden/vyrn_proto_vectors.py",
+ "vectors": [
+  {
+   "id": "V1",
+   "name": "V1 req  A: New buy Day 5 @ 100000, STP 1",
+   "tagging": "request",
+   "hex": "07301000010000000100e8030100000001100000a08601000500000011111111cea6ae0c1082138e0000000000000000",
+   "tags": {
+    "tag_seq": "0x8e1382100caea6ce",
+    "tag_com": "0x0000000000000000"
+   }
+  },
+  {
+   "id": "V2",
+   "name": "V2 resp A: Ack (lane, L-packet)",
+   "tagging": "single",
+   "hex": "07301000010000000100e80301000000810000002a000001a0860100111111117b0add3a3520db3c",
+   "tags": {
+    "tag": "0x3cdb20353add0a7b"
+   }
+  },
+  {
+   "id": "V3",
+   "name": "V3 req  A: Cancel A1, Reduce A2 by 2, Replace A3 -> buy 8 @ 100001",
+   "tagging": "request",
+   "hex": "07301000020000000300e80301000000020000002a0000010000000022222222030000002b0000010200000033333333041000002c000001a186010008000000217cccdc1c1c913a0000000000000000",
+   "tags": {
+    "tag_seq": "0x3a911c1cdccc7c21",
+    "tag_com": "0x0000000000000000"
+   }
+  },
+  {
+   "id": "V4",
+   "name": "V4 resp A: CancelAck, CancelAck, CancelAck(old) + Ack(new), stored tag 0x44444444",
+   "tagging": "single",
+   "hex": "07301000020000000400e80302000000840000002a0000010500000022222222840100002b0000010200000033333333840200002c0000010400000044444444810200002d000001a18601004444444417d2510e46ae134a",
+   "tags": {
+    "tag": "0x4a13ae460e51d217"
+   }
+  },
+  {
+   "id": "V5",
+   "name": "V5 req  B: New sell IOC 10 @ 100000",
+   "tagging": "request",
+   "hex": "09501000010000000100e8030100000001030000a08601000a00000055555555237b64e3776d4d3f0000000000000000",
+   "tags": {
+    "tag_seq": "0x3f4d6d77e3647b23",
+    "tag_com": "0x0000000000000000"
+   }
+  },
+  {
+   "id": "V6",
+   "name": "V6 resp B: B-packet Fill 8 @ 100001, Fill 1 @ 100000, Out IOC_REMAINDER 1",
+   "tagging": "single",
+   "hex": "09501000010000000300e803010000008200010007000003a1860100080000008200010007000003a0860100010000008500010007000003010000005555555542855c7988cfe3f2",
+   "tags": {
+    "tag": "0xf2e3cf88795c8542"
+   }
+  },
+  {
+   "id": "V7",
+   "name": "V7 resp A: maker Fill of A4 from the TX core, maker range (echo_pkt 0)",
+   "tagging": "single",
+   "hex": "07301000030000000100e8030000000082ff00002d000001a186010008000000b625c008da1de7d1",
+   "tags": {
+    "tag": "0xd1e71dda08c025b6"
+   }
+  },
+  {
+   "id": "V8",
+   "name": "V8 req  A: Heartbeat",
+   "tagging": "request",
+   "hex": "07301000030000000100e803010000001000000000000000000000000000000015e148481ef2babf0000000000000000",
+   "tags": {
+    "tag_seq": "0xbfbaf21e4848e115",
+    "tag_com": "0x0000000000000000"
+   }
+  },
+  {
+   "id": "V9",
+   "name": "V9 resp A: EpochNotice (answer): next 1001, LDN box 1, 3600 s",
+   "tagging": "single",
+   "hex": "07301000040000000100e8030300000086000000e903000002010000100e00004df2471aea6b2880",
+   "tags": {
+    "tag": "0x80286bea1a47f24d"
+   }
+  },
+  {
+   "id": "V10",
+   "name": "V10 req C: CHAIN mode, New sell post-only 3 @ 100002",
+   "tagging": "request",
+   "hex": "02004000010000000100e8030100000001090000a286010003000000666666662f67e730b4b6e4b29ca589aa10236a3a",
+   "tags": {
+    "tag_seq": "0xb2e4b6b430e7672f",
+    "tag_com": "0x3a6a2310aa89a59c"
+   }
+  },
+  {
+   "id": "V11",
+   "name": "V11 resp A: out-of-stream Reject EPOCH_MISMATCH, detail 1000",
+   "tagging": "single",
+   "hex": "07301000000000000100e8030400000083ff0f00e803000000000000000000002df40fbc5146ce1a",
+   "tags": {
+    "tag": "0x1ace4651bc0ff42d"
+   }
+  },
+  {
+   "id": "V12",
+   "name": "V12 req A: ResendReq(1, 1)",
+   "tagging": "request",
+   "hex": "07301000040000000100e803010000001100000001000000010000000000000044522eb1e1400c9c0000000000000000",
+   "tags": {
+    "tag_seq": "0x9c0c40e1b12e5244",
+    "tag_com": "0x0000000000000000"
+   }
+  },
+  {
+   "id": "V13",
+   "name": "V13 resp A: resend of V2 (flags bit0, same resp_seq, new tag)",
+   "tagging": "single",
+   "hex": "07301000010000000101e80301000000810000002a000001a086010011111111cb0a1c2cf00b2f66",
+   "tags": {
+    "tag": "0x662f0bf02c1c0acb"
+   }
+  },
+  {
+   "id": "V14",
+   "name": "V14 req A: CancelAll",
+   "tagging": "request",
+   "hex": "07301000050000000100e8030100000012000000000000000000000077777777c417c2a956951aee0000000000000000",
+   "tags": {
+    "tag_seq": "0xee1a9556a9c217c4",
+    "tag_com": "0x0000000000000000"
+   }
+  },
+  {
+   "id": "V15",
+   "name": "V15 resp A: CancelAck x2, summary CancelAck(HANDLE_ALL, 2)",
+   "tagging": "single",
+   "hex": "07301000060000000300e80305000000840000002b0000010300000077777777840000002e000001060000007777777784000000ffffffff0200000077777777f585d443ddfdc5b5",
+   "tags": {
+    "tag": "0xb5c5fddd43d485f5"
+   }
+  },
+  {
+   "id": "V16",
+   "name": "V16 req A: New buy IOC 2 @ 100000 (arrives in overload)",
+   "tagging": "request",
+   "hex": "07301000060000000100e8030100000001020000a08601000200000088888888fd45e43bdc2ada030000000000000000",
+   "tags": {
+    "tag_seq": "0x03da2adc3be445fd",
+    "tag_com": "0x0000000000000000"
+   }
+  },
+  {
+   "id": "V17",
+   "name": "V17 resp A: lane shed of V16, in-stream Reject BUSY at index 0, detail = expected 6, client_tag 0",
+   "tagging": "single",
+   "hex": "07301000070000000100e80306000000830018000600000000000000000000005e9888b70013392a",
+   "tags": {
+    "tag": "0x2a391300b788985e"
+   }
+  },
+  {
+   "id": "V18",
+   "name": "V18 req A: resend of V16, same pkt_seq and content, bit0 = 1",
+   "tagging": "request",
+   "hex": "07301000060000000101e8030100000001020000a0860100020000008888888837e2a317d7272c640000000000000000",
+   "tags": {
+    "tag_seq": "0x642c27d717a3e237",
+    "tag_com": "0x0000000000000000"
+   }
+  },
+  {
+   "id": "V19",
+   "name": "V19 redir A: DataRedirect data[0] down -> data[1], resend_from 5, tag under K_seq",
+   "tagging": "single",
+   "hex": "445201000100000007301000050000007996aa5244740421",
+   "tags": {
+    "tag": "0x2104744452aa9679"
+   }
+  },
+  {
+   "id": "V20",
+   "name": "V20 admin A: DataTierStatus push, epoch 1000, seq 1, data[0] down",
+   "tagging": "none",
+   "hex": "0e0000000380e80300000100000001000000"
+  },
+  {
+   "id": "V21",
+   "name": "V21 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload)",
+   "tagging": "request",
+   "hex": "07301000070000000200e8030100000001010000a5860100010000009999999910000000000000000000000000000000fc00f4626c6316ae0000000000000000",
+   "tags": {
+    "tag_seq": "0xae16636c62f400fc",
+    "tag_com": "0x0000000000000000"
+   }
+  },
+  {
+   "id": "V22",
+   "name": "V22 resp A: lane shed of V21, BUSY run: one Reject BUSY per message, detail = expected 7",
+   "tagging": "single",
+   "hex": "07301000090000000200e8030700000083001800070000000000000000000000830118000700000000000000000000000845f06d457b9010",
+   "tags": {
+    "tag": "0x10907b456df04508"
+   }
+  }
+ ],
+ "checks": [
+  "V1 verifies with K_SEQ",
+  "V1 fails with K_OUT",
+  "V1 with one tag bit flipped fails (bound source: close session)",
+  "V10 tag_com = SipHash(K_COM, bytes 0..32)",
+  "V13 tag differs from V2 tag",
+  "V17 is in stream (resp_seq 7), echo_pkt 6, Reject BUSY 24 at index 0, detail 6 >= 1, tag 0",
+  "V18 has V16's logical content (D3) and verifies",
+  "V19 tag = SipHash(K_SEQ, bytes 0..16), not K_OUT",
+  "V20 is a 0x8003 admin frame, len 14, and V19's data[to] is not down in it",
+  "V22 answers every message of V21 (count 2, Heartbeat included) with BUSY, detail 7, tag 0"
+ ]
+}
