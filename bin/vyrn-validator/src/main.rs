@@ -70,8 +70,8 @@
 //! the `[[data.peer]]`s; at Q votes it prints `DATA_DOWN box=<d> votes=<n> quorum=<q>`, and if it
 //! is the sessions' home every live box gets a sealed REDIRECT per session
 //! (`REDIRECT_SENT down=<d> to=<d'> sessions=<n> boxes=<n>`). Exit prints `FAILOVER down_sent=
-//! down_heard= down_bad= effective= redirects= redirect_msgs=` (sessions and messages sent, summed
-//! over the boxes).
+//! down_heard= down_bad= effective= redirects= redirect_msgs= repairs=` (sessions and messages
+//! sent, summed over the boxes; REDIRECTs queued again for keys every live box lacks).
 //! **Control** (stdin, one line each; *reading*: 07 and 08 name no transport for it yet).
 //! `EPOCH <e>` re-derives every `K_fetch` of a keyed `[data]` for epoch `e` (07 §5.5 Epoch
 //! boundary); once the order thread has installed the keys it prints `FETCH_EPOCH <e>`. A
@@ -1175,6 +1175,11 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             println!("DATA_DOWN box={d} votes={votes} quorum={}", fo.quorum());
         }
         let live: Vec<usize> = (0..self.boxes.len()).filter(|&b| fo.live(b)).collect();
+        self.sources.set_live(
+            live.iter()
+                .filter_map(|&b| 1u64.checked_shl(u32::try_from(b).unwrap_or(u32::MAX)))
+                .fold(0, |m, b| m | b),
+        );
         if !due.is_empty() {
             // Every client record of a pending block counts, resolved here or not: a block
             // that is not final may hold a payload only this replica has (reading t).
@@ -1278,6 +1283,11 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                         // blocks miss escalates at once (07 §5.5, `fetch.rs` reading (j)), so a
                         // burst reaches source 3 while the sequencer still retains it.
                         if self.sources.stuck(session, pkt_seq) {
+                            // Every live box lacks it: after a home move its session's REDIRECT
+                            // may have been lost, so it goes again, paced (07 §5.7 reading).
+                            if let Some(fo) = self.failover.as_mut() {
+                                fo.repair(session, pkt_seq, now);
+                            }
                             let join = Self::join(&mut self.join, &mut self.replay);
                             // From where the last round stopped, found by height from the front
                             // (heights are consecutive), to at most FETCH_SCAN_MAX steps and
@@ -1899,8 +1909,14 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         if let Some(f) = d.failover.as_ref() {
             let c = f.counts;
             println!(
-                "FAILOVER down_sent={} down_heard={} down_bad={} effective={} redirects={} redirect_msgs={}",
-                c.down_sent, c.down_heard, c.down_bad, c.effective, c.redirects, c.redirect_msgs
+                "FAILOVER down_sent={} down_heard={} down_bad={} effective={} redirects={} redirect_msgs={} repairs={}",
+                c.down_sent,
+                c.down_heard,
+                c.down_bad,
+                c.effective,
+                c.redirects,
+                c.redirect_msgs,
+                c.repairs
             );
         }
     }

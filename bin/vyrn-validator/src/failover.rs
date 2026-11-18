@@ -184,6 +184,8 @@ pub struct Counts {
     pub effective: u64,
     pub redirects: u64,
     pub redirect_msgs: u64,
+    /// REDIRECTs queued again by [`Failover::repair`].
+    pub repairs: u64,
 }
 
 /// [`Failover::step`]'s result: boxes newly effective with their vote counts, and redirect
@@ -214,6 +216,8 @@ pub struct Failover {
     /// session starts on to the current one, since it has followed no move (Codex r4612923593).
     moved: bool,
     redirected: BTreeSet<SessionId>,
+    /// Per session, when its last repair REDIRECT was queued ([`Failover::repair`]).
+    repaired: BTreeMap<SessionId, u64>,
     /// The highest `pkt_seq` per session in a final block.
     final_max: BTreeMap<SessionId, u32>,
     /// Released blocks not final yet: height and each session's lowest and highest `pkt_seq`.
@@ -238,6 +242,7 @@ impl Failover {
             next_batch: 0,
             moved: false,
             redirected: BTreeSet::new(),
+            repaired: BTreeMap::new(),
             final_max: BTreeMap::new(),
             unfinal: VecDeque::new(),
             counts: Counts::default(),
@@ -340,6 +345,26 @@ impl Failover {
         }
         self.rounds.retain(|r| r.2 > 0);
         (newly, due)
+    }
+
+    /// *Reading (07 §5.7):* after a home move, a pending key that every live box lacks may be
+    /// one whose session's REDIRECT was lost (no fetch repairs one), so its session's REDIRECT
+    /// from `pkt_seq` is queued again, at most once per [`GOSSIP_EVERY_NS`] per session. The
+    /// client takes only its first (DR2), so a repeat costs one box token and nothing else.
+    pub fn repair(&mut self, session: SessionId, pkt_seq: u32, now: u64) {
+        if !self.moved {
+            return;
+        }
+        let due = self
+            .repaired
+            .get(&session)
+            .is_none_or(|t| now.saturating_sub(*t) >= GOSSIP_EVERY_NS);
+        if due {
+            self.repaired.insert(session, now);
+            self.outbox
+                .push_back((session, pkt_seq, FIRST_HOME, self.home));
+            self.counts.repairs = self.counts.repairs.saturating_add(1);
+        }
     }
 
     /// Queues one round of REDIRECTs for `list`.
@@ -658,6 +683,25 @@ mod tests {
         f.released(2, [(SessionId(9), 7), (SessionId(9), 6), (SessionId(5), 4)]);
         f.held([(SessionId(9), 8)]);
         assert!(f.batch(GOSSIP_EVERY_NS).is_empty(), "queued once");
+    }
+
+    /// A pending key every live box lacks after the move: its session's REDIRECT goes again,
+    /// at most once per gossip period; never before a move.
+    #[test]
+    fn a_lost_redirect_is_repaired_paced() {
+        let mut f = Failover::new(2, 0, 1, 0, 1);
+        f.repair(SessionId(9), 4, 0);
+        assert!(f.batch(0).is_empty(), "no move yet");
+        f.silent(&[0], 0);
+        let _ = f.step(0);
+        f.repair(SessionId(9), 4, 1);
+        f.repair(SessionId(9), 4, 2);
+        let sent = flat(&f.batch(GOSSIP_EVERY_NS));
+        let r: Vec<_> = sent.iter().filter(|r| r.0 == SessionId(9)).collect();
+        assert_eq!(r.len(), 1, "paced");
+        assert_eq!((r[0].1, r[0].2, r[0].3), (4, 0, 1));
+        f.repair(SessionId(9), 4, 1 + GOSSIP_EVERY_NS);
+        assert_eq!(f.counts.repairs, 2);
     }
 
     /// Codex r4612923593: after 0 → 1 and 1 → 2, a late session still sends to box 0, so its

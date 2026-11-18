@@ -111,7 +111,9 @@
 //!   `DATA_DOWN box=0` at quorum, no `DATA_DOWN box=1` while the backup runs, validator 0's
 //!   sealed `REDIRECT_SENT down=0 to=1` (only it holds a `K_fetch`, R7), the backup's
 //!   `redirects > 0` and `redirect_unknown = 0`, and a verified `DataRedirect` (DR1, under the
-//!   session's `K_seq`) for every session. On its first one per session (DR2) the client moves
+//!   session's `K_seq`) for every session that sends after the kill (one that does not has
+//!   nothing at the dead box, and if every REDIRECT to it is lost it moves on its next send, by
+//!   the replicas' lost-REDIRECT repair, 07 §5.7; it is counted `idle`). On its first one per session (DR2) the client moves
 //!   copy 2 to the backup and resends its retained bytes from `resend_from` (DR3). `data` checks
 //!   the backup's `STATS` without `stored` (the killed box's are gone). R11's `fetch_unauth`
 //!   may count the unkeyed validators' plain REDIRECT_BATCHes (kind 5), which a keyed box reads
@@ -294,7 +296,7 @@
 //! DEV.
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -2413,6 +2415,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let box_drops = data_ingest
         .filter(|_| backup.is_none())
         .and_then(|a| udp_drops(a.port()));
+    // R13: the backup's ingest socket drops, read while it is open.
+    let backup_drops = backup.and_then(|b| udp_drops(b.ingest.port()));
     let data_ok =
         data_check_idx.map(|i| nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
     let seq_node = nodes.0.get(seq).ok_or("seq")?;
@@ -3286,8 +3290,31 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     CLIENT_RETAIN.as_millis()
                 ));
             }
-            if n_moved != sessions.len() {
-                errs.push(format!("{n_moved} of {} sessions moved copy 2", sessions.len()));
+            // A session that sent nothing after the kill has nothing at the dead box: if every
+            // REDIRECT to it was lost it moves on its next send, when every live box misses that
+            // key and the replicas send its REDIRECT again (07 §5.7 lost-REDIRECT repair). Only
+            // an unmoved session that sent after the kill fails.
+            let after: BTreeSet<SessionId> = killed
+                .map(|(k, _)| pkts.iter().skip(k).map(|p| p.session).collect())
+                .unwrap_or_default();
+            let unmoved: Vec<SessionId> = sessions
+                .iter()
+                .map(|s| s.id)
+                .filter(|s| !moved.contains_key(s))
+                .collect();
+            let idle = unmoved.iter().filter(|s| !after.contains(s)).count();
+            let stranded: Vec<String> = unmoved
+                .iter()
+                .filter(|s| after.contains(s))
+                .take(4)
+                .map(|s| format!("{:#x}", s.0))
+                .collect();
+            if !stranded.is_empty() {
+                errs.push(format!(
+                    "{n_moved} of {} sessions moved copy 2; unmoved and sending after the kill: {}; backup_sock_drops={backup_drops:?}",
+                    sessions.len(),
+                    stranded.join(", ")
+                ));
             }
             let mut from: Vec<String> = moved
                 .values()
@@ -3299,7 +3326,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
             if errs.is_empty() {
                 Ok(format!(
-                    "home box killed after {} packets; DATA_DOWN {}; validator-0 sent {} sealed REDIRECTs, the backup admitted and sent {}; the client heard {redirects_heard}, moved {n_moved} sessions (resend_from {}) and resent {resent} packets; DR4 ({} ms{}): slowest kill-to-redirect {worst:?} over the {n_live} sessions live at the kill ({worst_late:?} for those that started later), {lost} lost after the kill, {aged} older ones discarded",
+                    "home box killed after {} packets; DATA_DOWN {}; validator-0 sent {} sealed REDIRECTs, the backup admitted and sent {}; the client heard {redirects_heard}, moved {n_moved} sessions ({idle} idle since the kill unmoved; resend_from {}) and resent {resent} packets; DR4 ({} ms{}): slowest kill-to-redirect {worst:?} over the {n_live} sessions live at the kill ({worst_late:?} for those that started later), {lost} lost after the kill, {aged} older ones discarded",
                     killed.map_or(0, |k| k.0),
                     votes.join(" "),
                     v0_redirects.unwrap_or(0),

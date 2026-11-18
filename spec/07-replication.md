@@ -1386,6 +1386,16 @@ batched failover takes effect only once the replicas send kind 5; until then the
 the per-message limit above still applies. The box's operator line (`REDIRECT <down> <to> <session>:<resend_from>,…`, DEV) does the
 same for a list.
 
+**Lost REDIRECT repair (reading, `failover.rs`).** No fetch repairs a lost `DataRedirect`, and a
+replica sends each move's REDIRECTs in 3 rounds. Under load those rounds can all be lost: one loaded
+run moved only 749 of 1963 sessions, and their packets kept going to the dead box. So after a home
+move, when a pending key's KEY fetch has a miss from every live box, the replica queues that
+session's REDIRECT again from the key's `pkt_seq`, at most once per 10 ms per session, through the
+same paced outbox. It is a re-send, not a fetch, so it refines the 3 rounds rather than replacing
+them. The client acts on its first REDIRECT per session (DR2), so a repeat costs one box fetch token
+and nothing more. A dead box answers nothing, so "every live box" counts only the boxes not
+effectively down.
+
 **Redirect queue policy (*reading*, DEV policy; 07 names none).** No fetch repairs a lost
 `DataRedirect`, so a box does not drop one a full queue refuses (its TX queue, or on a sharded
 box the RX core's hop ring to the owning shard):
