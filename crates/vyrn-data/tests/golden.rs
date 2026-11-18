@@ -169,3 +169,34 @@ fn authenticated_fetches_match_the_published_vectors() {
     }
     assert_eq!((ok, err), (3, 4));
 }
+
+#[test]
+fn redirects_match_the_published_vectors() {
+    use vyrn_data::redirect::Redirect;
+    let key = |h: &str| -> [u8; 16] { unhex(h).try_into().unwrap() };
+    let (mut ok, mut err) = (0, 0);
+    for f in lines() {
+        match f[0].as_str() {
+            "redirect" => {
+                let n = |i: usize| f[i].parse::<u64>().unwrap();
+                let r = Redirect {
+                    down: n(3) as u8,
+                    to: n(4) as u8,
+                    session: SessionId(n(5) as u32),
+                    resend_from: n(6) as u32,
+                };
+                let (k, want) = (key(&f[2]), unhex(&f[7]));
+                assert_eq!(&r.seal(&k)[..], &want[..], "seal {}", f[1]);
+                assert_eq!(Redirect::open(&want, &k).unwrap(), r, "open {}", f[1]);
+                ok += 1;
+            }
+            "redirect_err" => {
+                let e = Redirect::open(&unhex(&f[3]), &key(&f[2])).unwrap_err();
+                assert_eq!(format!("{e:?}"), f[4], "{}", f[1]);
+                err += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((ok, err), (2, 6));
+}

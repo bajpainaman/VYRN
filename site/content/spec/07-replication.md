@@ -1121,6 +1121,15 @@ semantics are the same as CHAIN's `excl` rule (09 owns them).
    `REP_CLIENT_RETAIN_MS` = 100 ms (04 must require this). The resends carry `flags.resend`, and
    dedupe drops anything already stored.
 
+**`DataRedirect` bytes and address (reading, `vyrn-data`).** 04 owns the record; until it defines
+bytes, a data box sends 24 bytes LE: `magic` u16 0x5244 "DR", `version` u8 1, `down` u8 (d),
+`to` u8 (d'), 3 reserved 0, `session` u32, `resend_from` u32, then `tag` u64 = SipHash-2-4(the
+session's `K_seq` in BASE or `K_com` in CHAIN, bytes 0..16). It goes to the source address of the
+session's copy with the highest `pkt_seq` and a valid MAC; a duplicate, late or out-of-order copy never moves
+that address, so replayed bytes cannot steer a redirect. A box that never heard from a session
+sends it nothing and counts it; another live box has its address. Vectors:
+`tests/golden/vyrn_data_vectors`.
+
 Effect: fills and acks are unaffected. Blocks that reference the affected sessions cannot be voted
 until their data arrives. Finality stalls for those blocks for ≤ 1 + 0.5 + 1 + 0.5 = **3 ms**
 (budget) and then catches up (§6.7).

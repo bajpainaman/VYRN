@@ -9,11 +9,14 @@ use std::net::Ipv4Addr;
 
 use vyrn_log::BlockStore;
 use vyrn_nic::frame::{self as nic_frame, Endpoint, FrameHdr, MAX_FRAME_BYTES};
-use vyrn_types::{BookId, Height, MAX_MSGS_PER_PKT, MSG_BYTES, Nanos, PKT_HDR_BYTES, TAG_BYTES};
+use vyrn_types::{
+    BookId, Height, MAX_MSGS_PER_PKT, MSG_BYTES, Nanos, PKT_HDR_BYTES, SessionId, TAG_BYTES,
+};
 use vyrn_wire::{RX_BURST, RxPkt, RxRing, TxRing};
 
 use crate::frame::{DataHdr, Fetch, FrameBuf, FrameErr, Kind, key_seq};
 use crate::ingest::{DataHome, Event, HomeConfig, Reject};
+use crate::redirect::Redirect;
 
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -97,6 +100,10 @@ pub struct Counters {
     pub fetch_resent: u64,
     /// A logged block whose data region does not split into packets.
     pub log_bad: u64,
+    /// `DataRedirect`s sent (07 §5.7 step 3).
+    pub redirects: u64,
+    /// A redirect asked for a session with no known address or key: nothing was sent.
+    pub redirect_unknown: u64,
 }
 
 impl Counters {
@@ -318,7 +325,9 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
                 continue;
             };
             let mut ev = None;
-            let r = self.home.ingest(f.payload, p.rx_ts(), &mut ev);
+            let r = self
+                .home
+                .ingest_from(f.payload, Some(f.hdr.src), p.rx_ts(), &mut ev);
             if let Some(e) = ev {
                 if self.events.len() < self.cfg.max_events {
                     self.events.push(e);
@@ -578,6 +587,36 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
                 }
             }
             Fetch::Block { height } => self.serve_block(to, height),
+        }
+    }
+
+    /// 07 §5.7 step 3: sends `DataRedirect{down → to, resend_from}` to the address of each
+    /// session's newest authenticated copy, tagged under its MAC key. `sessions` holds each
+    /// affected session with the `resend_from` the replicas computed. A session this box never
+    /// heard from is counted in `redirect_unknown`: another live box knows its address.
+    pub fn redirect(&mut self, down: u8, to: u8, sessions: &[(SessionId, u32)]) {
+        for &(session, resend_from) in sessions {
+            let (Some(dst), Some(key)) = (self.home.source(session), self.home.key(session)) else {
+                bump(&mut self.counters.redirect_unknown);
+                continue;
+            };
+            let r = Redirect {
+                down,
+                to,
+                session,
+                resend_from,
+            };
+            let b = r.seal(key);
+            if Self::send_to(
+                &mut self.tx,
+                &mut self.wire,
+                &mut self.counters,
+                self.cfg.me,
+                dst,
+                &b,
+            ) {
+                bump(&mut self.counters.redirects);
+            }
         }
     }
 

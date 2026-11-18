@@ -14,6 +14,8 @@ Line formats (space-separated; '-' for an empty list):
   fetch_err <name> <hex> <reason>
   fetch_auth <name> <key hex> <32-byte fetch hex> <40-byte sealed hex>
   fetch_auth_err <name> <key hex> <hex> <reason>
+  redirect  <name> <key hex> <down> <to> <session> <resend_from> <24-byte hex>
+  redirect_err <name> <key hex> <hex> <reason>
   dedupe    <name> <pkt_seq,...> <verdict,...>   (verdicts: New Repeat Late; one session)
 """
 import struct
@@ -180,6 +182,25 @@ def main():
         ("tagged_bad_body", seal(fetch(9, bytes(24)), kf), "Kind"),
     ]:
         print(f"fetch_auth_err {name} {hx(kf)} {hx(b)} {why}")
+    kr = bytes(range(0x60, 0x70))
+
+    def redirect(down, to, session, frm, key=kr, magic=0x5244, version=1, reserved=b"\x00" * 3):
+        body = struct.pack("<HBBB", magic, version, down, to) + reserved + struct.pack(
+            "<II", session, frm)
+        return seal(body, key)
+
+    for name, args in [("first", (1, 3, 5, 1)), ("wide", (4, 0, 0xFFFFFFFF, 0x80000001))]:
+        print(f"redirect {name} {hx(kr)} {' '.join(map(str, args))} {hx(redirect(*args))}")
+    good = redirect(1, 2, 7, 9)
+    for name, b, why in [
+        ("bad_tag", good[:23] + bytes([good[23] ^ 1]), "Tag"),
+        ("other_key", redirect(1, 2, 7, 9, key=bytes(16)), "Tag"),
+        ("short", good[:23], "Short"),
+        ("magic", redirect(1, 2, 7, 9, magic=0x4450), "Magic"),
+        ("version", redirect(1, 2, 7, 9, version=2), "Version"),
+        ("reserved", redirect(1, 2, 7, 9, reserved=b"\x00\x01\x00"), "Reserved"),
+    ]:
+        print(f"redirect_err {name} {hx(kr)} {hx(b)} {why}")
     cases = [
         ("in_order", [1, 2, 3, 4]),
         ("repeat_and_reorder", [1, 3, 2, 3, 1, 5, 4]),
