@@ -635,6 +635,38 @@ fn writer(cfg: &Config, n: usize, seed: [u8; 32]) -> Result<SeqWriter, String> {
     SeqWriter::new(layout, ident, ts, seed, frame::MAX_PAYLOAD).map_err(|e| e.to_string())
 }
 
+/// A step's 07 §3.8 kind payload: a `Rescan` carries its band, which replay needs (an empty
+/// payload means every tick), and a `Control` step the command the engine queued for it, from
+/// `control`. A Seal's payload is empty; the caller stops on an Uncross step.
+fn step_payload(
+    kind: StepKind,
+    e: &vyrn_bbo::StepEntry,
+    control: &mut std::collections::VecDeque<[u8; vyrn_engine::CONTROL_PAYLOAD_LEN]>,
+) -> Result<Vec<u8>, String> {
+    Ok(match kind {
+        StepKind::Rescan => vyrn_engine::rescan_payload(e.band_lo, e.band_hi).to_vec(),
+        StepKind::Control => {
+            let p = control
+                .pop_front()
+                .ok_or("Control step without a queued command")?;
+            let what = match vyrn_engine::control_of_payload(&p) {
+                Some(vyrn_bbo::ControlCmd::Phase {
+                    phase: Phase::Halted,
+                    ..
+                }) => "halt",
+                Some(vyrn_bbo::ControlCmd::Phase {
+                    phase: Phase::Continuous,
+                    ..
+                }) => "resume",
+                _ => "other",
+            };
+            println!("CONTROL step={} phase={what}", e.step.0);
+            p.to_vec()
+        }
+        _ => Vec::new(),
+    })
+}
+
 #[cfg(test)]
 fn writer_for_test() -> SeqWriter {
     let p = concat!(env!("CARGO_MANIFEST_DIR"), "/dev.toml");
@@ -1200,35 +1232,13 @@ impl<T: TxRing> StreamCore<T> {
                 }
                 let kind = StepKind::from_code(e.kind).ok_or("unknown step kind")?;
                 let src = has_src(kind).then_some((e.src_lane, e.src_lane_seq));
-                // Spec gap: the engine's StepEntry carries no payload for Rescan (07 §3.8), so it
-                // is framed with an empty one; a Seal's payload is empty. A Control step takes
-                // the payload of the command the engine queued for it. An opening Uncross step
-                // must carry p* and Q, but this release queues only the gate's Phase commands,
-                // so an Uncross step here has no command to frame and stops the stream.
+                // An opening Uncross step must carry p* and Q, but this release queues only the
+                // gate's Phase commands, so an Uncross step here has no command to frame and
+                // stops the stream.
                 if kind == StepKind::Uncross {
                     return Err("Uncross step without a queued command".into());
                 }
-                let payload = if kind == StepKind::Control {
-                    let p = self
-                        .control
-                        .pop_front()
-                        .ok_or("Control step without a queued command")?;
-                    let what = match vyrn_engine::control_of_payload(&p) {
-                        Some(vyrn_bbo::ControlCmd::Phase {
-                            phase: Phase::Halted,
-                            ..
-                        }) => "halt",
-                        Some(vyrn_bbo::ControlCmd::Phase {
-                            phase: Phase::Continuous,
-                            ..
-                        }) => "resume",
-                        _ => "other",
-                    };
-                    println!("CONTROL step={} phase={what}", e.step.0);
-                    p.to_vec()
-                } else {
-                    Vec::new()
-                };
+                let payload = step_payload(kind, &e, &mut self.control)?;
                 // The route bit (05 §4.15, 07 §3.8 src byte bit 7) travels with the source op.
                 let flags = if src.is_some() && e.flags & vyrn_bbo::STEP_CROSS != 0 {
                     StepFlags::CROSS
@@ -1586,6 +1596,28 @@ mod tests {
             let v = stats.seal_violations.load(Ordering::Acquire);
             assert_eq!(v, 0, "{seal}: allocations on the sealed fault path");
         }
+    }
+
+    /// A `Rescan` step is framed with its band: replay reads an empty payload as every tick, so
+    /// a narrow live band scanned a different journal range than replay (the WL-SMOKE
+    /// `--dropcopy` `Step(Kind)` divergence).
+    #[test]
+    fn a_rescan_step_carries_its_band() {
+        use vyrn_types::{StepKind, Tick};
+        let e = vyrn_bbo::StepEntry {
+            kind: StepKind::Rescan.code(),
+            band_lo: Tick(99),
+            band_hi: Tick(101),
+            ..vyrn_bbo::StepEntry::default()
+        };
+        let mut q = std::collections::VecDeque::new();
+        let p = super::step_payload(StepKind::Rescan, &e, &mut q).unwrap();
+        assert_eq!(
+            vyrn_engine::rescan_of_payload(&p),
+            Some((Tick(99), Tick(101)))
+        );
+        let p = super::step_payload(StepKind::Seal, &e, &mut q).unwrap();
+        assert!(p.is_empty());
     }
 
     /// A response gated on a packet or step opens only once a returned frame carries it.

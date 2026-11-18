@@ -1796,7 +1796,9 @@ flag. The replay BBO core knows whether a continuation is pending, and when it i
 must be that continuation (05 §8.5, §8.6). The `Rescan` band is the kind payload (§3.8):
 `band_lo` u32 LE, then `band_hi` u32 LE, so `plen = 8`. `plen = 0` means all ticks (05 §10, the
 superset corollary of Lemma 9.7). A continuation's band is not read, because the first step of
-the sweep fixed it.
+the sweep fixed it. A writer frames every live `Rescan` with `plen = 8`: the band also picks the
+batch taker (the first in-band `New` of the cut), so a wider band is not equivalent for that
+choice, and `plen = 0` stands only for a band that is the whole arena.
 
 **`lowver` (§3.8 `LOWVER`).** For each lane `l` a step's `StepRecord.lowver` names, replay sets
 `lowver[l]` to `base + snap_lag` of its own packet record holding op `cut[l]`: the version that

@@ -131,7 +131,7 @@ mod snap_window_tests;
 
 pub use engine::{Engine, Fault, REPLAY_SNAP_HIST, Rec, SNAP_LAG_WINDOW, Shared, Sink};
 pub use replay::{
-    CONTROL_PAYLOAD_LEN, Diverged, NoResponses, OwnedRec, Payloads, Responses, UNCROSS_PAYLOAD_LEN,
-    Why, WireAt, WireDiverged, WireStep, control_of_payload, control_payload, uncross_of_payload,
-    uncross_payload,
+    CONTROL_PAYLOAD_LEN, Diverged, NoResponses, OwnedRec, Payloads, RESCAN_PAYLOAD_LEN, Responses,
+    UNCROSS_PAYLOAD_LEN, Why, WireAt, WireDiverged, WireStep, control_of_payload, control_payload,
+    rescan_of_payload, rescan_payload, uncross_of_payload, uncross_payload,
 };

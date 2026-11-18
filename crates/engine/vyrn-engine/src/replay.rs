@@ -406,6 +406,26 @@ pub fn control_of_payload(b: &[u8]) -> Option<ControlCmd> {
     }
 }
 
+/// Bytes of a `Rescan` step's payload (07 §3.8): `band_lo` u32 LE, then `band_hi` u32 LE. An
+/// empty payload means every tick of the arena.
+pub const RESCAN_PAYLOAD_LEN: usize = 8;
+
+/// A `Rescan` step's band `(lo, hi)` as its payload.
+pub fn rescan_payload(lo: Tick, hi: Tick) -> [u8; RESCAN_PAYLOAD_LEN] {
+    let ([l0, l1, l2, l3], [h0, h1, h2, h3]) = (lo.0.to_le_bytes(), hi.0.to_le_bytes());
+    [l0, l1, l2, l3, h0, h1, h2, h3]
+}
+
+/// The band a non-empty `Rescan` payload names ([`rescan_payload`]'s inverse).
+pub fn rescan_of_payload(b: &[u8]) -> Option<(Tick, Tick)> {
+    let b: &[u8; RESCAN_PAYLOAD_LEN] = b.try_into().ok()?;
+    let [l0, l1, l2, l3, h0, h1, h2, h3] = *b;
+    Some((
+        Tick(u32::from_le_bytes([l0, l1, l2, l3])),
+        Tick(u32::from_le_bytes([h0, h1, h2, h3])),
+    ))
+}
+
 /// One whole step as 07 delivers it (§3.8, merged by StepId): kind, source, cut, kind payload.
 /// Every other `StepEntry` field is an output of replay (07 §7.1 "Fields replay derives").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -744,11 +764,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             let band = if w.kind == StepKind::Rescan {
                 match w.payload {
                     [] => (lo, hi),
-                    [a, b, c, d, e, f, g, h] => (
-                        Tick(u32::from_le_bytes([*a, *b, *c, *d])),
-                        Tick(u32::from_le_bytes([*e, *f, *g, *h])),
-                    ),
-                    _ => return Err(at(Why::BadStep)),
+                    b => rescan_of_payload(b).ok_or(at(Why::BadStep))?,
                 }
             } else {
                 (Tick(0), Tick(0))
