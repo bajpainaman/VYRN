@@ -10,13 +10,18 @@
 //! - a non-`MID` Advance record of lane `l`: lane `l`'s idle poll, which reads the `LaneCut`
 //!   that the replayed steps wrote;
 //! - a packet record (with the `MID` Advance records the lane wrote while processing it): the
-//!   packet, fetched from [`Payloads`], with a late clock iff `SHED`.
+//!   packet, fetched from [`Payloads`], through `vyrn_lane::Lane::replay_packet` with a late
+//!   clock iff `SHED`, its `MID` records as `Mid` boundaries at `(f, C_f[l])` (05 §6.2, §10 row
+//!   3), and its forwarded ops taken from the later `StepRecord`s that name them (§10 row 7).
 
 use vyrn_bbo::admit::{FixedClock, NeverLate};
-use vyrn_bbo::{CutDelta, Diverge, MAX_LANES, ReplayStep, StepEntry};
+use vyrn_bbo::{CutDelta, Diverge, MAX_LANES, ReplayStep, STEP_CONT, StepEntry};
+use vyrn_cut::LaneCutEntry;
 use vyrn_cut::Visibility;
+use vyrn_lane::Mid;
 use vyrn_lane::RxIn;
-use vyrn_types::{PacketFlags, PacketRecord};
+use vyrn_risk::Route;
+use vyrn_types::{LaneSeq, PacketFlags, PacketRecord, StepKind};
 
 use crate::engine::{Engine, Fault, Rec, Sink, StepErr};
 
@@ -67,6 +72,8 @@ pub enum Why {
     NoPayload,
     /// The BBO core took no step where the log has one.
     NoStep,
+    /// A `MID` record names a step older than the cut history (`ENG_STEP_LOG` steps).
+    StepTooOld,
     /// A step record does not decode (`StepKind`, delta count or lane out of range).
     BadStep,
     /// The BBO core refused the logged step: it cannot be this core's next step.
@@ -127,6 +134,68 @@ fn same_step(a: &OwnedRec, b: &OwnedRec) -> bool {
     };
     let (x, y) = (strip(a), strip(b));
     x.is_some() && x == y
+}
+
+fn packet_of(r: &OwnedRec) -> Option<&PacketRecord> {
+    match r {
+        OwnedRec::Packet(p) => Some(p),
+        OwnedRec::Step(..) => None,
+    }
+}
+
+/// Boundaries one packet can hold: before pass 1 and pass 2 of each of its 10 ops.
+const MAX_MIDS: usize = 20;
+/// Forwarded ops one packet can hold.
+const MAX_ROUTES: usize = 10;
+
+/// The forwarded ops of packet `pk` and their routes (05 §10: op `(l, q)` is forwarded iff a
+/// `StepRecord` has `src = (l, q)`), from the steps after it in `recs`. A lane's sources come
+/// in `LaneSeq` order (its `FwdRing` is FIFO), so the scan stops at the first later one.
+///
+/// TEMPORARY (lane follow-up 18): the route comes from [`route_of_kind`] until the log carries
+/// the route the live lane classified (a `FwdEntry` route bit copied into a `StepRecord` flag,
+/// in progress). Switching is a change to that one function.
+/// TEMPORARY: the route of a step's source, from the step's kind (`Improve` → `Improve`,
+/// `Cross` and `Shed` → `Cross`); `None` for kinds that have no forwarded source. A `Cross`
+/// that STP stops before any fill is logged as `Improve`, and a shed `Improve` as `Shed`, so
+/// both replay with the other route's risk bucket: a known divergence (PR gap G7).
+fn route_of_kind(e: &StepEntry) -> Option<Route> {
+    match StepKind::from_code(e.kind)? {
+        StepKind::Improve => Some(Route::Improve),
+        StepKind::Cross | StepKind::Shed => Some(Route::Cross),
+        _ => None,
+    }
+}
+
+fn routes_of(
+    recs: &[OwnedRec],
+    pk: &PacketRecord,
+    out: &mut [(LaneSeq, Route); MAX_ROUTES],
+) -> usize {
+    let lo = pk.first_lane_seq.0;
+    let hi = lo.saturating_add(u64::from(pk.count));
+    let mut n = 0usize;
+    for r in recs {
+        let OwnedRec::Step(e, _) = r else { continue };
+        if e.src_lane != pk.lane || e.src_lane_seq.0 == 0 || e.flags & STEP_CONT != 0 {
+            continue;
+        }
+        let Some(route) = route_of_kind(e) else {
+            continue;
+        };
+        let q = e.src_lane_seq.0;
+        if q >= hi {
+            break;
+        }
+        if q < lo || out.iter().take(n).any(|(s, _)| s.0 == q) {
+            continue;
+        }
+        if let Some(d) = out.get_mut(n) {
+            *d = (e.src_lane_seq, route);
+            n = n.saturating_add(1);
+        }
+    }
+    n
 }
 
 fn is_advance(p: &PacketRecord) -> bool {
@@ -199,27 +268,65 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 }
                 OwnedRec::Packet(p) => {
                     let l = usize::from(p.lane.0);
-                    let pk = recs
-                        .get(i..)
-                        .unwrap_or(&[])
+                    let run = recs.get(i..).unwrap_or(&[]);
+                    let (k, pk) = run
                         .iter()
                         .map_while(|x| match x {
                             OwnedRec::Packet(q) if q.lane == p.lane => Some(q),
                             _ => None,
                         })
-                        .find(|q| !is_advance(q))
+                        .enumerate()
+                        .find(|(_, q)| !is_advance(q))
                         .ok_or(at(Why::BadRecord))?;
+                    // The packet's MID boundaries: the MID records of this lane before it in the
+                    // run and right after it, up to the lane's next other record (05 §6.2).
+                    let mut mids = [Mid {
+                        pass: 0,
+                        next: LaneSeq(0),
+                        at: LaneCutEntry::default(),
+                    }; MAX_MIDS];
+                    let mut n_mid = 0usize;
+                    let after = run.iter().skip(k.saturating_add(1)).map_while(|x| match x {
+                        OwnedRec::Packet(q) if q.lane == p.lane && is_mid(q) => Some(q),
+                        _ => None,
+                    });
+                    for m in run
+                        .iter()
+                        .take(k)
+                        .filter_map(packet_of)
+                        .filter(|q| is_mid(q))
+                        .chain(after)
+                    {
+                        let cut = self.cut_at(m.fills_applied, l).ok_or(at(Why::StepTooOld))?;
+                        let d = mids.get_mut(n_mid).ok_or(at(Why::BadRecord))?;
+                        *d = Mid {
+                            pass: if m.flags & PacketFlags::PASS2 != 0 {
+                                2
+                            } else {
+                                1
+                            },
+                            next: m.first_lane_seq,
+                            at: LaneCutEntry {
+                                step: m.fills_applied,
+                                cut,
+                            },
+                        };
+                        n_mid = n_mid.saturating_add(1);
+                    }
+                    let mut routes = [(LaneSeq(0), Route::Join); MAX_ROUTES];
+                    let n_route = routes_of(recs.get(i..).unwrap_or(&[]), pk, &mut routes);
                     let bytes = payloads.get(pk).ok_or(at(Why::NoPayload))?;
                     let rx = RxIn {
                         bytes,
                         rx_ts: pk.rx_ts,
                         pkt_hash: pk.pkt_hash,
                     };
-                    let shed = pk.flags & PacketFlags::SHED != 0;
-                    let res = if shed {
-                        self.ingest(l, rx, &FixedClock(u64::MAX), &mut tee)
+                    let mids = mids.get(..n_mid).unwrap_or(&[]);
+                    let routes = routes.get(..n_route).unwrap_or(&[]);
+                    let res = if pk.flags & PacketFlags::SHED != 0 {
+                        self.replay_ingest(l, rx, &FixedClock(u64::MAX), mids, routes, &mut tee)
                     } else {
-                        self.ingest(l, rx, &NeverLate, &mut tee)
+                        self.replay_ingest(l, rx, &NeverLate, mids, routes, &mut tee)
                     };
                     res.map_err(|f| at(Why::Fault(f)))?;
                     tee.pkts.len()

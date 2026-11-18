@@ -13,11 +13,14 @@ use vyrn_cut::{
     Producer, STEP_LOG_READERS, Snapshot, SnapshotLine, StepLog, TxRing, Visibility,
 };
 use vyrn_lane::{
-    Arena, ArenaConfig, ArenaView, ArenaWriter, Config as LaneConfig, Lane, LaneBook, LogRec,
+    Arena, ArenaConfig, ArenaView, ArenaWriter, Config as LaneConfig, Lane, LaneBook, LogRec, Mid,
     Ports, RespPkt, Rx, RxIn,
 };
+use vyrn_risk::Route;
 use vyrn_types::{LaneId, LaneSeq, PacketRecord, StepId};
 
+/// Steps whose cut replay keeps for `MID` boundaries (`ENG_STEP_LOG`).
+pub(crate) const STEP_HIST: usize = ENG_STEP_LOG;
 /// Records one fill TX packet can carry (`TxEntry.n_rec` is a `u8`).
 const TX_RECS: usize = 256;
 /// Polls per step before the engine reports no step (`Bbo::poll` may return `Idle` while it
@@ -134,6 +137,10 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     /// `C_f[l]` of the newest step.
     pub(crate) cut: Cut,
     deltas: [CutDelta; MAX_LANES],
+    /// `C_f` of the last [`STEP_HIST`] steps, `n` entries per step, keyed by `f mod STEP_HIST`;
+    /// `hist_id` holds the step each slot is for (step 0, the epoch start, is all zeros).
+    hist: Vec<LaneSeq>,
+    hist_id: Vec<StepId>,
     recs: Vec<Record>,
     pub(crate) scratch: Vec<PacketRecord>,
 }
@@ -229,6 +236,8 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             bbo,
             cut: [LaneSeq(0); MAX_LANES],
             deltas: [CutDelta::default(); MAX_LANES],
+            hist: vec![LaneSeq(0); n.saturating_mul(STEP_HIST)],
+            hist_id: vec![StepId(0); STEP_HIST],
             recs: Vec::with_capacity(TX_RECS),
             scratch: Vec::with_capacity(32),
         })
@@ -271,6 +280,23 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
     ) -> Result<Rx, Fault> {
         let lane = self.lanes.get_mut(l).ok_or(Fault::NoLane)?;
         let r = lane.process_packet(self.vis, p, clock, &[]);
+        self.drain(l, sink)?;
+        Ok(r)
+    }
+
+    /// Replay: lane `l` replays one logged packet with its boundaries and forwarded ops given
+    /// (`vyrn_lane::Lane::replay_packet`).
+    pub(crate) fn replay_ingest<C: Clock, S: Sink>(
+        &mut self,
+        l: usize,
+        p: RxIn<'_>,
+        clock: &C,
+        mids: &[Mid],
+        routes: &[(LaneSeq, Route)],
+        sink: &mut S,
+    ) -> Result<Rx, Fault> {
+        let lane = self.lanes.get_mut(l).ok_or(Fault::NoLane)?;
+        let r = lane.replay_packet(self.vis, p, clock, mids, routes);
         self.drain(l, sink)?;
         Ok(r)
     }
@@ -446,6 +472,7 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
                 }
             }
         }
+        self.remember_cut(entry.step);
         let deltas = self.deltas.get(..n_delta).ok_or(Fault::Ring)?;
         sink.record(&Rec::Step(entry, deltas));
         for c in &mut self.tx_c {
@@ -479,6 +506,41 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             line.publish(self.vis, &s);
         }
         Ok(())
+    }
+}
+
+impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
+    fn slot(f: StepId) -> usize {
+        usize::try_from(f.0)
+            .ok()
+            .and_then(|x| x.checked_rem(STEP_HIST))
+            .unwrap_or(0)
+    }
+
+    fn remember_cut(&mut self, f: StepId) {
+        let n = self.lanes.len();
+        let s = Self::slot(f);
+        let base = s.saturating_mul(n);
+        if let (Some(dst), Some(src)) = (
+            self.hist.get_mut(base..base.saturating_add(n)),
+            self.cut.get(..n),
+        ) {
+            dst.copy_from_slice(src);
+        }
+        if let Some(id) = self.hist_id.get_mut(s) {
+            *id = f;
+        }
+    }
+
+    /// `C_f[l]`, if step `f` is still in the history.
+    pub(crate) fn cut_at(&self, f: StepId, l: usize) -> Option<LaneSeq> {
+        let s = Self::slot(f);
+        if *self.hist_id.get(s)? != f {
+            return None;
+        }
+        self.hist
+            .get(s.saturating_mul(self.lanes.len()).saturating_add(l))
+            .copied()
     }
 }
 

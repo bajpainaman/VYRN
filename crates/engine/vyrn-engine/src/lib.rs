@@ -27,16 +27,19 @@
 //!   clock and every other packet with an on-time clock. Each step runs through
 //!   `vyrn_bbo::Bbo::replay_step` with its cut (`C_{s−1}` plus the record's deltas), source,
 //!   kind (incl. `Shed`, `CONT`) and `Rescan` band taken from the record (05 §10 rows 4–5); the
-//!   cut cores still publish before it, since it reads the half-cuts. Because the replayed
-//!   steps write the same `LaneCut` values in the same record order, a non-`MID` Advance record
-//!   is replayed as the lane's idle poll, and the `MID` Advance records of a packet are
-//!   reproduced by the lane's own polls inside it; both are then checked against the log (05
-//!   §10 table rows 1–3 and 6).
+//!   cut cores still publish before it, since it reads the half-cuts. Each packet goes through
+//!   `vyrn_lane::Lane::replay_packet`: its `MID` Advance records become `Mid` boundaries at
+//!   `(f, C_f[l])`, with `C_f` from the replayed step `f`'s cut (kept for the last
+//!   `ENG_STEP_LOG` steps), and op `(l, q)` is forwarded iff a later `StepRecord` has
+//!   `src = (l, q)`, never by the lane's snapshot (05 §10 rows 1–3, 7). A non-`MID` Advance
+//!   record is replayed as the lane's idle poll, which reads the `LaneCut` that the replayed
+//!   step wrote. Every call's output records are checked against the log.
 //!
 //! **Replay rejects** ([`Diverged`]): a record the replayed engine does not reproduce byte for
 //! byte ([`Why::Mismatch`]), a packet record without payload ([`Why::NoPayload`]), a step
 //! record that does not decode ([`Why::BadStep`]), a step the BBO core refuses as its next one
-//! ([`Why::Step`] with `vyrn_bbo::Diverge`), a record with no lane work behind it
+//! ([`Why::Step`] with `vyrn_bbo::Diverge`), a `MID` record older than the cut history
+//! ([`Why::StepTooOld`]), a record with no lane work behind it
 //! ([`Why::BadRecord`]), a step the BBO core does not publish ([`Why::NoStep`]), and any lane
 //! or BBO fault ([`Why::Fault`]).
 //!
@@ -45,10 +48,10 @@
 //! - Live mode is the single-threaded schedule of 11 §6.4 (`vyrn-sim` order). The engine
 //!   crates may not spawn threads (11 §3.3), so pinned cores are the binary's: it runs the same
 //!   roles from [`role`] on its own threads.
-//! - In replay the lane still routes by its snapshot. 05 §10 row 7 (forward op `(l, q)` iff a
-//!   `StepRecord` names it) needs `vyrn-lane`'s forced-route input. Until then a lane replays
-//!   correctly only where its snapshot routes as the live lane's did, which holds for logs of
-//!   this engine's schedule (the fan-out writes the same snapshots in the same record order).
+//! - A forwarded op's route (`Cross` or `Improve`, which risk charges to different buckets) is
+//!   derived from its first step's kind, because the log does not carry the live
+//!   classification. A `Cross` that STP stops before any fill is logged as `Improve`, so it
+//!   replays with the `Improve` bucket: a known divergence until the spec logs the route.
 //! - Pooled lanes (`AcctTake`), auction control steps, and the `Sim` visibility backend in tests.
 //!
 //! Determinism (`INV-DET`): the engine's own choices are the call order and nothing else. It
