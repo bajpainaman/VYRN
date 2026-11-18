@@ -1,5 +1,6 @@
 //! End to end over 07: a live `vyrn-engine` run is framed by `vyrn_log::SeqWriter`, decoded and
-//! checked by [`OrderCore`], joined by [`DataJoin`] and replayed by [`RustReplay`]. Replay must
+//! checked by [`OrderCore`], joined by [`DataJoin`] (fed directly, or by a `vyrn-data` box over
+//! the `sim` NIC through [`DataFeed`]) and replayed by [`RustReplay`]. Replay must
 //! reproduce every lane's packet records, every lane response and every fill TX packet of the live
 //! run byte for byte, and the output hash of both runs must agree.
 #![allow(
@@ -22,7 +23,8 @@ use vyrn_lane::{Rx, RxIn};
 use vyrn_log::{Ident, LaneBase, Layout, SeqWriter, TenureStart};
 use vyrn_replica::rust::{encode_resp, encode_tx};
 use vyrn_replica::{
-    BlockInputs, DataJoin, EpochView, OrderCore, ReplayEngine, RustReplay, full_hash, output_hash,
+    BlockInputs, DataFeed, DataJoin, EpochView, OrderCore, ReplayEngine, RustReplay, full_hash,
+    output_hash,
 };
 use vyrn_types::{
     BookId, Epoch, Handle, Hash, Height, LaneId, LaneSeq, MAX_REQ_PAYLOAD, Nanos, PacketFlags,
@@ -272,6 +274,15 @@ fn replay(
     for ((_, s, q, _), b) in &store.0 {
         data.put(*s, *q, b.clone());
     }
+    replay_with(live_j, data, blocks)
+}
+
+/// [`replay`] over payloads already joined.
+fn replay_with(
+    live_j: &Journal,
+    data: DataJoin,
+    blocks: &[BlockInputs<N>],
+) -> Result<(Journal, Vec<Hash>), vyrn_replica::ReplayError> {
     let (bbo, mut sh) = new_box();
     let e = engine(bbo, &mut sh);
     let mut rep = RustReplay::new(e, data, RespLog::of(live_j), Journal::default());
@@ -357,4 +368,151 @@ fn a_changed_step_diverges() {
     let mut short = blocks;
     short[0].steps.pop();
     assert!(replay(&live_j, &store, &short).is_err());
+}
+
+/// The data tier in the loop (03 F2 and F7): every client copy goes to a `vyrn-data` box over the
+/// `sim` NIC, one `DATA` frame per packet. The replica loses frame 2, sees the gap at frame 3,
+/// repairs it with a RANGE fetch, and then the block's `data_root` checks and replay matches the
+/// live run, from payloads the replica received only from the data box.
+#[test]
+fn payloads_from_a_data_box_replay_the_live_run() {
+    use core::net::{Ipv4Addr, SocketAddrV4};
+    use vyrn_data::frame::Fetch;
+    use vyrn_data::{DataNode, HomeConfig, Mode, NodeConfig};
+    use vyrn_nic::frame::{Endpoint, FrameHdr, build, parse};
+    use vyrn_nic::{
+        BackendKind, NicBackend, NicConfig, PortConfig, PortId, RxBind, SimNic, TxClass,
+    };
+    use vyrn_wire::{RX_BURST, RxPkt, RxRing};
+
+    let (live_j, store, blocks) = blocks(&[]);
+    let ep = |last: u8, port: u16| Endpoint {
+        mac: [2, 0, 0, 0, 0, last],
+        ip: Ipv4Addr::new(10, 0, 0, last),
+        port,
+    };
+    let (ingest_ep, fetch_ep, replica_ep, client) =
+        (ep(1, 19998), ep(1, 19997), ep(2, 20000), ep(9, 4000));
+    let ports = (0..2u8)
+        .map(|i| PortConfig {
+            id: PortId(i),
+            ip: Ipv4Addr::new(10, 0, 0, i + 1),
+        })
+        .collect();
+    let mut nic = SimNic::open(&NicConfig::new(BackendKind::Sim, ports)).unwrap();
+    let bind = |e: Endpoint, port: u8| RxBind {
+        lane: LaneId(0),
+        port: PortId(port),
+        ip: e.ip,
+        udp_port: e.port,
+    };
+    let ingest = nic.rx_ring(&bind(ingest_ep, 0)).unwrap();
+    let fetch = nic.rx_ring(&bind(fetch_ep, 0)).unwrap();
+    let mut rx = nic.rx_ring(&bind(replica_ep, 1)).unwrap();
+    let tx = nic.tx_ring(PortId(0), TxClass::OrderStream).unwrap();
+    let mut keys = std::collections::BTreeMap::new();
+    for a in script() {
+        if let Act::Pkt { l, a, .. } = a {
+            keys.insert(harness::sid(l, a), harness::kseq(l, a));
+        }
+    }
+    let home = HomeConfig {
+        mode: Mode::Base,
+        books: vec![BOOK],
+        keys,
+        ring_slots: 64,
+    };
+    let mut node = DataNode::new(
+        NodeConfig::new(home, 0, ingest_ep, vec![replica_ep]),
+        ingest,
+        fetch,
+        tx,
+        vyrn_log::MemStore::default(),
+    );
+    let inject = |to: Endpoint, payload: &[u8]| {
+        let mut b = [0u8; 1514];
+        let n = build(
+            &FrameHdr {
+                src: client,
+                dst: to,
+            },
+            payload,
+            &mut b,
+        )
+        .unwrap();
+        assert!(nic.inject(SocketAddrV4::new(to.ip, to.port), &b[..n], Nanos(0)));
+    };
+    let drain = |rx: &mut vyrn_nic::sim::SimRx| {
+        let mut out = vec![];
+        let mut burst = [RxPkt::empty(); RX_BURST];
+        loop {
+            let n = rx.poll(&mut burst);
+            if n == 0 {
+                return out;
+            }
+            out.extend(
+                burst[..n]
+                    .iter()
+                    .map(|p| parse(rx.bytes(p)).unwrap().payload.to_vec()),
+            );
+            rx.release(n);
+        }
+    };
+    for (_, b) in &store.0 {
+        inject(ingest_ep, b);
+        node.poll(Nanos(0));
+        node.flush(Nanos(0));
+    }
+    let frames = drain(&mut rx);
+    assert_eq!(frames.len(), store.0.len(), "one DATA frame per packet");
+    assert!(frames.len() >= 3);
+
+    let mut feed = DataFeed::new(BOOK, 1);
+    let mut join = DataJoin::default();
+    let mut gaps = vec![];
+    for (i, f) in frames.iter().enumerate() {
+        if i == 1 {
+            continue; // lost on the wire
+        }
+        let fed = feed.on_frame(&mut join, f, 0).unwrap();
+        assert_eq!((fed.stored, fed.dropped), (1, 0));
+        gaps.extend(fed.gap);
+    }
+    assert_eq!(
+        gaps,
+        vec![(0, 2, 2)],
+        "DATA 3 reveals that DATA 2 is missing"
+    );
+    assert!(
+        matches!(
+            join.check(&blocks[0]),
+            Err(vyrn_replica::DataErr::Missing { .. })
+        ),
+        "no vote while a payload is missing"
+    );
+    let (src, from, to) = gaps[0];
+    inject(fetch_ep, &Fetch::Range { dst: src, from, to }.encode());
+    node.poll(Nanos(0));
+    for f in drain(&mut rx) {
+        let fed = feed.on_frame(&mut join, &f, 0).unwrap();
+        assert_eq!(
+            (fed.stored, fed.gap),
+            (1, None),
+            "the resent frame, no new gap"
+        );
+    }
+    join.check(&blocks[0]).unwrap();
+    let (rep, hashes) = replay_with(&live_j, join, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    assert_eq!(hashes, vec![live_hash(&live_j)]);
+    // Silent for REP_DATA_SILENCE_MS after its last frame: the box is reported for DataDown.
+    assert_eq!(
+        feed.silent(vyrn_replica::REP_DATA_SILENCE_NS - 1).count(),
+        0
+    );
+    assert_eq!(
+        feed.silent(vyrn_replica::REP_DATA_SILENCE_NS)
+            .collect::<Vec<_>>(),
+        vec![0]
+    );
 }

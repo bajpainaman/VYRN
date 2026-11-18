@@ -67,7 +67,8 @@
 //! `vyrn_consensus` voter config. [`ReplicaLocal`] is this replica's `vyrn_epoch::LocalView`,
 //! and [`EpochJournal`] makes `SignOnce` admissions and `armed(e+1)` durable before they are
 //! acted on ([`epoch`]). [`DataJoin`] joins payloads, checks `data_root` (07 §6.4 item 3) and
-//! is the engine's `Payloads` ([`data`]). [`RustReplay`] implements `ReplayEngine` over
+//! is the engine's `Payloads` ([`data`]). [`DataFeed`] fills it from `vyrn-data` frames and
+//! reports `data_seq` gaps and silent data boxes ([`feed`]). [`RustReplay`] implements `ReplayEngine` over
 //! `vyrn_engine::Engine::replay_wire` ([`rust`], which also fixes the block output hash).
 //!
 //! **Conformance.** `tests/golden/vyrn_replica_vectors.txt` at the repository root lists frame
@@ -81,6 +82,7 @@
 pub mod check;
 pub mod data;
 pub mod epoch;
+pub mod feed;
 pub mod hashlag;
 pub mod lane;
 pub mod order;
@@ -94,6 +96,7 @@ pub mod vx;
 pub use check::{StepErr, check_step};
 pub use data::{DataErr, DataJoin, full_hash};
 pub use epoch::{ActiveEpoch, EpochJournal, JournalErr, ReplicaLocal};
+pub use feed::{DataFeed, Fed, FeedErr, REP_DATA_SILENCE_NS};
 pub use hashlag::{REP_HASHLAG_MAX_NS, check_hashlag};
 pub use lane::{LaneErr, LaneState};
 pub use order::{Fault, FaultKind, FrameErr, HeaderErr, OrderCore};

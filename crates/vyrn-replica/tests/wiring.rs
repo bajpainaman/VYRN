@@ -307,3 +307,74 @@ fn a_running_order_core_takes_its_epoch_fence() {
         vyrn_consensus::Verdict::Invalid
     );
 }
+
+/// The data feed's rejects and stream position: a heartbeat reveals a lost tail frame, a frame of
+/// another book or from an unconfigured box changes nothing, and a bad packet inside a good frame
+/// is dropped alone.
+#[test]
+fn data_feed_tracks_each_box_and_refuses_what_is_not_its_own() {
+    use vyrn_data::frame::{DataHdr, FrameBuf, Kind};
+    use vyrn_replica::{DataFeed, Fed, FeedErr};
+    let k = [7u8; 16];
+    let req = |session: u32, pkt_seq: u32, book: u16| {
+        let mut out = [0u8; vyrn_types::MAX_REQ_PAYLOAD];
+        let h = vyrn_wire::ReqHeader::new(SessionId(session), pkt_seq, 0, BookId(book), false);
+        let n =
+            vyrn_wire::encode_request(&mut out, h, &[vyrn_wire::Msg::Heartbeat], &k, None).unwrap();
+        out[..n].to_vec()
+    };
+    let frame = |kind, book, data_seq, src, pkts: &[&[u8]]| {
+        let mut b = FrameBuf::default();
+        for p in pkts {
+            assert!(b.push(p));
+        }
+        b.finish(&DataHdr {
+            kind,
+            book: BookId(book),
+            epoch16: 0,
+            data_seq,
+            src,
+        })
+        .to_vec()
+    };
+    let (good, other_book, seq0) = (req(5, 1, 1), req(5, 2, 2), req(5, 0, 1));
+    let mut feed = DataFeed::new(BookId(1), 2);
+    let mut j = DataJoin::default();
+    let f = frame(Kind::Data, 1, 1, 1, &[&good, &other_book, &seq0, b"short"]);
+    assert_eq!(
+        feed.on_frame(&mut j, &f, 10),
+        Ok(Fed {
+            stored: 1,
+            dropped: 3,
+            gap: None
+        })
+    );
+    // Box 0 was never heard from; box 1 is silent from 10 + 1 ms.
+    assert_eq!(feed.silent(10 + 999_999).count(), 0);
+    assert_eq!(feed.silent(10 + 1_000_000).collect::<Vec<_>>(), vec![1]);
+    // A heartbeat naming DATA 3 after DATA 1: frames 2 and 3 were lost.
+    let hb = frame(Kind::DataHb, 0, 3, 1, &[]);
+    assert_eq!(feed.on_frame(&mut j, &hb, 20).unwrap().gap, Some((1, 2, 3)));
+    assert_eq!(
+        feed.on_frame(&mut j, &hb, 30).unwrap().gap,
+        None,
+        "reported once"
+    );
+    assert_eq!(
+        feed.on_frame(&mut j, &frame(Kind::Data, 2, 4, 1, &[&other_book]), 40),
+        Err(FeedErr::Book(BookId(2)))
+    );
+    assert_eq!(
+        feed.on_frame(&mut j, &frame(Kind::Data, 1, 1, 2, &[&good]), 40),
+        Err(FeedErr::Src(2))
+    );
+    assert!(matches!(
+        feed.on_frame(&mut j, b"PD", 40),
+        Err(FeedErr::Frame(_))
+    ));
+    // The refused DATA 4 did not move box 1: DATA 5 reports frame 4 missing.
+    let f5 = frame(Kind::Data, 1, 5, 1, &[&good]);
+    assert_eq!(feed.on_frame(&mut j, &f5, 50).unwrap().gap, Some((1, 4, 4)));
+    let r = packet(5, 1, &good, 0);
+    assert_eq!(j.resolve(&r).map(|x| x.0), Ok(good.as_slice()));
+}

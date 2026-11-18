@@ -9,7 +9,7 @@ description = "The replica: two-path order frames, data fetch, replay engine (Ru
 
 # Layer 6 (spec/11-build.md §1.4): vyrn-engine (4) for replay, with the engine types its Sink and
 # Visibility bounds name (vyrn-bbo, vyrn-lane, vyrn-cut, below it); vyrn-epoch (5) for the
-# handoff, vyrn-consensus (4) and vyrn-log (2).
+# handoff, vyrn-consensus (4) and vyrn-log (2); vyrn-data (4) for its frame decoder (03 F7).
 [dependencies]
 vyrn-types = { workspace = true }
 vyrn-crypto = { workspace = true }
@@ -21,6 +21,7 @@ vyrn-epoch = { workspace = true }
 vyrn-wire = { workspace = true }
 vyrn-consensus = { workspace = true }
 vyrn-log = { workspace = true }
+vyrn-data = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
@@ -32,6 +33,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # The engine's test harness (`tests/replay.rs` includes it by path) builds its box from these.
 vyrn-risk = { workspace = true }
+vyrn-nic = { workspace = true }
 
 [lints]
 workspace = true
