@@ -16,7 +16,8 @@
 
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddrV4, UdpSocket};
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use vyrn_consensus::Verdict;
@@ -50,13 +51,15 @@ impl EpochView for View {
     }
 }
 
-#[test]
-fn one_order_end_to_end() {
-    let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
-    replica
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
-    let dir = std::env::temp_dir().join(format!("vyrn-seq-smoke-{}", std::process::id()));
+/// Writes a DEV config with `seal` and `block_ms`, starts the box and returns it with its
+/// stdout (read past `READY`) and lane 0's address.
+fn start(
+    replica: &UdpSocket,
+    seal: &str,
+    block_ms: u64,
+    tag: &str,
+) -> (Child, BufReader<ChildStdout>, SocketAddrV4, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("vyrn-seq-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = dir.join("seq.toml");
     std::fs::write(
@@ -83,11 +86,11 @@ port_base = 0
 [cores]
 engine = 2
 stream = 4
-seal = "count"
+seal = "{seal}"
 
 [replication]
 order = ["{}"]
-block_ms = 2
+block_ms = {block_ms}
 
 [keys]
 seq = "env:VYRN_SMOKE_SEQ_SEED"
@@ -126,28 +129,69 @@ base = 1000000000
             break rest.split(',').next().unwrap().parse().unwrap();
         }
     };
+    (child, out, lane0, dir)
+}
 
-    // One New from session (lane 0, slot 1, generation 1).
+/// One signed `New` at tick 100 from the DEV session (lane 0, slot 1, generation 1).
+fn order(
+    pkt_seq: u32,
+    side: vyrn_bbo::Side,
+    qty: u32,
+    client_tag: u32,
+    buf: &mut [u8; vyrn_types::MAX_REQ_PAYLOAD],
+) -> usize {
+    orders(pkt_seq, &[side], qty, client_tag, buf)
+}
+
+/// One packet with a `New` per side in `sides`.
+fn orders(
+    pkt_seq: u32,
+    sides: &[vyrn_bbo::Side],
+    qty: u32,
+    client_tag: u32,
+    buf: &mut [u8; vyrn_types::MAX_REQ_PAYLOAD],
+) -> usize {
     let session = vyrn_wire::session_id(1, LaneId(0), 1).unwrap();
-    let hdr = ReqHeader::new(session, 1, Epoch(0).low16(), BookId(7), false);
-    let flags = OrderFlags::from_byte(
-        vyrn_bbo::OrderFlags::new(
-            vyrn_bbo::Side::Buy,
-            vyrn_bbo::Tif::Day,
-            false,
-            vyrn_bbo::Stp::None,
-        )
-        .0,
-    )
-    .unwrap();
-    let msg = Msg::New {
-        flags,
-        tick: Tick(100),
-        qty: Qty(5),
-        client_tag: 77,
-    };
+    let hdr = ReqHeader::new(session, pkt_seq, Epoch(0).low16(), BookId(7), false);
+    let msgs: Vec<Msg> = sides
+        .iter()
+        .map(|&side| Msg::New {
+            flags: OrderFlags::from_byte(
+                vyrn_bbo::OrderFlags::new(side, vyrn_bbo::Tif::Day, false, vyrn_bbo::Stp::None).0,
+            )
+            .unwrap(),
+            tick: Tick(100),
+            qty: Qty(qty),
+            client_tag,
+        })
+        .collect();
+    encode_request(buf, hdr, &msgs, &K_SEQ, None).unwrap()
+}
+
+/// Closes stdin, reads stdout to EOF and returns the `STATS` line and whether the box exited 0.
+fn stop(child: &mut Child, out: BufReader<ChildStdout>) -> (String, bool) {
+    drop(child.stdin.take());
+    let mut stats = String::new();
+    for l in out.lines() {
+        let l = l.unwrap();
+        if l.starts_with("STATS") {
+            stats = l;
+        }
+    }
+    (stats, child.wait().unwrap().success())
+}
+
+#[test]
+fn one_order_end_to_end() {
+    let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
+    replica
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let (mut child, out, lane0, dir) = start(&replica, "count", 2, "smoke");
+
+    let session = vyrn_wire::session_id(1, LaneId(0), 1).unwrap();
     let mut buf = [0u8; vyrn_types::MAX_REQ_PAYLOAD];
-    let n = encode_request(&mut buf, hdr, &[msg], &K_SEQ, None).unwrap();
+    let n = order(1, vyrn_bbo::Side::Buy, 5, 77, &mut buf);
     let pkt = &buf[..n];
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
     client
@@ -219,16 +263,113 @@ base = 1000000000
     assert_eq!(core.verdict(Height(0), Height(0)), Verdict::Valid);
 
     // 3. Clean stop.
-    drop(child.stdin.take());
-    let mut stats = String::new();
-    for l in out.lines() {
-        let l = l.unwrap();
-        if l.starts_with("STATS") {
-            stats = l;
-        }
-    }
-    assert!(child.wait().unwrap().success());
+    let (stats, ok) = stop(&mut child, out);
+    assert!(ok, "{stats}");
     assert!(stats.contains(" tx=1 "), "{stats}");
     assert!(stats.contains("seal_violations=0"), "{stats}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Back-pressure with a sealed engine thread (`seal = "abort"`): the test stops reading stdout,
+/// so the stream thread blocks printing `BLOCK` lines while orders keep arriving. The handoff
+/// fills and the engine waits for room; once stdout is read again the box drains, closes its
+/// blocks and exits 0. An allocation on the engine thread aborts the process instead.
+#[test]
+fn sealed_engine_survives_a_full_handoff() {
+    let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut child, out, lane0, dir) = start(&replica, "abort", 1, "full");
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut buf = [0u8; vyrn_types::MAX_REQ_PAYLOAD];
+    // Buy, then sell, 1 at one tick: each pair rests and fills, so every packet makes a step
+    // and every block_ms closes a block. Lockstep (one response per packet, so no packet is
+    // lost) until a response stops coming: stdout's pipe is full and the stream thread blocked.
+    client
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut rbuf = [0u8; 2048];
+    let mut seq = 1u32;
+    let side = |s: u32| {
+        if s % 2 == 1 {
+            vyrn_bbo::Side::Buy
+        } else {
+            vyrn_bbo::Side::Sell
+        }
+    };
+    let t0 = Instant::now();
+    loop {
+        assert!(
+            t0.elapsed() < Duration::from_secs(60),
+            "stream never stalled"
+        );
+        let n = order(seq, side(seq), 1, seq, &mut buf);
+        client.send_to(&buf[..n], lane0).unwrap();
+        seq += 1;
+        if client.recv(&mut rbuf).is_err() {
+            break;
+        }
+    }
+    // The stream is stalled: these fill the handoff behind it, four orders (four steps) a packet.
+    let (b, s) = (vyrn_bbo::Side::Buy, vyrn_bbo::Side::Sell);
+    for _ in 0..1000 {
+        for _ in 0..4 {
+            let n = orders(seq, &[b, s, b, s], 1, seq, &mut buf);
+            client.send_to(&buf[..n], lane0).unwrap();
+            seq += 1;
+        }
+        // About 4 packets a millisecond (`thread::sleep` is disallowed).
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(1) {
+            std::thread::yield_now();
+        }
+    }
+    let (stats, ok) = stop(&mut child, out);
+    assert!(ok, "exit status: {stats}");
+    assert!(stats.contains("seal_violations=0"), "{stats}");
+    let field = |k: &str| -> u64 {
+        let v = stats.split(' ').find_map(|f| f.strip_prefix(k));
+        v.unwrap_or("0").parse().unwrap()
+    };
+    assert!(field("blocks=") > 1, "{stats}");
+    assert!(
+        field("handoff_full=") > 0,
+        "the handoff never filled: {stats}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A block holding a packet record but no step still closes on its deadline: a heartbeat makes
+/// a packet record and no step.
+#[test]
+fn packet_only_block_closes() {
+    let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
+    replica
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let (mut child, out, lane0, dir) = start(&replica, "abort", 2, "pkt-only");
+    let session = vyrn_wire::session_id(1, LaneId(0), 1).unwrap();
+    let hdr = ReqHeader::new(session, 1, Epoch(0).low16(), BookId(7), false);
+    let mut buf = [0u8; vyrn_types::MAX_REQ_PAYLOAD];
+    let n = encode_request(&mut buf, hdr, &[Msg::Heartbeat], &K_SEQ, None).unwrap();
+    UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .send_to(&buf[..n], lane0)
+        .unwrap();
+    let mut rbuf = [0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let header = loop {
+        if Instant::now() > deadline {
+            break false;
+        }
+        let Ok(k) = replica.recv(&mut rbuf) else {
+            continue;
+        };
+        if FrameHeader::parse(&rbuf[..k]).unwrap().0.kind == FrameKind::Header {
+            break true;
+        }
+    };
+    let (stats, ok) = stop(&mut child, out);
+    assert!(header, "no HEADER before stop: {stats}");
+    assert!(ok, "{stats}");
+    assert!(stats.contains("records=1 steps=0 "), "{stats}");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -39,14 +39,21 @@
 //! | `stream` | 4 (and 3, 5 for responses) | `SeqWriter` (vyrn-log): frames every record, sends ORDER and HASH, closes and signs a block every `block_ms`, then sends the responses those frames cover (`INV-FRAME-FIRST`) |
 //! | main | 51 | config, start, readiness, stop, stats |
 //!
-//! The engine thread hands records to the stream thread through a bounded channel whose
-//! messages are `Copy` data, so a sealed engine thread does not allocate on that path.
+//! **Handoff.** The engine thread hands its outputs to the stream thread through one
+//! `vyrn_cut::Ring` (SPSC, [`HANDOFF`] `Copy` entries), allocated before either thread starts, so
+//! a sealed engine thread never allocates on that path. When the ring is full the engine thread
+//! waits (back-pressure, 05 §14.2): it retries the push, yielding between tries, and stops polling
+//! its RX queues meanwhile, so the kernel holds or drops packets ahead of the box, never inside
+//! it. It gives up only once the stream thread has exited, and then fail-stops. `STATS
+//! handoff_full` counts the pushes that had to wait. The stream thread exits once the engine
+//! thread has been joined and the ring is empty, or on an error, which also sets the stop flag.
+//! A block closes `block_ms` after its first packet record or step, and at a clean stop.
 //!
 //! **Events on stdout**, one line each, for tests and operators: `LAYOUT engine=<core|unpinned>
 //! stream=<core|unpinned> control=main`, `READY ...`,
 //! `BLOCK height=<h> first_step=<s> last_step=<s>`, `NOTICE lane=<l> next=<e> secs=<s>`, and at
 //! exit `STATS records=<n> steps=<n> blocks=<n> responses=<n> tx=<n> tx_unsent=<n>
-//! seal_violations=<n>`.
+//! seal_violations=<n> handoff_full=<n>`.
 //!
 //! **Stop.** With `--stop-on-stdin-eof`, closing stdin stops both threads, flushes the stream
 //! and prints `STATS`. Otherwise the process runs until killed (06 §4.8: never restarted).
@@ -64,13 +71,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use vyrn_bbo::admit::FixedClock;
 use vyrn_bbo::{Bbo, CutDelta, Phase, Record, StepEntry, TxEntry};
-use vyrn_cut::Hw;
+use vyrn_cut::{Consumer, Hw, Producer, Ring};
 use vyrn_engine::alloc::SealingAlloc;
 use vyrn_engine::{Engine, Rec, Shared, Sink};
 use vyrn_epoch::{Boundary, EpochNotice, Notifier};
@@ -97,8 +104,8 @@ static ALLOC: SealingAlloc = SealingAlloc;
 /// Lane-local accounts per lane (`vyrn_lane::Lane`'s `NA`), fixed in this release.
 pub const NA: usize = 16;
 pub const MAX_LANES: usize = vyrn_bbo::MAX_LANES;
-/// Records in flight between the engine and stream threads.
-const CHANNEL: usize = 8192;
+/// Entries in flight between the engine and stream threads (a power of two).
+const HANDOFF: usize = 8192;
 /// Messages the stream thread takes before it drains responses and checks the block timer.
 const BATCH: usize = 1024;
 /// Records per response packet (01 §6.3).
@@ -116,7 +123,7 @@ struct Cli {
     stop_on_stdin_eof: bool,
 }
 
-/// Engine thread → stream thread. Every variant is `Copy`, so sending never allocates.
+/// Engine thread → stream thread, through the handoff ring: `Copy` data only.
 // Boxing the large variant would allocate on the sealed engine thread.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy)]
@@ -140,6 +147,8 @@ struct Stats {
     fills: AtomicU64,
     unsent: AtomicU64,
     seal_violations: AtomicU64,
+    /// Engine pushes that found the handoff full and waited.
+    full: AtomicU64,
 }
 
 fn fail(what: &str, e: impl std::fmt::Display) -> ExitCode {
@@ -209,7 +218,11 @@ where
 
     let stats = Arc::new(Stats::default());
     let stop = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = sync_channel::<Out>(CHANNEL);
+    // Set by the stream thread when it exits; set by this thread once the engine thread joined.
+    let stream_done = AtomicBool::new(false);
+    let engine_done = AtomicBool::new(false);
+    let mut ring = Ring::<Out, HANDOFF, 1, Hw>::new(&Hw);
+    let (tx, [rx]) = ring.split().ok_or("handoff ring")?;
     let (ready_tx, ready_rx) = sync_channel::<Result<(), String>>(2);
 
     let writer = writer(cfg, n, seed)?;
@@ -218,45 +231,113 @@ where
         .iter()
         .map(|s| Ok((dev_sid(s)?, config::hex::<16>(&s.k_out)?)))
         .collect::<Result<_, String>>()?;
-    let stream = {
-        let (stats, stop, ready) = (Arc::clone(&stats), Arc::clone(&stop), ready_tx.clone());
-        let block = Duration::from_millis(cfg.replication.block_ms);
-        let replicas = cfg.replication.order.clone();
-        let epoch16 = Epoch(cfg.epoch).low16();
-        std::thread::Builder::new()
-            .name("vyrn-seq/stream".into())
-            .spawn(move || {
-                let _ = ready.send(Ok(()));
-                let mut s = StreamCore {
-                    writer,
-                    order_tx,
-                    resp_tx,
-                    replicas,
-                    src: ip,
-                    k_out,
-                    epoch16,
-                    cut: vec![LaneSeq(0); n],
-                    stats,
-                    pending: Vec::new(),
-                    pending_tx: Vec::new(),
-                };
-                s.run(&rx, &stop, block)
-            })
-            .map_err(|e| e.to_string())?
-    };
-    let engine = {
-        let (stats, stop) = (Arc::clone(&stats), Arc::clone(&stop));
-        let plan = EnginePlan::from(cfg)?;
-        std::thread::Builder::new()
-            .name("vyrn-seq/engine".into())
-            .spawn(move || engine_thread(plan, rxs, tx, &ready_tx, &stop, &stats, class))
-            .map_err(|e| e.to_string())?
-    };
-    for _ in 0..2 {
-        ready_rx
-            .recv()
-            .map_err(|_| "a thread exited before ready".to_owned())??;
-    }
+    let block = Duration::from_millis(cfg.replication.block_ms);
+    let plan = EnginePlan::from(cfg)?;
+    std::thread::scope(|sc| {
+        let stream = {
+            let (stats, stop, ready) = (Arc::clone(&stats), Arc::clone(&stop), ready_tx.clone());
+            let (stream_done, engine_done) = (&stream_done, &engine_done);
+            let replicas = cfg.replication.order.clone();
+            let epoch16 = Epoch(cfg.epoch).low16();
+            std::thread::Builder::new()
+                .name("vyrn-seq/stream".into())
+                .spawn_scoped(sc, move || {
+                    let _ = ready.send(Ok(()));
+                    let mut s = StreamCore {
+                        writer,
+                        order_tx,
+                        resp_tx,
+                        replicas,
+                        src: ip,
+                        k_out,
+                        epoch16,
+                        cut: vec![LaneSeq(0); n],
+                        stats,
+                        pending: Vec::new(),
+                        pending_tx: Vec::new(),
+                    };
+                    let mut rx = rx;
+                    let r = s.run(&mut rx, engine_done, block);
+                    // Ends the engine's wait on a full ring, and the engine loop on an error.
+                    stream_done.store(true, Ordering::Release);
+                    stop.store(true, Ordering::Release);
+                    r
+                })
+                .map_err(|e| e.to_string())?
+        };
+        // From here every exit path joins both threads: the stream thread runs until
+        // `engine_done`, and the scope would wait for it.
+        let engine = {
+            let (stats, stop) = (Arc::clone(&stats), Arc::clone(&stop));
+            let stream_done = &stream_done;
+            std::thread::Builder::new()
+                .name("vyrn-seq/engine".into())
+                .spawn_scoped(sc, move || {
+                    let h = Handoff {
+                        tx,
+                        stream_done,
+                        dead: false,
+                    };
+                    engine_thread(plan, rxs, h, &ready_tx, &stop, &stats, class)
+                })
+        };
+        let engine = match engine {
+            Ok(t) => t,
+            Err(e) => {
+                engine_done.store(true, Ordering::Release);
+                let _ = stream.join();
+                return Err(e.to_string());
+            }
+        };
+        let mut failed = None;
+        for _ in 0..2 {
+            match ready_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => failed = Some(e),
+                Err(_) => failed = Some("a thread exited before ready".to_owned()),
+            }
+            if failed.is_some() {
+                break;
+            }
+        }
+        if failed.is_none() {
+            start_line(cfg, n, &addrs);
+            if stdin_stop {
+                let mut sink = Vec::new();
+                let _ = std::io::stdin().read_to_end(&mut sink);
+                stop.store(true, Ordering::Release);
+            }
+        } else {
+            stop.store(true, Ordering::Release);
+        }
+        let e = engine.join();
+        // Every push happened before the join: an empty ring now means the stream has it all.
+        engine_done.store(true, Ordering::Release);
+        stop.store(true, Ordering::Release);
+        let s = stream.join();
+        if let Some(f) = failed {
+            return Err(f);
+        }
+        let g = |c: &AtomicU64| c.load(Ordering::Acquire);
+        println!(
+            "STATS records={} steps={} blocks={} responses={} tx={} tx_unsent={} seal_violations={} handoff_full={}",
+            g(&stats.records),
+            g(&stats.steps),
+            g(&stats.blocks),
+            g(&stats.responses),
+            g(&stats.fills),
+            g(&stats.unsent),
+            g(&stats.seal_violations),
+            g(&stats.full)
+        );
+        let e = e.map_err(|_| "engine thread panicked")?;
+        let s = s.map_err(|_| "stream thread panicked")?;
+        e.and(s)
+    })
+}
+
+/// The `LAYOUT` and `READY` lines.
+fn start_line(cfg: &Config, n: usize, addrs: &[String]) {
     let core = |c: Option<u16>| c.map_or_else(|| "unpinned".to_owned(), |c| c.to_string());
     println!(
         "LAYOUT engine={} stream={} control=main",
@@ -264,26 +345,6 @@ where
         core(cfg.cores.stream)
     );
     println!("READY vyrn-seq lanes={n} rx={}", addrs.join(","));
-    if stdin_stop {
-        let mut sink = Vec::new();
-        let _ = std::io::stdin().read_to_end(&mut sink);
-        stop.store(true, Ordering::Release);
-    }
-    let e = engine.join().map_err(|_| "engine thread panicked")?;
-    stop.store(true, Ordering::Release);
-    let s = stream.join().map_err(|_| "stream thread panicked")?;
-    let g = |c: &AtomicU64| c.load(Ordering::Acquire);
-    println!(
-        "STATS records={} steps={} blocks={} responses={} tx={} tx_unsent={} seal_violations={}",
-        g(&stats.records),
-        g(&stats.steps),
-        g(&stats.blocks),
-        g(&stats.responses),
-        g(&stats.fills),
-        g(&stats.unsent),
-        g(&stats.seal_violations)
-    );
-    e.and(s)
 }
 
 /// The address a lane's RX queue listens on.
@@ -446,28 +507,51 @@ fn home_code(s: &str) -> Option<HomeCode> {
     }
 }
 
+/// The engine thread's end of the handoff ring.
+struct Handoff<'a> {
+    tx: Producer<'a, Out, HANDOFF, 1, Hw>,
+    stream_done: &'a AtomicBool,
+    /// The stream thread exited: nothing more is pushed and the engine loop stops.
+    dead: bool,
+}
+
 /// The engine's outputs, forwarded to the stream thread without allocating.
-struct EngineSink {
-    tx: SyncSender<Out>,
+struct EngineSink<'a> {
+    tx: Handoff<'a>,
     /// `(pkt_hash, full hash)` of recently received packets, oldest first.
     recent: std::collections::VecDeque<(PktHash, Hash)>,
     /// The source endpoint of each session's last packet.
     peers: Vec<(SessionId, Endpoint)>,
     notifiers: Vec<Notifier>,
     stats: Arc<Stats>,
-    dead: bool,
 }
 
-impl EngineSink {
+impl EngineSink<'_> {
+    /// Pushes `o`; on a full ring waits for the stream thread (back-pressure, never an
+    /// allocation or a drop). Only a stream thread that has exited ends the wait: fail-stop.
     fn send(&mut self, o: Out) {
-        // A full or closed channel means the stream core stopped: fail-stop.
-        if self.tx.send(o).is_err() {
-            self.dead = true;
+        let h = &mut self.tx;
+        let mut o = o;
+        let mut waited = false;
+        while !h.dead {
+            match h.tx.push(&Hw, o) {
+                Ok(()) => return,
+                Err(back) => o = back,
+            }
+            if !waited {
+                waited = true;
+                self.stats.full.fetch_add(1, Ordering::Relaxed);
+            }
+            if h.stream_done.load(Ordering::Acquire) {
+                h.dead = true;
+            } else {
+                std::thread::yield_now();
+            }
         }
     }
 }
 
-impl Sink for EngineSink {
+impl Sink for EngineSink<'_> {
     fn record(&mut self, r: &Rec<'_>) {
         match r {
             Rec::Packet(p) => {
@@ -528,7 +612,7 @@ impl Sink for EngineSink {
 fn engine_thread<R: RxRing>(
     plan: EnginePlan,
     mut rxs: Vec<R>,
-    tx: SyncSender<Out>,
+    tx: Handoff<'_>,
     ready: &SyncSender<Result<(), String>>,
     stop: &AtomicBool,
     stats: &Arc<Stats>,
@@ -545,7 +629,7 @@ fn engine_thread<R: RxRing>(
 fn engine_loop<R: RxRing>(
     plan: EnginePlan,
     rxs: &mut [R],
-    tx: SyncSender<Out>,
+    tx: Handoff<'_>,
     ready: &SyncSender<Result<(), String>>,
     stop: &AtomicBool,
     stats: &Arc<Stats>,
@@ -588,7 +672,6 @@ fn engine_loop<R: RxRing>(
         peers,
         notifiers: plan.notifier.map_or_else(Vec::new, |x| vec![x; n]),
         stats: Arc::clone(stats),
-        dead: false,
     };
     // Deadline admission needs a class A or C clock (06 §6.8); DEV backends run without it.
     if !matches!(class, LatencyClass::E | LatencyClass::S) {
@@ -605,7 +688,7 @@ fn engine_loop<R: RxRing>(
     }
     let _ = ready.send(Ok(()));
     let mut out = Ok(());
-    while !stop.load(Ordering::Acquire) && !sink.dead {
+    while !stop.load(Ordering::Acquire) && !sink.tx.dead {
         let mut got = 0usize;
         for (l, rx) in rxs.iter_mut().enumerate() {
             let k = rx.poll(&mut burst);
@@ -632,7 +715,7 @@ fn engine_loop<R: RxRing>(
         .seal_violations
         .store(vyrn_engine::alloc::violations(), Ordering::Release);
     vyrn_engine::alloc::unseal();
-    if sink.dead && out.is_ok() && !stop.load(Ordering::Acquire) {
+    if sink.tx.dead && out.is_ok() && !stop.load(Ordering::Acquire) {
         out = Err("stream core stopped".into());
     }
     out
@@ -651,7 +734,7 @@ const DEV_SLACK_NS: u64 = 1_000_000_000;
 /// One received frame into lane `l`.
 fn ingest<R: RxRing>(
     engine: &mut Engine<'_, Hw, NA>,
-    sink: &mut EngineSink,
+    sink: &mut EngineSink<'_>,
     l: usize,
     rx: &R,
     p: &RxPkt,
@@ -706,43 +789,54 @@ struct StreamCore<T: TxRing> {
 }
 
 impl<T: TxRing> StreamCore<T> {
+    /// Runs until `engine_done` is set and the ring is empty, then closes the open block.
     fn run(
         &mut self,
-        rx: &Receiver<Out>,
-        stop: &AtomicBool,
+        rx: &mut Consumer<'_, Out, HANDOFF, 1, Hw>,
+        engine_done: &AtomicBool,
         block: Duration,
     ) -> Result<(), String> {
-        let mut last_block = Instant::now();
-        let mut open_steps = false;
+        // The block holds a packet record or a step since `opened`: it closes `block` later.
+        let mut open = false;
+        let mut opened = Instant::now();
         loop {
-            let first = match rx.recv_timeout(Duration::from_millis(1)) {
-                Ok(o) => Some(o),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => {
-                    if stop.load(Ordering::Acquire) {
-                        return self.drain();
-                    }
-                    return Err("engine thread stopped".into());
-                }
-            };
+            // Read before popping: if the engine was done then, an empty ring is the end.
+            let done = engine_done.load(Ordering::Acquire);
             // A bounded batch, so responses and block closure run under sustained input.
-            for o in first.into_iter().chain(rx.try_iter()).take(BATCH) {
-                open_steps |= matches!(o, Out::Step(..));
+            let mut got = 0usize;
+            while got < BATCH {
+                let Some(o) = rx.pop(&Hw) else { break };
+                got = got.saturating_add(1);
+                if !open && matches!(o, Out::Pkt(..) | Out::Step(..)) {
+                    open = true;
+                    opened = Instant::now();
+                }
                 self.take(o)?;
             }
             self.drain()?;
-            if open_steps && last_block.elapsed() >= block {
-                let (frames, h) = self.writer.close_block().map_err(|e| e.to_string())?;
-                self.ship(&frames)?;
-                self.stats.blocks.fetch_add(1, Ordering::Relaxed);
-                println!(
-                    "BLOCK height={} first_step={} last_step={}",
-                    h.height.0, h.first_step.0, h.last_step.0
-                );
-                last_block = Instant::now();
-                open_steps = false;
+            let end = done && got == 0;
+            if open && (end || opened.elapsed() >= block) {
+                self.close_block()?;
+                open = false;
+            }
+            if end {
+                return Ok(());
+            }
+            if got == 0 {
+                std::thread::yield_now();
             }
         }
+    }
+
+    fn close_block(&mut self) -> Result<(), String> {
+        let (frames, h) = self.writer.close_block().map_err(|e| e.to_string())?;
+        self.ship(&frames)?;
+        self.stats.blocks.fetch_add(1, Ordering::Relaxed);
+        println!(
+            "BLOCK height={} first_step={} last_step={}",
+            h.height.0, h.first_step.0, h.last_step.0
+        );
+        Ok(())
     }
 
     fn take(&mut self, o: Out) -> Result<(), String> {
