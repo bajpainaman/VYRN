@@ -396,9 +396,13 @@ impl<E: Clock + Spawner, S: BlockSource> Reporter for Finalized<E, S> {
     fn report(&mut self, activity: Self::Activity) -> Feedback {
         let closed = match activity {
             Activity::Finalization(f) => self.cert(&f).is_some_and(|c| self.out.send(c).is_err()),
-            Activity::Finalize(f) => self
-                .own_vote(&f)
-                .is_some_and(|v| self.votes.send(v).is_err()),
+            Activity::Finalize(f) => {
+                // Optional output: a dropped receiver discards votes, never stops the reporter.
+                if let Some(v) = self.own_vote(&f) {
+                    let _ = self.votes.send(v);
+                }
+                false
+            }
             _ => false,
         };
         if closed {
@@ -408,7 +412,8 @@ impl<E: Clock + Spawner, S: BlockSource> Reporter for Finalized<E, S> {
     }
 }
 
-/// What one voter's instance hands out besides Simplex itself.
+/// What one voter's instance hands out besides Simplex itself. Dropping `certs` stops the
+/// reporter; dropping any other receiver only discards what it would carry.
 pub struct Outputs {
     /// Every finalization this voter learns, as a `REP_FinalityCert` (07 §6.5).
     pub certs: mpsc::UnboundedReceiver<FinalityCert>,
