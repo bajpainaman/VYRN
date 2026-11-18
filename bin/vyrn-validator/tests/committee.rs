@@ -85,12 +85,24 @@ fn vote_seed(i: usize) -> [u8; 32] {
     [u8::try_from(i + 1).unwrap(); 32]
 }
 
+/// A free TCP port below Linux's ephemeral range (32768 and up). A port the kernel picks for
+/// `:0` is released before the validator binds it, and a validator's own p2p dial, whose source
+/// port is ephemeral, could take it first ("BindFailed"); a port below the range is never
+/// handed out that way. Spread by pid so parallel test processes start apart.
 fn free_tcp() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    const BASE: u16 = 20_000;
+    const SPAN: u16 = 12_000;
+    let start = u16::try_from(std::process::id() % u32::from(SPAN)).unwrap();
+    loop {
+        let k = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(k < SPAN, "no free TCP port in {BASE}..{}", BASE + SPAN);
+        let port = BASE + (start + k) % SPAN;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 /// A child with its stdout lines on a channel.
