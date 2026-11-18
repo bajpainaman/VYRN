@@ -32,7 +32,7 @@ version = "0.1.0"                     # SemVer: the workspace version, or the cr
 tag = "v0.1.0"                        # "v<version>", or "<name>-v<version>" for a crate
 commit = "e54c379…"                   # 40 lowercase hex: the git commit the tag points at
 source_date_epoch = 1763416800        # seconds; the commit time, used as SOURCE_DATE_EPOCH
-protocol_version = 1                  # §10.2; vyrn-wire's PROTO_VERSION (04 §12)
+protocol_version = 2                  # §10.2; vyrn-wire's PROTO_VERSION (04 §12)
 config_schema_version = 0             # §10.1; 0 while deploy/schema/ defines none
 
 [[crate]]                             # every workspace package at this commit, sorted by name
