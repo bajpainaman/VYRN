@@ -58,6 +58,7 @@ commonware-storage = "=2026.10.0"
 commonware-utils = "=2026.10.0"
 commonware-parallel = "=2026.10.0"
 commonware-actor = "=2026.10.0"
+commonware-stream = "=2026.10.0"
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 libc = "=0.2.191"
 cc = "=1.11.2"

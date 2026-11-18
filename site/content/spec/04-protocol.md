@@ -617,8 +617,23 @@ struct BoxKeys {
 field), `type` u16, then the body. All integers are little-endian, like 01 §6. `SocketAddrV4` is 4 bytes of IPv4 address in network order, then the
 port u16 little-endian. A receiver rejects a frame with a nonzero reserved byte, an unknown
 `type`, or a `len` that does not match the body (VR1). Types: 0x0001 `OpenSessionReq`,
-0x8001 `OpenSessionResp`, 0x8002 `KeyBundle` push, 0x80FF `Error` (body: a 01 §6.5 reason u16,
-reserved u16, detail u32).
+0x8001 `OpenSessionResp`, 0x8002 `KeyBundle` push, 0x8003 `DataTierStatus` push (below), 0x80FF
+`Error` (body: a 01 §6.5 reason u16, reserved u16, detail u32).
+
+**`DataTierStatus` (reading, delegated ruling).** `vyrn-admin` pushes it to each session it
+affects when Q replicas mark a data box down or up (07 §5.7). Body, 12 bytes: `epoch` u32 | `seq`
+u32 | `down` u8 | reserved [u8; 3]. `down` bit i set means entry i of the session's
+`KeyBundle.data` list is down, the same positions as `DataRedirect` (§7.6). `seq` counts this
+epoch's statuses for the session from 1, so the **latest** status (D4, D5, DR2) is the one with
+the highest `seq` for that `epoch`. A client keeps the latest status of each epoch it holds a
+`KeyBundle` for (the current one and, once pushed, the next), applies the next epoch's at T, and
+ignores a push for any other `epoch` or with `seq` at or below the last it kept for that epoch. With every `KeyBundle` push and every `OpenSessionResp`, `vyrn-admin` also pushes a snapshot of that epoch's current health as its `seq` 1, so a box that stays down across a boundary stays marked down; until the client holds the snapshot for an epoch, it uses that epoch's `data[0]` only if no status of the previous epoch marked the same address down.
+On a push that marks its current data node down, the client moves copy 2 to the first entry not
+marked down (D4) and sends it **every** transmission it still retains (DR4), unchanged (DR3):
+an acknowledged packet may still be unresolved at the replicas, and a status carries no
+`resend_from`. A `DataRedirect` for the same failure that arrives later names a node the client
+has left, so DR2 drops it. In CHAIN mode the same fields come from chain state (09). Vector: V20
+(§11).
 
 `OpenSessionReq` body (20 + 2 × `n_books` bytes):
 
@@ -1585,9 +1600,10 @@ run (`resp_seq` 7, `echo_pkt` 6, one `Reject BUSY` at index 0, detail = `expecte
 `client_tag` 0), and nothing was applied. V18 is the client's resend of the same `pkt_seq` with the
 same logical content and bit0 = 1; the lane accepts it as a first acceptance, and its answer takes
 `resp_seq` 8 (not printed). V19 is the `DataRedirect` (§7.6) a live data box sends A when its data
-home (`data[0]`) is down: backup `data[1]`, `resend_from` 5, tag under `K_seq`. V20 (`pkt_seq` 7,
-a New and a Heartbeat) is shed at the lane too: V21 is its `BUSY` run, one record per message, the
-Heartbeat's included, as `resp_seq` 9, detail = `expected` = 7.
+home (`data[0]`) is down: backup `data[1]`, `resend_from` 5, tag under `K_seq`. V20 is the
+matching `DataTierStatus` admin frame (§4.4): epoch 1000, `seq` 1, `data[0]` down. V21 (`pkt_seq`
+7, a New and a Heartbeat) is shed at the lane too: V22 is its `BUSY` run, one record per message,
+the Heartbeat's included, as `resp_seq` 9, detail = `expected` = 7.
 
 ```python
 #!/usr/bin/env python3
@@ -1665,6 +1681,11 @@ def data_redirect(s, down, to, frm, key):                              # section
     return body + struct.pack("<Q", siphash24(key, body))
 
 
+def data_tier_status(epoch, seq, down):                                 # section 4.4 admin push
+    body = struct.pack("<IIB3s", epoch, seq, down, bytes(3))
+    return struct.pack("<IH", 2 + len(body), 0x8003) + body
+
+
 def request(s, seq, e16, book, msgs, k_com=None, flags=0):
     body = struct.pack("<IIBBHHH", s, seq, len(msgs), flags, e16, book, 0) + b"".join(msgs)
     tag_com = siphash24(k_com, body) if k_com else 0                    # 0 in BASE mode
@@ -1687,6 +1708,8 @@ def dump(name, pkt, req):
     print(f"\n{name} ({len(pkt)} B)")
     for off in range(0, len(pkt), 16):
         print(f"  {off:03x}: " + " ".join(f"{x:02x}" for x in pkt[off:off + 16]))
+    if req is None:                                                     # an admin frame: no tag
+        return
     tags = struct.unpack_from("<QQ", pkt, len(pkt) - 16) if req else struct.unpack_from("<Q", pkt, len(pkt) - 8)
     print("  " + "  ".join(f"{n}={t:#018x}" for n, t in zip(("tag_seq", "tag_com") if req else ("tag",), tags)))
 
@@ -1728,9 +1751,11 @@ V = [
      request(A, 6, E, B, [new(of(0, tif=1), 100_000, 2, 0x88888888)], flags=1), True),
     ("V19 redir A: DataRedirect data[0] down -> data[1], resend_from 5, tag under K_seq",
      data_redirect(A, 0, 1, 5, K_SEQ), False),
-    ("V20 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload)",
+    ("V20 admin A: DataTierStatus push, epoch 1000, seq 1, data[0] down",
+     data_tier_status(E, 1, 0b0000_0001), None),
+    ("V21 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload)",
      request(A, 7, E, B, [new(of(1), 100_005, 1, 0x99999999), heartbeat()]), True),
-    ("V21 resp A: lane shed of V20, BUSY run: one Reject BUSY per message, detail = expected 7",
+    ("V22 resp A: lane shed of V21, BUSY run: one Reject BUSY per message, detail = expected 7",
      response(A, 9, E, 7, [reject(0, 24, 7, 0), reject(1, 24, 7, 0)]), False),
 ]
 for name, pkt, req in V:
@@ -1753,10 +1778,13 @@ for what, ok in [("V1 verifies with K_SEQ", verify_request(v1, K_SEQ)),
                   and V[17][1][:9] == V[15][1][:9] and verify_request(V[17][1], K_SEQ)),
                  ("V19 tag = SipHash(K_SEQ, bytes 0..16), not K_OUT", struct.unpack_from("<Q", V[18][1], 16)[0]
                   == siphash24(K_SEQ, V[18][1][:16]) != siphash24(K_OUT, V[18][1][:16])),
-                 ("V21 answers every message of V20 (count 2, Heartbeat included) with BUSY, detail 7, tag 0",
-                  V[20][1][8] == V[19][1][8] == 2 and struct.unpack_from("<I", V[20][1], 12)[0] == 7
-                  and all(V[20][1][16 + 16 * i:18 + 16 * i] == bytes([0x83, i])
-                          and struct.unpack_from("<HII", V[20][1], 18 + 16 * i) == (24, 7, 0)
+                 ("V20 is a 0x8003 admin frame, len 14, and V19's data[to] is not down in it",
+                  struct.unpack_from("<IH", V[19][1]) == (14, 0x8003) and len(V[19][1]) == 18
+                  and not V[19][1][14] >> V[18][1][4] & 1),
+                 ("V22 answers every message of V21 (count 2, Heartbeat included) with BUSY, detail 7, tag 0",
+                  V[21][1][8] == V[20][1][8] == 2 and struct.unpack_from("<I", V[21][1], 12)[0] == 7
+                  and all(V[21][1][16 + 16 * i:18 + 16 * i] == bytes([0x83, i])
+                          and struct.unpack_from("<HII", V[21][1], 18 + 16 * i) == (24, 7, 0)
                           for i in range(2)))]:
     if not ok:
         raise SystemExit(f"FAILED: {what}")
@@ -1890,14 +1918,18 @@ V19 redir A: DataRedirect data[0] down -> data[1], resend_from 5, tag under K_se
   010: 79 96 aa 52 44 74 04 21
   tag=0x2104744452aa9679
 
-V20 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload) (64 B)
+V20 admin A: DataTierStatus push, epoch 1000, seq 1, data[0] down (18 B)
+  000: 0e 00 00 00 03 80 e8 03 00 00 01 00 00 00 01 00
+  010: 00 00
+
+V21 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload) (64 B)
   000: 07 30 10 00 07 00 00 00 02 00 e8 03 01 00 00 00
   010: 01 01 00 00 a5 86 01 00 01 00 00 00 99 99 99 99
   020: 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
   030: fc 00 f4 62 6c 63 16 ae 00 00 00 00 00 00 00 00
   tag_seq=0xae16636c62f400fc  tag_com=0x0000000000000000
 
-V21 resp A: lane shed of V20, BUSY run: one Reject BUSY per message, detail = expected 7 (56 B)
+V22 resp A: lane shed of V21, BUSY run: one Reject BUSY per message, detail = expected 7 (56 B)
   000: 07 30 10 00 09 00 00 00 02 00 e8 03 07 00 00 00
   010: 83 00 18 00 07 00 00 00 00 00 00 00 00 00 00 00
   020: 83 01 18 00 07 00 00 00 00 00 00 00 00 00 00 00
@@ -1911,7 +1943,8 @@ check OK: V13 tag differs from V2 tag
 check OK: V17 is in stream (resp_seq 7), echo_pkt 6, Reject BUSY 24 at index 0, detail 6 >= 1, tag 0
 check OK: V18 has V16's logical content (D3) and verifies
 check OK: V19 tag = SipHash(K_SEQ, bytes 0..16), not K_OUT
-check OK: V21 answers every message of V20 (count 2, Heartbeat included) with BUSY, detail 7, tag 0
+check OK: V20 is a 0x8003 admin frame, len 14, and V19's data[to] is not down in it
+check OK: V22 answers every message of V21 (count 2, Heartbeat included) with BUSY, detail 7, tag 0
 ```
 
 Expected lane behaviour for the negative vector: the flipped `tag_seq` comes from A's bound
@@ -1919,7 +1952,7 @@ address, so the lane closes session A at V6 and sends `Reject BAD_MAC` (index 0x
 the final in-stream record. The same bytes from any other address are dropped at V3 and counted,
 and A stays open. The same bytes with `epoch16` = 999 get `EPOCH_MISMATCH` at V4 and close nothing
 (01 §14.8). For V17, the expected client action is: keep `expected` = 6, resend from 6 (V18), do
-not count V16 as acknowledged, and take each record's tag from its own copy of V16. For V21 the
+not count V16 as acknowledged, and take each record's tag from its own copy of V16. For V22 the
 same holds from 7.
 
 ## 12. Versioning
@@ -1987,7 +2020,7 @@ Planned use of reserved fields (informative; not part of v1):
 | 08 | Client handoff rules H1–H9 and the `EpochNotice` variants. |
 | 09 | The session state machine, the key roles, the out-of-stream rules. |
 | 10 | Fee classes, bucket ids, `Out` causes, reject details; the four attestation levels that the drop copy labels separately (§7.5). |
-| 11 | Vectors V1–V21, the script, and the negative checks. |
+| 11 | Vectors V1–V22, the script, and the negative checks. |
 
 ## 14. Local definitions
 

@@ -122,14 +122,18 @@ V19 redir A: DataRedirect data[0] down -> data[1], resend_from 5, tag under K_se
   010: 79 96 aa 52 44 74 04 21
   tag=0x2104744452aa9679
 
-V20 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload) (64 B)
+V20 admin A: DataTierStatus push, epoch 1000, seq 1, data[0] down (18 B)
+  000: 0e 00 00 00 03 80 e8 03 00 00 01 00 00 00 01 00
+  010: 00 00
+
+V21 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload) (64 B)
   000: 07 30 10 00 07 00 00 00 02 00 e8 03 01 00 00 00
   010: 01 01 00 00 a5 86 01 00 01 00 00 00 99 99 99 99
   020: 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
   030: fc 00 f4 62 6c 63 16 ae 00 00 00 00 00 00 00 00
   tag_seq=0xae16636c62f400fc  tag_com=0x0000000000000000
 
-V21 resp A: lane shed of V20, BUSY run: one Reject BUSY per message, detail = expected 7 (56 B)
+V22 resp A: lane shed of V21, BUSY run: one Reject BUSY per message, detail = expected 7 (56 B)
   000: 07 30 10 00 09 00 00 00 02 00 e8 03 07 00 00 00
   010: 83 00 18 00 07 00 00 00 00 00 00 00 00 00 00 00
   020: 83 01 18 00 07 00 00 00 00 00 00 00 00 00 00 00
@@ -143,4 +147,5 @@ check OK: V13 tag differs from V2 tag
 check OK: V17 is in stream (resp_seq 7), echo_pkt 6, Reject BUSY 24 at index 0, detail 6 >= 1, tag 0
 check OK: V18 has V16's logical content (D3) and verifies
 check OK: V19 tag = SipHash(K_SEQ, bytes 0..16), not K_OUT
-check OK: V21 answers every message of V20 (count 2, Heartbeat included) with BUSY, detail 7, tag 0
+check OK: V20 is a 0x8003 admin frame, len 14, and V19's data[to] is not down in it
+check OK: V22 answers every message of V21 (count 2, Heartbeat included) with BUSY, detail 7, tag 0

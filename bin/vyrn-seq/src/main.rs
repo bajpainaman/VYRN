@@ -21,6 +21,7 @@
 //! | `[epoch_boundary] next, t_ns, to_home, seq_index` | optional: per-lane `EpochNotice` triggers (08 §2.4) |
 //! | `[[dev_session]] lane, slot, account, k_seq, k_out, quote, base` | DEV only: sessions opened at start |
 //! | `[repair] port, slots = 65536, max_pps = 50000, session_pps = 2000` | optional: `SeqDataReq` (07 §5.5 source 3) on its own thread; see `repair.rs` |
+//! | `[consensus] ctrl, roster, roster_hash, genesis_hash, seq_order` | optional: the finality listener (`finality.rs`) on `REP_UDP_CTRL`; committee from the roster file (08 §9.6), checked against `roster_hash` |
 //!
 //! **Start sequence** (11 §10.1), each step fail-stops with exit code 2 and one line on stderr:
 //! load and check config → resolve keys → (release manifest and Vx hash: not checked yet) →
@@ -39,6 +40,7 @@
 //! | `engine` | 1, 2, 6, 8–49 | polls every lane's RX queue, runs `Engine::ingest`, `Engine::run` (cut cores, BBO, lanes); per-lane `Notifier`s. `vyrn-engine` is single-threaded in this version, so these roles share one thread. |
 //! | `stream` | 4 (and 3, 5 for responses) | `SeqWriter` (vyrn-log): frames every record, sends ORDER and HASH, closes and signs a block every `block_ms`, then sends the responses those frames cover (`INV-FRAME-FIRST`) |
 //! | `repair` | 51 (07 §5.5 source 3) | with `[repair]`: takes the engine's retention copies (`vyrn_engine::retain`, through a second `vyrn_cut::Ring`, [`repair::RETAIN_HANDOFF`] entries, pushed without waiting) and answers replicas' KEY fetches (`repair.rs`) |
+//! | `finality` | 51 | with `[consensus]`: `REP_FinalizeVote`s and `REP_FinalityCert`s on `REP_UDP_CTRL`, `final_height`, the gate check (`finality.rs`); prints `CONSENSUS ctrl=<ip:port>` before `READY`, `FINAL height=<h> ...`, `GATE ...`, and `FINALITY ...` at exit |
 //! | main | 51 | config, start, readiness, stop, stats |
 //!
 //! **Handoff.** The engine thread hands its outputs to the stream thread through one
@@ -62,11 +64,12 @@
 //! and prints `STATS`. Otherwise the process runs until killed (06 §4.8: never restarted).
 //!
 //! **Not wired yet** (PR follow-ups): maker TX packets (`resp_seq` 0: counted as `tx_unsent`), pooled lanes, two
-//! substreams, retransmits and heartbeats, the Simplex proposer (`vyrn-consensus`), control
+//! substreams, retransmits and heartbeats, enforcing the finality gate (`HaltReq`), control
 //! ops, a class A deadline clock (class-E and S backends use `dev_clock`), pinning.
 #![forbid(unsafe_code)]
 
 mod config;
+mod finality;
 mod repair;
 
 use std::io::Read as _;
@@ -266,7 +269,24 @@ where
         .collect::<Result<_, String>>()?;
     let block = Duration::from_millis(cfg.replication.block_ms);
     let plan = EnginePlan::from(cfg)?;
-    std::thread::scope(|sc| {
+    let fin = match &cfg.consensus {
+        Some(c) => {
+            let st = Arc::clone(&stats);
+            let home = home_code(&cfg.home).ok_or("config home is not TYO, LDN or NYC")?;
+            let f = finality::Finality::start(
+                c,
+                home,
+                Epoch(cfg.epoch),
+                vyrn_crypto::ed25519::public_key(&seed),
+                Arc::new(move || st.blocks.load(Ordering::Acquire)),
+                Arc::clone(&stop),
+            )?;
+            println!("CONSENSUS ctrl={}", f.ctrl);
+            Some(f)
+        }
+        None => None,
+    };
+    let r = std::thread::scope(|sc| {
         // However this closure exits, a panic included (stdout closed before `READY` makes
         // `println!` panic), both threads are told to finish, so the scope's join cannot hang.
         let _stop = Done([&*stop, &engine_done]);
@@ -400,7 +420,12 @@ where
         let e = e.map_err(|_| "engine thread panicked")?;
         let s = s.map_err(|_| "stream thread panicked")?;
         e.and(s)
-    })
+    });
+    if let Some(f) = fin {
+        stop.store(true, Ordering::Release);
+        f.join();
+    }
+    r
 }
 
 /// Sets its flags when dropped, so a thread publishes its exit even when it unwinds.

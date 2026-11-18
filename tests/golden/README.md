@@ -6,7 +6,7 @@ enough to regenerate the protocol files.
 
 | File | What it checks | Source |
 |---|---|---|
-| `vyrn_proto_vectors.py`, `.out` | 18 request and response packets and one `DataRedirect` (V19, 04 §7.6) that a conforming implementation must build byte for byte and accept (04 §11) | the script is the one printed in 04 §11; `.out` is its output |
+| `vyrn_proto_vectors.py`, `.out` | 18 request and response packets one `DataRedirect` (V19, 04 §7.6) and one `DataTierStatus` admin frame (V20, 04 §4.4) that a conforming implementation must build byte for byte and accept (04 §11) | the script is the one printed in 04 §11; `.out` is its output |
 | `vyrn_reject_vectors.py`, `.out` | 45 validly tagged packets whose layout v1 must refuse, each with its verdict (04 §3.1 V1/V9, §3.3 M2/M3, §6.1, §12 VR1/VR3), and 4 `Reject RATE_LIMIT` records with 10's bucket ids 8–11 (04 §9.1) | written for this repository from those tables |
 | `vyrn_admin_vectors.py`, `.out` | 2 BASE-mode admin frames, `OpenSessionReq` and `OpenSessionResp`, that an implementation must build and accept, and 8 it must refuse (04 §4.4) | written for this repository from the §4.4 tables |
 | `vyrn_session_vectors.py`, `.out` | 35 packets, one per session state (04 §4.3) and message type, each with the lane's verdict (04 §3.1 V2/V7), and the final in-stream record of the 6 close causes | written for this repository from the 04 §3.1 and §4.3 tables |
@@ -57,7 +57,7 @@ handles and epoch behind each packet. An implementation passes when, for every v
 
 1. builds the same bytes from the scenario's fields and the test keys;
 2. parses the bytes back to the same fields, and verifies `tag_seq` with `K_seq` (and `tag_com`
-   with `K_com` for V10), a response's `tag` with `K_out`, or V19's `tag` with `K_seq`;
+   with `K_com` for V10), a response's `tag` with `K_out`, or V19's `tag` with `K_seq` (V20, an admin frame, has none);
 3. holds the `check OK:` lines at the end of the file, such as "V1 with one tag bit flipped fails".
 
 **Refusal (`vyrn_reject_vectors.out`).** Lines starting with `#` describe the vector below them.

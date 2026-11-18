@@ -4,7 +4,8 @@
 //!
 //! # Contract
 //!
-//! **Invocation.** `vyrn-validator --config FILE [--stop-on-stdin-eof]`.
+//! **Invocation.** `vyrn-validator --config FILE [--stop-on-stdin-eof]`. `VYRN_LOG=warn` (or
+//! `info`, `debug`) prints Commonware's and the voter's logs on stderr.
 //!
 //! **Config**: MINIMAL schema 1, a labelled subset of 11 §10.1. Unknown fields are refused.
 //!
@@ -16,28 +17,38 @@
 //! | `[nic] backend = "kernel_udp", ip, order_port` | where ORDER, HASH and HEADER frames arrive (0: ephemeral) |
 //! | `[cores] order` | REF core of the order core (07 §7.2 core 3); reported, not pinned |
 //! | `[membership] seq_keys = ["<hex>"]` | `REP_Membership`'s `seq_key` per sequencer index (07 §13.1); public keys, so they may sit in the file |
-//! | `[keys] vote` | vote key handle; read but unused until the Simplex voter is wired |
+//! | `[keys] vote, node` | vote key handle; `node` (the p2p identity) defaults to `vote`. Only `env:NAME` (seed hex) resolves, and only with `[consensus]` |
+//! | `[nic] data_port`, `[data] boxes = ["ip:port"], me, max_range` | optional: the data RX queue (07 §5.4); `boxes[i]` is data box `src = i`, `me` this replica's index in their destination lists. Without `[data]` vote-rule item 3 is not checked (DEV) |
+//! | `[consensus] roster, roster_hash, genesis_hash, home, seq_order, observers, delta_ms, storage` | optional: the Simplex voter (`consensus.rs`); committee and peers from the roster file (08 §9.6), checked against `roster_hash`; `membership.seq_keys[0]` must be the roster's primary `seq_key` |
 //!
-//! **Start sequence** (11 §10.1): load and check config → build the order core
-//! (`vyrn_replica::OrderCore`) over the config's `EpochView` → open the NIC queue → start the
-//! order thread → print `READY vyrn-validator order=<ip:port>` on stdout.
+//! **Start sequence** (11 §10.1): load and check config → resolve keys → build the order core
+//! (`vyrn_replica::OrderCore`) over the config's `EpochView` → open the NIC queues → start the
+//! order thread and, with `[consensus]`, the voter thread → print `DATA rx=<ip:port>` (with
+//! `[data]`), `CONSENSUS voter=<i> repl=<ip:port>` (with `[consensus]`) and
+//! `READY vyrn-validator order=<ip:port>` on stdout.
 //!
 //! **Threads.** `order` (07 §7.2 core 3): polls the queue, runs `OrderCore::on_frame` and the
 //! `REP_E_HASHLAG` timer, and for each ready block prints
 //! `BLOCK height=<h> first_step=<s> last_step=<s> lanes=<k> steps=<k> verdict=<Valid|Invalid|Pending>`
 //! (07 §6.4 items 2 and 5, the precondition for a vote). A sequencer fault prints
-//! `FAULT <code> height=<h>` once; the core then refuses every later frame. main: start,
-//! readiness, stop, `STATS frames=<n> blocks=<n> faults=<n>`.
+//! `FAULT <code> height=<h>` once; the core then refuses every later frame. A frame that is not
+//! its substream's next prints `OUT_OF_ORDER next_height=<h>` once per stall (no repair yet). With `[data]` it also
+//! polls the data RX queue: one `DataFeed::on_frame` per payload into the `DataJoin`, a
+//! `DataFetch` RANGE to the box for every gap, and item 3 (`DataJoin::check`) for each ready
+//! block before the voter may vote for it; a block whose data contradicts its header prints
+//! `DATA_FAULT height=<h>`. `voter` (`consensus.rs`): Simplex, `FINAL ...` per certificate.
+//! main: start, readiness, stop, `STATS frames=<n> blocks=<n> faults=<n>`.
 //!
-//! **Not wired yet** (PR follow-ups): the Simplex voter (`vyrn-consensus` `voter::config` needs
-//! a `BlockSource` over this order core and Commonware p2p), the chain guardian
+//! **Not wired yet** (PR follow-ups): seals in the voter's source (tail reports, Silence), the chain guardian
 //! (`vyrn_chain::bridge::Guardian` needs a `vyrn_chain::Replica` over finalized `StateCommit`s,
-//! which `vyrn-replica` does not produce yet), replay (`ReplayEngine` over `vyrn-engine`), path B
-//! dedupe and repair, data join, CHAIN mode.
+//! which `vyrn-replica` does not produce yet), replay (`RustReplay` over `vyrn-engine`, and with it
+//! `out=<hex>` on `BLOCK` lines), path B dedupe and repair, CHAIN mode.
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
+
 use std::io::Read as _;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -47,11 +58,17 @@ use std::time::Instant;
 use clap::Parser;
 use serde::Deserialize;
 use vyrn_chain as _;
+use vyrn_data::frame::Fetch;
+use vyrn_replica::feed::Gap;
+use vyrn_replica::{BlockInputs, DataErr, DataFeed, DataJoin};
+
+mod consensus;
+use vyrn_consensus::Verdict;
 use vyrn_log::Layout;
 use vyrn_nic::frame;
 use vyrn_nic::{BackendKind, KernelUdp, NicBackend, NicConfig, PortConfig, PortId, RxBind};
 use vyrn_replica::{EpochView, FrameErr, OrderCore};
-use vyrn_types::{BookId, Epoch, Height, LaneId, PubKey};
+use vyrn_types::{BookId, Epoch, Height, LaneId, PubKey, SessionId};
 use vyrn_wire::{RX_BURST, RxPkt, RxRing};
 
 #[derive(Parser)]
@@ -79,6 +96,24 @@ struct Config {
     cores: Cores,
     membership: Membership,
     keys: Keys,
+    #[serde(default)]
+    data: Option<Data>,
+    #[serde(default)]
+    consensus: Option<consensus::Section>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Data {
+    boxes: Vec<std::net::SocketAddrV4>,
+    me: u8,
+    /// The largest RANGE fetch a data box accepts, in frames.
+    #[serde(default = "d_range")]
+    max_range: u64,
+}
+
+fn d_range() -> u64 {
+    64
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +122,8 @@ struct Nic {
     backend: String,
     ip: Ipv4Addr,
     order_port: u16,
+    #[serde(default)]
+    data_port: u16,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -105,6 +142,8 @@ struct Membership {
 #[serde(deny_unknown_fields)]
 struct Keys {
     vote: String,
+    #[serde(default)]
+    node: Option<String>,
 }
 
 fn hex32(s: &str) -> Result<PubKey, String> {
@@ -178,6 +217,16 @@ struct Stats {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // `VYRN_LOG=warn|info|debug`: Commonware's and the voter's logs on stderr (off by default).
+    if let Some(level) = std::env::var("VYRN_LOG")
+        .ok()
+        .and_then(|l| l.parse::<tracing::Level>().ok())
+    {
+        tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_writer(std::io::stderr)
+            .init();
+    }
     let r = Config::load(&cli.config).and_then(|c| start(&c, cli.stop_on_stdin_eof));
     match r {
         Ok(()) => ExitCode::SUCCESS,
@@ -214,6 +263,17 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
         book: BookId(cfg.book),
         seq_keys,
     };
+    let plan = cfg
+        .consensus
+        .as_ref()
+        .map(|s| consensus::Plan::new(s, view.epoch, &cfg.keys.vote, cfg.keys.node.as_deref()))
+        .transpose()?;
+    if plan
+        .as_ref()
+        .is_some_and(|p| view.seq_keys.first() != Some(&p.seq_key))
+    {
+        return Err("config membership.seq_keys[0] is not the roster's primary seq_key".into());
+    }
     let layout = Layout::new(cfg.lanes, 1, 0).map_err(|e| e.to_string())?;
     let core: OrderCore<N, View> = OrderCore::new(layout, view).map_err(|e| e.to_string())?;
     let ip = cfg.nic.ip;
@@ -227,14 +287,65 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
     };
     let rx = nic.rx_ring(&bind).map_err(|e| e.to_string())?;
     let addr = rx.local_addr();
+    let data = match &cfg.data {
+        Some(d) => {
+            let drx = nic
+                .rx_ring(&RxBind {
+                    lane: LaneId(1),
+                    port: PortId(0),
+                    ip,
+                    udp_port: cfg.nic.data_port,
+                })
+                .map_err(|e| e.to_string())?;
+            let n = u8::try_from(d.boxes.len()).map_err(|_| "config data.boxes: too many")?;
+            let repair = UdpSocket::bind(SocketAddrV4::new(ip, 0)).map_err(|e| e.to_string())?;
+            repair.set_nonblocking(true).map_err(|e| e.to_string())?;
+            println!("DATA rx={}", drx.local_addr());
+            Some(DataRx {
+                feed: DataFeed::new(BookId(cfg.book), n, d.me),
+                join: DataJoin::default(),
+                pending: VecDeque::new(),
+                rx: drx,
+                repair,
+                boxes: d.boxes.clone(),
+                max_range: d.max_range,
+                fetches: VecDeque::new(),
+                missing: None,
+            })
+        }
+        None => None,
+    };
+    let source = if plan.is_some() {
+        consensus::Source::new()
+    } else {
+        consensus::Source::default()
+    };
     let stats = Arc::new(Stats::default());
     let stop = Arc::new(AtomicBool::new(false));
     let order = {
-        let (stats, stop) = (Arc::clone(&stats), Arc::clone(&stop));
+        let (stats, stop, source) = (Arc::clone(&stats), Arc::clone(&stop), source.clone());
         std::thread::Builder::new()
             .name("vyrn-validator/order".into())
-            .spawn(move || order_thread(core, rx, &stop, &stats))
+            .spawn(move || order_thread(core, rx, data, &source, &stop, &stats))
             .map_err(|e| e.to_string())?
+    };
+    let voter = match plan {
+        Some(plan) => {
+            println!("CONSENSUS voter={} repl={}", plan.me, plan.repl_addr());
+            let stop = Arc::clone(&stop);
+            Some(
+                std::thread::Builder::new()
+                    .name("vyrn-validator/voter".into())
+                    .spawn(move || {
+                        // However the voter ends, an error or a panic included, the order
+                        // thread stops too, so main joins both and reports the failure.
+                        let _stop = StopOnDrop(&stop);
+                        consensus::run(plan, source, &stop)
+                    })
+                    .map_err(|e| e.to_string())?,
+            )
+        }
+        None => None,
     };
     let core_of = cfg
         .cores
@@ -248,6 +359,10 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
         stop.store(true, Ordering::Release);
     }
     order.join().map_err(|_| "order thread panicked")?;
+    if let Some(v) = voter {
+        stop.store(true, Ordering::Release);
+        v.join().map_err(|_| "voter thread panicked")??;
+    }
     let g = |c: &AtomicU64| c.load(Ordering::Acquire);
     println!(
         "STATS frames={} blocks={} faults={}",
@@ -258,9 +373,155 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn order_thread<const N: usize, R: RxRing>(
+/// How long an idle order thread sleeps (`kernel_udp`, DEV).
+const IDLE: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// The data RX queue and the join it fills (07 §5.4).
+struct DataRx<const N: usize, R> {
+    feed: DataFeed,
+    join: DataJoin,
+    /// Ready blocks whose ORDER part passed, waiting for their payloads (item 3).
+    pending: VecDeque<BlockInputs<N>>,
+    rx: R,
+    /// Fetches go out on this socket and their answers come back to it: a data box answers a
+    /// KEY fetch to the fetch's source address (07 §5.5), and a `kernel_udp` TX ring sends from
+    /// an ephemeral socket nothing polls. RANGE answers come to `rx` as data frames.
+    repair: UdpSocket,
+    boxes: Vec<std::net::SocketAddrV4>,
+    max_range: u64,
+    /// Gaps not fully fetched yet, with the box to ask: at most `FETCH_BURST` RANGE fetches go
+    /// out per poll and a gap's `from` moves past them. One entry per gap, however long.
+    fetches: VecDeque<(SocketAddrV4, Gap)>,
+    /// The payload the front pending block waits for, and when it was last fetched by key.
+    missing: Option<(SessionId, u32, u64)>,
+}
+
+/// RANGE fetches sent per data poll.
+const FETCH_BURST: usize = 16;
+
+impl<const N: usize, R: RxRing> DataRx<N, R> {
+    /// Polls the queue and the repair socket once; sends queued fetches. Returns the datagrams
+    /// taken.
+    fn poll(&mut self, now: u64) -> usize {
+        let mut burst = [RxPkt::empty(); RX_BURST];
+        let k = self.rx.poll(&mut burst);
+        let mut gaps = Vec::new();
+        for p in burst.iter().take(k) {
+            let Ok(f) = frame::parse(self.rx.bytes(p)) else {
+                continue;
+            };
+            if let Ok(fed) = self.feed.on_frame(&mut self.join, f.payload, now)
+                && let Some(g) = fed.gap
+            {
+                gaps.push(g);
+            }
+        }
+        self.rx.release(k);
+        // Answers to KEY fetches, on the repair socket: at most `RX_BURST` per poll, like the
+        // data queue, so a flood of datagrams cannot hold the order thread here.
+        let mut buf = [0u8; frame::MAX_FRAME_BYTES];
+        let mut answers = 0;
+        while answers < RX_BURST
+            && let Ok(n) = self.repair.recv(&mut buf)
+        {
+            answers += 1;
+            if let Ok(fed) = self
+                .feed
+                .on_frame(&mut self.join, buf.get(..n).unwrap_or(&[]), now)
+                && let Some(g) = fed.gap
+            {
+                gaps.push(g);
+            }
+        }
+        for g in gaps {
+            if let Some(to) = self.boxes.get(usize::from(g.src)) {
+                self.fetches.push_back((*to, g));
+            }
+        }
+        let mut budget = FETCH_BURST;
+        while budget > 0
+            && let Some((to, g)) = self.fetches.front_mut()
+        {
+            let mut done = g.from > g.to;
+            for q in g.fetches(self.max_range).take(budget).collect::<Vec<_>>() {
+                budget -= 1;
+                if let Fetch::Range { to, .. } = q {
+                    match to.checked_add(1) {
+                        Some(next) if next <= g.to => g.from = next,
+                        _ => done = true,
+                    }
+                }
+                // UDP: a lost fetch is retried by key while its payload stays missing.
+                let _ = self.repair.send_to(&Fetch::encode(&q), *to);
+            }
+            if done {
+                self.fetches.pop_front();
+            }
+        }
+        k + answers
+    }
+
+    /// Item 3 for the pending blocks, in height order: a block whose payloads are all joined
+    /// passes or contradicts; a missing payload waits. A payload still missing
+    /// `REP_DATA_WAIT_US` after it was first seen missing, or after its last KEY fetch, is
+    /// fetched by key (07 §5.5 source 1), so a lost RANGE request or reply does not stall the
+    /// queue.
+    fn check(&mut self, source: &consensus::Source, now: u64) {
+        while let Some(b) = self.pending.front() {
+            let h = b.header.height;
+            match self.join.check(b) {
+                Err(DataErr::Missing { session, pkt_seq }) => {
+                    match self.missing {
+                        Some((s, q, at)) if (s, q) == (session, pkt_seq) => {
+                            if now.saturating_sub(at) >= REP_DATA_WAIT_NS {
+                                self.fetch_key(session, pkt_seq);
+                                self.missing = Some((session, pkt_seq, now));
+                            }
+                        }
+                        _ => self.missing = Some((session, pkt_seq, now)),
+                    }
+                    return;
+                }
+                Ok(()) => source.valid(h),
+                Err(_) => {
+                    source.invalid_from(h);
+                    println!("DATA_FAULT height={}", h.0);
+                }
+            }
+            // Replay is not wired, so nothing else reads these payloads.
+            if let Some(b) = self.pending.pop_front() {
+                self.join.release(h, &b.lanes);
+            }
+        }
+    }
+
+    /// A KEY fetch to every configured box: the validator has no session-to-data-home map yet
+    /// (DEV reading, PR body), and a box that lacks the packet does not answer.
+    fn fetch_key(&mut self, session: SessionId, pkt_seq: u32) {
+        let q = Fetch::encode(&Fetch::Key { session, pkt_seq });
+        for to in &self.boxes {
+            let _ = self.repair.send_to(&q, to);
+        }
+    }
+}
+
+/// Sets the flag when dropped.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// `REP_DATA_WAIT_US` (07 §5.5): how long a missing payload waits before a KEY fetch.
+const REP_DATA_WAIT_NS: u64 = 300_000;
+
+fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     mut core: OrderCore<N, View>,
     mut rx: R,
+    mut data: Option<DataRx<N, D>>,
+    source: &consensus::Source,
     stop: &AtomicBool,
     stats: &Stats,
 ) {
@@ -268,6 +529,7 @@ fn order_thread<const N: usize, R: RxRing>(
     let now = || u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let mut burst = [RxPkt::empty(); RX_BURST];
     let mut faulted = false;
+    let mut stalled = false;
     while !stop.load(Ordering::Acquire) {
         let k = rx.poll(&mut burst);
         for p in burst.iter().take(k) {
@@ -276,38 +538,85 @@ fn order_thread<const N: usize, R: RxRing>(
             };
             stats.frames.fetch_add(1, Ordering::Relaxed);
             let r = core.on_frame(f.payload, now());
-            report(&mut core, r, &mut faulted, stats);
+            report(
+                &mut core,
+                r,
+                &mut faulted,
+                &mut stalled,
+                stats,
+                source,
+                data.as_mut(),
+            );
         }
         rx.release(k);
+        let dk = data.as_mut().map_or(0, |d| d.poll(now()));
+        if let Some(d) = data.as_mut() {
+            d.check(source, now());
+        }
+        // No ORDER frame this turn: the deadlines `on_frame` would have checked (REP_E_HASHLAG),
+        // whatever the data queue is doing.
         if k == 0 {
             let r = core.tick(now());
-            report(&mut core, r, &mut faulted, stats);
-            std::thread::yield_now();
+            report(
+                &mut core,
+                r,
+                &mut faulted,
+                &mut stalled,
+                stats,
+                source,
+                data.as_mut(),
+            );
+        }
+        if k == 0 && dk == 0 {
+            // kernel_udp only (class E): an idle order thread parks instead of spinning, so
+            // several boxes and their voters share a small host. The socket holds what arrives.
+            std::thread::park_timeout(IDLE);
         }
     }
 }
 
-fn report<const N: usize>(
+fn report<const N: usize, D: RxRing>(
     core: &mut OrderCore<N, View>,
     r: Result<(), FrameErr>,
     faulted: &mut bool,
+    stalled: &mut bool,
     stats: &Stats,
+    source: &consensus::Source,
+    mut data: Option<&mut DataRx<N, D>>,
 ) {
     while let Some(b) = core.take_ready() {
         let h = b.header.height;
         stats.blocks.fetch_add(1, Ordering::Relaxed);
+        let verdict = core.verdict(h, h);
         println!(
-            "BLOCK height={} first_step={} last_step={} lanes={} steps={} verdict={:?}",
+            "BLOCK height={} first_step={} last_step={} lanes={} steps={} verdict={verdict:?}",
             h.0,
             b.header.first_step.0,
             b.header.last_step.0,
             b.lanes.len(),
             b.steps.len(),
-            core.verdict(h, h)
         );
+        source.header(b.header);
+        match (verdict, data.as_deref_mut()) {
+            (Verdict::Invalid, _) => source.invalid_from(h),
+            (Verdict::Valid, Some(d)) => d.pending.push_back(b),
+            (Verdict::Valid, None) => source.valid(h),
+            (Verdict::Pending, _) => {}
+        }
+    }
+    // A frame that is not its substream's next one: a loss this release does not repair yet
+    // (07 §4.10). Printed once per stall, so a stalled order core is visible.
+    match r {
+        Err(FrameErr::OutOfOrder) if !*stalled => {
+            *stalled = true;
+            println!("OUT_OF_ORDER next_height={}", core.next_height().0);
+        }
+        Ok(()) => *stalled = false,
+        Err(_) => {}
     }
     if let (Err(FrameErr::Fault(f)), false) = (r, *faulted) {
         *faulted = true;
+        source.invalid_from(f.height);
         stats.faults.fetch_add(1, Ordering::Relaxed);
         println!("FAULT {} height={}", f.kind.code(), f.height.0);
     }
