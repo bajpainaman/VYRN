@@ -1355,14 +1355,17 @@ Client handling:
 | ID | Rule |
 |---|---|
 | DR1 | Drop it, silently, unless it is 24 bytes, `magic`, `version` and reserved match, `session` is the client's, `down` and `to` are < 8 and differ, and `tag` verifies. A bad redirect closes nothing (unlike a bad MAC on a bound source, §3.1). |
-| DR2 | Drop it unless `down` is the position of the data node the client sends copy 2 to now. Every live data box sends the same redirect, and a stale or replayed one names a node the client has already left, so the duplicates are no-ops. |
-| DR3 | Otherwise switch copy 2 to `data[to]` for the rest of the epoch, or until a `DataTierStatus` says otherwise (D5), and resend every retained packet with `pkt_seq` ≥ `resend_from`, bit0 = 1, to `data[to]` only. The sequencer already holds them; dedupe at the data tier drops what is already stored (07 §5.7). |
-| DR4 | A client keeps every sent request packet for at least `REP_CLIENT_RETAIN_MS` = 100 ms (07 §5.7), so that DR3 can resend it. A packet it no longer holds is the `DATA_MISSING` case (§8). |
+| DR2 | Drop it unless `down` is the position of the data node the client sends copy 2 to now, and the latest `DataTierStatus` does not mark `data[to]` down. Every live data box sends the same redirect, and a stale or replayed one names a node the client has already left, so the duplicates are no-ops. |
+| DR3 | Otherwise switch copy 2 to `data[to]` for the rest of the epoch, or until a `DataTierStatus` says otherwise (D5), and send `data[to]` the retained bytes of every transmission of every packet with `pkt_seq` ≥ `resend_from`, **unchanged**: same `flags`, `epoch16` and tags. The sequencer's `PacketRecord` names the `PktHash` of the transmission it accepted, and only those exact bytes resolve it (07 §5.4); a copy with bit0 newly set would hash differently. It sends nothing to the sequencer, which already holds them; dedupe at the data tier drops what is already stored (07 §5.7). |
+| DR4 | A client keeps the bytes of every transmission of every sent request packet (an original and its resends, 04 D3) for at least `REP_CLIENT_RETAIN_MS` = 100 ms (07 §5.7), so that DR3 can send them again. A packet it no longer holds is the `DATA_MISSING` case (§8). |
 
 **Reading (`vyrn-data`, 07 §5.7):** `down` and `to` index the session's `data` list, so the
 client needs no other table, and "next live box in facility order" of 07 §5.7 step 2 is the next
-live entry of that list. The record binds the epoch only through the key: a replay inside one
-epoch is stopped by DR2, and a replay across epochs fails the tag. Vector: V19 (§11).
+live entry of that list. The record binds the epoch only through the key: a replay across epochs fails the tag, and
+DR2 makes most replays inside one epoch no-ops. One remains: after a `DataTierStatus` returns the
+client to a node that an earlier redirect left, a replay of that redirect moves copy 2 to a
+backup that is up. It costs no data, because every data box fans out to every voter (07 §5.2);
+a sequence number in the record would close it and is a v2 candidate. Vector: V19 (§11).
 
 ## 8. Reject reasons
 

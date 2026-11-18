@@ -1118,8 +1118,9 @@ semantics are the same as CHAIN's `excl` rule (09 owns them).
    received. `resend_from` is per session: the lowest `pkt_seq` that no replica has resolved. The
    replicas compute it and send it to the data boxes.
 4. Clients resend copy 2 from `resend_from` to `d'`. Clients keep sent request packets for
-   `REP_CLIENT_RETAIN_MS` = 100 ms (04 must require this). The resends carry `flags.resend`, and
-   dedupe drops anything already stored.
+   `REP_CLIENT_RETAIN_MS` = 100 ms (04 DR4). The resends are the retained bytes of each
+   transmission unchanged, not new copies with `flags.resend`, so each one's `PktHash` still matches
+   the `PacketRecord` (04 DR3); dedupe drops anything already stored.
 
 **`DataRedirect` bytes and address.** 04 §7.6 owns the record: its 24 bytes, the tag under the
 session's `K_seq` (BASE) or `K_com` (CHAIN), and the client rules DR1–DR4. `down` and `to` are
