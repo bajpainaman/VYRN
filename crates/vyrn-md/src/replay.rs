@@ -303,6 +303,11 @@ impl<K: PacketSink> SinkStream<K> {
         if let Some(o) = lane.back_mut().filter(|_| n > 0) {
             o.last = true;
         }
+        if n == 0 {
+            // Session-only messages, accepted: no op, so nothing to map or to wait for.
+            self.early.retain(|&(s, q, at, _)| !mine(s, q, at));
+            return Ok(());
+        }
         self.pkts.insert(
             key,
             PktOps {
