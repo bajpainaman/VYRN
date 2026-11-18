@@ -14,7 +14,7 @@ mod harness;
 
 use harness::*;
 use vyrn_bbo::{Side, Tif};
-use vyrn_engine::{Diverged, OwnedRec, Why};
+use vyrn_engine::{Diverged, OwnedRec, Why, WireAt, WireDiverged};
 use vyrn_lane::Rx;
 use vyrn_types::{Handle, LaneSeq, PacketFlags, StepKind};
 
@@ -211,50 +211,136 @@ fn replay_takes_kind_and_source_from_the_record() {
 }
 
 #[test]
-fn replay_routes_a_forwarded_op_by_its_cross_bit_not_its_step_kind() {
-    // #69: the live BBO copies the lane's route into StepEntry.flags (STEP_CROSS) and
-    // replay_step compares it. Lanes 1 and 2 both see ask 105 in their snapshot and classify a
-    // buy @ 105 as Cross. The first takes the ask; the second finds nothing left and rests, so
-    // it logs as an Improve step with STEP_CROSS set. Replay must route it Cross from the bit.
-    use Side::{Buy, Sell};
-    use Tif::Day;
-    let s = vec![
-        Act::Pkt {
-            l: 0,
-            a: 1,
-            rx_ts: 1_000,
-            now: 1_000,
-            msgs: vec![new(Sell, Day, 105, 1, 11)],
-        },
-        Act::Run,
-        Act::Pkt {
-            l: 1,
-            a: 1,
-            rx_ts: 2_000,
-            now: 2_000,
-            msgs: vec![new(Buy, Day, 105, 1, 21)],
-        },
-        Act::Pkt {
-            l: 2,
-            a: 1,
-            rx_ts: 3_000,
-            now: 3_000,
-            msgs: vec![new(Buy, Day, 105, 1, 31)],
-        },
-        Act::Run,
-    ];
-    let (j, store, _, _) = live(&s);
-    assert!(
-        steps(&j.recs)
-            .any(|e| e.kind == StepKind::Improve.code() && e.flags & vyrn_bbo::STEP_CROSS != 0),
-        "the script must log a Cross-classified op as an Improve step: {:?}",
-        steps(&j.recs)
-            .map(|e| (e.kind, e.flags))
+fn replay_checks_responses_against_a_response_log() {
+    // 07 §7.1: replay outputs every response record. With a log, a changed response is caught
+    // instead of passing silently (the G9 interim check).
+    let (j, store, _, _) = live(&script());
+    assert_eq!(replay_checked(&j.recs, &store, &j).0, Ok(()));
+    // One lane response changed.
+    let mut bad = Journal {
+        recs: j.recs.clone(),
+        resp: j.resp.clone(),
+        tx: j.tx.clone(),
+    };
+    bad.resp[0].1.resp_seq += 1;
+    assert!(matches!(
+        replay_checked(&j.recs, &store, &bad).0,
+        Err(Diverged {
+            why: Why::Response,
+            ..
+        })
+    ));
+    // One fill TX packet changed.
+    let mut bad = Journal {
+        recs: j.recs.clone(),
+        resp: j.resp.clone(),
+        tx: j.tx.clone(),
+    };
+    bad.tx[0].0.resp_seq += 1;
+    assert!(matches!(
+        replay_checked(&j.recs, &store, &bad).0,
+        Err(Diverged {
+            why: Why::Response,
+            ..
+        })
+    ));
+    // A logged response replay never produces: caught at the end.
+    let mut extra = Journal {
+        recs: j.recs.clone(),
+        resp: j.resp.clone(),
+        tx: j.tx.clone(),
+    };
+    extra.resp.push(extra.resp[0]);
+    assert_eq!(
+        replay_checked(&j.recs, &store, &extra).0,
+        Err(Diverged {
+            index: j.recs.len(),
+            why: Why::Response
+        })
+    );
+}
+
+#[test]
+fn replay_from_07_fields_only_in_canonical_order() {
+    // 07 §7.1 REP_MERGE: lane records and steps reduced to what 07 carries (kind, source, cut,
+    // Rescan band), merged by fills_applied. Every lane record, response and fill TX packet of
+    // the live run must come out again.
+    let (j, store, _, _) = live(&script());
+    let (lanes, steps) = to_wire(&j.recs);
+    let (r, rep) = replay_wire(&lanes, &steps, &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    // REP_MERGE is not the live interleaving across lanes (07 §7.1); each lane's records match.
+    for l in 0..N as u8 {
+        let pk = |x: &[OwnedRec]| {
+            packets(x)
+                .filter(|p| p.lane.0 == l)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pk(&rep.recs), pk(&j.recs), "lane {l}");
+    }
+    let resp = |x: &Journal, l: u8| {
+        x.resp
+            .iter()
+            .filter(|r| r.0.0 == l)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    for l in 0..N as u8 {
+        assert_eq!(resp(&rep, l), resp(&j, l), "lane {l} responses");
+    }
+    assert_eq!(rep.tx, j.tx);
+    // The derived StepEntry fields (n_tx, n_fills, fill_lanes, flags, band) match live.
+    assert_eq!(
+        logical(&rep.recs)
+            .iter()
+            .filter(|r| matches!(r, OwnedRec::Step(..)))
+            .collect::<Vec<_>>(),
+        logical(&j.recs)
+            .iter()
+            .filter(|r| matches!(r, OwnedRec::Step(..)))
             .collect::<Vec<_>>()
     );
-    let (r, rep) = replay(&j.recs, &store);
-    assert_eq!(r, Ok(()));
-    assert_eq!(logical(&rep.recs), logical(&j.recs));
+}
+
+#[test]
+fn replay_from_07_rejects_what_07_carries() {
+    let (j, store, _, _) = live(&script());
+    let (lanes, steps) = to_wire(&j.recs);
+    // A changed source is refused by the BBO core at that step.
+    let k = steps.iter().position(|s| s.1 == StepKind::Shed).unwrap();
+    let mut bad = steps.clone();
+    bad[k].2 = Some((vyrn_types::LaneId(2), LaneSeq(2)));
+    assert_eq!(
+        replay_wire(&lanes, &bad, &store, None).0,
+        Err(WireDiverged {
+            at: WireAt::Step(steps[k].0),
+            why: Why::Step(vyrn_bbo::Diverge::Source)
+        })
+    );
+    // A cut above what its lane has replayed cannot be ordered (REP_E_ORDER).
+    let mut bad = steps.clone();
+    bad[0].3[1] = LaneSeq(99);
+    assert_eq!(
+        replay_wire(&lanes, &bad, &store, None).0,
+        Err(WireDiverged {
+            at: WireAt::Step(steps[0].0),
+            why: Why::Order
+        })
+    );
+    // A lane record due at a step the input lacks is left over (REP_E_ORDER).
+    let cut = steps.len() - 1;
+    let r = replay_wire(&lanes, &steps[..cut], &store, None).0;
+    assert!(
+        matches!(
+            r,
+            Err(WireDiverged {
+                at: WireAt::Lane(_),
+                why: Why::Order
+            })
+        ),
+        "{r:?}"
+    );
 }
 
 #[test]

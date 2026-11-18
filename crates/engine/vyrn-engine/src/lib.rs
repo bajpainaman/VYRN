@@ -37,12 +37,26 @@
 //!   record is replayed as the lane's idle poll, which reads the `LaneCut` that the replayed
 //!   step wrote. Every call's output records are checked against the log.
 //!
+//! - **Replay from 07** ([`Engine::replay_wire`]): the replica's entry point. Input is 07's wire
+//!   records only: every lane's `PacketRecord`s in O-order and the merged steps as
+//!   [`WireStep`] (kind, source, full cut, kind payload; build one with [`WireStep::of`] from a
+//!   `vyrn-log` `MergedStep`). They are merged by 07 §7.1 `REP_MERGE`: before step `s`, each lane
+//!   in lane id order replays its records due at `f < s`, where `f` is a packet's
+//!   `fills_applied` raised to that of its `MID` records. `n_tx`, `n_fills`, `fill_lanes`,
+//!   `flags`, `pub_a/b` and `CONT` are derived, not compared; the `Rescan` band is the payload
+//!   (8 B, or empty for all ticks). Errors are [`WireDiverged`] at a lane record index, a step,
+//!   or the end.
+//! - **Response log** ([`Responses`]): both entry points check every lane response (per lane, in
+//!   order) and fill TX packet (in order) against a log when one is given, and that the log is
+//!   used up at the end ([`Why::Response`]). [`NoResponses`] checks nothing.
+//!
 //! **Replay rejects** ([`Diverged`]): a record the replayed engine does not reproduce byte for
 //! byte ([`Why::Mismatch`]), a packet record without payload ([`Why::NoPayload`]), a step
 //! record that does not decode ([`Why::BadStep`]), a step the BBO core refuses as its next one
 //! ([`Why::Step`] with `vyrn_bbo::Diverge`), a `MID` record older than the cut history
 //! ([`Why::StepTooOld`]), a record with no lane work behind it
-//! ([`Why::BadRecord`]), a step the BBO core does not publish ([`Why::NoStep`]), and any lane
+//! ([`Why::BadRecord`]), a response that differs from the log ([`Why::Response`]), inputs
+//! `REP_MERGE` cannot order ([`Why::Order`], `REP_E_ORDER`), a step the BBO core does not publish ([`Why::NoStep`]), and any lane
 //! or BBO fault ([`Why::Fault`]).
 //!
 //! **Scope of this version** (each is a PR follow-up):
@@ -87,4 +101,6 @@ mod replay;
 pub mod role;
 
 pub use engine::{Engine, Fault, Rec, Shared, Sink};
-pub use replay::{Diverged, OwnedRec, Payloads, Why};
+pub use replay::{
+    Diverged, NoResponses, OwnedRec, Payloads, Responses, Why, WireAt, WireDiverged, WireStep,
+};

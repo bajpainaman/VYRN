@@ -121,7 +121,7 @@ type StepLogCons<'a, V> = Consumer<'a, Line64, ENG_STEP_LOG, STEP_LOG_READERS, V
 pub struct Engine<'a, V: Visibility, const NA: usize> {
     pub(crate) vis: &'a V,
     pub(crate) lanes: Vec<Lane<'a, V, NA>>,
-    views: Vec<ArenaView<'a>>,
+    pub(crate) views: Vec<ArenaView<'a>>,
     fwd_c: Vec<FwdCons<'a, V>>,
     fill_p: Vec<FillProd<'a, V>>,
     ctl_p: Producer<'a, Line64, ENG_CONTROL_RING, 1, V>,
