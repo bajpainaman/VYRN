@@ -216,6 +216,7 @@ fn roster_verdict(r: Result<(), crate::RosterErr>) -> String {
             E::ClientSplit(_) => "client_split",
             E::DuplicateKey(_) => "duplicate_key",
             E::Recovery(_) => "recovery",
+            E::OperatorBoxes(_) => "operator_boxes",
             E::SeqCount(_) => "seq_count",
             E::Bridge => "bridge",
             E::SeqOrder(_) => "seq_order",
@@ -233,7 +234,7 @@ fn roster() -> String {
          # roster_hash = derive_key(\"vyrn      v1 roster\", genesis_hash || mode || roster).\n\
          # Fixture: testkit::roster. LDN voter i has vote seed [0x41+i; 32] and GXK seed [2, i, 0xC7 x 30];\n\
          # LDN vyrn-seq box j has seq seed [0x90+j; 32] and XK seed [0x98+j; 32].\n\
-         # EpoConfig(8) is LDN with seq_order [n, n+1].\n\
+         # EpoConfig(8) is LDN with seq_order BASE [n, n+1], CHAIN [n, n+3].\n\
          # verdict is Membership::from_roster; CHAIN passes a signer table whose rotation 0 is the\n\
          # roster's bridge set. A reject_ case edits the fixture as its name says;\n\
          # its roster_hash is the hash of the edited bytes unless the case edits the hash itself.\n\n",

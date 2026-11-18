@@ -15,8 +15,8 @@
 //!   `sent: Nanos` (the sender's PTP time) to the signed body.
 //! - `member` is "a voting member of R_{e+1}, or a sequencer box" in one u8. This crate sets bit 7
 //!   ([`SEQ_MEMBER`]) for a sequencer box, whose roster index is then bits 0–6.
-//! - The signing key is `NK(member, home(e+1))`, a node key with no roster field yet. This crate
-//!   verifies with the voter's vote key and the box's seq key from [`Membership`].
+//! - The signing key is `NK(member, home(e+1))` from the roster (08 §9.6): a voter's
+//!   [`Membership::node_key`] or a box's [`crate::SeqBox::node_key`].
 //! - The signed body is 35 bytes, little-endian: `epoch u32, member u8, follow_height u64,
 //!   lag_ns u64, keys_ready u8, version u32, b4_pass u8, sent u64`, under
 //!   `derive_key("vyrn      v1 ready", genesis_hash ‖ mode ‖ body)`.
@@ -131,9 +131,9 @@ fn key_of(next: &Membership, member: u8) -> Option<PubKey> {
         next.seq()
             .iter()
             .find(|b| b.index == index)
-            .map(|b| b.seq_key)
+            .map(|b| b.node_key)
     } else {
-        next.committee().voter(member).copied()
+        next.node_key(member).copied()
     }
 }
 
@@ -325,6 +325,7 @@ mod tests {
             vyrn_types::HomeCode::Nyc,
             Mode::Base,
             testkit::next_voters(Mode::Base),
+            testkit::next_node_keys(Mode::Base),
             *testkit::next(Mode::Base).seq(),
         )
         .unwrap_or_else(|e| panic!("{e}"));
@@ -380,12 +381,28 @@ mod tests {
         let next = testkit::next(Mode::Base);
         let mut r = testkit::ready(1, AT, &domain);
         r.lag_ns = EPO_READY_LAG_MS * NS_PER_MS + 1;
-        let r = r.signed(&testkit::next_seed(1), &domain);
+        let r = r.signed(&testkit::node_seed(2, 1), &domain);
         let mut pool = ReadyPool::new(testkit::VERSION);
         assert_eq!(pool.add(r, &domain, &next), Err(GoErr::NotReady(1)));
         let mut seq = testkit::ready(SEQ_MEMBER | 5, AT, &domain);
         seq.keys_ready = false;
-        let seq = seq.signed(&testkit::seq_seed(0), &domain);
+        let seq = seq.signed(&testkit::seq_node_seed(2, 0), &domain);
         assert_eq!(pool.add(seq, &domain, &next), Err(GoErr::NotReady(0x85)));
+    }
+
+    #[test]
+    fn epoready_verifies_under_nk_not_vk_or_sk() {
+        let domain = testkit::domain(Mode::Base);
+        let next = testkit::next(Mode::Base);
+        let mut pool = ReadyPool::new(testkit::VERSION);
+        let by_vk = testkit::ready(1, AT, &domain).signed(&testkit::next_seed(1), &domain);
+        assert_eq!(pool.add(by_vk, &domain, &next), Err(GoErr::BadSig(1)));
+        let by_sk =
+            testkit::ready(SEQ_MEMBER | 5, AT, &domain).signed(&testkit::seq_seed(0), &domain);
+        assert_eq!(pool.add(by_sk, &domain, &next), Err(GoErr::BadSig(0x85)));
+        assert_eq!(
+            pool.add(testkit::ready(1, AT, &domain), &domain, &next),
+            Ok(())
+        );
     }
 }
