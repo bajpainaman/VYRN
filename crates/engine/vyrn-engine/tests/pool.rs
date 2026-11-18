@@ -123,7 +123,7 @@ fn a_pooled_session_logs_one_take_before_each_of_its_records() {
     let mut sh = box_shared();
     let mut e = pooled_engine(&mut sh, &tok, true);
     let mut s = Takes::default();
-    feed(
+    let store = feed(
         &mut e,
         &[
             (1, 1, order(Sell, Day, Stp::None, 200, 1, 1)),
@@ -155,6 +155,14 @@ fn a_pooled_session_logs_one_take_before_each_of_its_records() {
         );
     }
     assert_eq!(tok.peek(), (None, 3), "released after each take");
+
+    // Replay on a pooled box hands the caller's sink the same takes at the same places.
+    let rtok = PoolTok::new();
+    let mut rsh = box_shared();
+    let mut r = pooled_engine(&mut rsh, &rtok, true);
+    let mut rs = Takes::default();
+    assert_eq!(r.replay(&s.j.recs, &store, &mut rs), Ok(()));
+    assert_eq!(rs.takes, s.takes);
 }
 
 #[test]
