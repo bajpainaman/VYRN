@@ -608,4 +608,30 @@ mod tests {
         );
         assert_eq!(reporter_share(1_000_001), 50_000);
     }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Pins `VOTE_CONTEXT` (09 §17.3): `b3sum --derive-key "vyrn v1 vote"` (BLAKE3 1.8.7 CLI) over
+    /// the 57 encoded bytes.
+    #[test]
+    fn vote_signing_message_vector() {
+        let m = VoteMsg {
+            chain_id: 7,
+            epoch: Epoch(10),
+            kind: VoteKind::Finalize,
+            view: 3,
+            height: Height(9),
+            block: Hash([0xab; 32]),
+        };
+        assert_eq!(
+            hex(&m.encode()),
+            "070000000a0000000303000000000000000900000000000000abababababababababababababababababababababababababababababababab"
+        );
+        assert_eq!(
+            hex(&m.signing_message()),
+            "8adf8052bc0556caccb3a0844502b6b0c1d869daa8d9cac94099c2c24c4542b6"
+        );
+    }
 }
