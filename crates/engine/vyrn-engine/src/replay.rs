@@ -685,11 +685,14 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             }
         }
         // A route record belongs to a packet of its lane in these inputs (07 §3.6): replayed
-        // (and compared in that lane call) or carried with it.
+        // (and compared in that lane call) or carried with it. Its owner is the last packet
+        // whose range holds it, as in the lane call's rule: an earlier one (a `SHED` record
+        // before its resend, a heartbeat-only packet) shares the range but took no op there.
         for x in lanes.routes() {
             let lane_cur = cur.get(usize::from(x.lane.0)).copied().unwrap_or(0);
-            let Some(i) =
-                (0..lanes.len()).find(|&i| lanes.get(i).is_some_and(|p| in_packet(p, &x)))
+            let Some(i) = (0..lanes.len())
+                .rev()
+                .find(|&i| lanes.get(i).is_some_and(|p| in_packet(p, &x)))
             else {
                 return Err(WireDiverged {
                     at: WireAt::End,
