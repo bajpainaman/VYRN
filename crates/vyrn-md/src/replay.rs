@@ -273,8 +273,10 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
     /// The payloads of one block's packet records, before `replay_block` runs it.
     pub fn prepare<const N: usize>(&mut self, blk: &BlockInputs<N>, p: &impl Payloads) {
         for r in &blk.lanes {
+            // A heartbeat-only packet (`count` 0) has no ops, so nothing would take its payload.
             if let LaneRec::Pkt(r) = r
                 && r.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) == 0
+                && r.count != 0
                 && let Some(b) = p.get(r)
             {
                 self.payload(b);

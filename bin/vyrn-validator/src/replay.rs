@@ -9,16 +9,24 @@
 //! the first block that depends on it, which prints `REPLAY_FAULT`.
 //!
 //! **Responses.** The validator holds no response log, so replay checks none
-//! (`vyrn_engine::NoResponses`) and its sink discards everything: `out=` is the comparison.
+//! (`vyrn_engine::NoResponses`) and a voter's sink discards everything: `out=` is the comparison.
+//!
+//! **Observer** (`role = "observer"`, 03 §4.5). The sink is `vyrn_md::SinkStream` with a
+//! `RingTap`: every resolved lane op and released step goes to the output ring that
+//! `vyrn-dropcopy` reads (10 §8.6), and [`Out::final_block`] adds a `DC_FINAL` frame per final
+//! block. The `MBO` packets it encodes are dropped here: publishing them is `vyrn-md`'s, from the
+//! same ring, and not wired yet.
 
 use serde::Deserialize;
 use vyrn_bbo::{Bbo, Phase, Record, TxEntry};
 use vyrn_cut::Hw;
 use vyrn_engine::{Engine, NoResponses, Rec, Shared, Sink};
 use vyrn_lane::{ArenaConfig, Lane, PathTable, RespPkt, SessionSpec};
+use vyrn_md::dropcopy::ring::RingTap;
+use vyrn_md::{Channel, PacketSink, SinkStream};
 use vyrn_replica::{BlockInputs, DataJoin, ReplayEngine, RustReplay};
 use vyrn_risk::{AcctRisk, AcctSlot, BookSpec, SessionBuckets};
-use vyrn_types::{AccountId, BookId, Epoch, Hash, LaneId, Tick};
+use vyrn_types::{AccountId, BookId, Epoch, Hash, Height, LaneId, StepId, Tick};
 
 /// Lane-local accounts per lane, as in `vyrn-seq` (`vyrn_lane::Lane`'s `NA`).
 pub const NA: usize = 16;
@@ -57,16 +65,61 @@ pub struct Session {
     pub base: u64,
 }
 
-/// A sink that keeps nothing.
-pub struct Discard;
+/// `MBO` packets nobody publishes yet (module docs).
+pub struct NoPackets;
 
-impl Sink for Discard {
-    fn record(&mut self, _: &Rec<'_>) {}
-    fn lane_resp(&mut self, _: LaneId, _: &RespPkt) {}
-    fn tx(&mut self, _: &TxEntry, _: &[Record]) {}
+impl PacketSink for NoPackets {
+    fn emit(&mut self, _: Channel, _: &[u8]) {}
 }
 
-pub type Replay = RustReplay<'static, Hw, NA, DataJoin, NoResponses, Discard>;
+/// The observer's sink: the `MBO` adapter, tapped into the output ring.
+pub type Observer = SinkStream<NoPackets, RingTap>;
+
+/// The replay's sink: nothing for a voter, the output ring for an observer (module docs).
+pub enum Out {
+    Discard,
+    Observer(Box<Observer>),
+}
+
+impl Sink for Out {
+    fn record(&mut self, r: &Rec<'_>) {
+        if let Self::Observer(o) = self {
+            o.record(r);
+        }
+    }
+    fn lane_resp(&mut self, l: LaneId, p: &RespPkt) {
+        if let Self::Observer(o) = self {
+            o.lane_resp(l, p);
+        }
+    }
+    fn tx(&mut self, e: &TxEntry, r: &[Record]) {
+        if let Self::Observer(o) = self {
+            o.tx(e, r);
+        }
+    }
+}
+
+impl Out {
+    /// Block `h`, whose last step is `last_step`, is final: one `DC_FINAL` frame on the ring.
+    pub fn final_block(&mut self, h: Height, last_step: StepId) {
+        if let Self::Observer(o) = self {
+            o.tap_mut().final_block(h, last_step);
+        }
+    }
+
+    /// The first ring or adapter error: the drop copy is then rebuilt from the log (03 §7).
+    pub fn error(&self) -> Option<String> {
+        match self {
+            Self::Discard => None,
+            Self::Observer(o) => o
+                .error()
+                .map(|e| format!("{e:?}"))
+                .or_else(|| o.tap().error().map(ToString::to_string)),
+        }
+    }
+}
+
+pub type Replay = RustReplay<'static, Hw, NA, DataJoin, NoResponses, Out>;
 
 fn hex16(s: &str) -> Result<[u8; 16], String> {
     let b = s.as_bytes();
@@ -89,6 +142,7 @@ pub fn open(
     book: BookId,
     epoch: Epoch,
     join: DataJoin,
+    out: Out,
 ) -> Result<Replay, String> {
     let (tick_min, tick_max) = (Tick(s.tick_min), Tick(s.tick_max));
     let spec = BookSpec::new(1, tick_min, tick_max, 10_000).ok_or("replay tick range")?;
@@ -161,13 +215,41 @@ pub fn open(
             return Err(format!("replay.session {id:?} did not open"));
         }
     }
-    Ok(RustReplay::new(engine, join, NoResponses, Discard))
+    Ok(RustReplay::new(engine, join, NoResponses, out))
 }
 
 /// Replays `b` and releases the payloads it settled. `Err` is a divergence: the engine's state is
 /// then unknown and the caller stops replaying.
 pub fn block<const N: usize>(rep: &mut Replay, b: &BlockInputs<N>) -> Result<Hash, String> {
+    if let (p, Out::Observer(o)) = rep.payloads_and_sink() {
+        o.prepare(b, p);
+    }
     let out = rep.replay_block(b).map_err(|e| e.0)?;
+    // Unreleased on every `Err`: the caller releases the block's payloads then.
+    if let Some(e) = rep.payloads_and_sink().1.error() {
+        return Err(format!("output ring: {e}"));
+    }
     rep.release(b.header.height);
     Ok(out.output_hash)
+}
+
+/// The observer's sink over a new ring at `path` of `cap` data bytes, its epoch begun.
+pub fn observer(
+    path: &std::path::Path,
+    cap: u64,
+    book: BookId,
+    epoch: Epoch,
+    n_lanes: usize,
+) -> Result<Out, String> {
+    if cap == 0 {
+        return Err("observer.ring_cap must be at least 1".into());
+    }
+    let mut ring = RingTap::create(path, cap).map_err(|e| format!("observer.ring: {e}"))?;
+    ring.begin_epoch(epoch);
+    if let Some(e) = ring.error() {
+        return Err(format!("observer.ring: {e}"));
+    }
+    Ok(Out::Observer(Box::new(SinkStream::with_tap(
+        book, epoch, n_lanes, NoPackets, ring,
+    ))))
 }

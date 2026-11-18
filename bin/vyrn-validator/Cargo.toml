@@ -22,6 +22,7 @@ vyrn-risk = { workspace = true }
 vyrn-bbo = { workspace = true }
 vyrn-lane = { workspace = true }
 vyrn-engine = { workspace = true }
+vyrn-md = { workspace = true }
 vyrn-epoch = { workspace = true }
 commonware-consensus = { workspace = true }
 commonware-runtime = { workspace = true }

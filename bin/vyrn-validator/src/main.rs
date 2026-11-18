@@ -12,7 +12,7 @@
 //! | Field | Meaning |
 //! |---|---|
 //! | `schema = 1`, `protocol = 1` | must match this release |
-//! | `role = "validator"`, `mode = "BASE"`, `book`, `epoch` | the book and epoch served (`EpochView`) |
+//! | `role = "validator"` or `"observer"`, `mode = "BASE"`, `book`, `epoch` | the book and epoch served (`EpochView`); an observer is described below |
 //! | `lanes` | the sequencer box's lane count, one substream (07 §2.2); 1–4, 8, 11 or 49 |
 //! | `[nic] backend = "kernel_udp", ip, order_port` | where ORDER, HASH and HEADER frames arrive (0: ephemeral) |
 //! | `[cores] order` | REF core of the order core (07 §7.2 core 3); reported, not pinned |
@@ -47,6 +47,19 @@
 //! `[data]`, `FETCH box=<n> peer=<n> seq=<n> served=<n> missed=<n> limited=<n> bad=<n>`: KEY
 //! fetches it sent to each 07 §5.5 source, and peers' fetches it served (`fetch.rs`).
 //!
+//! **Observer** (`role = "observer"`, 03 §4.5: the same binary, without c3's votes). It needs
+//! `[replay]`, `[consensus]` and `[observer] ring, ring_cap, ctrl`, and refuses `[keys]`.
+//! Replay's sink is `vyrn_md::SinkStream` tapped into the output ring at `ring` (10 §8.6,
+//! `ring_cap` data bytes, default 64 MiB), which `vyrn-dropcopy` reads. `[consensus]` gives the
+//! roster only (no voter starts): it binds `ctrl`, where the validators send their finalize votes and certificates
+//! (their `[consensus] observers`), and prints `OBSERVER ctrl=<ip:port>` and `FINAL height=<h>
+//! from=<votes|cert>` as finality moves. Each block that is both replayed and final gets one
+//! `DC_FINAL` frame on the ring, in height order, once the certificate's `last_hash` equals the
+//! header hash of the replayed block at its `last_height`; a different hash prints
+//! `FINALITY_FAULT height=<h> ...` and replay stops. A ring or adapter error prints
+//! `REPLAY_FAULT height=<h> output ring: <why>` and replay stops. Not wired here: the epoch's
+//! end (`DC_EOD`; this build serves one epoch), settlement, and `MBO` publication.
+//!
 //! **Not wired yet** (PR follow-ups): seals in the voter's source (tail reports, Silence), the chain guardian
 //! (`vyrn_chain::bridge::Guardian` needs a `vyrn_chain::Replica` over finalized `StateCommit`s,
 //! which `vyrn-replica` does not produce yet), path B dedupe and repair, CHAIN mode.
@@ -77,7 +90,7 @@ use vyrn_log::Layout;
 use vyrn_nic::frame;
 use vyrn_nic::{BackendKind, KernelUdp, NicBackend, NicConfig, PortConfig, PortId, RxBind};
 use vyrn_replica::{EpochView, FrameErr, OrderCore};
-use vyrn_types::{BookId, Epoch, Height, LaneId, PubKey};
+use vyrn_types::{BookId, Epoch, Hash, Height, LaneId, PubKey, StepId};
 use vyrn_wire::{RX_BURST, RxPkt, RxRing};
 
 #[derive(Parser)]
@@ -106,13 +119,30 @@ struct Config {
     #[serde(default)]
     cores: Cores,
     membership: Membership,
-    keys: Keys,
+    #[serde(default)]
+    keys: Option<Keys>,
+    #[serde(default)]
+    observer: Option<ObserverCfg>,
     #[serde(default)]
     data: Option<Data>,
     #[serde(default)]
     consensus: Option<consensus::Section>,
     #[serde(default)]
     replay: Option<replay::Section>,
+}
+
+/// `[observer]` (module docs).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObserverCfg {
+    ring: PathBuf,
+    #[serde(default = "d_ring_cap")]
+    ring_cap: u64,
+    ctrl: std::net::SocketAddr,
+}
+
+fn d_ring_cap() -> u64 {
+    64 << 20
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,11 +234,27 @@ impl Config {
         if c.schema != 1 || c.protocol != 1 {
             return bad("schema/protocol", "must be 1 and 1 in this release");
         }
-        if c.role != "validator" || c.mode != "BASE" {
+        if !matches!(c.role.as_str(), "validator" | "observer") || c.mode != "BASE" {
             return bad(
                 "role/mode",
-                "must be validator and BASE (CHAIN needs the guardian)",
+                "must be validator or observer, and BASE (CHAIN needs the guardian)",
             );
+        }
+        if c.observer() {
+            if c.keys.is_some() {
+                return bad(
+                    "keys",
+                    "is refused for an observer: it does not vote (03 §4.5)",
+                );
+            }
+            if c.observer.is_none() || c.replay.is_none() || c.consensus.is_none() {
+                return bad(
+                    "role",
+                    "observer needs [observer], [replay] and [consensus] (its finality)",
+                );
+            }
+        } else if c.observer.is_some() {
+            return bad("observer", "needs role = \"observer\"");
         }
         if c.nic.backend != "kernel_udp" {
             return bad("nic.backend", "must be kernel_udp in this release");
@@ -216,8 +262,8 @@ impl Config {
         if c.membership.seq_keys.is_empty() {
             return bad("membership.seq_keys", "is empty");
         }
-        if c.keys.vote.is_empty() {
-            return bad("keys.vote", "is empty");
+        if !c.observer() && c.keys.as_ref().is_none_or(|k| k.vote.is_empty()) {
+            return bad("keys.vote", "is missing or empty");
         }
         if c.replay.is_some() && c.data.is_none() {
             return bad("replay", "needs [data]: replay reads the blocks' payloads");
@@ -233,6 +279,10 @@ impl Config {
             _ => {}
         }
         Ok(c)
+    }
+
+    fn observer(&self) -> bool {
+        self.role == "observer"
     }
 }
 
@@ -313,11 +363,27 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
         book: BookId(cfg.book),
         seq_keys,
     };
-    let plan = cfg
-        .consensus
-        .as_ref()
-        .map(|s| consensus::Plan::new(s, view.epoch, &cfg.keys.vote, cfg.keys.node.as_deref()))
-        .transpose()?;
+    let plan = match (&cfg.consensus, &cfg.keys) {
+        (Some(s), Some(k)) => Some(consensus::Plan::new(
+            s,
+            view.epoch,
+            &k.vote,
+            k.node.as_deref(),
+        )?),
+        _ => None,
+    };
+    // An observer's finality: the roster's committee, heard on `[observer] ctrl` (module docs).
+    let (cert_tx, cert_rx) = std::sync::mpsc::channel();
+    let mut cert_rx = cfg.observer.is_some().then_some(cert_rx);
+    let observe = match (&cfg.consensus, &cfg.observer) {
+        (Some(s), Some(o)) => {
+            let sock = UdpSocket::bind(o.ctrl).map_err(|e| format!("observer.ctrl: {e}"))?;
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(20)))
+                .map_err(|e| e.to_string())?;
+            Some((consensus::committee(s, view.epoch)?, sock, cert_tx))
+        }
+        _ => None,
+    };
     if plan
         .as_ref()
         .is_some_and(|p| view.seq_keys.first() != Some(&p.seq_key))
@@ -458,6 +524,10 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                 fetches: VecDeque::new(),
                 sources,
                 peer,
+                unfinal: VecDeque::new(),
+                certs: cert_rx.take(),
+                tips: VecDeque::new(),
+                replayed: None,
             })
         }
         None => None,
@@ -466,15 +536,26 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
     if let (Some(r), Some(d)) = (&cfg.replay, data.as_mut()) {
         let n = u8::try_from(N).map_err(|e| e.to_string())?;
         let join = std::mem::take(&mut d.join);
-        d.replay = Some(Box::new(replay::open(
+        let mut rep = Box::new(replay::open(
             r,
             n,
             BookId(cfg.book),
             Epoch(cfg.epoch),
             join,
-        )?));
+            replay::Out::Discard,
+        )?);
+        // The ring replaces any ring at its path, so only once the replay is built.
+        if let Some(o) = &cfg.observer {
+            *rep.payloads_and_sink().1 =
+                replay::observer(&o.ring, o.ring_cap, BookId(cfg.book), Epoch(cfg.epoch), N)?;
+        }
+        d.replay = Some(rep);
         println!("REPLAY lanes={n} sessions={}", r.session.len());
     }
+    let view_epoch = Epoch(cfg.epoch);
+    // The observer's finality thread stops first, so the order thread's last drain sees every
+    // certificate it accepted.
+    let obs_stop = Arc::new(AtomicBool::new(false));
     let source = if plan.is_some() {
         consensus::Source::new()
     } else {
@@ -488,6 +569,24 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
             .name("vyrn-validator/order".into())
             .spawn(move || order_thread(core, rx, data, &source, &stop, &stats))
             .map_err(|e| e.to_string())?
+    };
+    let observer = match observe {
+        Some((committee, sock, certs)) => {
+            println!(
+                "OBSERVER ctrl={}",
+                sock.local_addr().map_err(|e| e.to_string())?
+            );
+            let (stop, source, epoch) = (Arc::clone(&obs_stop), source.clone(), view_epoch);
+            Some(
+                std::thread::Builder::new()
+                    .name("vyrn-validator/observer".into())
+                    .spawn(move || {
+                        consensus::observe(committee, epoch, &sock, &source, &certs, &stop)
+                    })
+                    .map_err(|e| e.to_string())?,
+            )
+        }
+        None => None,
     };
     let voter = match plan {
         Some(plan) => {
@@ -516,9 +615,27 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
     if stdin_stop {
         let mut sink = Vec::new();
         let _ = std::io::stdin().read_to_end(&mut sink);
+    }
+    // Shutdown (stdin EOF): the finality thread stops and is joined first, so the order
+    // thread's last drain sees every certificate it accepted. Without `--stop-on-stdin-eof`
+    // both run until the process is killed.
+    let stop_observer = |o: std::thread::JoinHandle<u64>| -> Result<(), String> {
+        obs_stop.store(true, Ordering::Release);
+        let refused = o.join().map_err(|_| "observer thread panicked")?;
+        println!("FINALITY refused={refused}");
+        Ok(())
+    };
+    let mut observer = observer;
+    if stdin_stop {
+        if let Some(o) = observer.take() {
+            stop_observer(o)?;
+        }
         stop.store(true, Ordering::Release);
     }
     let evicted = order.join().map_err(|_| "order thread panicked")?;
+    if let Some(o) = observer {
+        stop_observer(o)?;
+    }
     if let Some(v) = voter {
         stop.store(true, Ordering::Release);
         v.join().map_err(|_| "voter thread panicked")??;
@@ -565,7 +682,20 @@ struct DataRx<const N: usize, R> {
     sources: fetch::Sources,
     /// Peers' KEY fetches, answered from the join (07 §5.5 source 2).
     peer: fetch::PeerServer,
+    /// Observer: replayed blocks not final yet, with their last step and header hash.
+    unfinal: VecDeque<(Height, StepId, Hash)>,
+    /// Observer: certified tips `(last_height, last_hash)` from `consensus::observe`, and the
+    /// ones whose block has not replayed yet.
+    certs: Option<std::sync::mpsc::Receiver<(Height, Hash)>>,
+    tips: VecDeque<(Height, Hash)>,
+    /// Observer: the newest replayed height.
+    replayed: Option<Height>,
 }
+
+/// Observer: the most replayed blocks that may wait for finality, and the most certified tips
+/// that may wait for replay, before replay stops. Far above
+/// `FIN_GATE_BLOCKS` (8), past which the sequencer itself halts (07 §6.8).
+const OBS_MAX_UNFINAL: usize = 1024;
 
 /// RANGE fetches sent per data poll.
 const FETCH_BURST: usize = 16;
@@ -688,7 +818,26 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 .keep(Self::join(&mut self.join, &mut self.replay), &b.lanes);
             match (&mut self.replay, self.replay_dead) {
                 (Some(r), false) => match replay::block(r, &b) {
-                    Ok(out) => println!("{} out={}", block_line(&b, Verdict::Valid), hex(&out.0)),
+                    Ok(out) => {
+                        println!("{} out={}", block_line(&b, Verdict::Valid), hex(&out.0));
+                        if matches!(r.payloads_and_sink().1, replay::Out::Observer(_)) {
+                            self.replayed = Some(h);
+                            if self.unfinal.len() >= OBS_MAX_UNFINAL {
+                                // Finality input lost: stop rather than grow without bound.
+                                println!(
+                                    "FINALITY_FAULT height={} {OBS_MAX_UNFINAL} replayed blocks wait for finality",
+                                    h.0
+                                );
+                                self.replay_dead = true;
+                            } else {
+                                self.unfinal.push_back((
+                                    h,
+                                    b.header.last_step,
+                                    vyrn_log::block::header_hash(&b.header),
+                                ));
+                            }
+                        }
+                    }
                     Err(e) => {
                         self.replay_dead = true;
                         println!("{}", block_line(&b, Verdict::Valid));
@@ -702,6 +851,69 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 }
                 // Without replay nothing else reads these payloads.
                 (None, _) => self.join.release(h, &b.lanes),
+            }
+        }
+    }
+
+    /// Observer: one `DC_FINAL` per replayed block up to each certified tip, in order, once the
+    /// tip's block has replayed and its header hash is the certificate's `last_hash` (the
+    /// `prev` links of the replayed chain then commit to every block below it). A tip whose
+    /// block has not replayed yet waits. A hash that differs means this observer replayed
+    /// another chain than the one certified: `FINALITY_FAULT`, and nothing more is marked final.
+    /// A ring error stops replay as in [`DataRx::check`].
+    fn finals(&mut self) {
+        if let Some(rx) = &self.certs {
+            if self.replay_dead {
+                // Nothing more is marked final after a fault (the drop copy is rebuilt from
+                // the log, 03 §7): take certificates without keeping them.
+                rx.try_iter().for_each(drop);
+                self.tips.clear();
+                return;
+            }
+            self.tips.extend(rx.try_iter());
+            if self.tips.len() > OBS_MAX_UNFINAL {
+                // The voters finalize blocks this observer has not replayed (a stalled order
+                // stream): stop rather than keep certificates without bound.
+                println!(
+                    "FINALITY_FAULT height={} {OBS_MAX_UNFINAL} certified tips wait for replay",
+                    self.tips.back().map_or(0, |t| t.0.0)
+                );
+                self.replay_dead = true;
+                self.tips.clear();
+                return;
+            }
+        }
+        let Some(r) = self.replay.as_mut() else {
+            return;
+        };
+        while !self.replay_dead
+            && let Some(&(tip, hash)) = self.tips.front()
+        {
+            let Some(at) = self.unfinal.iter().position(|u| u.0 == tip) else {
+                if self.replayed.is_some_and(|r| tip <= r) {
+                    // Replayed and already marked final by a later tip.
+                    self.tips.pop_front();
+                    continue;
+                }
+                return; // its block has not replayed yet
+            };
+            self.tips.pop_front();
+            if self.unfinal.get(at).map(|u| u.2) != Some(hash) {
+                println!(
+                    "FINALITY_FAULT height={} replayed chain differs from the certified one",
+                    tip.0
+                );
+                self.replay_dead = true;
+                return;
+            }
+            for (h, last, _) in self.unfinal.drain(..=at) {
+                let out = r.payloads_and_sink().1;
+                out.final_block(h, last);
+                if let Some(e) = out.error() {
+                    println!("REPLAY_FAULT height={} output ring: {e}", h.0);
+                    self.replay_dead = true;
+                    return;
+                }
             }
         }
     }
@@ -772,6 +984,7 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         let dk = data.as_mut().map_or(0, |d| d.poll(now()));
         if let Some(d) = data.as_mut() {
             d.check(source, now());
+            d.finals();
         }
         // No ORDER frame this turn: the deadlines `on_frame` would have checked (REP_E_HASHLAG),
         // whatever the data queue is doing.
@@ -792,6 +1005,9 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             // several boxes and their voters share a small host. The socket holds what arrives.
             std::thread::park_timeout(IDLE);
         }
+    }
+    if let Some(d) = data.as_mut() {
+        d.finals();
     }
     if let Some(d) = data.as_ref() {
         let c = d.sources.counts;

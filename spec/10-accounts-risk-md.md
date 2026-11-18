@@ -1868,6 +1868,26 @@ makes, byte for byte. That equality is tested against `RustReplay` at every spli
    `DC_EOD`, so a settlement that comes after the next epoch begins settles the right records.
    Its `DC_SETTLED` is appended to the ended epoch's stream after `END`; a session that has
    moved on reads it by reconnecting to that epoch. \[Guessing\]
+6. **The writer.** The writer is `vyrn-validator` with `role = "observer"`, the same binary as
+   a voter (03 §4.5), which refuses `[keys]` and starts no voter. Its `RustReplay` sink is
+   `SinkStream` with a `RingTap` at `[observer] ring`, created at start with the epoch begun.
+   Finality comes from the voters: each lists the observer's `[observer] ctrl` among its
+   `[consensus] observers`, as it lists the sequencer's, and the observer counts their finalize
+   votes and certificates against the roster's committee with the sequencer's listener
+   (`vyrn_consensus::Listener`). A block gets its `final_block` once it is both replayed and
+   final, in height order, so a certificate that arrives before its block replays waits for
+   it. Finality is bound to the chain, not the height: the certificate's `last_hash` must equal
+   the header hash of the block the observer replayed at `last_height` (whose `prev` links then
+   commit to every block below it). A different hash means the observer replayed another chain
+   than the one certified, such as an equivocating sequencer's: it marks nothing more final and
+   stops replay (`FINALITY_FAULT`). A ring or adapter error stops replay (`REPLAY_FAULT`) and never touches voting: the
+   observer has none. The `MBO` packets `SinkStream` encodes are not published from here yet,
+   and nothing calls epoch end, allocations, settlement, reverts or routes yet: this build serves
+   one epoch. \[Likely\]
+   `tools/e2e-smoke --data --finality --dropcopy --workload tools/e2e-smoke/wl-smoke-nocross.toml`
+   (with `vyrn-dropcopy` built beside the other binaries) runs it end to end (box, voters, observer, `vyrn-dropcopy`, one
+   client per session) and checks each served stream against an in-process `DropCopy` over the
+   same blocks.
 
 ## 9. Surveillance
 
