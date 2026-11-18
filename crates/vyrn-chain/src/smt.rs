@@ -24,7 +24,7 @@
 //! `AllocLeaf`, `SessionLeaf` and `OperatorLeaf` have no fixed layout yet (a follow-up).
 //!
 //! [`Smt`] is the reference tree: an in-memory map, rebuilt per query. The commit box's incremental
-//! tree (09 §9.3 "net diff", B-CHN-2) must produce the same roots and proofs.
+//! tree, [`crate::smtinc::IncSmt`] (09 §9.3 "net diff", B-CHN-2), produces the same roots and proofs.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
