@@ -16,7 +16,7 @@
 //! | `[engine] dedicated, pooled = 0, tick_min, tick_max, win_center, slot_cap` | lanes and book window |
 //! | `[nic] backend, ip, port_base` | `kernel_udp` or `sim`; lane `l` listens on `port_base + l` (0: ephemeral) |
 //! | `[cores] pin = false, engine, stream, seal` | `pin = true` pins the engine and stream threads to `engine` and `stream` (both required); a failed pin fail-stops before `READY`; `seal` is `abort`, `count` or `off` |
-//! | `[replication] order = ["ip:port", ...], order_b = [...], block_ms` | where ORDER, HASH and HEADER frames go on path A and, flagged `PATH_B`, on path B (optional; 07 §3.1); block period |
+//! | `[replication] order = ["ip:port", ...], order_b = [...], block_ms` | where ORDER, HASH and HEADER frames go on path A and, flagged `PATH_B`, on path B (optional; 07 §3.1; opt-in cost: one header copy and one send per frame per path-B replica on the stream thread, +30–40% per frame in DEV with 5 replicas, not a latency result); block period |
 //! | `[keys] seq` | the `seq_key` handle (Ed25519 seed) |
 //! | `[epoch_boundary] next, t_ns, to_home, seq_index` | optional: per-lane `EpochNotice` triggers (08 §2.4) |
 //! | `[[dev_session]] lane, slot, account, k_seq, k_out, quote, base` | DEV only: sessions opened at start |
