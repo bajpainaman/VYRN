@@ -3825,7 +3825,6 @@ fn kill_maker(c : *mut Ctx, ml : u64, mr : u64) -> void {
     let open = bopen(c, ml, mr);
     let mh = handle(mr);
     (*mo).killed = 1u64;
-    (*mo).state = 3u64;
     (*b).n_stp = (*b).n_stp + 1u64;
     event(c, ml, EV_OUT, LIQ_MAKER, OUT_STP, (*mo).vslot, mh, (*mo).tick, open);
     let lo = rec_lo(R_OUT, INDEX_NONE, OUT_STP, mh);

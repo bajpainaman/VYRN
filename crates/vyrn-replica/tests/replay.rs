@@ -3078,7 +3078,8 @@ fn stp_new(
 /// fillable before its own maker (`FOK_UNFILLABLE`); a FOK cancel-oldest skips it in the dry
 /// run, then the sweep ends it (`Out STP`) and fills the sell at 106. Lane 1 and lane 0's
 /// account 1 rest sells at 104; account 1's cancel-both buy of 3 fills lane 1's, then ends its
-/// own maker and goes `Out STP` for its open 2, since it has filled.
+/// own maker and goes `Out STP` for its open 2, since it has filled. A CancelAll of that session
+/// then finds nothing open: the makers STP ended have left the book.
 fn stp_script() -> Vec<Act> {
     use Side::{Buy, Sell};
     use Tif::{Day, Fok};
@@ -3116,6 +3117,9 @@ fn stp_script() -> Vec<Act> {
     s.extend(settle.clone());
     // The order `Reject STP` ended is ended by the exchange: TOO_LATE with detail OUT.
     s.push(p(0, 1, 6_000, cancel(Handle::new(3, 1).unwrap(), 9)));
+    s.extend(settle.clone());
+    // A CancelAll of the session whose makers STP ended: nothing left to cancel.
+    s.push(p(0, 1, 7_000, vyrn_wire::Msg::CancelAll { client_tag: 10 }));
     s.extend(settle);
     s
 }
@@ -3175,6 +3179,10 @@ fn the_vx_client_replays_stp_that_triggers() {
                 ..
             }
         )),
+        "{all:?}"
+    );
+    assert!(
+        has(&|r| matches!(r, R::CancelAck { client_tag: 10, canceled, .. } if canceled.0 == 0)),
         "{all:?}"
     );
     let (j, _) = live07(&script);
