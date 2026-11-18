@@ -885,12 +885,19 @@ impl<T: TxRing> StreamCore<T> {
                     open = true;
                     opened = Instant::now();
                 }
+                let ends = matches!(o, Out::GroupEnd);
                 match &o {
                     Out::Pkt(p, _) if p.flags & PacketFlags::ADVANCE == 0 => group = true,
                     Out::GroupEnd => group = false,
                     _ => {}
                 }
                 self.take(o)?;
+                // A group's end is a safe cut: close an expired block here, so a batch that
+                // keeps ending inside a group cannot postpone the close.
+                if ends && open && opened.elapsed() >= block {
+                    self.close_block()?;
+                    open = false;
+                }
             }
             self.drain()?;
             let end = done && got == 0;
