@@ -634,3 +634,39 @@ fn deadlines_wait_for_held_frames_but_a_late_hash_run_still_faults() {
     assert_eq!(run(2_000_000, 60, true), Ok(()));
     assert!(run(500, 1_000_001, true).unwrap_err().contains("HashLag"));
 }
+
+/// Codex #213: after a gap fill a lane's records need not be in receive order, so each HashRun
+/// entry is checked against its own record, not only the lane's oldest.
+#[test]
+fn each_hash_run_entry_is_checked_against_its_own_record() {
+    let key = vyrn_crypto::ed25519::public_key(&SEED);
+    let run = |second_rx: u64| {
+        let mut core: OrderCore<N, View> = OrderCore::new(layout(), View(key)).unwrap();
+        core.set_hashlag_max(50);
+        let mut a = StreamEncoder::new(layout(), 0, ident()).unwrap();
+        let first = a
+            .encode(&order(true, vec![bind(0, 7), pkt(0, 7, 3, 0)]))
+            .unwrap();
+        let mut second = pkt(0, 7, 1, 0);
+        if let Section::LaneRun { recs, .. } = &mut second
+            && let Some(LaneRec::Pkt(p)) = recs.first_mut()
+        {
+            p.pkt_seq = 2;
+            p.first_lane_seq = LaneSeq(4);
+        }
+        let second = a.encode(&order(false, vec![second])).unwrap();
+        let hash = a
+            .encode(&Body::Hash(vec![Section::HashRun {
+                lane: LaneId(0),
+                entries: vec![(LaneSeq(1), PktHash(1)), (LaneSeq(4), PktHash(2))],
+            }]))
+            .unwrap();
+        core.on_frame_at(&first, 150, 0).unwrap();
+        core.on_frame_at(&second, second_rx, 0).unwrap();
+        core.on_frame_at(&hash, 160, 0)
+            .map_err(|e| format!("{e:?}"))
+    };
+    // The first record waited 10 ns; the second, released by a gap fill, 60 or 20.
+    assert!(run(100).unwrap_err().contains("HashLag"));
+    assert_eq!(run(140), Ok(()));
+}
