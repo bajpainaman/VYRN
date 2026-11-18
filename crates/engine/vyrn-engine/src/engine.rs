@@ -192,6 +192,15 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     /// The route records of the carried packets, and the buffer the next one is built in.
     pub(crate) carry_routes: Vec<RouteRecord>,
     pub(crate) carry_routes_next: Vec<RouteRecord>,
+    /// The `AcctTake`s of the carried packets, each with its packet's index in the carry, and
+    /// the buffer the next one is built in (05 §6.9, 07 §7.1).
+    pub(crate) carry_takes: Vec<(usize, AcctTake)>,
+    pub(crate) carry_takes_next: Vec<(usize, AcctTake)>,
+    /// Per `replay_wire` call: the take of each lane record by index, the takes sorted by
+    /// `(account, ver)`, and each account's next unreproduced entry in that order.
+    pub(crate) take_at: Vec<Option<AcctTake>>,
+    pub(crate) take_order: Vec<(AccountId, u32)>,
+    pub(crate) take_pos: Vec<(AccountId, usize)>,
 }
 
 impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
@@ -300,6 +309,11 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             carry_next: Vec::new(),
             carry_routes: Vec::new(),
             carry_routes_next: Vec::new(),
+            carry_takes: Vec::new(),
+            carry_takes_next: Vec::new(),
+            take_at: Vec::new(),
+            take_order: Vec::new(),
+            take_pos: Vec::new(),
         })
     }
 

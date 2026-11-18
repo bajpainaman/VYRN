@@ -37,7 +37,8 @@
 //!
 //! **Reject reasons** ([`ReplayError`]; any of them halts this replica's attestations):
 //! - the block's step records are not `N` lanes wide where the engine has a different count;
-//! - the block holds an `AcctTake` (pooled lanes, 01 §14.17): not replayed yet;
+//! - an `AcctTake` (pooled lanes, 01 §14.17) whose lane's next record in the block is not its
+//!   packet record (05 §6.9: the take sits right before its packet's group);
 //! - `Engine::replay_wire` diverged (`WireDiverged { at, why }`, in the message);
 //! - `load_snapshot` and `write_state`: the engine has no canonical state encoding yet.
 
@@ -46,7 +47,7 @@ use vyrn_cut::Visibility;
 use vyrn_engine::{Engine, Payloads, Rec, Responses, Sink, WireStep};
 use vyrn_lane::RespPkt;
 use vyrn_log::LaneRec;
-use vyrn_types::{AcctTake, Hash, Height, LaneId, PacketRecord, RouteRecord};
+use vyrn_types::{AcctTake, Hash, Height, LaneId, PacketFlags, PacketRecord, RouteRecord};
 
 use crate::DataJoin;
 
@@ -66,6 +67,7 @@ pub struct RustReplay<'a, V: Visibility, const NA: usize, P, R, S> {
     /// Per-block scratch, reused: packet and route records, per-lane and TX output bytes.
     pkts: Vec<PacketRecord>,
     routes: Vec<RouteRecord>,
+    takes: Vec<(usize, AcctTake)>,
     lane_out: Vec<Vec<u8>>,
     tx_out: Vec<u8>,
     /// The records the last `replay_block` settled: those carried into it and its own, minus
@@ -86,6 +88,7 @@ impl<'a, V: Visibility, const NA: usize, P: Payloads, R: Responses, S: Sink>
             sink,
             pkts: Vec::new(),
             routes: Vec::new(),
+            takes: Vec::new(),
             lane_out: vec![Vec::new(); n],
             tx_out: Vec::new(),
             settled: Vec::new(),
@@ -156,11 +159,26 @@ impl<V: Visibility, const NA: usize, P: Payloads, R: Responses, S: Sink, const N
         }
         self.pkts.clear();
         self.routes.clear();
-        for r in &blk.lanes {
+        self.takes.clear();
+        for (k, r) in blk.lanes.iter().enumerate() {
             match r {
                 LaneRec::Pkt(p) => self.pkts.push(*p),
                 LaneRec::Route(x) => self.routes.push(*x),
-                LaneRec::Take(_) => return Err(ReplayError("AcctTake replay".into())),
+                LaneRec::Take(t) => {
+                    // 05 §6.9: the take sits right before its packet's group, so the block's
+                    // next record, of any lane, is that packet record.
+                    let placed = matches!(blk.lanes.get(k.saturating_add(1)), Some(LaneRec::Pkt(p))
+                        if p.lane == t.lane
+                            && p.flags & PacketFlags::ADVANCE == 0
+                            && p.first_lane_seq == t.lane_seq);
+                    if !placed {
+                        return Err(ReplayError(format!(
+                            "height {}: AcctTake {t:?} is not right before its packet record",
+                            blk.header.height.0
+                        )));
+                    }
+                    self.takes.push((self.pkts.len(), *t));
+                }
             }
         }
         let steps: Vec<WireStep<'_>> = blk
@@ -180,6 +198,7 @@ impl<V: Visibility, const NA: usize, P: Payloads, R: Responses, S: Sink, const N
             .replay_wire(
                 &self.pkts,
                 &self.routes,
+                &self.takes,
                 &steps,
                 &self.payloads,
                 &mut self.log,

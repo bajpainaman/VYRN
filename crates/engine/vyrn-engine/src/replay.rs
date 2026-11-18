@@ -27,8 +27,8 @@ use vyrn_cut::Visibility;
 use vyrn_lane::{Mid, RespPkt, RxIn};
 use vyrn_risk::Route;
 use vyrn_types::{
-    AcctTake, LaneId, LaneSeq, PacketFlags, PacketRecord, RouteRecord, StepFlags, StepId, StepKind,
-    StepRecord, Tick,
+    AccountId, AcctTake, LaneId, LaneSeq, PacketFlags, PacketRecord, RouteRecord, StepFlags,
+    StepId, StepKind, StepRecord, Tick,
 };
 
 use crate::engine::{CARRY_CAP, Engine, Fault, Rec, Sink, StepErr};
@@ -462,6 +462,10 @@ struct Recs<'a> {
     /// The carried route records, then this block's.
     ra: &'a [RouteRecord],
     rb: &'a [RouteRecord],
+    /// The carried `AcctTake`s, then this block's, each with the index of its packet record
+    /// in `a` and `b` respectively.
+    ta: &'a [(usize, AcctTake)],
+    tb: &'a [(usize, AcctTake)],
 }
 
 impl Recs<'_> {
@@ -476,6 +480,15 @@ impl Recs<'_> {
     }
     fn routes(&self) -> impl Iterator<Item = RouteRecord> + '_ {
         self.ra.iter().chain(self.rb).copied()
+    }
+    /// Every take with its packet record's index in this sequence.
+    fn takes(&self) -> impl Iterator<Item = (usize, AcctTake)> + '_ {
+        let off = self.a.len();
+        self.ta.iter().copied().chain(
+            self.tb
+                .iter()
+                .map(move |&(i, t)| (i.saturating_add(off), t)),
+        )
     }
 }
 
@@ -549,7 +562,9 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
     /// Replays one block's 07 inputs (07 §7.1): `lanes` holds every lane's records, each lane in
     /// O-order (other lanes' records may sit between them, as in a decoded block), `routes` the
     /// block's route records (07 §3.6, any order: each joins the lane call of the packet that
-    /// holds its `(lane, lane_seq)`, and must equal the route record that call emits), and
+    /// holds its `(lane, lane_seq)`, and must equal the route record that call emits), `takes`
+    /// the block's `AcctTake`s, each with the index in `lanes` of the packet record it covers
+    /// (any order, 05 §6.9), and
     /// `steps` the merged steps in StepId order. The two are merged by `REP_MERGE`. Steps
     /// compare only what 07 carries (kind, source, `CROSS`, cut, checked by `Bbo::replay_step`);
     /// packet records compare byte for byte; responses compare against `log`. A route record
@@ -560,16 +575,22 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
     /// into the next call
     /// ([`Engine::carried`]), ahead of that call's `lanes` (07 §7.1 `REP_MERGE` item 3). A response
     /// log spans blocks, so the caller checks [`Responses::finished`] after its last block.
+    #[allow(clippy::too_many_arguments)]
     pub fn replay_wire<P: Payloads, S: Sink, R: Responses>(
         &mut self,
         lanes: &[PacketRecord],
         routes: &[RouteRecord],
+        takes: &[(usize, AcctTake)],
         steps: &[WireStep<'_>],
         payloads: &P,
         log: &mut R,
         sink: &mut S,
     ) -> Result<(), WireDiverged> {
         self.track_snapshots();
+        let carry_t = core::mem::take(&mut self.carry_takes);
+        let mut next_t = core::mem::take(&mut self.carry_takes_next);
+        next_t.clear();
+        next_t.reserve(CARRY_CAP);
         let mut buf = core::mem::take(&mut self.scratch);
         let carry = core::mem::take(&mut self.carry);
         let mut next = core::mem::take(&mut self.carry_next);
@@ -585,6 +606,8 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             b: lanes,
             ra: &carry_r,
             rb: routes,
+            ta: &carry_t,
+            tb: takes,
         };
         let r = self.wire_in(
             recs,
@@ -593,7 +616,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             log,
             sink,
             &mut buf,
-            (&mut next, &mut next_r),
+            (&mut next, &mut next_r, &mut next_t),
         );
         buf.clear();
         self.scratch = buf;
@@ -602,6 +625,8 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         self.carry_next = carry;
         self.carry_routes = next_r;
         self.carry_routes_next = carry_r;
+        self.carry_takes = next_t;
+        self.carry_takes_next = carry_t;
         r
     }
 
@@ -614,7 +639,11 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         log: &mut R,
         sink: &mut S,
         buf: &mut Vec<PacketRecord>,
-        (carry, carry_r): (&mut Vec<PacketRecord>, &mut Vec<RouteRecord>),
+        (carry, carry_r, carry_t): (
+            &mut Vec<PacketRecord>,
+            &mut Vec<RouteRecord>,
+            &mut Vec<(usize, AcctTake)>,
+        ),
     ) -> Result<(), WireDiverged> {
         let n = self.lanes.len();
         if (0..lanes.len()).any(|i| lanes.get(i).is_some_and(|r| usize::from(r.lane.0) >= n)) {
@@ -623,6 +652,10 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 why: Why::BadRecord,
             });
         }
+        self.index_takes(lanes).map_err(|why| WireDiverged {
+            at: WireAt::End,
+            why,
+        })?;
         // cur[l]: index of lane l's next record.
         let mut cur = [0usize; MAX_LANES];
         let (lo, hi) = self.tick_range().ok_or(WireDiverged {
@@ -713,11 +746,15 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 .copied()
                 .unwrap_or(usize::MAX)
             {
-                if carry.len() >= CARRY_CAP {
+                if carry.len() >= CARRY_CAP || carry_t.len() >= CARRY_CAP {
                     return Err(WireDiverged {
                         at: WireAt::Lane(i),
                         why: Why::Order,
                     });
+                }
+                // Its take carries with it, at the record's index in the carry.
+                if let Some(t) = self.take_at.get(i).copied().flatten() {
+                    carry_t.push((carry.len(), t));
                 }
                 carry.push(*r);
             }
@@ -762,81 +799,157 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         sink: &mut S,
         buf: &mut Vec<PacketRecord>,
     ) -> Result<(), WireDiverged> {
-        for l in 0..self.lanes.len() {
-            let lane = crate::engine::lane_id(l);
-            loop {
-                let from = cur.get(l).copied().unwrap_or(0);
-                let (i, c) = match next_call(lanes, lane, from) {
-                    None => {
-                        // Nothing left: later passes skip this lane in O(1).
-                        if let Some(x) = cur.get_mut(l) {
-                            *x = lanes.len();
+        // Passes repeat until no lane moves: a pooled record waiting on another lane's take
+        // (below) becomes due once that lane replays it (07 §7.1 item 2).
+        loop {
+            let mut moved = false;
+            for l in 0..self.lanes.len() {
+                let lane = crate::engine::lane_id(l);
+                loop {
+                    let from = cur.get(l).copied().unwrap_or(0);
+                    let (i, c) = match next_call(lanes, lane, from) {
+                        None => {
+                            // Nothing left: later passes skip this lane in O(1).
+                            if let Some(x) = cur.get_mut(l) {
+                                *x = lanes.len();
+                            }
+                            break;
                         }
+                        Some((_, Err(j))) => {
+                            return Err(WireDiverged {
+                                at: WireAt::Lane(j),
+                                why: Why::BadRecord,
+                            });
+                        }
+                        Some((i, Ok(c))) => (i, c),
+                    };
+                    // Park the cursor on the found record so the next pass starts there.
+                    if let Some(x) = cur.get_mut(l) {
+                        *x = i;
+                    }
+                    // Due once its step's fills are in, and once the replayed BBO has published the
+                    // snapshot it was classified against (its `snap_lag`, 07 §7.1).
+                    // A version the ring already evicted is not waited for: `lane_call` rejects it
+                    // with `Why::NoSnapshot`.
+                    if c.f >= s
+                        || self.snap_want(l, &c.rec).is_some_and(|v| v > self.snap_now)
+                        || self.take_waits(i)
+                    {
                         break;
                     }
-                    Some((_, Err(j))) => {
-                        return Err(WireDiverged {
-                            at: WireAt::Lane(j),
-                            why: Why::BadRecord,
-                        });
+                    let at = |why| WireDiverged {
+                        at: WireAt::Lane(i),
+                        why,
+                    };
+                    let mut tee = Tee::new(sink, log, buf);
+                    let mids = c.mids.get(..c.n_mid).unwrap_or(&[]);
+                    // A route record belongs to this packet only if the lane's next packet starts
+                    // above it: a session-only packet (heartbeat) counts its messages but takes no
+                    // LaneSeq, so its range overlaps the next packet's.
+                    let next_first = (c.end..lanes.len())
+                        .filter_map(|j| lanes.get(j))
+                        .find(|p| p.lane == c.rec.lane && !is_advance(p))
+                        .map(|p| p.first_lane_seq.0);
+                    let owns = |x: &RouteRecord| {
+                        in_packet(&c.rec, x) && next_first.is_none_or(|f| x.lane_seq.0 < f)
+                    };
+                    let rejected = lanes.routes().filter(|x| owns(x));
+                    self.lane_call(l, &c.rec, mids, rejected, payloads, &mut tee)
+                        .map_err(at)?;
+                    if tee.bad_resp {
+                        return Err(at(Why::Response));
                     }
-                    Some((i, Ok(c))) => (i, c),
-                };
-                // Park the cursor on the found record so the next pass starts there.
-                if let Some(x) = cur.get_mut(l) {
-                    *x = i;
+                    // The call's route records must be the packet's input route records, matched by
+                    // op in any order (07 §3.6): none missing, extra, repeated or conflicting.
+                    let want_r = || lanes.routes().filter(|x| owns(x));
+                    let got = tee.routes();
+                    let same_r = want_r().count() == got.len()
+                        && want_r().all(|x| got.contains(&x))
+                        && got.iter().all(|g| want_r().any(|x| x == *g));
+                    if !same_r {
+                        return Err(at(Why::Mismatch));
+                    }
+                    // The call's `AcctTake`s are exactly the input's take of this record: one
+                    // of another `ver` or account, a missing one or an extra one diverges here
+                    // (05 §6.9).
+                    let want_t = self.take_at.get(i).copied().flatten();
+                    let mut got_t = tee.takes.iter().flatten();
+                    if got_t.next().copied() != want_t || got_t.next().is_some() {
+                        return Err(at(Why::Mismatch));
+                    }
+                    if let Some(t) = want_t {
+                        self.take_done(t.account);
+                    }
+                    let want = core::iter::once(&c.rec).chain(mids.iter());
+                    if buf.len() != c.n_mid.saturating_add(1)
+                        || !want.zip(buf.iter()).all(|(w, g)| w == g)
+                    {
+                        return Err(at(Why::Mismatch));
+                    }
+                    if let Some(x) = cur.get_mut(l) {
+                        *x = c.end;
+                    }
+                    moved = true;
                 }
-                // Due once its step's fills are in, and once the replayed BBO has published the
-                // snapshot it was classified against (its `snap_lag`, 07 §7.1).
-                // A version the ring already evicted is not waited for: `lane_call` rejects it
-                // with `Why::NoSnapshot`.
-                if c.f >= s || self.snap_want(l, &c.rec).is_some_and(|v| v > self.snap_now) {
-                    break;
-                }
-                let at = |why| WireDiverged {
-                    at: WireAt::Lane(i),
-                    why,
-                };
-                let mut tee = Tee::new(sink, log, buf);
-                let mids = c.mids.get(..c.n_mid).unwrap_or(&[]);
-                // A route record belongs to this packet only if the lane's next packet starts
-                // above it: a session-only packet (heartbeat) counts its messages but takes no
-                // LaneSeq, so its range overlaps the next packet's.
-                let next_first = (c.end..lanes.len())
-                    .filter_map(|j| lanes.get(j))
-                    .find(|p| p.lane == c.rec.lane && !is_advance(p))
-                    .map(|p| p.first_lane_seq.0);
-                let owns = |x: &RouteRecord| {
-                    in_packet(&c.rec, x) && next_first.is_none_or(|f| x.lane_seq.0 < f)
-                };
-                let rejected = lanes.routes().filter(|x| owns(x));
-                self.lane_call(l, &c.rec, mids, rejected, payloads, &mut tee)
-                    .map_err(at)?;
-                if tee.bad_resp {
-                    return Err(at(Why::Response));
-                }
-                // The call's route records must be the packet's input route records, matched by
-                // op in any order (07 §3.6): none missing, extra, repeated or conflicting.
-                let want_r = || lanes.routes().filter(|x| owns(x));
-                let got = tee.routes();
-                let same_r = want_r().count() == got.len()
-                    && want_r().all(|x| got.contains(&x))
-                    && got.iter().all(|g| want_r().any(|x| x == *g));
-                if !same_r {
-                    return Err(at(Why::Mismatch));
-                }
-                let want = core::iter::once(&c.rec).chain(mids.iter());
-                if buf.len() != c.n_mid.saturating_add(1)
-                    || !want.zip(buf.iter()).all(|(w, g)| w == g)
-                {
-                    return Err(at(Why::Mismatch));
-                }
-                if let Some(x) = cur.get_mut(l) {
-                    *x = c.end;
-                }
+            }
+            if !moved {
+                break;
             }
         }
         Ok(())
+    }
+
+    /// Binds each input take to its packet record (05 §6.9) and orders them per account. A
+    /// take whose index names no packet record of its lane at its `lane_seq`, or a second take
+    /// of one record or of one `(account, ver)`, is [`Why::BadRecord`].
+    fn index_takes(&mut self, lanes: Recs<'_>) -> Result<(), Why> {
+        self.take_at.clear();
+        self.take_at.resize(lanes.len(), None);
+        self.take_order.clear();
+        self.take_pos.clear();
+        for (i, t) in lanes.takes() {
+            let rec = lanes.get(i).ok_or(Why::BadRecord)?;
+            let slot = self.take_at.get_mut(i).ok_or(Why::BadRecord)?;
+            if is_advance(rec)
+                || rec.lane != t.lane
+                || rec.first_lane_seq != t.lane_seq
+                || slot.is_some()
+            {
+                return Err(Why::BadRecord);
+            }
+            *slot = Some(t);
+            self.take_order.push((t.account, t.ver));
+        }
+        self.take_order.sort_unstable();
+        if self.take_order.windows(2).any(|w| w.first() == w.last()) {
+            return Err(Why::BadRecord);
+        }
+        for (k, (a, _)) in self.take_order.iter().enumerate() {
+            if self.take_pos.last().is_none_or(|(b, _)| b != a) {
+                self.take_pos.push((*a, k));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the lane record at index `i` must wait: its take has a lower-`ver` take of the
+    /// same account still unreproduced, so the pool's take order would change (07 §7.1).
+    fn take_waits(&self, i: usize) -> bool {
+        let Some(t) = self.take_at.get(i).copied().flatten() else {
+            return false;
+        };
+        self.take_pos
+            .iter()
+            .find(|(a, _)| *a == t.account)
+            .and_then(|(_, k)| self.take_order.get(*k))
+            .is_some_and(|(b, v)| *b == t.account && *v < t.ver)
+    }
+
+    /// Account `a`'s next take is reproduced.
+    fn take_done(&mut self, a: AccountId) {
+        if let Some((_, k)) = self.take_pos.iter_mut().find(|(b, _)| *b == a) {
+            *k = k.saturating_add(1);
+        }
     }
 
     /// The snapshot version packet record `rec` of lane `l` names, `snap_base + snap_lag`;
