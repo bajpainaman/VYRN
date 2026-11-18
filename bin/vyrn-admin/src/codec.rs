@@ -1,4 +1,5 @@
-//! The admin-channel messages of 04 §4.4 (BASE session open) and the `CtlDone` control response of
+//! The admin-channel messages of 04 §4.4 (BASE session open, `KeyBundle` and `DataTierStatus`
+//! pushes) and the `CtlDone` control response of
 //! 10 §2.4, as bytes.
 //!
 //! Every admin message on the TLS stream is one frame: `len` u32 (the bytes after it), `type` u16,
@@ -11,7 +12,7 @@
 //! | `len` does not match the body, or the body is cut short | `BAD_TYPE`, `PROTO_D_BAD_HDR` |
 //! | unknown `type` | `BAD_TYPE`, `PROTO_D_UNKNOWN_TYPE` |
 //! | a nonzero reserved byte | `BAD_TYPE`, `PROTO_D_RESERVED` |
-//! | a field outside its table range (`proto_version` ≠ 2, `cod`, `attest`, `rate_tier`, `n_books`, `timeout_ms`, a duplicate book, an unknown home, limit id or reason) | `BAD_TYPE`, `PROTO_D_BAD_HDR` |
+//! | a field outside its table range (`DataTierStatus.seq` = 0, `proto_version` ≠ 2, `cod`, `attest`, `rate_tier`, `n_books`, `timeout_ms`, a duplicate book, an unknown home, limit id or reason) | `BAD_TYPE`, `PROTO_D_BAD_HDR` |
 //!
 //! Reading (spec gap, labelled): 04 §4.4 names no reason for a field outside its range, so the
 //! codec uses the VR1 header detail. 04 §4.4 also leaves `N_MAX` undefined, so `n_boxes` is any
@@ -36,6 +37,7 @@ use vyrn_wire::{
 pub const T_OPEN_SESSION_REQ: u16 = 0x0001;
 pub const T_OPEN_SESSION_RESP: u16 = 0x8001;
 pub const T_KEY_BUNDLE: u16 = 0x8002;
+pub const T_DATA_TIER_STATUS: u16 = 0x8003;
 pub const T_ERROR: u16 = 0x80FF;
 
 /// `timeout_ms` range (04 §4.8, §14).
@@ -112,12 +114,23 @@ pub struct BoxKeys {
     pub k_out: [u8; 16],
 }
 
+/// `DataTierStatus` push (04 §4.4), 12-byte body: `epoch` u32 | `seq` u32 | `down` u8 |
+/// reserved [u8; 3]. Bit i of `down` marks entry i of the session's `KeyBundle.data` list down.
+/// `seq` counts from 1 per epoch and session, so 0 is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataTierStatus {
+    pub epoch: Epoch,
+    pub seq: u32,
+    pub down: u8,
+}
+
 /// One admin frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdminMsg {
     OpenSessionReq(OpenSessionReq),
     OpenSessionResp(OpenSessionResp),
     KeyBundle(KeyBundle),
+    DataTierStatus(DataTierStatus),
     /// Body: a 01 §6.5 reason u16, reserved u16, detail u32.
     Error {
         reason: RejectReason,
@@ -147,6 +160,16 @@ pub fn decode(frame: &[u8]) -> Result<AdminMsg, WireError> {
         T_OPEN_SESSION_REQ => AdminMsg::OpenSessionReq(open_req(&mut r)?),
         T_OPEN_SESSION_RESP => AdminMsg::OpenSessionResp(open_resp(&mut r)?),
         T_KEY_BUNDLE => AdminMsg::KeyBundle(key_bundle(&mut r)?),
+        T_DATA_TIER_STATUS => {
+            let epoch = Epoch(r.u32()?);
+            let seq = r.u32()?;
+            let down = r.u8()?;
+            r.zero(3)?;
+            if seq == 0 {
+                return Err(hdr());
+            }
+            AdminMsg::DataTierStatus(DataTierStatus { epoch, seq, down })
+        }
         T_ERROR => {
             let reason = RejectReason::from_code(r.u16()?).ok_or_else(hdr)?;
             r.zero(2)?;
@@ -203,6 +226,15 @@ pub fn encode(msg: &AdminMsg) -> Result<Vec<u8>, WireError> {
         AdminMsg::KeyBundle(b) => {
             put_u16(&mut w, T_KEY_BUNDLE);
             put_bundle(&mut w, b)?;
+        }
+        AdminMsg::DataTierStatus(d) => {
+            put_u16(&mut w, T_DATA_TIER_STATUS);
+            if d.seq == 0 {
+                return Err(hdr());
+            }
+            put_u32(&mut w, d.epoch.0);
+            put_u32(&mut w, d.seq);
+            w.extend([d.down, 0, 0, 0]);
         }
         AdminMsg::Error { reason, detail } => {
             put_u16(&mut w, T_ERROR);
