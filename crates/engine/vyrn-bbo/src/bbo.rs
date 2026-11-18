@@ -349,6 +349,10 @@ impl Bbo {
     pub fn continuing(&self) -> bool {
         self.cont.is_some() || self.rcont.is_some()
     }
+    /// An uncross is open: its next `Uncross` step is a chunk, not a new auction's first.
+    pub fn uncrossing(&self) -> bool {
+        self.unc.is_some()
+    }
 
     /// Bounds `(B, A)` (05 §8.6, `INV-ENG-4`).
     pub fn bounds(&self) -> (Tick, Tick) {

@@ -427,6 +427,49 @@ fn an_auction_runs_through_control_steps_and_replays() {
     assert_eq!(r.replay(&j.recs, &store, &mut NoResponses, &mut rj), Ok(()));
     assert_eq!(rj.tx, j.tx);
     assert_eq!(rj.resp, j.resp);
+
+    // 07-only replay (07 §3.8): each Control step carries its command and the opening Uncross
+    // step carries p* and Q, so `replay_wire` needs no hand-queued commands.
+    let (lanes, routes, mut ws) = to_wire(&j.recs);
+    let mut ctl = cmds
+        .iter()
+        .filter(|c| matches!(c, ControlCmd::Phase { .. }));
+    for w in ws.iter_mut().filter(|w| w.1 == StepKind::Control) {
+        w.5 = vyrn_engine::control_payload(ctl.next().unwrap())
+            .unwrap()
+            .to_vec();
+    }
+    assert!(ctl.next().is_none(), "one Control step per Phase command");
+    let opening = ws.iter().position(|w| w.1 == StepKind::Uncross).unwrap();
+    let unc_at = ws[opening].0;
+    let with = |price: u32, qty: u64| {
+        let mut ws = ws.clone();
+        ws[opening].5 = vyrn_engine::uncross_payload(Tick(price), qty).to_vec();
+        ws
+    };
+    let (r, rep) = replay_wire(&lanes, &routes, &with(105, 2), &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    assert_eq!(rep.tx, j.tx);
+    assert_eq!(rep.resp, j.resp);
+    // The payload is a checked log of the uncross, not an input that overrides it.
+    let at = |why| {
+        Err(vyrn_engine::WireDiverged {
+            at: vyrn_engine::WireAt::Step(unc_at),
+            why,
+        })
+    };
+    for (p, q) in [(105, 3), (103, 2)] {
+        assert_eq!(
+            replay_wire(&lanes, &routes, &with(p, q), &store, None).0,
+            at(Why::Mismatch),
+            "p* {p}, Q {q}"
+        );
+    }
+    // An opening Uncross step without its payload is malformed.
+    assert_eq!(
+        replay_wire(&lanes, &routes, &ws, &store, None).0,
+        at(Why::BadStep)
+    );
 }
 
 /// Replays 07-only blocks (`Engine::replay_wire`) on a fresh box, pooled as `pool` says; each

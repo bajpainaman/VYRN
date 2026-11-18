@@ -415,7 +415,7 @@ with any other flag bit (`REP_E_KIND`). It costs no byte. The clamped step-cut r
 | Shed | the shed op | — | the BBO core's deadline test failed (01 §14.1); its lane answers `BUSY` |
 | Control | 0xFF | code, argument | phase, band, halt, resume (§6.8), and uncross request (05 §8.8) |
 | Seal | 0xFF | — | the book's last step of an epoch (08) |
-| Uncross | 0xFF | uncross data | the auction uncross (05 §8.8, 08) |
+| Uncross | 0xFF | uncross data: on the step that opens an uncross, `price` u32 LE (p\*), `qty` u64 LE (Q) (`plen` 12); empty on its chunk steps | the auction uncross (05 §8.8, 08) |
 
 **Control payload** (reading, **wire**; 05 and 07 name the fields only): `plen` 10, `code` u8
 (1 phase, 2 band), `phase` u8 (05 `Phase` code: 0 continuous, 1 auction, 2 halted, 3 frozen;
@@ -423,6 +423,16 @@ with any other flag bit (`REP_E_KIND`). It costs no byte. The clamped step-cut r
 phase 0, both with `lo` = `hi` = 0. Replay queues the command a Control step's payload names
 before replaying the step; any other payload is a replay divergence. Uncross and Seal have their
 own kinds.
+
+**Uncross and Seal payloads** (ruling, **wire**; 05 §8.8 and this section name the uncross data
+only): the `Uncross` step that opens an uncross carries `plen` 12, `price` u32 LE then `qty` u64
+LE, the p\* and Q of the `ControlCmd::Uncross` the control role queued. The later chunk steps of
+the same uncross carry an empty payload, and so does a `Seal` step. Replay queues the uncross the
+opening step's payload names, and a Seal before a Seal step, then replays the step. The payload
+is a checked log of the result, not an input that overrides it: an uncross the replayed frozen
+book cannot fill at `price` for `qty` on both sides is a replay divergence at that step
+(`Mismatch`), and a missing or malformed payload, or a payload on a chunk or Seal step, is a
+malformed step (`BadStep`).
 
 **Size (budget):** each cut core publishes every ≤ `CUT_REFRESH_NS` = 100 ns, so each half changes
 ≤ 10M times/s and the two halves ≤ 20M times/s together. A changed half moves ~2 ops per lane, so
