@@ -235,8 +235,11 @@
 //!   key at a time, reached source 3 after it had dropped the rest (`REPAIR_STATS served=0
 //!   missed=67240`). Validators now escalate every missing key at once (`fetch.rs` reading (j)).
 //!   The tap, which replays like a replica, KEY-fetches from the unkeyed boxes and sequencer each
-//!   packet the client sent that its join still lacks 2 ms on (`TAP_SEQ_WAIT`), again every 2 ms
-//!   (the box: a run lost a packet the box had since repaired, past the sequencer's 50 ms); under
+//!   packet the client sent that its join still lacks 2 ms on (`TAP_SEQ_WAIT`), then every 20 ms
+//!   (`TAP_REASK`) from them and one validator's data port (source 2) in turn. Re-asking every
+//!   2 ms flooded the box under load (`fetch_limited=51916`) and the tap missed a packet every
+//!   replica had; and a packet the box lost and the tap asked for after the sequencer's 50 ms is
+//!   still held by a validator that released it. Under
 //!   `--keyed` (R8) the box would refuse its plain fetch, so it does not ask, and `--copy2-gap`
 //!   is refused. *Ruled-style, as R1, for the box's count only:* `data` lets the box store fewer
 //!   than it was sent by at most its ingest socket's kernel drop count (`/proc/net/udp`, read
@@ -909,6 +912,7 @@ fn data_tap(
     n_boxes: u8,
     fetch: Vec<SocketAddrV4>,
     seq: Option<(SocketAddrV4, Receiver<Sent>)>,
+    peers: Vec<SocketAddrV4>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<DataTap> {
     std::thread::spawn(move || {
@@ -920,8 +924,9 @@ fn data_tap(
             seq_asked: 0,
             errs: Vec::new(),
         };
-        // R19: every packet the client sent, by key: when it was sent, then last asked of source 3.
-        let mut sent: BTreeMap<(SessionId, u32), Instant> = BTreeMap::new();
+        // R19: every packet the client sent, by key: when it was sent (then last asked), and how
+        // many times it was asked.
+        let mut sent: BTreeMap<(SessionId, u32), (Instant, usize)> = BTreeMap::new();
         let mut feed = DataFeed::new(BookId(BOOK), n_boxes, 0);
         // (src, data_seq) still missing → when it was last asked for.
         let mut pending: BTreeMap<(u8, u64), Instant> = BTreeMap::new();
@@ -969,26 +974,33 @@ fn data_tap(
                     *at = now;
                 }
             }
-            // R19: a packet still missing TAP_SEQ_WAIT after it was sent (or last asked) is
-            // KEY-fetched from its boxes (source 1), which may have repaired it, and from the
-            // sequencer's retention (source 3), at once (07 §5.5).
+            // R19: a packet still missing TAP_SEQ_WAIT after it was sent is KEY-fetched from its
+            // boxes (source 1), which may have repaired it, and the sequencer's retention
+            // (source 3) at once, then again every TAP_REASK, adding one validator (source 2)
+            // in turn, which holds what it released (07 §5.5).
             if let Some((to, rx)) = &seq {
-                sent.extend(rx.try_iter().map(|(s, q, t)| ((s, q), t)));
-                sent.retain(|&(s, q), at| {
+                sent.extend(rx.try_iter().map(|(s, q, t)| ((s, q), (t, 0))));
+                sent.retain(|&(s, q), (at, asks)| {
                     if t.join.variants(s, q).next().is_some() {
                         return false;
                     }
-                    if now.duration_since(*at) >= TAP_SEQ_WAIT {
+                    let wait = if *asks == 0 { TAP_SEQ_WAIT } else { TAP_REASK };
+                    if now.duration_since(*at) >= wait {
                         let f = vyrn_data::frame::Fetch::Key {
                             session: s,
                             pkt_seq: q,
                         };
                         let f = f.encode();
-                        for a in fetch.iter().chain([to]) {
+                        let peer = asks
+                            .checked_sub(1)
+                            .and_then(|i| i.checked_rem(peers.len()))
+                            .and_then(|i| peers.get(i));
+                        for a in fetch.iter().chain([to]).chain(peer) {
                             let _ = sock.send_to(&f, a);
                         }
                         t.seq_asked += 1;
                         *at = now;
+                        *asks = asks.saturating_add(1);
                     }
                     true
                 });
@@ -1879,7 +1891,16 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
             _ => None,
         };
-        Some((boxes, data_tap(sock, n, fetch, seq, Arc::clone(&stop_tap))))
+        // R19: the validators' data ports serve the tap's plain KEY fetches as a peer's (source
+        // 2); keyed ones would not, so under --keyed seq is None and none are asked.
+        let peers = val_data
+            .iter()
+            .map(|&p| SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, p))
+            .collect();
+        Some((
+            boxes,
+            data_tap(sock, n, fetch, seq, peers, Arc::clone(&stop_tap)),
+        ))
     } else {
         None
     };

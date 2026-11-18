@@ -126,10 +126,10 @@ pub struct Sources {
     next_peer: usize,
     /// Per missing key, its escalation.
     missing: BTreeMap<(SessionId, u32), Esc>,
-    /// Scan cycles: one ends each time the scan wraps past the last pending record.
+    /// Scan cycles: one ends each time the scan passes the last pending record.
     round: u64,
-    /// Where the next scan starts, in the pending blocks' records.
-    scan_at: usize,
+    /// Where the next scan starts: a pending block's height and a record index in it.
+    scan_at: (u64, usize),
     /// When the last round began (`None`: none yet).
     round_at: Option<u64>,
     pub counts: Counts,
@@ -144,7 +144,7 @@ impl Sources {
             next_peer: 0,
             missing: BTreeMap::new(),
             round: 0,
-            scan_at: 0,
+            scan_at: (0, 0),
             round_at: None,
             counts: Counts::default(),
         }
@@ -212,23 +212,21 @@ impl Sources {
             .is_some_and(|x| x.box_missed)
     }
 
-    /// Where this round's scan starts among `total` pending records: where the last one
-    /// stopped, so every record gets its turn (Codex r4618145217, CodeRabbit r4618053807).
-    pub fn scan_start(&self, total: usize) -> usize {
-        self.scan_at.checked_rem(total).unwrap_or(0)
+    /// Where this round's scan starts: the height and record index where the last one stopped,
+    /// so every record gets its turn (Codex r4618145217, CodeRabbit r4618053807). The caller
+    /// finds that block from the front block's height, so a round costs no walk of the backlog
+    /// (Codex r4618501668); a height no longer pending starts at the front.
+    pub fn scan_start(&self) -> (u64, usize) {
+        self.scan_at
     }
 
-    /// The round examined `examined` records from [`Sources::scan_start`]. When the scan wraps
-    /// past the last record a cycle ends, and keys neither it nor the cycle before named
-    /// (joined, or released) are forgotten: a wrapping round names its prefix under the cycle
-    /// it ends, so a key is named at least once in any two cycles in a row (Vercel
-    /// r4618223901). Nothing is cut mid-cycle, so a key the scan has not reached keeps its
-    /// escalation (Codex r4618241007); the keys held are those of the pending records named in
-    /// the last two cycles.
-    pub fn scanned(&mut self, examined: usize, total: usize) {
-        let at = self.scan_start(total).saturating_add(examined);
-        let ended = total > 0 && at >= total;
-        self.scan_at = if ended { at.saturating_sub(total) } else { at };
+    /// The round stopped before `next` (height, record index); `ended` when it passed the last
+    /// pending record, ending a cycle: the next round starts at the front, and keys neither
+    /// this cycle nor the one before named (joined, or released) are forgotten, so a key the
+    /// scan reaches is named in any two cycles in a row (Vercel r4618223901). Nothing is cut
+    /// mid-cycle, so a key the scan has not reached keeps its escalation (Codex r4618241007).
+    pub fn scanned(&mut self, next: (u64, usize), ended: bool) {
+        self.scan_at = if ended { (0, 0) } else { next };
         let r = self.round;
         if ended {
             self.round = r.wrapping_add(1);
@@ -569,7 +567,7 @@ mod tests {
         let round = |s: &mut Sources, keys: &[u32], now: u64| {
             assert!(s.begin_round(now));
             let out: Vec<Vec<Target>> = keys.iter().map(|&q| s.due(k, q, now)).collect();
-            s.scanned(keys.len(), keys.len());
+            s.scanned((0, 0), true);
             out
         };
         assert_eq!(round(&mut s, &[1, 2, 3], 0), vec![vec![]; 3]);
@@ -590,7 +588,7 @@ mod tests {
             for (q, g) in (1u32..).zip(got.iter_mut()) {
                 g.extend(s.due(k, q, c * w));
             }
-            s.scanned(2, 2);
+            s.scanned((0, 0), true);
         }
         for g in &got {
             assert!(g.contains(&t(11)) && g.contains(&t(12)), "{g:?}");
@@ -613,7 +611,6 @@ mod tests {
         // its keys (Codex r4618328951).
         for q in 10..1000u32 {
             let _ = s.due(k, q, 8 * w);
-            s.scanned(0, 0);
         }
         s.released((10..1000u32).map(|q| (k, q)));
         assert_eq!(s.missing.keys().copied().collect::<Vec<_>>(), vec![(k, 9)]);
@@ -625,32 +622,31 @@ mod tests {
     #[test]
     fn the_scan_resumes_where_it_stopped_and_keeps_timers_across_rounds() {
         let mut s = Sources::new(vec![t(1)], Vec::new(), None);
-        assert_eq!(s.scan_start(10), 0);
-        s.scanned(4, 10);
-        assert_eq!(s.scan_start(10), 4);
-        s.scanned(4, 10);
-        assert_eq!(s.scan_start(10), 8);
-        // Key 7 named in cycle 0, then the scan wraps twice past it without naming it in the
-        // second cycle: forgotten only then.
+        assert_eq!(s.scan_start(), (0, 0));
+        s.scanned((7, 4), false);
+        assert_eq!(s.scan_start(), (7, 4));
+        // Key 7 named in cycle 0, which then ends: it stays, and its timer keeps running.
         let k = SessionId(5);
         assert!(s.due(k, 7, 0).is_empty());
-        s.scanned(4, 10); // wraps: cycle 0 ends, key 7 named in it stays
-        assert_eq!(s.scan_start(10), 2);
+        s.scanned((9, 0), true);
+        assert_eq!(
+            s.scan_start(),
+            (0, 0),
+            "a cycle's end starts the next at the front"
+        );
         assert_eq!(s.missing.len(), 1);
         assert_eq!(
             s.due(k, 7, REP_DATA_WAIT_NS),
             vec![t(1)],
             "its timer kept running"
         );
-        s.scanned(10, 10); // cycle 1 named it: stays
+        s.scanned((0, 0), true); // cycle 1 named it: stays
         assert_eq!(s.missing.len(), 1);
-        s.scanned(10, 10); // cycle 2 did not, cycle 1 did: stays (Vercel r4618223901)
+        s.scanned((3, 1), false); // mid-cycle: nothing is cut (Codex r4618241007)
+        s.scanned((0, 0), true); // cycle 2 did not, cycle 1 did: stays (Vercel r4618223901)
         assert_eq!(s.missing.len(), 1);
-        s.scanned(10, 10); // neither cycle 3 nor 2: forgotten
+        s.scanned((0, 0), true); // neither cycle 3 nor 2: forgotten
         assert!(s.missing.is_empty());
-        // A shrinking backlog cannot leave the cursor past its end.
-        s.scanned(3, 10);
-        assert_eq!(s.scan_start(2), 1);
     }
 
     /// A keyed target gets the 40-byte form that opens under its key; an unkeyed one the 32.

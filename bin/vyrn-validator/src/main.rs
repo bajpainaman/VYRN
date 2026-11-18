@@ -1238,21 +1238,34 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                         // burst reaches source 3 while the sequencer still retains it.
                         if self.sources.stuck(session, pkt_seq) {
                             let join = Self::join(&mut self.join, &mut self.replay);
-                            let total: usize =
-                                self.pending.iter().map(|(b, _)| b.lanes.len()).sum();
-                            let start = self.sources.scan_start(total);
-                            let recs = self.pending.iter().flat_map(|(b, _)| &b.lanes);
-                            let mut examined = 0usize;
+                            // From where the last round stopped, found by height from the front
+                            // (heights are consecutive), to at most FETCH_SCAN_MAX steps and
+                            // FETCH_KEYS_MAX fetches, or the last record: no walk of the backlog.
+                            let (sh, si) = self.sources.scan_start();
+                            let front = self.pending.front().map_or(0, |(b, _)| b.header.height.0);
+                            let (mut bi, mut ri) = sh
+                                .checked_sub(front)
+                                .and_then(|d| usize::try_from(d).ok())
+                                .filter(|&i| {
+                                    self.pending
+                                        .get(i)
+                                        .is_some_and(|(b, _)| b.header.height.0 == sh)
+                                })
+                                .map_or((0, 0), |i| (i, si));
+                            let mut steps = 0usize;
                             let mut sent = 0usize;
-                            // From where the last round stopped, wrapping once: at most
-                            // FETCH_SCAN_MAX records and FETCH_KEYS_MAX fetches.
-                            for r in recs.clone().skip(start).chain(recs.take(start)) {
-                                if examined >= fetch::FETCH_SCAN_MAX
-                                    || sent >= fetch::FETCH_KEYS_MAX
-                                {
+                            let mut ended = false;
+                            while steps < fetch::FETCH_SCAN_MAX && sent < fetch::FETCH_KEYS_MAX {
+                                let Some((b, _)) = self.pending.get(bi) else {
+                                    ended = true;
                                     break;
-                                }
-                                examined = examined.saturating_add(1);
+                                };
+                                steps = steps.saturating_add(1);
+                                let Some(r) = b.lanes.get(ri) else {
+                                    (bi, ri) = (bi.saturating_add(1), 0);
+                                    continue;
+                                };
+                                ri = ri.saturating_add(1);
                                 let LaneRec::Pkt(p) = r else { continue };
                                 if p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) != 0
                                     || (p.session, p.pkt_seq) == (session, pkt_seq)
@@ -1264,9 +1277,8 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                                 sent = sent.saturating_add(usize::from(!to.is_empty()));
                                 fetch::send_key(&self.repair, p.session, p.pkt_seq, &to);
                             }
-                            self.sources.scanned(examined, total);
-                        } else {
-                            self.sources.scanned(0, 0);
+                            let at = self.pending.get(bi).map_or(0, |(b, _)| b.header.height.0);
+                            self.sources.scanned((at, ri), ended);
                         }
                         return;
                     }
