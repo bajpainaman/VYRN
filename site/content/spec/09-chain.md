@@ -1413,8 +1413,9 @@ Anyone submits an `Evidence` item. Its handling is automatic:
    genuine hybrid-signed `NodeCert` that certifies a scheme-0 vote key leaves a forged scheme-0
    vote forgeable. From the first chain block of `E_pq`, classical evidence slashes or jails only
    if it, or `EvidenceCommit { hash }` of its encoding, is in a chain block final before `E_pq`
-   began. Otherwise it is verified with the scheme-0 rules, recorded, and changes no bond and no
-   jail. `BadPost`'s secp256k1 signature is not a `SigScheme`; PQ-5 covers it (below).
+   began. Otherwise it is still verified, each signature under the rules of its own scheme (a
+   hybrid `NodeCert` signature under 01 §14.20 A, a scheme-0 vote under 11 §2.5), and, if valid,
+   recorded; it changes no bond and no jail. `BadPost`'s secp256k1 signature is not a `SigScheme`; PQ-5 covers it (below).
 
    | Evidence | Offending signatures (the misconduct itself) | Signatures it relies on besides |
    |---|---|---|
