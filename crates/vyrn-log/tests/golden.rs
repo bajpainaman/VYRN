@@ -22,6 +22,30 @@ use vyrn_types::{
     PacketFlags, PacketRecord, PktHash, RouteRecord, SessionId, StepFlags, StepId, StepKind,
 };
 
+#[path = "../../engine/vyrn-lane/tests/json/mod.rs"]
+mod json;
+
+/// The JSON form (`vyrn_log_vectors.json`, README "JSON form") read through the shared reader
+/// carries the `.out` entries exactly (`rec.len` as an integer `value`), so every check here
+/// holds for it too.
+#[test]
+fn the_json_form_is_the_out_form() {
+    let doc = json::load(env!("CARGO_MANIFEST_DIR"), "vyrn_log_vectors.json");
+    let entries = doc.arr("entries");
+    let got: BTreeMap<String, String> = entries
+        .iter()
+        .map(|e| {
+            let v = match e.get("hex") {
+                Some(_) => e.s("hex").to_owned(),
+                None => e.n("value").to_string(),
+            };
+            (e.s("name").to_owned(), v)
+        })
+        .collect();
+    assert_eq!(got.len(), entries.len(), "no name twice");
+    assert_eq!(got, golden());
+}
+
 fn golden() -> BTreeMap<String, String> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),

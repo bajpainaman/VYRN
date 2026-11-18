@@ -44,7 +44,7 @@ so an implementation in another language (Vx, for one) needs no parser for the t
 diffs both forms, and `crates/vyrn-sim/tests/golden_json.rs` reads the proto, reject and session
 JSON and checks it against `vyrn-wire` and `vyrn-lane`; `crates/vyrn-data/tests/golden.rs` and
 `bin/vyrn-admin/tests/admin_vectors.rs` check that the data and admin JSON carry their `.out` vectors
-exactly:
+exactly, and `crates/vyrn-log/tests/golden.rs` and `nack_vectors.rs` the log and nack JSON:
 
 ```sh
 for v in proto log session data admin reject nack; do

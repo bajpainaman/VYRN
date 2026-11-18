@@ -14,6 +14,26 @@ fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
+#[path = "../../engine/vyrn-lane/tests/json/mod.rs"]
+mod json;
+
+/// The JSON form (`vyrn_nack_vectors.json`, README "JSON form") read through the shared reader
+/// carries the `.out` vectors exactly, so every check here holds for it too.
+#[test]
+fn the_json_form_is_the_out_form() {
+    let doc = json::load(env!("CARGO_MANIFEST_DIR"), "vyrn_nack_vectors.json");
+    let got: Vec<String> = doc
+        .arr("vectors")
+        .iter()
+        .map(|v| {
+            let f = ["id", "message", "verdict", "hex"].map(|k| v.s(k));
+            f.join(" ")
+        })
+        .collect();
+    let want: Vec<&str> = OUT.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(got, want);
+}
+
 #[test]
 fn nack_vectors() {
     let mut seen = 0;
