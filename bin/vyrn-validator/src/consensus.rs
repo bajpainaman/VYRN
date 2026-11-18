@@ -239,30 +239,44 @@ fn sock(a: Addr) -> SocketAddr {
     }
 }
 
+/// The roster `s` names, checked against its `roster_hash` (08 §9.6), and the home it serves.
+fn membership(
+    s: &Section,
+    epoch: Epoch,
+) -> Result<(vyrn_epoch::Membership, vyrn_epoch::Roster, HomeCode, Domain), String> {
+    let bytes = roster_bytes(&s.roster)?;
+    let home = home_code(&s.home)?;
+    let n = u8::try_from(Mode::Base.n()).unwrap_or(u8::MAX);
+    let cfg = EpoConfig {
+        epoch,
+        home,
+        t_start: Nanos(0),
+        roster_hash: Hash(hex32(&s.roster_hash)?),
+        seq_order: s.seq_order.unwrap_or([n, n + 1]),
+        lane_map_hash: [Hash([0; 32]); 3],
+        n_lanes: [0; 3],
+        version: 0,
+        endpoint_hash: Hash([0; 32]),
+        flags: 0,
+        sig_scheme: 0,
+    };
+    let domain = Domain {
+        genesis_hash: Hash(hex32(&s.genesis_hash)?),
+        mode: Mode::Base,
+    };
+    let (membership, roster) = vyrn_epoch::Membership::from_roster(&cfg, &bytes, &domain, None)
+        .map_err(|e| format!("config consensus.roster: {e}"))?;
+    Ok((membership, roster, home, domain))
+}
+
+/// The committee whose certificates an observer accepts.
+pub fn committee(s: &Section, epoch: Epoch) -> Result<Committee, String> {
+    Ok(membership(s, epoch)?.0.committee().clone())
+}
+
 impl Plan {
     pub fn new(s: &Section, epoch: Epoch, vote: &str, node: Option<&str>) -> Result<Self, String> {
-        let bytes = roster_bytes(&s.roster)?;
-        let home = home_code(&s.home)?;
-        let n = u8::try_from(Mode::Base.n()).unwrap_or(u8::MAX);
-        let cfg = EpoConfig {
-            epoch,
-            home,
-            t_start: Nanos(0),
-            roster_hash: Hash(hex32(&s.roster_hash)?),
-            seq_order: s.seq_order.unwrap_or([n, n + 1]),
-            lane_map_hash: [Hash([0; 32]); 3],
-            n_lanes: [0; 3],
-            version: 0,
-            endpoint_hash: Hash([0; 32]),
-            flags: 0,
-            sig_scheme: 0,
-        };
-        let domain = Domain {
-            genesis_hash: Hash(hex32(&s.genesis_hash)?),
-            mode: Mode::Base,
-        };
-        let (membership, roster) = vyrn_epoch::Membership::from_roster(&cfg, &bytes, &domain, None)
-            .map_err(|e| format!("config consensus.roster: {e}"))?;
+        let (membership, roster, home, domain) = membership(s, epoch)?;
         let peers = roster
             .home(home)
             .voters
@@ -371,6 +385,50 @@ impl Plan {
     pub fn repl_addr(&self) -> SocketAddr {
         self.peers[self.me].repl_addr
     }
+}
+
+/// An observer's finality (03 §4.5: it runs no votes): binds `ctrl`, which the validators list
+/// in their `[consensus] observers`, and takes their finalize votes and certificates through a
+/// `vyrn_consensus::Listener`, as the sequencer does. Each time the final height moves it
+/// prints `FINAL height=<h> from=<votes|cert>`, marks it in `source` (the data join's
+/// retention) and sends the certified tip, `(last_height, last_hash)`, to `certs`: the order
+/// thread marks its own replayed blocks final only when their header hash is that tip's.
+/// Returns the datagrams refused.
+pub fn observe(
+    committee: Committee,
+    epoch: Epoch,
+    sock: &UdpSocket,
+    source: &Source,
+    certs: &std::sync::mpsc::Sender<(Height, Hash)>,
+    stop: &AtomicBool,
+) -> u64 {
+    let mut l = vyrn_consensus::Listener::new(committee, epoch, Height(0));
+    let mut buf = [0u8; 9216];
+    let mut refused = 0;
+    while !stop.load(Ordering::Acquire) {
+        let Ok((n, _)) = sock.recv_from(&mut buf) else {
+            continue;
+        };
+        let before = l.final_height();
+        let from = match ctrl::decode(buf.get(..n).unwrap_or(&[])) {
+            Ok(ctrl::Ctrl::Vote(v)) => l.on_vote(&v).map(|c| c.map(|c| (c.proposal, "votes"))),
+            Ok(ctrl::Ctrl::Cert(c)) => l.on_cert(&c).map(|()| Some((c.proposal, "cert"))),
+            Err(_) => {
+                refused += 1;
+                continue;
+            }
+        };
+        match from {
+            Ok(Some((p, from))) if l.final_height() > before => {
+                source.finalized(l.final_height());
+                let _ = certs.send((p.last_height, p.last_hash));
+                println!("FINAL height={} from={from}", l.final_height().0);
+            }
+            Ok(_) => {}
+            Err(_) => refused += 1,
+        }
+    }
+    refused
 }
 
 /// Runs the voter until `stop`: waits for the genesis header, then Simplex. Prints

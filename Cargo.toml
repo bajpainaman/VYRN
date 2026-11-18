@@ -29,6 +29,7 @@ vyrn-data = { path = "crates/vyrn-data" }
 vyrn-consensus = { path = "crates/vyrn-consensus" }
 vyrn-epoch = { path = "crates/vyrn-epoch" }
 vyrn-replica = { path = "crates/vyrn-replica" }
+vyrn-md = { path = "crates/vyrn-md" }
 vyrn-chain = { path = "crates/vyrn-chain" }
 # Test-only (§1.4): tools/sim-swarm drives it.
 vyrn-sim = { path = "crates/vyrn-sim" }

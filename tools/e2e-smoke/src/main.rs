@@ -4,8 +4,8 @@
 //!
 //! **Invocation.** `e2e-smoke [--bin-dir DIR] [--validators K] [--packets P] [--rate R]
 //! [--seed S] [--wait-s T] [--seq-cpus L] [--validator-cpus L] [--strict-hashlag] [--finality]
-//! [--data]`. `DIR` holds `vyrn-seq`, `vyrn-validator` and (with `--data`) `vyrn-data`
-//! (default: this binary's directory). Exit 0 when every enabled check passes, 1 when one fails,
+//! [--data] [--dropcopy]`. `DIR` holds `vyrn-seq`, `vyrn-validator`, (with `--data`) `vyrn-data` and (with
+//! `--dropcopy`) `vyrn-dropcopy` (default: this binary's directory). Exit 0 when every enabled check passes, 1 when one fails,
 //! 2 when the run could not start. Every wait has a deadline of `T` seconds (default 30): the
 //! harness never blocks on a child, a socket or a pipe without one, and kills every child it
 //! started on any exit path.
@@ -31,6 +31,7 @@
 //! | `replay` | the tap's `OrderCore` readies the same blocks, holding every packet sent exactly once, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box |
 //! | `replica-out` | with `--data` every validator replays (`[replay]`) and its `out=<hex>` on each `BLOCK` line equals the tap's output hash of that block; one stopped at `REP_E_HASHLAG` is compared on the blocks it printed (R5); SKIP while no validator replays |
 //! | `finality` | with `--finality` (default 4 validators, a DEV roster as in `bin/vyrn-validator/tests/committee.rs`, `[consensus]` in every validator and the box): while the box still runs, the box's listener (`FINAL height=<h> ... from=<votes\|cert>`) and every validator that did not stop print `FINAL` through the box's last block. A validator's `OUT_OF_ORDER`, `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT` line fails `validators`; `REP_E_HASHLAG` follows R5 and R6. SKIP without it |
+//! | `dropcopy` | with `--dropcopy` (needs `--data` and `--finality`): an observer (`vyrn-validator`, `role = "observer"`, data destination `n + 1`, in the box's order list and every validator's `[consensus] observers`) replays every block into its output ring and finalizes from the validators' certificates; `vyrn-dropcopy` serves the ring over Noise, and one client per session logs in to its account's stream. Each stream's served records, without stage markers, equal an in-process `DropCopy` over the tap's `RustReplay` byte for byte, with gapless seqs, and end in a `DC_FINAL`; every record with a `resp_seq` (acks, cancels, outs, taker fills) names a response packet the client received (10 §8.3). It prints a DEV timing of those records after their response packets (R9); SKIP without it |
 //! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed reports no gap or rejected frame, and that join is the one `replay` reads; SKIP without `--data` |
 //!
 //! **Readings** (the spec does not settle these; PR body):
@@ -82,6 +83,15 @@
 //!   keep the box's two polling threads off the validators' cores. Without them all validators
 //!   can stop at one height when the box is preempted between an ORDER frame and its HASH frame.
 //!
+//! - R9. `--dropcopy`'s timing is the receive time of a drop-copy record at its client minus
+//!   the receive time of the response packet that carried the same client record (its
+//!   `(session, resp_seq)`), both on this host's monotonic clock: REQ-LAT-12's "record after the
+//!   `Fill`", over every record that names a response, since `WL-SMOKE-NOCROSS` has no fills.
+//!   `WL-SMOKE` (crossing) stops the observer's ring at `SinkStream`'s `Unsupported` cases
+//!   (10 §7.9: dependency TX packets), so `--dropcopy` gates CI on `WL-SMOKE-NOCROSS`. REQ-LAT-12 budgets p99 ≤ 50 µs on REF; this build's observer replays per
+//!   block, after the block closes and its payloads arrive, so the number is bounded below by the
+//!   block interval. It is a DEV number on a shared machine, printed as one, not a latency result.
+//!
 //! **Post-only.** A post-only `New` that crosses the lane's snapshot is forwarded, and the BBO
 //! core decides it against the true book (03 ARC-D6), so `wl-smoke.toml`, which sends them,
 //! replays byte for byte and gates CI alongside `wl-smoke-nocross.toml`.
@@ -90,7 +100,8 @@
 //! `REP_HASHLAG_MAX_NS` (1 ms) on ORDER frames often enough to raise `REP_E_HASHLAG` in most
 //! runs (R5).
 //!
-//! DEV timings on shared machines are not latency results; the harness prints none.
+//! DEV timings on shared machines are not latency results; the harness prints only R9's, labeled
+//! DEV.
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -104,6 +115,10 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use vyrn_md::dropcopy::{DcConfig, DcRecord, DropCopy, StreamId};
+use vyrn_md::{Channel, PacketSink, SinkStream};
+
+mod dropcopy;
 use vyrn_bbo::{Bbo, Phase, Record, TxEntry};
 use vyrn_bench::config::{Config as WlConfig, Mode};
 use vyrn_bench::generator::{GenOptions, Generator, session_keys};
@@ -186,6 +201,10 @@ struct Cli {
     /// its sealed fetches must be served (R7; needs --data and --finality).
     #[arg(long)]
     keyed: bool,
+    /// Add an observer replica and vyrn-dropcopy, and check the drop copy end to end (needs
+    /// --data and --finality).
+    #[arg(long)]
+    dropcopy: bool,
 }
 
 fn main() -> ExitCode {
@@ -458,6 +477,42 @@ impl Sink for Collect {
     }
 }
 
+/// `MBO` packets the harness does not read.
+struct NoPackets;
+
+impl PacketSink for NoPackets {
+    fn emit(&mut self, _: Channel, _: &[u8]) {}
+}
+
+type DcRecs = Vec<(StreamId, u64, DcRecord)>;
+
+/// The tap's sink: the responses (R1) and, with `--dropcopy`, an in-process drop copy over
+/// `vyrn-md`'s `SinkStream`, as the observer's ring carries it.
+struct TapSink {
+    resp: Collect,
+    dc: Option<SinkStream<NoPackets, DropCopy<DcRecs>>>,
+}
+
+impl Sink for TapSink {
+    fn record(&mut self, r: &Rec<'_>) {
+        if let Some(d) = &mut self.dc {
+            d.record(r);
+        }
+    }
+    fn lane_resp(&mut self, l: LaneId, p: &RespPkt) {
+        self.resp.lane_resp(l, p);
+        if let Some(d) = &mut self.dc {
+            d.lane_resp(l, p);
+        }
+    }
+    fn tx(&mut self, h: &TxEntry, recs: &[Record]) {
+        self.resp.tx(h, recs);
+        if let Some(d) = &mut self.dc {
+            d.tx(h, recs);
+        }
+    }
+}
+
 /// The order frames the tap received, until `stop`.
 fn tap(sock: UdpSocket, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<Vec<Vec<u8>>> {
     std::thread::spawn(move || {
@@ -500,14 +555,17 @@ fn relay(
     Ok((addr, h))
 }
 
-/// The responses the client received, until `stop`, unchecked.
-fn client(sock: UdpSocket, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<Vec<Vec<u8>>> {
+/// The responses the client received, with their receive times, until `stop`, unchecked.
+fn client(
+    sock: UdpSocket,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Vec<(Instant, Vec<u8>)>> {
     std::thread::spawn(move || {
         let mut got = Vec::new();
         let mut buf = [0u8; 4096];
         while !stop.load(Ordering::Acquire) {
             if let Ok(k) = sock.recv(&mut buf) {
-                got.push(buf.get(..k).unwrap_or_default().to_vec());
+                got.push((Instant::now(), buf.get(..k).unwrap_or_default().to_vec()));
             }
         }
         got
@@ -519,7 +577,8 @@ fn replay_all(
     sessions: &[Sess],
     data: DataJoin,
     blocks: &[BlockInputs<LANES>],
-) -> Result<(Vec<Hash>, Vec<Resp>), String> {
+    dc: Option<&DcConfig>,
+) -> Result<(Vec<Hash>, Vec<Resp>, DcRecs), String> {
     let n = u8::try_from(LANES).map_err(|e| e.to_string())?;
     let (tick_min, tick_max) = (Tick(TICK_MIN), Tick(TICK_MAX));
     let book = BookId(BOOK);
@@ -585,13 +644,28 @@ fn replay_all(
             return Err(format!("session {:?} did not open", s.id));
         }
     }
-    let mut rep = RustReplay::new(engine, data, NoResponses, Collect::default());
+    let sink = TapSink {
+        resp: Collect::default(),
+        dc: dc.map(|c| {
+            SinkStream::with_tap(
+                book,
+                Epoch(0),
+                LANES,
+                NoPackets,
+                DropCopy::new(c, Vec::new()),
+            )
+        }),
+    };
+    let mut rep = RustReplay::new(engine, data, NoResponses, sink);
     let mut hashes = Vec::new();
     for b in blocks {
         let h = b.header.height.0;
         rep.payloads_mut()
             .check(b)
             .map_err(|e| format!("height {h}: data join: {e:?}"))?;
+        if let (p, TapSink { dc: Some(d), .. }) = rep.payloads_and_sink() {
+            d.prepare(b, p);
+        }
         let out = rep.replay_block(b).map_err(|e| {
             let steps: Vec<String> = b
                 .steps
@@ -613,7 +687,18 @@ fn replay_all(
         rep.release(b.header.height);
     }
     rep.finish().map_err(|e| e.0)?;
-    Ok((hashes, rep.into_sink().0))
+    let sink = rep.into_sink();
+    let recs = match sink.dc {
+        Some(d) => {
+            let (_, dc) = d
+                .finish_tap()
+                .map_err(|e| format!("in-process drop copy: {e:?}"))?;
+            dc.into_out()
+                .map_err(|e| format!("in-process drop copy: {e:?}"))?
+        }
+        None => Vec::new(),
+    };
+    Ok((hashes, sink.resp.0, recs))
 }
 
 // ----- the run -----
@@ -740,6 +825,7 @@ fn data_ports(n: usize) -> Result<Vec<u16>, String> {
 /// the tap is 0), the other validators as `[[data.peer]]` (voter `j`, data port) and the box's `[repair]` port as
 /// `seq_repair` (07 §5.5 sources 2 and 3), and `[replay]` with the sequencer's engine and
 /// sessions, so it prints `out=` per block.
+#[allow(clippy::too_many_arguments)] // one flag per harness mode
 fn validator_config(
     dir: &Path,
     i: usize,
@@ -748,6 +834,7 @@ fn validator_config(
     cons: Option<&Cons>,
     hashlag_us: Option<u64>,
     keyed: bool,
+    observer: Option<(&Path, SocketAddrV4)>,
 ) -> Result<PathBuf, String> {
     let key = hex(&vyrn_crypto::ed25519::public_key(&SEQ_SEED));
     let data_port = data.and_then(|(_, ps, _)| ps.get(i).copied()).unwrap_or(0);
@@ -757,6 +844,11 @@ fn validator_config(
     } else {
         format!("dev:validator-{i}")
     };
+    let role = if observer.is_some() {
+        "observer"
+    } else {
+        "validator"
+    };
     let dev = if hashlag_us.is_some() {
         "dev = true\n"
     } else {
@@ -765,7 +857,7 @@ fn validator_config(
     let mut s = format!(
         r#"{dev}schema = 1
 protocol = 1
-role = "validator"
+role = "{role}"
 mode = "BASE"
 book = {BOOK}
 epoch = 0
@@ -779,11 +871,15 @@ data_port = {data_port}
 
 [membership]
 seq_keys = ["{key}"]
-
-[keys]
-vote = "{vote}"
 "#
     );
+    match observer {
+        Some((ring, ctrl)) => s.push_str(&format!(
+            "\n[observer]\nring = \"{}\"\nring_cap = 16777216\nctrl = \"{ctrl}\"\n",
+            ring.display()
+        )),
+        None => s.push_str(&format!("\n[keys]\nvote = \"{vote}\"\n")),
+    }
     if let Some((fetch, ports, repair)) = data {
         let peers = ports
             .iter()
@@ -814,12 +910,17 @@ vote = "{vote}"
         }
     }
     if let Some(c) = cons {
+        // Finalize votes and certificates go to the box and, with --dropcopy, the observer.
+        let observers = std::iter::once(c.ctrl)
+            .chain(c.obs)
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         s.push_str(&format!(
-            "\n[consensus]\nroster = \"{}\"\nroster_hash = \"{}\"\ngenesis_hash = \"{}\"\nhome = \"LDN\"\nobservers = [\"{}\"]\ndelta_ms = 500\n",
+            "\n[consensus]\nroster = \"{}\"\nroster_hash = \"{}\"\ngenesis_hash = \"{}\"\nhome = \"LDN\"\nobservers = [{observers}]\ndelta_ms = 500\n",
             c.roster.display(),
             c.roster_hash,
             hex(&[0; 32]),
-            c.ctrl
         ));
     }
     let p = dir.join(format!("validator-{i}.toml"));
@@ -900,6 +1001,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
     if cli.keyed && !(cli.data && cli.finality) {
         return Err("--keyed needs --data and --finality: K_fetch comes from the roster".into());
     }
+    if cli.dropcopy && !(cli.data && cli.finality) {
+        return Err(
+            "--dropcopy needs --data and --finality: the observer replays and finalizes".into(),
+        );
+    }
     let wait = Duration::from_secs(cli.wait_s);
     let bin_dir = match &cli.bin_dir {
         Some(d) => d.clone(),
@@ -929,7 +1035,10 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // With --finality also each validator's TCP repl port and the box's CTRL port, from the
     // same range in one pick, so no two picks overlap.
     // With --data also the box's `[repair]` port (07 §5.5 source 3), last of the data picks.
-    let want = if cli.data { n_val + 1 } else { 0 } + if cli.finality { n_val + 1 } else { 0 };
+    // With --dropcopy also the observer's data and CTRL ports and vyrn-dropcopy's TCP port.
+    let want = if cli.data { n_val + 1 } else { 0 }
+        + if cli.finality { n_val + 1 } else { 0 }
+        + if cli.dropcopy { 3 } else { 0 };
     let mut picked = data_ports(want)?;
     let val_data: Vec<u16> = if cli.data {
         picked.drain(..n_val).collect()
@@ -941,11 +1050,22 @@ fn run(cli: &Cli) -> Result<bool, String> {
     } else {
         None
     };
+    let dc_ports: Vec<u16> = if cli.dropcopy {
+        picked.drain(..3).collect()
+    } else {
+        Vec::new()
+    };
+    let lo = |p: u16| SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, p);
+    let obs_ctrl = dc_ports.get(1).map(|p| lo(*p));
     let cons = if cli.finality {
-        Some(Cons::new(&dir, &picked, cli.keyed)?)
+        let mut c = Cons::new(&dir, &picked, cli.keyed)?;
+        c.obs = obs_ctrl;
+        Some(c)
     } else {
         None
     };
+    let dc_cfg = cli.dropcopy.then(|| dropcopy::dc_config(&sessions));
+    let ring = dir.join("dc.ring");
     // --data: a vyrn-data node takes copy 2 from the client and fans DATA frames out to the
     // tap's data socket and every validator's data port (07 §5.1, §5.2). It starts first, so
     // the validators' configs can name its fetch address; their data ports are picked here.
@@ -963,6 +1083,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
             *d = addr.to_string();
             relay_h = Some(h);
         }
+        // The observer is the last destination (its `[data] me`).
+        dests.extend(dc_ports.first().map(|p| format!("127.0.0.1:{p}")));
         let keyed = cons.as_ref().filter(|_| cli.keyed);
         let cfg = data_config(&dir, &dests, &sessions, keyed)?;
         let mut c = command(&bin_dir.join("vyrn-data"), cli.seq_cpus.as_deref());
@@ -1010,6 +1132,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 cons.as_ref(),
                 cli.dev_hashlag_us,
                 keyed,
+                None,
             )?;
             let mut c = command(
                 &bin_dir.join("vyrn-validator"),
@@ -1023,15 +1146,50 @@ fn run(cli: &Cli) -> Result<bool, String> {
             nodes.spawn(&format!("validator-{i}"), &mut c, &tx)
         })
         .collect::<Result<_, String>>()?;
+    // --dropcopy: the observer, data destination `n_val + 1`, in the box's order list too.
+    let obs = match (&data_node, dc_ports.first(), obs_ctrl) {
+        (Some((_, _, fetch, _)), Some(port), Some(ctrl)) => {
+            // Its data port is `ports[n_val]`; the validators are its `[[data.peer]]`s.
+            let ports: Vec<u16> = val_data.iter().copied().chain([*port]).collect();
+            let cfg = validator_config(
+                &dir,
+                n_val,
+                Some((*fetch, &ports[..], seq_repair.ok_or("seq_repair")?)),
+                &sessions,
+                cons.as_ref(),
+                cli.dev_hashlag_us,
+                false,
+                Some((&ring, ctrl)),
+            )?;
+            let mut c = command(
+                &bin_dir.join("vyrn-validator"),
+                cli.validator_cpus.as_deref(),
+            );
+            c.arg("--config").arg(cfg).arg("--stop-on-stdin-eof");
+            Some(nodes.spawn("observer", &mut c, &tx)?)
+        }
+        _ => None,
+    };
+    let dc_addr = dc_ports.get(2).map(|p| lo(*p));
+    if let Some(addr) = dc_addr {
+        let cfg = dropcopy::server_config(&dir, addr, &sessions)?;
+        let mut c = command(
+            &bin_dir.join("vyrn-dropcopy"),
+            cli.validator_cpus.as_deref(),
+        );
+        c.arg("--config").arg(cfg).arg("--ring").arg(&ring);
+        nodes.spawn("vyrn-dropcopy", &mut c, &tx)?;
+    }
     let deadline = Instant::now() + wait;
     nodes.wait(&rx, deadline, "validators READY", |ns| {
-        vals.iter().all(|&i| {
+        vals.iter().chain(&obs).all(|&i| {
             ns.get(i)
                 .is_some_and(|n| line(n, "READY vyrn-validator order=").is_some())
         })
     })?;
     let mut order: Vec<String> = vals
         .iter()
+        .chain(&obs)
         .filter_map(|&i| {
             nodes
                 .0
@@ -1082,6 +1240,12 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let tap_h = tap(tap_sock, Arc::clone(&stop_tap));
     let stop_cl = Arc::new(AtomicBool::new(false));
     let cl_h = client(cl_recv, Arc::clone(&stop_cl));
+    let stop_dc = Arc::new(AtomicBool::new(false));
+    let dc_clients: Vec<_> = dc_addr.map_or_else(Vec::new, |addr| {
+        (0..sessions.len())
+            .map(|i| dropcopy::client(addr, i, Arc::clone(&stop_dc), Instant::now() + wait))
+            .collect()
+    });
     let (data_idx, data_ingest, data_h) = match data_node {
         Some((i, ingest, _, h)) => (Some(i), Some(ingest), Some(h)),
         None => (None, None, None),
@@ -1176,6 +1340,53 @@ fn run(cli: &Cli) -> Result<bool, String> {
     } else {
         Ok(())
     };
+    // --dropcopy: the observer replays and finalizes through the last block, then every
+    // client stream ends in a DC_FINAL (10 §8.4 item 7); only then does it stop.
+    let obs_wait = match obs {
+        Some(o) => {
+            let r = nodes.wait(
+                &rx,
+                Instant::now() + wait,
+                "observer FINAL through the last block",
+                |ns| {
+                    ns.get(o).is_some_and(|n| {
+                        stopped(n).is_some()
+                            || (blocks(n).last().map(|b| b.0.0) >= top
+                                && finals(n).last().copied() >= top)
+                    })
+                },
+            );
+            let ok = nodes.stop(o, &rx, Instant::now() + wait).unwrap_or(false);
+            // The ring is complete once the observer stops; give vyrn-dropcopy time to apply
+            // it, then wait for every stream to drain (`dropcopy::settled`).
+            let since = Instant::now() + Duration::from_millis(300);
+            let got: Vec<dropcopy::Got> = dc_clients.iter().map(|c| Arc::clone(&c.0)).collect();
+            let until = Instant::now() + wait;
+            while r.is_ok() && !dropcopy::settled(&got, since) && Instant::now() < until {
+                std::thread::park_timeout(Duration::from_millis(20));
+            }
+            let r = r.and_then(|()| {
+                if dropcopy::settled(&got, since) {
+                    Ok(())
+                } else {
+                    Err("drain timeout: a drop-copy stream did not report every record read".into())
+                }
+            });
+            Some(r.map(|()| ok))
+        }
+        None => None,
+    };
+    stop_dc.store(true, Ordering::Release);
+    let mut dc_got = Vec::new();
+    let mut dc_errs = Vec::new();
+    for (g, h) in dc_clients {
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => dc_errs.push(e),
+            Err(_) => dc_errs.push("drop-copy client panicked".into()),
+        }
+        dc_got.push(g);
+    }
     let mut val_ok = Vec::new();
     for &i in &vals {
         val_ok.push(nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
@@ -1320,6 +1531,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
 
     // The tap: order core, data join, replay.
     let mut out_hashes: Vec<Hash> = Vec::new();
+    let mut dc_inproc = Vec::new();
+    let mut resp_times = Vec::new();
     rep.check(
         "replay",
         (|| {
@@ -1376,10 +1589,16 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     sent.len()
                 ));
             }
-            let (hashes, mut replayed) = replay_all(&sessions, std::mem::take(&mut join), &ready)?;
+            let (hashes, mut replayed, recs) = replay_all(
+                &sessions,
+                std::mem::take(&mut join),
+                &ready,
+                dc_cfg.as_ref(),
+            )?;
             out_hashes = hashes;
+            dc_inproc = recs;
             let mut live: Vec<Resp> = Vec::new();
-            for g in &got {
+            for (t, g) in &got {
                 let r = Response::parse(g).map_err(|e| format!("response: {e:?}"))?;
                 let h = r.header();
                 let s = sessions
@@ -1395,6 +1614,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     h.echo_pkt.get(),
                     r.raw_records().to_vec(),
                 ));
+                resp_times.push((*t, h.session.get(), h.resp_seq.get()));
             }
             live.sort();
             replayed.sort();
@@ -1579,6 +1799,19 @@ fn run(cli: &Cli) -> Result<bool, String> {
     } else {
         Report::skip("finality", "off (enable with --finality)");
     }
+    match (obs, obs_wait) {
+        (Some(o), Some(w)) => rep.check("dropcopy", {
+            let n = nodes.0.get(o).ok_or("observer")?;
+            match (w, stopped(n)) {
+                (_, Some(f)) => Err(format!("observer: {f}")),
+                (Err(e), None) => Err(e),
+                (Ok(false), None) => Err("observer did not stop cleanly".into()),
+                (Ok(true), None) if !dc_errs.is_empty() => Err(dc_errs.join("; ")),
+                (Ok(true), None) => dropcopy::check(&dc_got, &resp_times, &dc_inproc),
+            }
+        }),
+        _ => Report::skip("dropcopy", "off (enable with --dropcopy)"),
+    }
     match (data_idx, data_ok) {
         (Some(i), Some(ok)) => rep.check("data", {
             let n = nodes.0.get(i).ok_or("data node")?;
@@ -1641,12 +1874,13 @@ fn run(cli: &Cli) -> Result<bool, String> {
 /// The line that stopped or stalled a validator: a sequencer `FAULT`, `OUT_OF_ORDER` (a stall
 /// with no repair), `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT`.
 fn stopped(n: &Node) -> Option<&str> {
-    const STOP: [&str; 5] = [
+    const STOP: [&str; 6] = [
         "FAULT ",
         "OUT_OF_ORDER ",
         "VOTER_FAULT ",
         "DATA_FAULT ",
         "REPLAY_FAULT ",
+        "FINALITY_FAULT ",
     ];
     n.lines
         .iter()
@@ -1668,6 +1902,8 @@ struct Cons {
     roster: PathBuf,
     roster_hash: String,
     ctrl: SocketAddrV4,
+    /// --dropcopy: the observer's CTRL address.
+    obs: Option<SocketAddrV4>,
 }
 
 impl Cons {
@@ -1769,6 +2005,7 @@ impl Cons {
                 std::net::Ipv4Addr::LOCALHOST,
                 *ctrl.first().ok_or("ctrl port")?,
             ),
+            obs: None,
         })
     }
 }
