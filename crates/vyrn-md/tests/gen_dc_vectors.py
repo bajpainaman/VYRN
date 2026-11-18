@@ -149,6 +149,7 @@ class Model:
         self.released = 0
         self.finals = []
         self.final_step = 0
+        self.last_final = None
         self.allocs = []
         self.run = None
         # State after each released step, for a revert (an independent stand-in for the undo log).
@@ -251,6 +252,9 @@ class Model:
     def alloc(self, step, acct, asset, debit, amount):
         self.allocs.append((step, acct, asset, debit, amount))
         self.flush_allocs(self.released)
+        # After its block's DC_FINAL went out, an allocation gets that DC_FINAL again.
+        if self.last_final is not None:
+            self.final_to(*self.last_final)
 
     def flush_allocs(self, upto):
         while self.allocs and self.allocs[0][0] <= upto:
@@ -358,19 +362,24 @@ class Model:
         while self.finals and (all_ or self.finals[0][1] <= self.released):
             h, s = self.finals.pop(0)
             self.final_step = max(self.final_step, s)
-            # DC_FINAL(s) to every stream with a record released at a step <= s that no
-            # earlier DC_FINAL covers; those records become canonical.
-            for sid in sorted(self.streams):
-                p = self.streams[sid]["pend"]
-                if p and p[0][0] <= s:
-                    self.commit(sid, s)
-                    self.push(sid, stage(FINAL, sid[0], s, h))
+            self.last_final = (h, s)
+            self.final_to(h, s)
+
+    def final_to(self, h, s):
+        # DC_FINAL(s) to every stream with a record released at a step <= s that no
+        # earlier DC_FINAL covers; those records become canonical.
+        for sid in sorted(self.streams):
+            p = self.streams[sid]["pend"]
+            if p and p[0][0] <= s:
+                self.commit(sid, s)
+                self.push(sid, stage(FINAL, sid[0], s, h))
 
     def finish(self, bal):
         self.flush_allocs(2**64)
         self.flush(True)
         for sid in sorted(self.streams):
             self.commit(sid, 2**64)
+        self.final_step = max(self.final_step, self.released)
         self.rel = self.released
         for sid in sorted(self.streams):
             acct, master = sid
@@ -479,6 +488,28 @@ REVERT_CASE = [
     ("step", 3, "idle", 0, None, []),
     ("final", 2, 2),
 ]
+# A speculative step 2 removes 101's maker by STP and is reverted; the final log's step 2 fills
+# it. Block 2's DC_FINAL goes out at step 3, before step 3's allocation for 301, which then gets
+# it too. Step 4 is final only by the epoch's end and is settled after DC_EOD.
+STP_ALLOC_CASE = [
+    ("op", 0, 1, S01, 1, ("new", 1, 105, 5, 11), ("ack", 0, h(1), 105, 11)),
+    ("step", 1, "idle", 0, None, []),
+    ("final", 1, 1),
+    ("step", 2, "cross", CROSS, (0, 2, S01, ("new", 0, 105, 3, 12)), [
+        ((TAKER_ROLE, 0, S01, 2), ("ack", 0, h(2), 105, 12)),
+        ((MAKER, 0, S01, 0), ("out", 0, OUT_STP, h(1), 5, 11)),
+    ]),
+    ("revert", 1),
+    ("step", 2, "cross", CROSS, (1, 1, S11, ("new", 0, 105, 3, 31)), [
+        ((TAKER_ROLE, 1, S11, 1), ("fill", 0, 1, h(1), 105, 3)),
+        ((MAKER, 0, S01, 0), ("fill", 0xFF, 0, h(1), 105, 3)),
+    ]),
+    ("final", 2, 3),
+    ("step", 3, "idle", 0, None, []),
+    ("alloc", 3, 301, 1, False, 250),
+    ("op", 0, 2, S02, 1, ("new", 1, 110, 2, 21), ("ack", 0, h(2), 110, 21)),
+    ("step", 4, "idle", 0, None, []),
+]
 BAL = {101: (1000, 20, 7, 0), 102: (5, 0, 3, 1), 201: (77, 0, 0, 0)}
 
 
@@ -578,6 +609,7 @@ def main(out_dir):
     m1 = run_case(lines, "quiet", 10, [], {})
     run_case(lines, "late_final", 10, LATE_FINAL_CASE, {})
     run_case(lines, "revert_settle", 100, REVERT_CASE, BAL, post_settled=[(9, 2)])
+    run_case(lines, "stp_alloc", 100, STP_ALLOC_CASE, BAL, post_settled=[(3, 4)])
     # Sessions over a store of epoch 5 (case cross, ended) and epoch 6 (case quiet, open).
     E0, E1 = 5, 6
     seeds = {101: bytes([1]) * 32, 102: bytes([2]) * 32, 900: bytes([9]) * 32,

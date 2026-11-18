@@ -1722,11 +1722,14 @@ carries its label.
     `DC_ALLOC` right after its control step's other records: `step` = the control step,
     `ordinal` bit 0 the asset (base), bit 1 a debit, bytes 24–31 the amount credited or actually
     debited. No replay output carries the reply (the StepRecord does not carry the command,
-    §7.9 item 9), so the observer's shell hands it over as it hands over `CtlTimerTick`.
+    §7.9 item 9), so the observer's shell hands it over as it hands over `CtlTimerTick`. When
+    its block's `DC_FINAL` has already gone out (the block became final before the step was
+    released), the streams the `DC_ALLOC` went to get that `DC_FINAL` again, right after it.
     \[Guessing\]
 11. **`DC_SETTLED`.** `settled(height, s)`, `s` ≤ the newest final step, goes to every stream
     holding a canonical record released at a step ≤ `s` that no `DC_SETTLED` covers; layout as
-    `DC_FINAL`. It may follow the epoch's `DC_EOD`, since `BASE` settles on the ledger's credit of
+    `DC_FINAL`. The epoch's end makes every released step final, so `s` may be any of them after
+    `DC_EOD`. It may follow the epoch's `DC_EOD`, since `BASE` settles on the ledger's credit of
     the epoch statement (§8.2). \[Likely\]
 12. **`DC_ROUTE`.** An accepted `RouteMove` (§2.8) is a `DC_ROUTE` released like a lane op:
     `step` = its LaneSeq, `ordinal` = its message index, `session`, `resp_seq` of its `Routed`,

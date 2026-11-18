@@ -232,6 +232,8 @@ pub struct DropCopy<O: DcOut> {
     finals: VecDeque<(Height, StepId)>,
     /// The newest step a `DC_FINAL` covers: no revert reaches it.
     final_step: StepId,
+    /// The newest `DC_FINAL` sent, for an allocation of its block that comes after it.
+    last_final: Option<(Height, StepId)>,
     /// Allocations waiting for their control step's release.
     allocs: VecDeque<Alloc>,
     /// Order-state changes of steps no `DC_FINAL` covers yet, with their release steps.
@@ -314,6 +316,7 @@ impl<O: DcOut> DropCopy<O> {
             rel: 0,
             finals: VecDeque::new(),
             final_step: StepId(0),
+            last_final: None,
             allocs: VecDeque::new(),
             undo: VecDeque::new(),
             taker_acc: None,
@@ -362,7 +365,15 @@ impl<O: DcOut> DropCopy<O> {
             return self.fail(DcError::Final);
         }
         self.allocs.push_back(a);
-        if let Err(e) = self.flush_allocs(self.released) {
+        // An allocation of a step whose block's DC_FINAL went out already gets that DC_FINAL
+        // again in its streams, after it (10 §8.4 item 10).
+        let r = self
+            .flush_allocs(self.released)
+            .and_then(|()| match self.last_final {
+                Some((h, s)) => self.final_to(h, s),
+                None => Ok(()),
+            });
+        if let Err(e) = r {
             self.fail(e);
         }
     }
@@ -493,6 +504,8 @@ impl<O: DcOut> DropCopy<O> {
             self.commit_upto(*id, u64::MAX)?;
         }
         self.undo.clear();
+        // The epoch's end makes every released step final, so they can settle.
+        self.final_step = self.final_step.max(self.released);
         self.ended = true;
         // Each account's balance once, into its own stream and its master's (10 §8.4 item 6).
         let mut bal: BTreeMap<StreamId, Balances> = BTreeMap::new();
@@ -573,20 +586,28 @@ impl<O: DcOut> DropCopy<O> {
             }
             self.finals.pop_front();
             self.final_step = self.final_step.max(s);
+            self.last_final = Some((h, s));
             while self.undo.front().is_some_and(|(r, _)| *r <= s.0) {
                 self.undo.pop_front();
             }
-            let ids: Vec<StreamId> = self
-                .streams
-                .iter()
-                .filter(|(_, x)| x.pend.front().is_some_and(|(r, _)| *r <= s.0))
-                .map(|(k, _)| *k)
-                .collect();
-            for id in ids {
-                self.commit_upto(id, s.0)?;
-                let r = DcRecord::stage(DcType::Final, id.account, s, h);
-                self.push(id, &r);
-            }
+            self.final_to(h, s)?;
+        }
+        Ok(())
+    }
+
+    /// `DC_FINAL(s)` to every stream holding a record released at a step ≤ `s` that no
+    /// earlier `DC_FINAL` covers; those records become canonical.
+    fn final_to(&mut self, h: Height, s: StepId) -> Result<(), DcError> {
+        let ids: Vec<StreamId> = self
+            .streams
+            .iter()
+            .filter(|(_, x)| x.pend.front().is_some_and(|(r, _)| *r <= s.0))
+            .map(|(k, _)| *k)
+            .collect();
+        for id in ids {
+            self.commit_upto(id, s.0)?;
+            let r = DcRecord::stage(DcType::Final, id.account, s, h);
+            self.push(id, &r);
         }
         Ok(())
     }
@@ -949,10 +970,9 @@ impl<O: DcOut> DropCopy<O> {
                     qty,
                     client_tag,
                 } => {
-                    let m = self
-                        .orders
-                        .remove(&(h.lane.0, handle.0))
-                        .ok_or(DcError::Order)?;
+                    let mkey = (h.lane.0, handle.0);
+                    let m = *self.orders.get(&mkey).ok_or(DcError::Order)?;
+                    self.set_order(mkey, None);
                     if let Some(a) = m.account {
                         self.emit(&DcOrder {
                             kind: DcType::Out,
