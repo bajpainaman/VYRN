@@ -77,8 +77,8 @@ may give a meaning (VR1, VR2). It would then misread that version's traffic.
 `ok` frame is built from the field values in the comment above it, and a conforming
 implementation builds the same bytes and parses them back to those fields. A `refuse` frame has
 a nonzero reserved byte, an unknown `type`, or a `len` that does not match the body (04 §4.4);
-a receiver refuses it. The keys inside `A02` are test keys only. No code in this repository
-implements the admin channel yet, so only the CI diff checks these files.
+a receiver refuses it. The keys inside `A02` are test keys only. In this repository,
+`bin/vyrn-admin/tests/admin_vectors.rs` checks `vyrn_admin::codec` against them.
 
 **Crypto.** Each of `siphash.txt` and `ed25519-edge.txt` explains its columns in its header
 comment. `blake3_test_vectors.json` explains its format in its `_comment` field.
