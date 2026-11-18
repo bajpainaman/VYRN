@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use vyrn_nic::frame::Endpoint;
 use vyrn_types::SessionId;
 
 pub const WINDOW: u32 = 256;
@@ -22,6 +23,8 @@ pub enum Seen {
 struct Win {
     hi: u32,
     bits: [u64; 4],
+    /// The source of the newest copy marked with one (07 §5.7 step 3: the bound address).
+    src: Option<Endpoint>,
 }
 
 fn shift_up(bits: &mut [u64; 4], k: u32) {
@@ -84,6 +87,23 @@ impl Dedupe {
     /// allocates.
     pub fn mark(&mut self, session: SessionId, pkt_seq: u32) -> Seen {
         self.wins.entry(session).or_default().mark(pkt_seq)
+    }
+
+    /// [`Dedupe::mark`], also recording `src` as the session's address when `pkt_seq` is new.
+    /// A repeat or late copy never moves the address: replaying captured bytes from another
+    /// address must not steer the session's `DataRedirect` (07 §5.7). One lookup.
+    pub fn mark_from(&mut self, session: SessionId, pkt_seq: u32, src: Endpoint) -> Seen {
+        let w = self.wins.entry(session).or_default();
+        let seen = w.mark(pkt_seq);
+        if seen == Seen::New {
+            w.src = Some(src);
+        }
+        seen
+    }
+
+    /// The address of the newest copy marked with [`Dedupe::mark_from`].
+    pub fn source(&self, session: SessionId) -> Option<Endpoint> {
+        self.wins.get(&session).and_then(|w| w.src)
     }
 
     /// The highest `pkt_seq` seen of `session`.

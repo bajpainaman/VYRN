@@ -122,6 +122,7 @@ pub mod dedupe;
 pub mod frame;
 pub mod ingest;
 pub mod node;
+pub mod redirect;
 pub mod ring;
 
 pub use ingest::{DataHome, Event, HomeConfig, Ingested, Mode, Packet, Reject};

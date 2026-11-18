@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use vyrn_crypto::hash::hash;
+use vyrn_nic::frame::Endpoint;
 use vyrn_types::{BookId, Hash, MAX_REQ_PAYLOAD, Nanos, PktHash, SessionId};
 use vyrn_wire::Request;
 
@@ -135,10 +136,32 @@ impl DataHome {
         &self.ring
     }
 
+    /// The address of `session`'s newest copy whose MAC passed (07 §5.7 step 3).
+    pub fn source(&self, session: SessionId) -> Option<Endpoint> {
+        self.dedupe.source(session)
+    }
+
+    /// `session`'s MAC key (`K_seq` or `K_com`), which also tags its `DataRedirect`.
+    pub fn key(&self, session: SessionId) -> Option<&[u8; 16]> {
+        self.keys.get(&session)
+    }
+
     /// Runs 07 §5.2 steps 1–5 on one UDP payload. An event, if any, is written to `event`.
     pub fn ingest(
         &mut self,
         pkt: &[u8],
+        rx_ts: Nanos,
+        event: &mut Option<Event>,
+    ) -> Result<Ingested, Reject> {
+        self.ingest_from(pkt, None, rx_ts, event)
+    }
+
+    /// [`DataHome::ingest`] of a copy from `src`. Once the MAC passes, `src` becomes the
+    /// session's address ([`DataHome::source`]), where a `DataRedirect` goes (07 §5.7).
+    pub fn ingest_from(
+        &mut self,
+        pkt: &[u8],
+        src: Option<Endpoint>,
         rx_ts: Nanos,
         event: &mut Option<Event>,
     ) -> Result<Ingested, Reject> {
@@ -164,7 +187,11 @@ impl DataHome {
         }
         let full = hash(req.signed_bytes());
         let mut forward = true;
-        match self.dedupe.mark(session, pkt_seq) {
+        let seen = match src {
+            Some(a) => self.dedupe.mark_from(session, pkt_seq, a),
+            None => self.dedupe.mark(session, pkt_seq),
+        };
+        match seen {
             Seen::New => {}
             Seen::Late => return Err(Reject::Late),
             Seen::Repeat => {

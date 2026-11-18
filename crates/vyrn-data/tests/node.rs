@@ -11,6 +11,7 @@ use core::net::{Ipv4Addr, SocketAddrV4};
 use std::collections::BTreeMap;
 
 use vyrn_data::frame::{self, Fetch, Kind, key_seq};
+use vyrn_data::redirect::Redirect;
 use vyrn_data::{DataNode, Event, HomeConfig, Mode, NodeConfig};
 use vyrn_log::block::{order_root, sign_header};
 use vyrn_log::{Block, BlockKind, BlockStore, MemStore};
@@ -537,4 +538,35 @@ fn authenticated_fetches_and_the_per_source_rate_limit() {
     r.node.poll(Nanos(1_000_000));
     let k = *r.node.counters();
     assert_eq!((k.fetch_limited, k.fetch_miss), (2, 3));
+}
+
+/// 07 §5.7 step 3: a redirect goes to the address of the session's newest new copy, tagged
+/// under its key. A replay of those bytes from another address does not move it, and a session
+/// the box never heard from is counted, not sent.
+#[test]
+fn redirects_go_to_the_sessions_address_and_replays_do_not_move_it() {
+    let mut r = rig(MemStore::default());
+    let mut c = client_rx(&mut r);
+    let p1 = req(5, 1, &[Msg::Heartbeat], &K);
+    r.send(&p1, 0);
+    // The same bytes replayed from another address: a duplicate, so the address stays.
+    let f = wire(ep(8, 4000), r.me_ingest, &p1);
+    assert!(r.nic.inject(addr(r.me_ingest), &f, Nanos(0)));
+    r.node.poll(Nanos(0));
+    assert_eq!(r.node.counters().duplicate, 1);
+    r.node
+        .redirect(1, 3, &[(SessionId(5), 1), (SessionId(6), 1)]);
+    let got = drain_rx(&mut c);
+    assert_eq!(got.len(), 1, "one redirect, to the client's address");
+    assert_eq!(
+        Redirect::open(&got[0], &K).unwrap(),
+        Redirect {
+            down: 1,
+            to: 3,
+            session: SessionId(5),
+            resend_from: 1
+        }
+    );
+    let k = *r.node.counters();
+    assert_eq!((k.redirects, k.redirect_unknown), (1, 1));
 }
