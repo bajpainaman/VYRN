@@ -202,6 +202,10 @@ fn run(args: &Args) -> Result<(), String> {
     let store = Arc::new(RwLock::new(store));
     let wake = Arc::new(Wake::new());
     if let Some(ring) = args.ring.clone() {
+        // Fees and statement totals scale with it (10 §2.1: `tick_size` ≥ 1).
+        if cfg.tick_size == 0 {
+            return Err("config: --ring needs tick_size ≥ 1".into());
+        }
         let out = StoreOut {
             store: Arc::clone(&store),
             wake: Arc::clone(&wake),

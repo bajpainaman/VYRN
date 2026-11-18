@@ -430,14 +430,19 @@ pub struct RingTap {
 }
 
 impl RingTap {
-    /// Creates (or truncates) the ring at `path` with a data region of `cap` bytes.
+    /// Creates the ring at `path` with a data region of `cap` bytes, replacing any ring there.
+    /// The ring is built under `<path>.new` and renamed into place once its header is written,
+    /// so a reader never opens a half-made ring.
     pub fn create(path: &Path, cap: u64) -> Result<Self, RingError> {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".new");
+        let tmp = std::path::PathBuf::from(tmp);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path)
+            .open(&tmp)
             .map_err(io)?;
         file.set_len(RING_HEADER + cap).map_err(io)?;
         let mut h = [0u8; 32];
@@ -446,6 +451,7 @@ impl RingTap {
         h[24..32].copy_from_slice(&(!0u64).to_le_bytes());
         file.write_all_at(&h, 0).map_err(io)?;
         file.write_all_at(&pair(0), 32).map_err(io)?;
+        std::fs::rename(&tmp, path).map_err(io)?;
         Ok(Self {
             file,
             cap,

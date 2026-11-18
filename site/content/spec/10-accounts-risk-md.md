@@ -1799,7 +1799,9 @@ makes, byte for byte. That equality is tested against `RustReplay` at every spli
    observer's `SinkStream`) uses `pwrite`; the reader (`RingReader`) uses `pread`. 11 §3.2
    closes the `unsafe` list, so neither side maps it; tmpfs makes the page cache the shared
    memory. The writer never waits for a reader, so a reader crash or stall cannot stop replay
-   or voting. \[Guessing\]
+   or voting. The writer builds a new ring as `<path>.new` and renames it into place once its
+   header is written, so a reader that waits for the path never opens a half-made ring.
+   \[Guessing\]
 2. **Layout.** All fields little-endian. Header (64 bytes): magic `VYRNDCR1`, `cap` (u64),
    `head` (u64, bytes ever written), `!head`, `resv` (u64, `head` once the batch in flight lands),
    `!resv`. Data byte `i` is at `64 + i % cap`. A frame is a
