@@ -417,6 +417,7 @@ fn a_slow_login_is_cut_off_at_the_deadline() {
         Session::new(BOOK, [0; 32]),
         &Keys::new(),
         &store,
+        &vyrn_md::dropcopy::server::Wake::new(),
         Duration::from_millis(300),
         |c, d| c.set_read_timeout(Some(d)),
     );
@@ -450,4 +451,111 @@ fn master_balance_overflow_is_an_error() {
         ..Balances::default()
     });
     assert_eq!(r.err(), Some(vyrn_md::dropcopy::DcError::Overflow));
+}
+
+/// A logged-in session on a real socket: the client end, the server thread, the store.
+struct Live {
+    client: std::net::TcpStream,
+    server: std::thread::JoinHandle<std::io::Result<()>>,
+    store: std::sync::Arc<std::sync::RwLock<DcStore>>,
+    wake: std::sync::Arc<vyrn_md::dropcopy::server::Wake>,
+}
+
+fn live_session(records: u64) -> Live {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, RwLock};
+    use vyrn_md::dropcopy::server::{Wake, serve};
+    let seed = [1u8; 32];
+    let mut keys = Keys::new();
+    keys.add(AccountId(1), vyrn_crypto::ed25519::public_key(&seed), None);
+    let mut st = DcStore::new();
+    st.begin_epoch(Epoch(1));
+    st.open(own(1));
+    for q in 1..=records {
+        st.push(own(1), q, &DcRecord::eod(AccountId(1), 0, [q, 0, 0, 0, 0]));
+    }
+    let store = Arc::new(RwLock::new(st));
+    let wake = Arc::new(Wake::new());
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+    let (mut s, _) = l.accept().unwrap();
+    let (st2, w2) = (Arc::clone(&store), Arc::clone(&wake));
+    let server = std::thread::spawn(move || {
+        serve(
+            &mut s,
+            Session::new(BOOK, [7; 32]),
+            &keys,
+            &st2,
+            &w2,
+            std::time::Duration::from_secs(5),
+            |c, d| {
+                c.set_read_timeout(Some(d))?;
+                c.set_write_timeout(Some(d))
+            },
+        )
+    });
+    let mut hello = [0u8; FRAME_BYTES];
+    client.read_exact(&mut hello).unwrap();
+    let login = Login {
+        master: false,
+        book: BOOK,
+        account: AccountId(1),
+        epoch: Epoch(1),
+        from: 1,
+        signer: AccountId(1),
+        challenge: [7; 32],
+    };
+    client.write_all(&login.encode_signed(&seed)).unwrap();
+    Live {
+        client,
+        server,
+        store,
+        wake,
+    }
+}
+
+/// A record pushed while the session waits goes out at once, not at the next heartbeat.
+#[test]
+fn a_new_record_wakes_the_session() {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    let mut x = live_session(0);
+    let mut f = [0u8; FRAME_BYTES];
+    x.client.read_exact(&mut f).unwrap(); // ACCEPT
+    // Let the server reach its wait, right after a heartbeat window opened.
+    x.client
+        .set_read_timeout(Some(Duration::from_millis(30)))
+        .unwrap();
+    assert!(x.client.read_exact(&mut f).is_err(), "nothing to send yet");
+    x.client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let t = Instant::now();
+    x.store
+        .write()
+        .unwrap()
+        .push(own(1), 1, &DcRecord::eod(AccountId(1), 0, [0; 5]));
+    x.wake.bump();
+    x.client.read_exact(&mut f).unwrap();
+    let took = t.elapsed();
+    let fr = Frame::decode(&f).unwrap();
+    assert_eq!(
+        (fr.kind, fr.seq),
+        (vyrn_md::dropcopy::wire::FrameKind::Record, 1)
+    );
+    assert!(took < Duration::from_millis(20), "{took:?}");
+    drop(x.client);
+    let _ = x.server.join();
+}
+
+/// A subscriber that stops reading a large replay is dropped by the write timeout.
+#[test]
+fn a_stalled_subscriber_is_dropped() {
+    use std::time::{Duration, Instant};
+    let x = live_session(200_000); // 12.8 MB of frames: more than the socket buffers hold
+    let t = Instant::now();
+    let r = x.server.join().unwrap();
+    assert!(r.is_err(), "{r:?}");
+    assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+    drop(x.client);
 }

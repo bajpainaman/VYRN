@@ -351,27 +351,67 @@ fn read(
         .map_err(|_| std::io::Error::other("store lock poisoned"))
 }
 
+/// Wakes serving connections when the store grows. The writer calls [`Wake::bump`] after it
+/// pushes records (and after `end_epoch`), so a session sends them at once instead of at its
+/// next heartbeat.
+#[derive(Debug, Default)]
+pub struct Wake {
+    count: std::sync::Mutex<u64>,
+    cv: std::sync::Condvar,
+}
+
+impl Wake {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The store changed.
+    pub fn bump(&self) {
+        if let Ok(mut g) = self.count.lock() {
+            *g = g.wrapping_add(1);
+        }
+        self.cv.notify_all();
+    }
+
+    /// The current generation.
+    pub fn generation(&self) -> u64 {
+        self.count.lock().map_or(0, |g| *g)
+    }
+
+    /// Waits up to `d` for a generation other than `seen`.
+    pub fn wait(&self, seen: u64, d: std::time::Duration) {
+        if let Ok(g) = self.count.lock() {
+            let _ = self.cv.wait_timeout_while(g, d, |g| *g == seen);
+        }
+    }
+}
+
 /// Serves one connection to its end (module docs): `HELLO`, the login, then records as the
-/// store grows and a heartbeat every idle read timeout. `timeout` sets the transport's read
-/// timeout: the time left of `login_timeout` before each login read, so a client that sends
-/// its login slowly or not at all is dropped when it runs out, then `DC_HEARTBEAT_MS`. Returns
-/// when the client closes, sends anything after its login, the session closes, or I/O fails.
+/// store grows ([`Wake`]) and a heartbeat every `DC_HEARTBEAT_MS` without one. `timeout` sets
+/// the transport's read and write timeouts: the time left of `login_timeout` before `HELLO`
+/// and each login read, so a client that sends its login slowly or not at all is dropped when
+/// it runs out, then `DC_WRITE_TIMEOUT_MS`, so a subscriber that stops draining its stream is
+/// dropped. Returns when the session closes or I/O fails (a client that closes fails the next
+/// write, at the latest its next heartbeat).
 pub fn serve<S: std::io::Read + std::io::Write>(
     io: &mut S,
     mut sess: Session,
     keys: &Keys,
     store: &std::sync::RwLock<DcStore>,
+    wake: &Wake,
     login_timeout: std::time::Duration,
     mut timeout: impl FnMut(&mut S, std::time::Duration) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     use std::io::ErrorKind;
-    let deadline = std::time::Instant::now() + login_timeout;
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + login_timeout;
+    timeout(io, login_timeout)?;
     let hello = sess.hello(&*read(store)?);
     io.write_all(&hello.encode())?;
     let mut login = [0; LOGIN_BYTES];
     let mut got = 0;
     while got < LOGIN_BYTES {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(ErrorKind::TimedOut.into());
         }
@@ -388,33 +428,34 @@ pub fn serve<S: std::io::Read + std::io::Write>(
     if sess.closed() {
         return Ok(());
     }
-    timeout(
-        io,
-        std::time::Duration::from_millis(super::wire::DC_HEARTBEAT_MS),
-    )?;
-    let mut byte = [0; 1];
+    timeout(io, Duration::from_millis(super::wire::DC_WRITE_TIMEOUT_MS))?;
+    let hb = Duration::from_millis(super::wire::DC_HEARTBEAT_MS);
+    let mut next_hb = Instant::now() + hb;
     loop {
+        // Read the generation first: a record pushed after this poll ends the wait below.
+        let seen = wake.generation();
         let frames = sess.poll(&*read(store)?, 256);
         for f in &frames {
             io.write_all(&f.encode())?;
         }
-        if sess.closed() {
+        if !frames.is_empty() || sess.closed() {
             io.flush()?;
+        }
+        if sess.closed() {
             return Ok(());
         }
         if !frames.is_empty() {
-            io.flush()?;
             continue;
         }
-        match io.read(&mut byte) {
-            Ok(_) => return Ok(()), // closed, or a byte the protocol does not allow
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                if let Some(hb) = sess.tick() {
-                    io.write_all(&hb.encode())?;
-                    io.flush()?;
-                }
+        let now = Instant::now();
+        if now >= next_hb {
+            if let Some(f) = sess.tick() {
+                io.write_all(&f.encode())?;
+                io.flush()?;
             }
-            Err(e) => return Err(e),
+            next_hb = now + hb;
+            continue;
         }
+        wake.wait(seen, next_hb - now);
     }
 }

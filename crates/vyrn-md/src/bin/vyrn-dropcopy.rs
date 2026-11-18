@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use serde::Deserialize;
-use vyrn_md::dropcopy::server::{DcStore, Keys, Session, serve};
+use vyrn_md::dropcopy::server::{DcStore, Keys, Session, Wake, serve};
 use vyrn_md::dropcopy::wire::DC_LOGIN_TIMEOUT_MS;
 use vyrn_types::{AccountId, BookId};
 
@@ -90,6 +90,8 @@ fn run(args: &Args) -> Result<(), String> {
     let mut store = DcStore::load_text(&recs)?;
     store.end_epoch();
     let store = Arc::new(RwLock::new(store));
+    // Nothing grows the file-fed store; the observer's ring writer will bump it per push.
+    let wake = Arc::new(Wake::new());
     let keys = Arc::new(keys);
     let book = BookId(cfg.book);
     let addr = args
@@ -103,7 +105,7 @@ fn run(args: &Args) -> Result<(), String> {
     for (n, conn) in (0u64..).zip(l.incoming()) {
         let Ok(mut c) = conn else { continue };
         let Ok(peer) = c.peer_addr() else { continue };
-        let (keys, store) = (Arc::clone(&keys), Arc::clone(&store));
+        let (keys, store, wake) = (Arc::clone(&keys), Arc::clone(&store), Arc::clone(&wake));
         let sess = Session::new(book, challenge(&secret, n, peer));
         std::thread::spawn(move || {
             let _ = c.set_nodelay(true);
@@ -113,8 +115,12 @@ fn run(args: &Args) -> Result<(), String> {
                 sess,
                 &keys,
                 &store,
+                &wake,
                 Duration::from_millis(DC_LOGIN_TIMEOUT_MS),
-                |c, t| c.set_read_timeout(Some(t)),
+                |c, t| {
+                    c.set_read_timeout(Some(t))?;
+                    c.set_write_timeout(Some(t))
+                },
             );
             tracing::debug!(%peer, ?r, "connection closed");
         });

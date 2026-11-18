@@ -1753,7 +1753,10 @@ Login (client → server, 128 B)
    previous epoch's stream ends with `END(last seq)` and the current epoch's follows from seq 1.
    An idle stream sends `HEARTBEAT(last seq sent)` every `DC_HEARTBEAT_MS = 100` (config), so a
    client sees a gap or a stall at the next frame; it recovers by reconnecting with `from` =
-   its last seq + 1. Anything the client sends after its login ends the connection. A session
+   its last seq + 1. A record goes out as soon as the store holds it, not at the next
+   heartbeat (§8.2's budget). The server reads nothing after the login: a client that closes is
+   noticed at the next write, at the latest its next heartbeat, and a subscriber that does not
+   drain its stream for `DC_WRITE_TIMEOUT_MS = 1_000` (config) is dropped. A session
    whose epoch leaves the replay window before it caught up gets `REJECT(5)` and is closed; it
    rebuilds from the statement (§10).
 

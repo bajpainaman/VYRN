@@ -40,6 +40,9 @@ pub const DC_HEARTBEAT_MS: u64 = 100;
 /// Time a connection has to send its login after `HELLO` before the server drops it
 /// (\[Guessing\], config).
 pub const DC_LOGIN_TIMEOUT_MS: u64 = 5_000;
+/// Time a write may block on a subscriber that does not drain its stream before the server
+/// drops it (\[Guessing\], config).
+pub const DC_WRITE_TIMEOUT_MS: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
