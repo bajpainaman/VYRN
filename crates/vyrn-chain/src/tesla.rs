@@ -9,9 +9,8 @@
 //! K_com(e, s, i) = derive_key("vyrn v1 kcom", c(i))[0..16]          i = 1 ..= N
 //! ```
 //!
-//! **Spec gap (contexts).** 09 §5.3 prints the contexts with a run of spaces after `vyrn`
-//! (`"vyrn      v1 kcom"`); 09 §17.3 and 01 §4 print one space. This crate reads one space, as
-//! `vyrn_crypto::SESSION_CONTEXT` and the SMT contexts (whose vectors are on main) already do.
+//! Contexts have one space after `vyrn`, as `vyrn_crypto::SESSION_CONTEXT` does; the vectors below
+//! pin them, and 09 §5.3 now prints them byte for byte (`tools/check-contexts.py` keeps them so).
 //!
 //! **Spec gap (traversal).** 09 §5.4 names Jakobsson's fractal traversal (15 pebbles, ≤ 15 hashes
 //! per step). [`Traversal`] is the simpler binary-split traversal: ≤ 16 stored values, the same

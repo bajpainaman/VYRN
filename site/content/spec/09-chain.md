@@ -226,7 +226,7 @@ layout, signed with `VK(op, home)`:
 
 ```
 VoteMsg {
-    ctx:     "vyrn      v1 vote",
+    ctx:     "vyrn v1 vote",
     chain_id: u32,
     epoch:   Epoch,
     kind:    u8,       // 1 Notarize, 2 Nullify, 3 Finalize
@@ -857,15 +857,15 @@ ciphertexts `ct_seq(e, s)` and `ct_com(e, s)` of §5.2 and the secrets `m_seq(e,
 
 ```
 P_seq(e, s)    = X25519(x, XK(s, home(e))) ‖ m_seq(e, s) ‖ BLAKE3(ct_seq(e, s))   // client ↔ sequencer node of s
-K_seq(e, s)    = derive_key("vyrn      v1 session", P_seq ‖ x25519_pub ‖ le(e) ‖ [s] ‖ "seq")[0..16]
-K_out(e, s)    = derive_key("vyrn      v1 session", P_seq ‖ x25519_pub ‖ le(e) ‖ [s] ‖ "out")[0..16]
+K_seq(e, s)    = derive_key("vyrn v1 session", P_seq ‖ x25519_pub ‖ le(e) ‖ [s] ‖ "seq")[0..16]
+K_out(e, s)    = derive_key("vyrn v1 session", P_seq ‖ x25519_pub ‖ le(e) ‖ [s] ‖ "out")[0..16]
 
 P_com(e, s)    = X25519(x, G(e, s).pub) ‖ m_com(e, s) ‖ BLAKE3(ct_com(e, s))      // client ↔ committee(e) minus s
-head(e, s)     = derive_key("vyrn      v1 kcom head", P_com ‖ x25519_pub ‖ le(e) ‖ [s])   // 32 B
+head(e, s)     = derive_key("vyrn v1 kcom head", P_com ‖ x25519_pub ‖ le(e) ‖ [s])        // 32 B
 c(e, s, N)     = head(e, s)
 c(e, s, k − 1) = BLAKE3(c(e, s, k))          for k = N, N−1, …, 1
 A(e, s)        = c(e, s, 0)                                       // the anchor, on chain
-K_com(e, s, i) = derive_key("vyrn      v1 kcom", c(e, s, i))[0..16]    for i = 1 ..= N
+K_com(e, s, i) = derive_key("vyrn v1 kcom", c(e, s, i))[0..16]         for i = 1 ..= N
 ```
 
 `N = CHN_TESLA_N = 28,800`, the number of 1 s intervals in an 8 h epoch.
@@ -1391,7 +1391,7 @@ ForcedPacket {                         // TxEnvelope kind 0x10, signer = Session
     packet: [u8; ≤ MAX_REQ_PAYLOAD],   // the request packet of 01 §6.1; tags may be zero
 }
 // envelope.nonce = packet.pkt_seq; envelope.sig = Ed25519 by σ.sign_pub over
-//   derive_key("vyrn      v1 tx", envelope without sig)
+//   derive_key("vyrn v1 tx", envelope without sig)
 ```
 
 A forced packet is authenticated by the session's Ed25519 signature, not by its tags. Why: with
@@ -1558,7 +1558,7 @@ because one equivocation can make different clients see different fills.
 ### 9.2 The log hash chain
 
 ```
-log_hash(H) = BLAKE3(derive_key("vyrn      v1 log",
+log_hash(H) = BLAKE3(derive_key("vyrn v1 log",
                 log_hash(H − 1) ‖ books_root(H) ‖ items_root(H) ‖ excl_root(H)))
 log_hash(0) = genesis_hash
 ```
@@ -1588,8 +1588,8 @@ A binary sparse Merkle tree of depth 256. A key is a BLAKE3 hash, so leaves spre
 | `OperatorLeaf` | `BLAKE3(0x05 ‖ [op])` | bonds, jail flag, `NodeCert` hashes |
 
 ```
-leaf_hash = BLAKE3(derive_key("vyrn      v1 smt leaf", key ‖ encode(value)))
-node_hash = BLAKE3(derive_key("vyrn      v1 smt node", left ‖ right))
+leaf_hash = BLAKE3(derive_key("vyrn v1 smt leaf", key ‖ encode(value)))
+node_hash = BLAKE3(derive_key("vyrn v1 smt node", left ‖ right))
 E[0] = [0; 32];  E[d + 1] = node_hash(E[d], E[d])        // the empty subtree of height d
 proof = { bitmap: [u8; 32], siblings: [Hash] }           // bit d set ⇔ sibling at depth d not empty
 ```
@@ -1611,10 +1611,10 @@ million times in a second costs 2 leaf updates. Budget: 1M distinct changed leav
 ```
 elem(o)  = encode { book: u16, lane: u8, handle: u32, account: u32, side: u8,
                     tick: u32, open_qty: u32, rx_ts: u64 }                       // 28 bytes
-v(o)     = BLAKE3_XOF(derive_key("vyrn      v1 lthash", elem(o)))[0..2048] as [u16; 1024] (LE)
+v(o)     = BLAKE3_XOF(derive_key("vyrn v1 lthash", elem(o)))[0..2048] as [u16; 1024] (LE)
 L(S)     = Σ_{o ∈ S} v(o)   componentwise mod 2^16                               // S = resting set
 L_k      = L_{k−1} + Σ_{o ∈ S_k \ S_{k−1}} v(o) − Σ_{o ∈ S_{k−1} \ S_k} v(o)
-digest_k = BLAKE3(derive_key("vyrn      v1 lthash digest", L_k as bytes))
+digest_k = BLAKE3(derive_key("vyrn v1 lthash digest", L_k as bytes))
 ```
 
 - An order whose `open_qty` changes is a different element: the commit removes the old element
