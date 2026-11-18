@@ -201,9 +201,33 @@ fn writer() -> SeqWriter {
 
 const SESSION: SessionId = SessionId(0x0010_0001);
 
+/// Request packet `i` of `SESSION`: one Heartbeat (count 1 fits it, 07 §5.4), book 7.
+fn request(i: u32) -> Vec<u8> {
+    let mut out = [0u8; vyrn_types::MAX_REQ_PAYLOAD];
+    let h = vyrn_wire::ReqHeader::new(SESSION, i, 0, BookId(7), false);
+    let n = vyrn_wire::encode_request(&mut out, h, &[vyrn_wire::Msg::Heartbeat], &[7; 16], None)
+        .unwrap();
+    out[..n].to_vec()
+}
+
+/// Data box 0's DATA frame `data_seq` carrying request packet `i` (07 §5.3).
+fn data_frame(data_seq: u64, i: u32) -> Vec<u8> {
+    use vyrn_data::frame::{DataHdr, FrameBuf, Kind};
+    let mut b = FrameBuf::default();
+    assert!(b.push(&request(i)));
+    b.finish(&DataHdr {
+        kind: Kind::Data,
+        book: BookId(7),
+        epoch16: 0,
+        data_seq,
+        src: 0,
+    })
+    .to_vec()
+}
+
 /// Packet `i` and its Improve step, framed (`flush`) but in no closed block.
 fn records(w: &mut SeqWriter, i: u32) -> Vec<Vec<u8>> {
-    let body = format!("request packet {i}");
+    let full = vyrn_replica::full_hash(&request(i));
     let p = PacketRecord {
         lane: LaneId(0),
         count: 1,
@@ -211,14 +235,12 @@ fn records(w: &mut SeqWriter, i: u32) -> Vec<Vec<u8>> {
         session: SESSION,
         pkt_seq: i,
         rx_ts: Nanos(u64::from(i) * 1_000),
-        pkt_hash: vyrn_crypto::pkt_hash(body.as_bytes()),
+        pkt_hash: vyrn_data::ingest::pkt_hash_of(&full),
         first_lane_seq: LaneSeq(u64::from(i)),
         fills_applied: StepId(0),
         snap_lag: 0,
     };
-    let mut f = w
-        .packet(p, Some(vyrn_crypto::hash::hash(body.as_bytes())))
-        .unwrap();
+    let mut f = w.packet(p, Some(full)).unwrap();
     let cut = [LaneSeq(u64::from(i)), LaneSeq(0)];
     f.extend(
         w.step(
@@ -255,16 +277,22 @@ fn blocks(n: u32) -> Vec<Vec<u8>> {
 }
 
 /// Four validators of a roster committee on localhost, their CTRL listener socket and ORDER
-/// ports. `extra` is appended to every config (`[failover]`), `dev` sets `dev = true`.
+/// ports. `extra` is appended to every config (`[failover]`), `dev` sets `dev = true`. With
+/// `data`, each has a data RX queue (`datas`) fed by one data box, `src = 0`, that is the test.
 struct Committee4 {
     dir: std::path::PathBuf,
     committee: Committee,
     ctrl: UdpSocket,
     vals: Vec<Box_>,
     orders: Vec<SocketAddrV4>,
+    datas: Vec<SocketAddrV4>,
 }
 
 fn committee4(tag: &str, dev: bool, extra: &str) -> Committee4 {
+    committee4_with(tag, dev, false, extra)
+}
+
+fn committee4_with(tag: &str, dev: bool, data: bool, extra: &str) -> Committee4 {
     let dir = std::env::temp_dir().join(format!("vyrn-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let seq_key = vyrn_crypto::ed25519::public_key(&SEQ_SEED);
@@ -284,7 +312,17 @@ fn committee4(tag: &str, dev: bool, extra: &str) -> Committee4 {
     std::fs::write(&roster_file, roster_hex).unwrap();
     let mut vals = Vec::new();
     let mut orders: Vec<SocketAddrV4> = Vec::new();
+    let mut datas: Vec<SocketAddrV4> = Vec::new();
     for (i, port) in repl.iter().enumerate() {
+        // The data box never answers a fetch (port 9, discard); its silence is never declared.
+        let (data_port, data_sec) = if data {
+            (
+                "data_port = 0\n",
+                format!("\n[data]\nboxes = [\"127.0.0.1:9\"]\nme = {i}\nsilence_us = 600000000\n"),
+            )
+        } else {
+            ("", String::new())
+        };
         let cfg = dir.join(format!("validator-{i}.toml"));
         std::fs::write(
             &cfg,
@@ -301,7 +339,7 @@ dev = {dev}
 backend = "kernel_udp"
 ip = "127.0.0.1"
 order_port = 0
-
+{data_port}
 [membership]
 seq_keys = ["{}"]
 
@@ -316,7 +354,7 @@ home = "LDN"
 observers = ["{ctrl}"]
 delta_ms = 500
 storage = "{}"
-{extra}"#,
+{data_sec}{extra}"#,
                 hex(&seq_key),
                 roster_file.display(),
                 hex(&[0; 32]),
@@ -329,6 +367,10 @@ storage = "{}"
             &cfg,
             ("VYRN_COMMITTEE_VOTE_SEED", hex(&vote_seed(i))),
         );
+        if data {
+            let d = v.wait("DATA rx=", 30);
+            datas.push(d.rsplit('=').next().unwrap().parse().unwrap());
+        }
         assert_eq!(
             v.wait("CONSENSUS", 30),
             format!("CONSENSUS voter={i} repl=127.0.0.1:{port}")
@@ -343,6 +385,7 @@ storage = "{}"
         ctrl: ctrl_sock,
         vals,
         orders,
+        datas,
     }
 }
 
@@ -354,6 +397,7 @@ fn four_validators_finalize_and_the_listener_learns_it() {
         ctrl: ctrl_sock,
         vals,
         orders,
+        ..
     } = committee4("committee", false, "");
     let mut listener = Listener::new(committee.clone(), Epoch(0), Height(0));
 
@@ -431,6 +475,7 @@ fn a_silent_sequencer_is_deposed_and_its_prefix_sealed() {
         ctrl,
         vals,
         orders,
+        ..
     } = committee4(
         "depose",
         true,
@@ -516,6 +561,94 @@ fn a_silent_sequencer_is_deposed_and_its_prefix_sealed() {
             .find_map(|l| l.strip_prefix("DEPOSED_DROPS frames="))
             .and_then(|n| n.parse::<u64>().ok());
         assert!(drops.is_some_and(|d| d >= 1), "{drops:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex r4618710713: with `[data]`, the tail packet's payload reaches voters 0 and 1 before
+/// deposition and voters 2 and 3 only after their seal candidates were built (with it in
+/// `unavail`). Neither candidate holds Q votes; the late payload rebuilds 2 and 3's candidates
+/// (`RESEAL`), and the seal finalizes with the payload joined: `unavail` empty, `data_root`
+/// over its full hash.
+#[test]
+fn a_late_payload_rebuilds_the_seal_candidate() {
+    use vyrn_consensus::ProposalKind;
+    let Committee4 {
+        dir,
+        committee,
+        ctrl,
+        vals,
+        orders,
+        datas,
+    } = committee4_with(
+        "reseal",
+        true,
+        true,
+        "\n[failover]\nsilence_us = 300000\nabort_us = 2000000\n",
+    );
+    let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // Payloads first (each voter's data_seq 1..=40), then packet 41's to voters 0 and 1 only.
+    for d in &datas {
+        for i in 1..=40 {
+            s.send_to(&data_frame(u64::from(i), i), d).unwrap();
+        }
+    }
+    for d in &datas[..2] {
+        s.send_to(&data_frame(41, 41), d).unwrap();
+    }
+    let mut w = writer();
+    let (mut frames, star) = blocks_with(&mut w, 40);
+    let star = star.unwrap();
+    frames.extend(records(&mut w, 41));
+    for a in &orders {
+        for f in &frames {
+            s.send_to(f, a).unwrap();
+        }
+    }
+    let late = vyrn_replica::full_hash(&request(41));
+    let want = vyrn_consensus::tail::seal_header(
+        &star,
+        StepId(41),
+        vyrn_log::block::order_root(w.open_order_bytes(), &[]),
+        vyrn_log::block::data_root(&[late], &[]),
+    );
+    let mut sealed = Vec::new();
+    for (i, v) in vals.iter().enumerate() {
+        let l = v.wait_any(&["SEAL ", "NO_SEAL "], 60);
+        if l.starts_with("SEAL ") {
+            let want = if i < 2 { "unavail=0" } else { "unavail=1" };
+            assert!(l.ends_with(want), "voter {i}: {l}");
+            sealed.push(i);
+        }
+    }
+    assert!(
+        sealed.iter().filter(|&&i| i >= 2).count() >= 1 && sealed.len() >= committee.quorum(),
+        "sealed: {sealed:?}"
+    );
+    for d in &datas[2..] {
+        s.send_to(&data_frame(41, 41), d).unwrap();
+    }
+    for &i in sealed.iter().filter(|&&i| i >= 2) {
+        let l = vals[i].wait("RESEAL ", 30);
+        assert!(l.ends_with("unavail=0"), "voter {i}: {l}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut buf = [0u8; 9216];
+    let cert = loop {
+        assert!(Instant::now() < deadline, "no seal certificate");
+        let Ok(n) = ctrl.recv(&mut buf) else { continue };
+        if let Ctrl::Cert(c) = ctrl::decode(&buf[..n]).unwrap()
+            && c.proposal.kind == ProposalKind::Seal
+        {
+            break c;
+        }
+    };
+    assert_eq!(verify_finality_cert(&cert, &committee), Ok(()));
+    assert_eq!(cert.proposal.last_height, Height(40));
+    assert_eq!(cert.proposal.last_hash, vyrn_log::block::header_hash(&want));
+    assert_eq!(cert.seal.map(|x| x.unavail), Some(Vec::new()));
+    for v in vals {
+        assert!(v.stop());
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
