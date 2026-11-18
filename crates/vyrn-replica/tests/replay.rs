@@ -491,7 +491,20 @@ fn payloads_from_a_data_box_replay_the_live_run() {
         node.flush(Nanos(0));
     }
     let frames = drain(&mut rx);
-    assert_eq!(frames.len(), store.0.len(), "one DATA frame per packet");
+    // 07 §5.2 step 3: the box dedupes by (session, pkt_seq) and drops a repeat with an equal
+    // full hash. The lane-shed packet's resend is byte-identical, so it is stored once; both
+    // PacketRecords share its pkt_hash and join to that one payload (07 §3.5).
+    let distinct: std::collections::BTreeSet<_> =
+        store.0.iter().map(|((_, s, q, _), _)| (*s, *q)).collect();
+    assert!(
+        distinct.len() < store.0.len(),
+        "the script resends a shed packet"
+    );
+    assert_eq!(
+        frames.len(),
+        distinct.len(),
+        "one DATA frame per distinct packet"
+    );
     assert!(frames.len() >= 3);
 
     let mut feed = DataFeed::new(BOOK, 1, 1);
