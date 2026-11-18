@@ -647,6 +647,10 @@ vote = "dev:validator-{i}"
 }
 
 fn run(cli: &Cli) -> Result<bool, String> {
+    // R5's HASHLAG exception needs validators that actually report; zero would pass vacuously.
+    if cli.validators == 0 {
+        return Err("--validators must be at least 1".into());
+    }
     if cli.data {
         return Err(
             "--data: vyrn-data is an empty binary and vyrn-validator polls no data RX queue on this build".into(),
