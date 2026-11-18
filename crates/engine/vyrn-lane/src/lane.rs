@@ -525,10 +525,11 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         self.jpos = self.jpos.wrapping_add(1);
     }
 
-    /// Refreshes the lane's snapshot (05 §6.5: every later op uses this version or newer),
-    /// unless its `snap_lag` would pass the lane's window (`lag_max`).
-    pub(crate) fn refresh_snapshot(&mut self, vis: &V) {
-        if let Some(s) = self.io.snapshot.try_read(vis)
+    /// Refreshes the lane's snapshot from `read`, one read of its snapshot line (05 §6.5:
+    /// every later op uses this version or newer), unless its `snap_lag` would pass the lane's
+    /// window (`lag_max`).
+    pub(crate) fn refresh_snapshot(&mut self, read: Option<Snapshot>) {
+        if let Some(s) = read
             && s.version >= self.snap.version
             && s.version.saturating_sub(self.f_snap.version) <= self.lag_max
         {
@@ -659,19 +660,20 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             *d = Some(*m);
         }
         self.scripted = !mids.is_empty();
+        // One read of the snapshot line per packet: the catch-up check and the accept refresh
+        // both use it.
+        let snap = (!self.scripted)
+            .then(|| self.io.snapshot.try_read(vis))
+            .flatten();
         // A lane so far behind that the newest snapshot's `snap_lag` would pass its window first
         // takes a boundary at the newest framed step (an Advance record), so it never saturates.
-        if !self.scripted
-            && self
-                .io
-                .snapshot
-                .try_read(vis)
-                .is_some_and(|s| s.version.saturating_sub(self.f_snap.version) > self.lag_max)
-            && let Some(lc) = self.catch_up_due(vis)
+        if let Some(s) = snap
+            && s.version.saturating_sub(self.f_snap.version) > self.lag_max
+            && let Some(lc) = self.catch_up_due(vis, s)
         {
             self.boundary(vis, lc, None);
         }
-        let r = self.packet(vis, p, clock);
+        let r = self.packet(vis, p, clock, snap);
         self.mids = [None; 20];
         self.scripted = false;
         r
@@ -702,7 +704,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             *d = Some(*m);
         }
         self.scripted = true;
-        let r = self.packet(vis, p, clock);
+        let r = self.packet(vis, p, clock, None);
         self.mids = [None; 20];
         self.scripted = false;
         self.forced = None;
@@ -755,7 +757,9 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         }
     }
 
-    fn packet<C: Clock>(&mut self, vis: &V, p: RxIn<'_>, clock: &C) -> Rx {
+    /// `snap`: the snapshot line as [`Self::process_packet`] read it (`None` in replay, which
+    /// restores the logged snapshot instead).
+    fn packet<C: Clock>(&mut self, vis: &V, p: RxIn<'_>, clock: &C, snap: Option<Snapshot>) -> Rx {
         // V1.
         let Ok(req) = Request::parse(p.bytes) else {
             return Rx::Dropped;
@@ -843,7 +847,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         self.last_prio_ts = prio_ts;
         // Replay restored the logged snapshot before the packet (07 §7.1).
         if self.forced.is_none() {
-            self.refresh_snapshot(vis);
+            self.refresh_snapshot(snap);
         }
         if self.snap.version < self.f_snap.version {
             self.snap = self.f_snap;

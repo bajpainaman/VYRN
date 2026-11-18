@@ -631,3 +631,87 @@ fn replay_wire_reproduces_each_take_and_carries_it_with_its_packet() {
         Err((vyrn_engine::WireAt::End, Why::BadRecord))
     );
 }
+
+#[test]
+fn takes_of_two_accounts_sharing_a_lane_seq_bind_to_their_own_packets() {
+    // #157 review 1 (P1): a heartbeat-only packet takes no LaneSeq, so the next packet of the
+    // lane has the same `first_lane_seq`. With two pooled accounts, each with its own token
+    // and `ver` counter, the two takes share `(lane, lane_seq)`: account 77's heartbeat take has
+    // a higher `ver` than account 88's first take. Each take must bind to its own packet, not to
+    // the lowest `ver` at that `lane_seq` (05 §6.9, 07 §7.1 item 2).
+    use Side::Sell;
+    use Tif::Day;
+    const OTHER: AccountId = AccountId(88);
+    let (tok, tok2) = (PoolTok::new(), PoolTok::new());
+    fn two<'a>(sh: &'a mut Shared<Hw>, a: &'a PoolTok, b: &'a PoolTok) -> Engine<'a, Hw, NA> {
+        let mut e = pooled_engine(sh, a, true);
+        for l in [1, 2] {
+            assert!(e.lane_mut(l).unwrap().set_pool_index(AcctSlot(2), 10));
+        }
+        assert!(e.pool_session(1, sid(1, 2), OTHER, b));
+        e
+    }
+    let mut sh = box_shared();
+    let mut e = two(&mut sh, &tok, &tok2);
+    let mut s = Takes::default();
+    let store = feed(
+        &mut e,
+        &[
+            (1, 1, order(Sell, Day, Stp::None, 200, 1, 1)),
+            (2, 1, order(Sell, Day, Stp::None, 201, 1, 2)),
+            (1, 1, Msg::Heartbeat),
+            (1, 2, order(Sell, Day, Stp::None, 202, 1, 3)),
+        ],
+        &mut s,
+    );
+    let takes = takes_of(&s.j.recs);
+    let got: Vec<_> = takes
+        .iter()
+        .map(|(_, t)| (t.lane.0, t.account, t.ver, t.lane_seq.0))
+        .collect();
+    // The heartbeat (77, ver 3) and the next order (88, ver 1) share lane 1's LaneSeq 2.
+    assert_eq!(
+        got,
+        vec![
+            (1, POOLED, 1, 1),
+            (2, POOLED, 2, 1),
+            (1, POOLED, 3, 2),
+            (1, OTHER, 1, 2)
+        ]
+    );
+    // Journal replay and 07 replay both reproduce the live run.
+    let rtok = (PoolTok::new(), PoolTok::new());
+    let mut rsh = box_shared();
+    let mut r = two(&mut rsh, &rtok.0, &rtok.1);
+    assert_eq!(
+        r.replay(&s.j.recs, &store, &mut NoResponses, &mut Journal::default()),
+        Ok(())
+    );
+    let (lanes, routes, steps) = to_wire(&s.j.recs);
+    let rtok = (PoolTok::new(), PoolTok::new());
+    let mut rsh = box_shared();
+    let mut r = two(&mut rsh, &rtok.0, &rtok.1);
+    let ws: Vec<vyrn_engine::WireStep<'_>> = steps
+        .iter()
+        .map(
+            |(step, kind, src, cross, cut, payload)| vyrn_engine::WireStep {
+                step: *step,
+                kind: *kind,
+                src: *src,
+                cross: *cross,
+                cut,
+                payload,
+            },
+        )
+        .collect();
+    let r = r.replay_wire(
+        &lanes,
+        &routes,
+        &takes,
+        &ws,
+        &store,
+        &mut NoResponses,
+        &mut Journal::default(),
+    );
+    assert_eq!(r.map_err(|d| (d.at, d.why)), Ok(()));
+}
