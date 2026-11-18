@@ -3624,6 +3624,7 @@ dependencies = [
  "vyrn-bbo",
  "vyrn-cut",
  "vyrn-lane",
+ "vyrn-risk",
  "vyrn-types",
  "vyrn-wire",
 ]

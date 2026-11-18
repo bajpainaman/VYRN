@@ -16,3 +16,6 @@ vyrn-wire = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+vyrn-risk = { workspace = true }
