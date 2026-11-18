@@ -25,8 +25,9 @@
 //!   the lane boundaries. Clocks are passed in: the lane's and the BBO's deadline tests are the
 //!   only clock reads (11 §3.1).
 //! - **Replay.** [`Engine::replay`] takes the order stream and a [`Payloads`] store and re-runs
-//!   every lane call and every step. No clock is read: a `SHED` record is replayed with a late
-//!   clock and every other packet with an on-time clock. Each step runs through
+//!   every lane call and every step. No clock is read: a `SHED` record is replayed from the record
+//!   alone, with no payload (`vyrn_lane::Lane::replay_shed`, 05 §18 Q17), and every other packet
+//!   with an on-time clock. Each step runs through
 //!   `vyrn_bbo::Bbo::replay_step` with its cut (`C_{s−1}` plus the record's deltas), source,
 //!   kind (incl. `Shed`, `CONT`) and `Rescan` band taken from the record (05 §10 rows 4–5); the
 //!   cut cores still publish before it, since it reads the half-cuts. Each packet goes through

@@ -138,7 +138,7 @@ pub struct SinkStream<K: PacketSink> {
     enc: MboEncoder,
     out: K,
     err: Option<SinkError>,
-    msgs: BTreeMap<(SessionId, u32), VecDeque<Msgs>>,
+    msgs: BTreeMap<(SessionId, u32), Msgs>,
     pkts: BTreeMap<(SessionId, u32), PktOps>,
     /// Lane responses that came before their packet record (immediate rejects).
     /// With the packet's first LaneSeq when the response's gate names it.
@@ -186,24 +186,25 @@ impl<K: PacketSink> SinkStream<K> {
         self.err
     }
 
-    /// One request payload (its signed bytes and tags), before its packet record arrives.
+    /// One request payload (its signed bytes and tags), before its packet record arrives. A
+    /// `SHED` record needs none; a later payload of the same key replaces it, and an accepted
+    /// record takes the one held.
     pub fn payload(&mut self, bytes: &[u8]) {
         let Ok(req) = Request::parse(bytes) else {
             return; // V1 rejects it; the lane logs no op for it.
         };
         let h = req.header();
         let msgs = req.msgs().map(Result::ok).collect();
-        self.msgs
-            .entry((h.session(), h.pkt_seq.get()))
-            .or_default()
-            .push_back(msgs);
+        // One payload per key, the newest: an accepted record uses only that one, so repeated
+        // sheds of one `pkt_seq` cannot grow this map.
+        self.msgs.insert((h.session(), h.pkt_seq.get()), msgs);
     }
 
     /// The payloads of one block's packet records, before `replay_block` runs it.
     pub fn prepare<const N: usize>(&mut self, blk: &BlockInputs<N>, p: &impl Payloads) {
         for r in &blk.lanes {
             if let LaneRec::Pkt(r) = r
-                && r.flags & PacketFlags::ADVANCE == 0
+                && r.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) == 0
                 && let Some(b) = p.get(r)
             {
                 self.payload(b);
@@ -255,11 +256,14 @@ impl<K: PacketSink> SinkStream<K> {
         let shed = p.flags & PacketFlags::SHED != 0;
         let l = usize::from(p.lane.0);
         let key = (p.session, p.pkt_seq);
-        let q = self.msgs.get_mut(&key).ok_or(SinkError::NoPayload)?;
-        let msgs = q.pop_front().ok_or(SinkError::NoPayload)?;
-        if q.is_empty() {
-            self.msgs.remove(&key);
-        }
+        // A shed packet's ops are all numbered and only take `BUSY` (05 §6.8), so it needs no
+        // payload (05 §18 Q17). An accepted packet takes the newest payload of its key: older
+        // ones are shed attempts of the same `pkt_seq`.
+        let msgs = if shed {
+            vec![None; usize::from(p.count)]
+        } else {
+            self.msgs.remove(&key).ok_or(SinkError::NoPayload)?
+        };
         let session_only =
             |m: &Option<Msg>| matches!(m, Some(Msg::Heartbeat | Msg::ResendReq { .. }));
         // A session-only message takes a LaneSeq only when the header is rejected (`vyrn-lane`

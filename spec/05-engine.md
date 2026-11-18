@@ -354,9 +354,12 @@ the byte encoding. `vyrn-sim` diffs `oracle_state_hash` against the engine after
   `PacketRecord`. It never enters the order stream.
 - A packet that deadline admission rejects (§6.8) keeps its `LaneSeq`s (one per counted
   message, as an accepted packet), does not advance the session's `pkt_seq`, and produces a
-  `PacketRecord` with `flags.SHED` and its real `pkt_hash`: 07 §3.5 hashes and joins it, so
-  `data_root` covers it. The record is needed because the `BUSY` response consumes a
-  `resp_seq`, which `LaneCut` gates on those `LaneSeq`s. A resend of the same `pkt_seq` takes
+  `PacketRecord` with `flags.SHED` and its real `pkt_hash` (07 §3.5 hashes it). The record is
+  needed because the `BUSY` response consumes a `resp_seq`, which `LaneCut` gates on those
+  `LaneSeq`s. Each `Reject BUSY` carries `client_tag` 0 (04 §3.5), so the response depends on
+  the record alone (`session`, `pkt_seq`, `count`): replay reads no payload for it, and the
+  record is not joined and has no `data_root` entry (07 §6.1). This closes Q17 and amends the
+  #106 ruling that a shed packet is joined. A resend of the same `pkt_seq` takes
   new `LaneSeq`s.
 - `PacketRecord.count` is the number of the packet's messages that take a `LaneSeq`, not the
   header's message count: without a packet-level reject, a `Heartbeat` or `ResendReq` takes none.
@@ -1408,9 +1411,11 @@ fn late(l: &Lane, rx_ts: Nanos, cls: Class, at: Point) -> bool {
 
   `11` checks each entry against B3's measured maxima before a configuration is accepted.
 - **At dequeue**, a late packet costs ~20 ns: session lookup, bound-address check, one
-  `Reject { BUSY }` per message in one response packet, no MAC verification. It does not advance
-  `pkt_seq` (the client resends) and cannot change book state; its record is `PacketRecord
-  { flags: SHED, pkt_hash: 0 }`. **At the commit point** (after the MAC and the prefetch wait) the
+  `Reject { BUSY }` per message in one response packet with `client_tag` 0, no MAC verification
+  and no message read. It does not advance `pkt_seq` (the client resends) and cannot change book
+  state; its record is `PacketRecord { flags: SHED }` with its real `pkt_hash` (§3.1). Its bytes
+  are never needed: replay rebuilds the responses from the record, and `data_root` leaves it out
+  (§3.1, Q17 closed). A commit-point shed is recorded and answered the same way. **At the commit point** (after the MAC and the prefetch wait) the
   same test runs without the pre-pass part, so a cold-line wait becomes `BUSY`, never lateness.
 - **The BBO core's test.** `FwdEntry.deadline = rx_ts + 980 − 355`, where 355 ns is the §11.1
   path from a step's start to the first bit out (step 15, gate 60, TX 40, NIC TX 240). If `now >
@@ -1514,7 +1519,8 @@ The packets kept are the lane verdicts `Accepted` and `Shed`.
     session and a `pkt_seq` inside its V5 window, so a sender cannot aim several keys at one bucket.
     Repeating one key can fill its bucket, but an unchecked packet never takes an index way from an
     `Accepted` (MAC-checked) one; it stays unindexed instead. A shed copy a flood displaces is
-    lost: its record cannot be resolved unless another source holds the bytes, which Q17 covers. A record joins only the variant its `pkt_hash` names (07 §5.4).
+    lost, which costs nothing: a `SHED` record is never joined and replay never reads its bytes
+    (§3.1, Q17 closed). A record joins only the variant its `pkt_hash` names (07 §5.4).
 - **Determinism.** Retention changes no engine state and no output. Replay neither reads it nor
   rebuilds it.
 
@@ -3067,7 +3073,9 @@ flag half of R11 (§6.6 now has `flags`), and R14's step part (15 ns steps, §14
 ## 18. Open questions
 
 Settled by 01 §14 and removed: Q3 (`LaneCut` on the stream cores), Q7 (fail-stop on a dead lane),
-Q9's `liq` half (`liq = 2`), Q12's percentile form (cold lines are paid before the commit point).
+Q9's `liq` half (`liq = 2`), Q12's percentile form (cold lines are paid before the commit point),
+Q17 (a `SHED` record of a packet whose MAC was never checked: its `BUSY`s carry `client_tag` 0, so
+it is not joined and has no `data_root` entry, §3.1, §6.8; 07 §6.1).
 
 | # | Question | Owner | Settled by |
 |---|---|---|---|
@@ -3085,4 +3093,3 @@ Q9's `liq` half (`liq = 2`), Q12's percentile form (cold lines are paid before t
 | Q14 | `MakerSeq` gives 8 spare numbers, which a market maker hit by many consecutive crosses can use up before its lane refills (`eng_maker_seq_wait`). | 01, 05 | B3 with a market maker at the touch |
 | Q15 | 01 §14.14 bounds every maker fill by the taker's first bit. At index 9 about five continuation steps (≤ 40 fills) fit; later steps' maker fills exceed `LAT_MAX_NS`. Cap the fills one taker may take, or re-budget? | 01 | decision; B3 with a 64-maker sweep |
 | Q16 | A crash after an ack but before its boundary record leaves loses the boundary's position (01 §14.16 gates on op and step records). Gate on the boundary record too? | 07 | failover test with acks in flight |
-| Q17 | Test D (§6.8) sheds before V6, so a packet with a bad MAC still gets a logged `SHED` record whose bytes only the sequencer holds (§6.10). Repeating one key can push those bytes out of retention. The record then stays unresolved and its block's vote waits: DAV-3 (07 §5.5) needs DAV-1's quorum of `DataMissing` (> 16 source-3 resolutions in 10 ms), which one such record does not reach. Check the MAC before logging `SHED`, exempt unchecked `SHED` records from `data_root`, or make an unrepairable `SHED` record unavailable directly? | 05, 07, 13 | decision; `vyrn-sim` shed flood on one key |

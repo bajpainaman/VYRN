@@ -404,6 +404,15 @@ also arrives in time.
 | Client action | resend from `detail`, same `pkt_seq` and the same logical content (D3), bit0 = 1 | send the shed message again in a new packet |
 | Arrives | ≤ `LAT_MAX_NS` | ≤ `LAT_MAX_NS` |
 
+**Matching a lane `BUSY` (05 §6.8, §18 Q17).** A lane-shed `Reject BUSY` carries `client_tag` 0:
+the lane reads none of a shed packet's messages, and replay rebuilds the response from the
+`SHED` record alone. The client matches it to its packet by `echo_pkt` (the shed `pkt_seq`) and
+to a message by `index`, and takes the tag from its own copy of that packet. A BBO-core `BUSY`
+keeps the message's `client_tag`. [Spec gap: the table's out-of-stream form for the lane shed
+(index 0xFF, `resp_seq` 0, detail = `expected`) predates 05 §6.8, which merged `vyrn-lane`
+follows: one `Reject BUSY` per message at its index, detail 0, in a response packet that takes a
+`resp_seq` and is gated on the `SHED` record.]
+
 A later message of the same packet that lists a shed op in its dependency list, or names the
 handle pre-assigned to it, is shed with it and gets its own `Reject BUSY`. Every shed decision is
 read from the log on replay, never recomputed, so `INV-DET` holds. A lane shed skips V6 because

@@ -460,13 +460,17 @@ fn deadline_admission_at_the_threshold() {
             index: 0,
             reason: RejectReason::Busy,
             detail: 0,
-            client_tag: 9
+            client_tag: 0 // 04 §3.5, 05 §18 Q17: from the record alone, not the message's tag 9
         }]
     );
     let p = packets(&x, 0);
     assert_eq!(p[0].flags, PacketFlags::SHED);
     assert_eq!(p[0].first_lane_seq, LaneSeq(1));
-    assert_ne!(p[0].pkt_hash, vyrn_types::PktHash(0), "hashed and joined");
+    assert_ne!(
+        p[0].pkt_hash,
+        vyrn_types::PktHash(0),
+        "hashed (07 §3.6), not joined"
+    );
     // The client resends the same pkt_seq; on time now. It takes the next LaneSeq.
     assert_eq!(x.send_at(0, 1, 20_000, 20_461, &m, &[]), Rx::Accepted);
     assert_eq!(x.lanes[0].seq(), LaneSeq(2));

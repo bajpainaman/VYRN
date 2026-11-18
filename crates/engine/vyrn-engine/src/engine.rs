@@ -363,6 +363,20 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
         Ok(r)
     }
 
+    /// Replay: lane `l` replays one logged `SHED` record without its payload
+    /// (`vyrn_lane::Lane::replay_shed`, 05 §18 Q17).
+    pub(crate) fn replay_shed<S: Sink>(
+        &mut self,
+        l: usize,
+        rec: &PacketRecord,
+        sink: &mut S,
+    ) -> Result<Rx, Fault> {
+        let lane = self.lanes.get_mut(l).ok_or(Fault::NoLane)?;
+        let r = lane.replay_shed(rec);
+        self.drain(l, sink)?;
+        Ok(r)
+    }
+
     /// Both cut cores publish, then the BBO core decides at most one step; the stream core then
     /// writes every `LaneCut` and the fan-out copies the new snapshot to every lane.
     /// `clock` is the BBO core's deadline clock.

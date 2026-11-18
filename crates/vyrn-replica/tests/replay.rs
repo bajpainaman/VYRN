@@ -55,7 +55,7 @@ impl EpochView for View {
 /// The engine's conformance script (`vyrn-engine/tests/engine.rs`), whole: a resting order, a
 /// forwarded improve whose step runs before lane 0's next packet (a `MID` Advance record, 07
 /// §3.6), a forwarded cross, a forwarded op late at the BBO (a `Shed` step), a packet shed at
-/// the lane and its resend (07 §3.5: hashed, joined, its LaneSeqs kept), a packet whose
+/// the lane and its resend (07 §3.6: hashed, not joined, its LaneSeqs kept), a packet whose
 /// Heartbeat takes no LaneSeq, a cancel and an idle poll.
 fn script() -> Vec<Act> {
     use Side::{Buy, Sell};
@@ -509,7 +509,7 @@ fn payloads_from_a_data_box_replay_the_live_run() {
     let frames = drain(&mut rx);
     // 07 §5.2 step 3: the box dedupes by (session, pkt_seq) and drops a repeat with an equal
     // full hash. The lane-shed packet's resend is byte-identical, so it is stored once; both
-    // PacketRecords share its pkt_hash and join to that one payload (07 §3.5).
+    // PacketRecords share its pkt_hash; only the resend joins that payload (05 §18 Q17).
     let distinct: std::collections::BTreeSet<_> =
         store.0.iter().map(|((_, s, q, _), _)| (*s, *q)).collect();
     assert!(
