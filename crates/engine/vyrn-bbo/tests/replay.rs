@@ -161,7 +161,15 @@ fn replaying_a_live_log_gives_the_same_bytes() {
     ] {
         assert!(kinds.contains(&want), "scenario covers {want:?}: {kinds:?}");
     }
-    let mut rp = Drive::replay(live.log.clone());
+    // A Rescan CONT record's band is not read: zero it, the replay is unchanged.
+    let mut log = live.log.clone();
+    for r in log
+        .iter_mut()
+        .filter(|r| r.kind == StepKind::Rescan && r.cont)
+    {
+        r.band = (Tick(0), Tick(0));
+    }
+    let mut rp = Drive::replay(log);
     let b = scenario(&mut rp);
     assert_eq!(rp.i, live.log.len());
     assert_eq!(a.len(), b.len());

@@ -459,7 +459,8 @@ impl Bbo {
             if rec.kind != StepKind::Rescan || !rec.cont || rec.src.is_some() {
                 return Err(Diverge::Kind);
             }
-            if c != r.cut || rec.band != r.band {
+            // The band was fixed by the first step of the sweep; a CONT record's band is not read.
+            if c != r.cut {
                 return Err(Diverge::Cut);
             }
             self.out.reset(self.next);
