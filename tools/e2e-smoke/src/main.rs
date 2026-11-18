@@ -540,12 +540,14 @@ impl Nodes {
         let tx = tx.clone();
         std::thread::spawn(move || {
             for l in BufReader::new(out).lines() {
-                let Ok(l) = l else { break };
+                // A read error ends the stream without EOF_MARK: a check that needs the whole
+                // output (R16) then fails at its deadline instead of reading a partial one.
+                let Ok(l) = l else { return };
                 if tx.send((idx, l)).is_err() {
-                    break;
+                    return;
                 }
             }
-            // Ordered after the child's last line: its output is complete (R16).
+            // Clean EOF, ordered after the child's last line: its output is complete (R16).
             let _ = tx.send((idx, EOF_MARK.to_owned()));
         });
         self.0.push(Node {
