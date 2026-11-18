@@ -2073,8 +2073,7 @@ qty`, where `qty` is the reversed quantity of the original fill.
    §14.4 and §14.9.* Remaining: list both by name in §7, with the `G`-key rule of `INV-CHN-SPLIT`.
 10. **§1:** add the terms operator, node (one operator's boxes in one home), committee, chain block,
     book height, chain height and bust.
-11. **§14.9:** its last bullet still says `FINALITY_P99_MS`; it should say `FINALITY_MAX_MS`, the
-    name §5 now uses.
+11. **§14.9:** *Resolved by 01:* its last bullet says `FINALITY_MAX_MS`, the name §5 uses.
 12. **§6.5:** fix the `detail` of `BOOK_HALTED`: 1 = chain gate (§4.6), 2 = `HaltBook`. Fix the
     `Control` sub-codes 1 *halt* and 2 *gate open* with §14.10's `StepKind::Control`.
 13. **§14.9:** state that `FIN_GATE_BLOCKS` counts closed blocks (block h + 9 opens only when h is

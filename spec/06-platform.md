@@ -1848,8 +1848,7 @@ TX ≤ 240 ns as its own maximum (§14.16), `N_LANES_CONSUMER` = 11 (§5) and th
 3. **§10 REF row and §14.7:** the NIC column becomes per role: sequencer and standby 4 × X2541
    client plus 2 × dual-port X2542 replication, one port per stream core (06 §2.3 rule 4; two
    stream cores on single-port cards would break `INV-PLT-7`); replica 4 × X2541; observer
-   3 × CX-6 Dx + 3 × X2541. §14.7's replica drives become 12 × 61.44 TB, because 12 × 30.72 TB
-   holds ~3.9 h at sustained peak, short of §14.16's 6 h (06 §2.2).
+   3 × CX-6 Dx + 3 × X2541. §14.7's replica drives are already 12 × 61.44 TB (resolved by 01).
 4. **§5:** add `PLT_TX_MAX_NS` = 240 as `NIC_TX_MAX_NS`, the name for §14.16's TX maximum.
 5. **§14.1:** say that the RX stamp's calibration error (≤ 10 ns) is added to `age` like the
    TSC↔PHC error, now that the guard is gap budget only (06 §4.11, §8.4).
@@ -1860,9 +1859,8 @@ TX ≤ 240 ns as its own maximum (§14.16), `N_LANES_CONSUMER` = 11 (§5) and th
    requirement cites.
 8. **§9:** list the `vyrn-nic` backends (`efvi`, `dpdk`, `afxdp`, `kernel`, `sim`) and note that the
    ring traits live in `vyrn-wire` (11 §1.3) while `NicBackend` lives in `vyrn-nic`.
-9. **§5 and §14.3:** `N_LANES_REF` = 50 disagrees with the core map's 49 lanes (0–48: 42
-   dedicated, 7 pooled), and §14.3 still says cut B reads lanes 25–49 and the hasher is on core 7.
-   06 uses 49 lanes and the §10 map.
+9. **§5 and §14.3:** *Resolved by 01:* §5 has `N_LANES_REF` = 49 (0–48: 42 dedicated, 7 pooled), and
+   §14.3 has cut B on lanes 25–48 with the hasher on core 50. 06 uses 49 lanes and the §10 map.
 10. **§10:** name the fill TX core → client port map: TX-A NIC0, TX-B NIC2, TX-C NIC1 and NIC3
     (06 §2.3 rule 3). The map's "TX-A lanes 0–24, TX-B lanes 25–48" cannot hold with three TX
     cores and one CTPIO writer per port.

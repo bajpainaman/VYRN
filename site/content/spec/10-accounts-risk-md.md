@@ -1791,8 +1791,8 @@ token takes (`AcctTake`, §14.17 item 4). Still open:
    records, with its place relative to the `PacketRecord` it precedes. Keep `flags` as §6.6 fixes
    them (bit0 SHED, bit1 ADVANCE); `AcctTake` needs no flag bit. State that a `PoolRisk` take
    (§3.8) is logged the same way.
-10. §5: `BBO_CROSS_NS` = 40 is superseded by §14.15 item 2 (15). The message fee (§5.3) and the
-    lane-bucket load (§3.8) use 15. `N_LANES_REF` = 50 does not match the §10 core map (49 lanes).
+10. §5: *Resolved by 01:* `BBO_CROSS_NS` = 15 (§14.15 item 2), which the message fee (§5.3) and the
+    lane-bucket load (§3.8) use, and `N_LANES_REF` = 49, matching the §10 core map.
 11. §14.13 item 5: the router domain is one router account per (group, lane class), the dedicated
     one sharded per lane (§2.8).
 

@@ -1680,8 +1680,8 @@ Admin boxes and load boxes are not counted. The CHAIN count is dominated by idle
 Resolved by 01 and dropped: `PacketRecord.flags` (§6.6), the 935/955 ack sum (§14.17.1), the
 §10 core-map duties (§10, §14.17.3), `ARC_MAKER_FILL_MAX_NS` (§14.16).
 
-1. **Lane count and §14.3.** The §10 map has 49 lanes, `N_LANES_REF` says 50, and §14.3 still puts
-   cut B on lanes 25–49 and the hasher on core 7. Align them with §10 (hasher on c50).
+1. **Lane count and §14.3.** *Resolved by 01:* §5 has `N_LANES_REF` = 49, and §14.3 puts cut B on lanes
+   25–48 with the hasher on c50, as the §10 map does.
 2. **`LaneCut` rule in `INV-ACK-AFTER-CUT`:** "a published cut" means a step cut that the stream core has
    released and written to `LaneCut[l]` (`INV-ARC-1`), after the lane drained its fill ring through
    the previous step. Promote `INV-ARC-1` to 4.
