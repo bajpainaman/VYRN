@@ -29,7 +29,7 @@
 //! |---|---|
 //! | `seq` | the box exits 0, `records` equals the packets sent, `seal_violations=0`, at least 2 blocks |
 //! | `validators` | each validator reports heights `0..=H` contiguous with the box's `first_step`/`last_step`, every verdict `Valid`, no `FAULT` (R5 for `REP_E_HASHLAG`) |
-//! | `replay` | the tap's `OrderCore` readies the same blocks, holding every packet sent exactly once, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box (R1); the tap Nacks its own ORDER holes, at most as many as its socket dropped (R17) |
+//! | `replay` | the tap's `OrderCore` readies the same blocks, holding every packet sent exactly once, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box (R1); the tap Nacks its own ORDER holes, at most as many as its socket dropped (R18) |
 //! | `replica-out` | with `--data` every validator replays (`[replay]`) and its `out=<hex>` on each `BLOCK` line equals the tap's output hash of that block; one stopped at `REP_E_HASHLAG` is compared on the blocks it printed (R5); SKIP while no validator replays |
 //! | `finality` | with `--finality` (default 4 validators, a DEV roster as in `bin/vyrn-validator/tests/committee.rs`, `[consensus]` in every validator and the box): while the box still runs, the box's listener (`FINAL height=<h> ... from=<votes\|cert>`) and every validator that did not stop print `FINAL` through the box's last block. A validator's `OUT_OF_ORDER`, `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT` line fails `validators`; `REP_E_HASHLAG` follows R5 and R6. SKIP without it |
 //! | `dropcopy` | with `--dropcopy` (needs `--data` and `--finality`): an observer (`vyrn-validator`, `role = "observer"`, data destination `n + 1`, in the box's order list on both paths (R12) and every validator's `[consensus] observers`) replays every block into its output ring and finalizes from the validators' certificates; `vyrn-dropcopy` serves the ring over Noise, and one client per session logs in to its account's stream. Each stream's served records, without stage markers, equal an in-process `DropCopy` over the tap's `RustReplay` byte for byte, with gapless seqs, and end in a `DC_FINAL`; every record with a `resp_seq` (acks, cancels, outs, taker fills) names a response packet the client received (10 §8.3), or one replay produced that R1 counts as lost at the client's socket. It prints a DEV timing of those records after their response packets (R9); SKIP without it |
@@ -423,7 +423,7 @@ struct Cli {
     /// does.
     #[arg(long, value_name = "N")]
     tap_loss: Option<u64>,
-    /// Relay the tap's order socket and drop every N-th datagram the box sends it (R17; needs
+    /// Relay the tap's order socket and drop every N-th datagram the box sends it (R18; needs
     /// --finality): the tap must Nack its holes, as a replica does.
     #[arg(long, value_name = "N")]
     tap_order_loss: Option<u64>,
@@ -953,7 +953,7 @@ fn data_tap(
     })
 }
 
-/// What the tap's order repair did (R17): Nacks sent, holes given up, `NackTooOld`s received,
+/// What the tap's order repair did (R18): Nacks sent, holes given up, `NackTooOld`s received,
 /// and frames that only a retransmit delivered.
 #[derive(Default)]
 struct TapRepair {
@@ -964,7 +964,7 @@ struct TapRepair {
 }
 
 /// The order frames the tap received, until `stop`, in `frame_seq` order. With `nack` (the
-/// box's CTRL, and the port the box has for the tap) the tap repairs its holes as a path-A replica does (R17, 07 §4.10); without it
+/// box's CTRL, and the port the box has for the tap) the tap repairs its holes as a path-A replica does (R18, 07 §4.10); without it
 /// the frames stay in arrival order. Once `drain` is set, while the box still runs, the tap
 /// also Nacks past its last frame of each substream, every retry, until a probe brings nothing
 /// and no frame is held, then sends on `drained`: a hole at the tail has no later frame to
@@ -1627,7 +1627,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     }
     if cli.tap_order_loss.is_some_and(|n| n < 2) || (cli.tap_order_loss.is_some() && !cli.finality)
     {
-        return Err("--tap-order-loss needs --finality and N >= 2 (R17)".into());
+        return Err("--tap-order-loss needs --finality and N >= 2 (R18)".into());
     }
     if cli.drop_rtx && cli.drop_path_b.is_none() {
         return Err("--drop-rtx needs --drop-path-b".into());
@@ -1941,7 +1941,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     tap_sock
         .set_read_timeout(timeout)
         .map_err(|e| e.to_string())?;
-    // R17: --tap-order-loss puts a lossy relay in front of the tap's order socket; the box
+    // R18: --tap-order-loss puts a lossy relay in front of the tap's order socket; the box
     // knows the tap by the relay's address.
     let tap_order_relay = match cli.tap_order_loss {
         Some(every) => Some(relay(
@@ -2274,10 +2274,10 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 &pkts,
             )
         });
-    // R17: the tap repairs its tail while the box can still retransmit it.
+    // R18: the tap repairs its tail while the box can still retransmit it.
     tap_drain.store(true, Ordering::Release);
     if tap_drained.recv_timeout(wait).is_err() {
-        println!("WARN the tap's ORDER tail did not drain within {wait:?} (R17)");
+        println!("WARN the tap's ORDER tail did not drain within {wait:?} (R18)");
     }
     let seq_ok = nodes.stop(seq, &rx, Instant::now() + wait)?;
     // The data node flushes its open frames on stop. R13: the home box was killed, so the
@@ -2392,7 +2392,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // Read while the client's socket is still open (it closes with its thread).
     let cl_drops = udp_drops(cl_port);
     let cl_drops_s = cl_drops.map_or_else(|| "n/a".to_owned(), |d| d.to_string());
-    // R17: the frames lost before the tap's thread read them: its socket's drops, and with
+    // R18: the frames lost before the tap's thread read them: its socket's drops, and with
     // --tap-order-loss the relay's socket drops too (the relay's own drops are added below).
     let tap_drops = udp_drops(tap_port).and_then(|d| match &tap_order_relay {
         Some((a, _)) => udp_drops(a.port()).map(|r| d.saturating_add(r)),
@@ -2554,7 +2554,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
             )
             .map_err(|e| e.to_string())?;
             let mut ready = Vec::new();
-            // R17: only frames the tap's own socket dropped may need a retransmit; without
+            // R18: only frames the tap's own socket dropped may need a retransmit; without
             // that count, none may.
             let rep_s = format!(
                 "tap_sock_drops={tap_drops_s} tap_relay_dropped={} tap_repaired={} tap_nacks={} tap_gaps={} tap_too_old={}",
