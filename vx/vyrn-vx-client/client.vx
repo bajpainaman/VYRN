@@ -241,6 +241,8 @@ struct Slot {
   r_route : u64, r_fee_mul : u64, r_msg_fee : u64,
   // A Rescan batch taker in a capped sweep (rule B): its Ack waits.
   inflt : u64,
+  // The version this one replaced (vyrn-lane prev_ver), 0 for an order's first version.
+  pv : u64,
 }
 
 struct Root {
@@ -300,6 +302,9 @@ struct Lane {
   // The lane order view of the phase (05 §2.5): the last Phase event applied.
   phase : u64,
   held : *mut Held, n_held : i64,
+  // C* of an uncross whose auction-only remainders B2 has not ended yet (vyrn-lane
+  // auction_out, 05 §8.8 item 6).
+  ao_has : u64, ao_cs : u64,
 }
 
 struct Bbo {
@@ -319,6 +324,9 @@ struct Bbo {
   // whether its last step was a chunk. `sealed`: the epoch's last step ran (08).
   has_fz : u64, fz : *mut u64, has_unc : u64, unc_p : u64, unc_rem_b : u64, unc_rem_s : u64,
   unc_last : u64, sealed : u64,
+  // C* of the last uncross (vyrn-bbo State::adead, 05 §8.8 item 6): an auction-only order at or
+  // before it ended there, so no later uncross sees it.
+  adead : *mut u64,
   // A capped Rescan batch taker (Bbo::rcont): its lane and LaneSeq and the band; the next step
   // must be its CONT Rescan at the same cut.
   rc_has : u64, rc_l : u64, rc_q : u64, rc_lo : u64, rc_hi : u64,
@@ -1477,7 +1485,7 @@ fn pass1(c : *mut Ctx, l : i64, ix : u64, m : *mut i8, op : *mut Op, detail : *m
         (*wp).kind = SK_KEEP; (*wp).root = r; (*wp).leg = (*vp).leg; (*wp).side = (*vp).side;
         (*wp).flags = (*vp).flags; (*wp).tick = (*vp).tick; (*wp).total = (*vp).total - by;
         (*wp).ins_seq = (*op).seq; (*wp).ts = ts; (*wp).ix = ix; (*wp).sess = si;
-        (*wp).pkt = (*ln).cur_pkt;
+        (*wp).pkt = (*ln).cur_pkt; (*wp).pv = v;
         (*rp).cur = w;
         (*op).k = OK_REDUCE; (*op).root = r; (*op).v = v; (*op).w = w; (*op).side = (*vp).side;
         (*op).has_side = 1u64; (*op).tick = (*vp).tick; (*op).r = by; (*op).tag = tag;
@@ -1674,7 +1682,17 @@ fn boundary(c : *mut Ctx, l : i64, f : u64, pass : u64, next : u64) -> void {
     taker_end(c, ln);
     // B2.
     let cc = min(cf, (*ln).applied);
-    while (*ln).pend_n > 0i64 {
+    loop {
+      // Auction-only remainders end once every pending op at or before C* has settled, and
+      // before any later one (vyrn-lane B2).
+      if (*ln).ao_has != 0u64
+         && ((*ln).pend_n == 0i64 || (*offset_mut((*ln).pend, (*ln).pend_head)).seq > (*ln).ao_cs) {
+        (*ln).ao_has = 0u64;
+        end_auction_only(c, ln, (*ln).ao_cs);
+        if (*ln).err != 0u64 { return; }
+        continue;
+      }
+      if (*ln).pend_n == 0i64 { break; }
       let p : *mut Pend = offset_mut((*ln).pend, (*ln).pend_head);
       if (*p).seq > cc { break; }
       // Rule B: an Ack waits while its version is a batch taker in flight.
@@ -1697,8 +1715,13 @@ fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
     // A Phase event moves the lane's phase; a Band event names no order (vyrn-lane B1).
     if (*ev).kind == EV_PHASE { (*ln).phase = (*ev).cause; return; }
     if (*ev).kind == EV_BAND { return; }
-    // The auction ends (05 §8.8); auction-only remainders are a follow-up, as in vyrn-lane.
-    if (*ev).kind == EV_UNCROSS { (*ln).phase = PH_CONT; return; }
+    // The auction ends (05 §8.8); B2 ends its auction-only remainders (item 6).
+    if (*ev).kind == EV_UNCROSS {
+      (*ln).phase = PH_CONT;
+      (*ln).ao_has = 1u64;
+      (*ln).ao_cs = (*ev).handle | ((*ev).vslot << 32u64);
+      return;
+    }
     let v = (*ev).vslot;
     if v == 0u64 || v >= (*ln).next_slot { fail_lane(ln, E_FAULT); return; }
     let sp = slot(ln, v);
@@ -1765,6 +1788,66 @@ fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
     (*rp).ended = 1u64;
     (*rp).end_detail = d;
   }
+}
+
+// 05 §8.8 item 6 (vyrn-lane end_auction_only): every auction-only order visible at C* with
+// open > 0 is dead; its lane sends Out{cause: AUCTION} for the open quantity. Sessions in slot
+// order (vyrn-wire session_slot, the id's low 12 bits, not the config's order), each session's
+// roots in creation order. The record follows every held one.
+fn end_auction_only(c : *mut Ctx, ln : *mut Lane, cs : u64) -> void {
+  unsafe {
+    let mut last = U64_MAX;
+    loop {
+      // The next session by slot: one scan per session, once per uncross.
+      let mut si = NONE;
+      let mut bs = U64_MAX;
+      for i in 0i64..(*ln).n_sess {
+        let sl = (*sess(ln, i)).id & 4095u64;
+        if (last == U64_MAX || sl > last) && sl < bs { bs = sl; si = i; } else { }
+      }
+      if si == NONE { break; }
+      last = bs;
+      for r in 1u64..(*ln).next_slot {
+        let rp = root(ln, r);
+        if (*rp).live == 0u64 || (*rp).sess != si || (*rp).ended != 0u64 { continue; }
+        // The version in effect at C*: a reduce admitted after the freeze has already moved
+        // cur past it, but the order was visible at C* (vyrn-lane version_at).
+        let at = version_at(ln, (*rp).cur, cs);
+        if at == 0u64 || (((*slot(ln, at)).flags >> 1u64) & 3u64) != 3u64 { continue; }
+        let open = open_of(ln, r, at);
+        if open == 0u64 { continue; }
+        // Every leg from cur back to at is released and dead, so a later reduce of the order
+        // settles TOO_LATE (vyrn-lane auction_out_of).
+        let mut v = (*rp).cur;
+        loop {
+          let leg = (*slot(ln, v)).leg;
+          release(c, ln, leg);
+          (*slot(ln, leg)).dead = 1u64;
+          if v == at || (*slot(ln, v)).pv == 0u64 { break; }
+          v = (*slot(ln, v)).pv;
+        }
+        (*rp).ended = 1u64;
+        (*rp).end_detail = D_OUT;
+        // Held under at: a later settle of that version emits it first (05 §8.10 rule 4.1).
+        hold(ln, at, si, 0u64, rec_lo(R_OUT, INDEX_NONE, OUT_AUCTION, handle(r)), rec_hi(open, (*rp).tag));
+        if (*ln).err != 0u64 { return; }
+      }
+    }
+  }
+}
+
+// The newest version from v back with ins_seq <= cut, or 0 when none is (vyrn-lane version_at).
+fn version_at(ln : *mut Lane, v0 : u64, cut : u64) -> u64 {
+  let mut v = v0;
+  unsafe {
+    for _i in 0u64..(*ln).next_slot {
+      let s = slot(ln, v);
+      if (*s).ins_seq <= cut { return v; }
+      if (*s).pv == 0u64 { return 0u64; }
+      v = (*s).pv;
+    }
+  }
+  return 0u64;
 }
 
 // A record the lane holds until version v settles (vyrn-lane emit).
@@ -2758,7 +2841,12 @@ fn rescan_run(c : *mut Ctx, cont : bool) -> void {
 // holds one stops with PBV_E_UNSUPPORTED (uncross_chunk).
 fn at_fz(c : *mut Ctx, l : u64, r : u64) -> u64 {
   unsafe {
-    if (*bord(c, l, r)).seq > *offset_mut((*(*c).bbo).fz, l as i64) { return 0u64; }
+    let o = bord(c, l, r);
+    if (*o).seq > *offset_mut((*(*c).bbo).fz, l as i64) { return 0u64; }
+    // 05 §8.8 item 6: an auction-only order an earlier uncross ended is not live (Ctx::live).
+    if (((*o).flags >> 1u64) & 3u64) == 3u64 && (*o).seq <= *offset_mut((*(*c).bbo).adead, l as i64) {
+      return 0u64;
+    }
     return bopen(c, l, r);
   }
 }
@@ -2832,6 +2920,7 @@ fn uncross_chunk(c : *mut Ctx) -> void {
       for l in 0i64..n {
         let fz = *offset_mut((*b).fz, l);
         event(c, l as u64, EV_UNCROSS, 0u64, 0u64, fz >> 32u64, fz & U32_MAX, p, 0u64);
+        *offset_mut((*b).adead, l) = fz;
       }
       (*b).phase = PH_CONT;
       (*b).has_fz = 0u64;
@@ -3333,7 +3422,8 @@ pub fn pbv_new(cfg : *const i8, accts : *const i8, n_accts : u32, sp : *const i8
     (*b).vh_f = zalloc(8i64 * (HIST as i64));
     (*b).fz = zalloc(8i64 * n);
     (*b).lowver = zalloc(8i64 * n);
-    if is_null_mut((*b).vh_ver) || is_null_mut((*b).vh_b) || is_null_mut((*b).vh_a) || is_null_mut((*b).vh_f) || is_null_mut((*b).fz)
+    (*b).adead = zalloc(8i64 * n);
+    if is_null_mut((*b).adead) || is_null_mut((*b).vh_ver) || is_null_mut((*b).vh_b) || is_null_mut((*b).vh_a) || is_null_mut((*b).vh_f) || is_null_mut((*b).fz)
        || is_null_mut((*b).lowver)
        || is_null_mut((*c).hist_ver) || is_null_mut((*c).sv_id) || is_null_mut((*c).sv_bid)
        || is_null_mut((*c).sv_ask) {
@@ -3420,6 +3510,7 @@ pub fn pbv_free(c : *mut Ctx) -> void {
     let v6 : *mut i8 = (*b).vh_f; free(v6);
     let v7 : *mut i8 = (*b).fz; free(v7);
     let v3 : *mut i8 = (*b).lowver; free(v3);
+    let v4 : *mut i8 = (*b).adead; free(v4);
     let r0 : *mut i8 = (*c).bbo; free(r0);
     let r1 : *mut i8 = (*c).lanes; free(r1);
     let r2 : *mut i8 = (*c).sync; free(r2);

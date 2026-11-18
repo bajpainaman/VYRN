@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 
 use vyrn_bbo::admit::{FixedClock, NeverLate};
 use vyrn_bbo::{Bbo, OrderFlags, Phase, Record, Side, Stp, Tif, TxEntry};
-use vyrn_cut::{Hw, PoolTok};
+use vyrn_cut::{Hw, PoolTok, Visibility};
 use vyrn_engine::{
     Engine, NoResponses, OwnedRec, Payloads, Rec, Responses, Shared, Sink, WireStep,
 };
@@ -128,11 +128,21 @@ pub fn pooled_engine<'a>(
 
 /// Every lane with sessions 1..NA, each funded.
 pub fn engine(bbo: Bbo, sh: &mut Shared<Hw>) -> Engine<'_, Hw, NA> {
-    Engine::new(&Hw, sh, bbo, &lane_cfgs(), |cfg, aw, ports| {
+    engine_on(&Hw, bbo, sh)
+}
+
+/// [`engine`] over the visibility backend `vis` (`vyrn_cut::Sim` delays publications).
+#[allow(dead_code)]
+pub fn engine_on<'a, V: Visibility>(
+    vis: &'a V,
+    bbo: Bbo,
+    sh: &'a mut Shared<V>,
+) -> Engine<'a, V, NA> {
+    Engine::new(vis, sh, bbo, &lane_cfgs(), |cfg, aw, ports| {
         let l = usize::from(cfg.lane.0);
         let mut acct = AcctRisk::new(AccountId(1), AccountId(1));
         acct.max_open_orders = 1000;
-        let mut lane = Lane::<Hw, NA>::new(cfg, aw, ports, acct);
+        let mut lane = Lane::<V, NA>::new(cfg, aw, ports, acct);
         for a in 1..NA as u32 {
             let (_, bal) = lane.account_mut(AcctSlot(a)).unwrap();
             bal.quote_free = 1 << 60;

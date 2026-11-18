@@ -1066,15 +1066,30 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   `tests/replay.rs` checks the oracle's price-time allocation by hand. **[Reading, 1b]** A cut
   past C\* that holds a Cancel or Reduce while an uncross is open stops with
   `PBV_E_UNSUPPORTED`: the Vx book has already applied it, but at C\* it is not visible.
-  **[Reading, 1b]** Auction-only remainders are not killed at the uncross, as in `vyrn-lane`
-  and `Bbo` today; the oracle's `OUT_AUCTION` for them is not replayed. **Known divergence**
-  from 05 §2229 item 6, which says every visible auction-only order with open > 0 is dead after
-  the last chunk and the lane ends it with `Out{cause: AUCTION}` at B1 (04 `AUCTION_UNFILLED`).
-  The oracle is right; `vyrn-lane` and `Bbo` are wrong. The engine fix is pending, and the Vx
-  client follows it in its own PR, with a test for an unfilled auction-only remainder. Until
-  then the client matches `RustReplay`.
-- *Gap list (the plan, in order).* What `RustReplay` replays and the Vx client does not yet
-  (1, Uncross and Seal, and 2, Rescan batch takers that trade, are done):
+  *Auction-only remainders (05 §8.8 item 6, #193).* The chunk that ends the auction sends each
+  lane its C\* in the Uncross event. The lane ends every auction-only order with `ins_seq` ≤
+  C\*[l] and open > 0 with `Out{cause: AUCTION}` for its open quantity, in session slot order
+  (`session_slot`, not the order `VxConfig` lists sessions) and then root creation order. It does this in B2, right after every pending op ≤ C\*[l] has
+  settled and before any later one, as `vyrn-lane` does. The BBO keeps C\* (`adead`, vyrn-bbo
+  `State::adead`), so no later uncross sees those orders. `tests/replay.rs` checks this with an
+  unfilled auction-only sell, a later cancel of it (TOO_LATE), and a second auction in which that
+  sell would otherwise fill first. Mutation check: dropping the end or `adead` fails the test.
+  Running the end before the pending ops ≤ C\* still passes, because no script yet has such an
+  op pending at the uncross.
+  An order a Reduce moved past C\\* after the freeze is still ended: the lane takes the version
+  in effect at C\\* (`version_at`, through each version's predecessor), outs that version's open
+  quantity, releases and kills every leg from the current version back to it, and holds the
+  `Out` under that version, so the Reduce then settles `TOO_LATE` (05 §8.10 rule 4.1), as
+  `vyrn-lane` does since #202. `tests/replay.rs` drives that script live over `vyrn_cut::Sim`,
+  so the lane admits the Reduce before it sees the freeze and the BBO runs the uncross before it
+  sees the Reduce. A client that tests the current version fails it. Holding the `Out` under the
+  current version, or releasing only its leg, still passes: the `Out` flushes at the uncross
+  boundary, before the Reduce settles, and a Reduce keeps its predecessor's leg. Replace (3b)
+  makes the second one observable.
+- *Gap list (the plan).* What `RustReplay` replays and the Vx client does not yet
+  (1, Uncross and Seal, and 2, Rescan batch takers that trade, are done). The order is 5, then 3,
+  then 4: dependencies first, since without them the client fully replays only 3 of the first
+  149 sim-swarm seeds.
   3. Replace (keep and new priority); CancelAll (3a) is done.
   4. STP that triggers (currently `PBV_E_UNSUPPORTED` in a forwarded or batch sweep and the FOK
      dry run).
