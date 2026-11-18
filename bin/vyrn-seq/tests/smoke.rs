@@ -197,6 +197,25 @@ base = 1000000000
     });
     assert!(ours, "packet not in block 0: {:?}", block.lanes);
     assert!(!block.steps.is_empty(), "block 0 has no step");
+    // The resting buy is an improve: its step names our op and its route bit (07 §3.8 src byte
+    // bit 7, StepFlags::CROSS) is clear, end to end through the 07 wire.
+    let ours = block
+        .steps
+        .iter()
+        .find(|m| m.rec.src_lane == LaneId(0) && m.rec.src_lane_seq.0 == 1)
+        .expect("no step names the order");
+    assert_eq!(
+        ours.rec.kind,
+        vyrn_types::StepKind::Improve,
+        "{:?}",
+        ours.rec
+    );
+    assert_eq!(
+        ours.rec.flags & vyrn_types::StepFlags::CROSS,
+        0,
+        "{:?}",
+        ours.rec
+    );
     assert_eq!(core.verdict(Height(0), Height(0)), Verdict::Valid);
 
     // 3. Clean stop.

@@ -211,13 +211,15 @@ impl SeqWriter {
         Ok(out)
     }
 
-    /// One step: `src` is the source op for Cross, Improve and Shed, `cut` the whole box's cut
-    /// after the step.
+    /// One step: `src` is the source op for Cross, Improve and Shed, `flags` its
+    /// `StepRecord.flags` (`StepFlags::CROSS` or 0; must be 0 without a source), `cut` the whole
+    /// box's cut after the step.
     pub fn step(
         &mut self,
         step: StepId,
         kind: StepKind,
         src: Option<(LaneId, LaneSeq)>,
+        flags: u8,
         payload: Vec<u8>,
         cut: &[LaneSeq],
     ) -> Result<Frames, RepErr> {
@@ -234,6 +236,7 @@ impl SeqWriter {
             home: Some(Home {
                 src_lane: src.map_or(LaneId(0xFF), |s| s.0),
                 src_lane_seq: src.map_or(LaneSeq(0), |s| s.1),
+                flags,
                 payload,
             }),
             cut: cut.to_vec(),

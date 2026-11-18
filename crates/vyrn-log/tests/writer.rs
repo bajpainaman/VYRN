@@ -11,7 +11,7 @@ use vyrn_log::{
 };
 use vyrn_types::{
     BookId, Epoch, Hash, Height, LaneId, LaneSeq, Nanos, PacketFlags, PacketRecord, PktHash,
-    SessionId, StepId, StepKind,
+    SessionId, StepFlags, StepId, StepKind,
 };
 
 const SEED: [u8; 32] = [7; 32];
@@ -78,8 +78,9 @@ fn frames_decode_and_headers_chain() {
     frames.extend(
         w.step(
             StepId(1),
-            StepKind::Improve,
+            StepKind::Cross,
             Some((LaneId(2), LaneSeq(3))),
+            StepFlags::CROSS,
             Vec::new(),
             &cut,
         )
@@ -101,7 +102,7 @@ fn frames_decode_and_headers_chain() {
     frames.extend(f0);
     // Block 1: one step, no packets.
     frames.extend(
-        w.step(StepId(2), StepKind::Idle, None, Vec::new(), &cut)
+        w.step(StepId(2), StepKind::Idle, None, 0, Vec::new(), &cut)
             .unwrap(),
     );
     let (f1, h1) = w.close_block().unwrap();
@@ -110,13 +111,18 @@ fn frames_decode_and_headers_chain() {
     let mut dec = StreamDecoder::new(layout, 0).unwrap();
     let mut recs = Vec::new();
     let mut hashes = Vec::new();
+    let mut homes = Vec::new();
     let mut headers = Vec::new();
     for f in &frames {
         match dec.decode(f).unwrap().body {
             Body::Order { sections, .. } => {
                 for s in sections {
-                    if let Section::LaneRun { recs: r, .. } = s {
-                        recs.extend(r);
+                    match s {
+                        Section::LaneRun { recs: r, .. } => recs.extend(r),
+                        Section::StepRun(v) => {
+                            homes.extend(v.into_iter().filter_map(|h| h.home.map(|x| x.flags)))
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -142,6 +148,8 @@ fn frames_decode_and_headers_chain() {
         .chain([LaneRec::Pkt(adv)])
         .collect();
     assert_eq!(recs, want);
+    // The route bit survives the wire (07 §3.8 src byte bit 7): set on the Cross, clear on Idle.
+    assert_eq!(homes, vec![StepFlags::CROSS, 0]);
     // One HashRun per lane in lane order, each in FIFO order; the Advance record waits for none.
     let want_h = [
         (LaneSeq(1), PktHash(0xA001)), // lane 0
@@ -224,7 +232,7 @@ fn frames_stay_within_the_limit() {
     );
     let cut: Vec<LaneSeq> = (0..n).map(|_| LaneSeq(u64::from(u32::MAX))).collect();
     frames.extend(
-        w.step(StepId(1), StepKind::Idle, None, Vec::new(), &cut)
+        w.step(StepId(1), StepKind::Idle, None, 0, Vec::new(), &cut)
             .unwrap(),
     );
     assert_eq!(w.framed_step(), StepId(0), "the step is not framed yet");
@@ -251,7 +259,7 @@ fn a_step_too_long_for_any_frame_is_refused() {
     let mut w = SeqWriter::new(Layout::new(3, 1, 0).unwrap(), ident, ts(), SEED, 1472).unwrap();
     let cut = [LaneSeq(0); 3];
     assert!(
-        w.step(StepId(1), StepKind::Control, None, vec![0; 1500], &cut)
+        w.step(StepId(1), StepKind::Control, None, 0, vec![0; 1500], &cut)
             .is_err()
     );
 }

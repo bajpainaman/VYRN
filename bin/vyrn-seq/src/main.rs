@@ -85,7 +85,7 @@ use vyrn_nic::{
 use vyrn_risk::{AcctRisk, AcctSlot, BookSpec, SessionBuckets};
 use vyrn_types::{
     AccountId, BookId, Epoch, Hash, HomeCode, LaneId, LaneSeq, Nanos, PacketRecord, PktHash,
-    SessionId, StepId, StepKind, TAG_BYTES,
+    SessionId, StepFlags, StepId, StepKind, TAG_BYTES,
 };
 use vyrn_wire::{PROTO_RESP_MAX_BYTES, RX_BURST, RespHeader, RxPkt, RxRing, TxRing};
 
@@ -758,7 +758,14 @@ impl<T: TxRing> StreamCore<T> {
                 let src = has_src(kind).then_some((e.src_lane, e.src_lane_seq));
                 // Spec gap: the engine's StepEntry carries no payload for Rescan, Control, Seal
                 // and Uncross (07 §3.8), so those steps are framed with an empty one.
-                self.writer.step(e.step, kind, src, Vec::new(), &self.cut)
+                // The route bit (05 §4.15, 07 §3.8 src byte bit 7) travels with the source op.
+                let flags = if src.is_some() && e.flags & vyrn_bbo::STEP_CROSS != 0 {
+                    StepFlags::CROSS
+                } else {
+                    0
+                };
+                self.writer
+                    .step(e.step, kind, src, flags, Vec::new(), &self.cut)
             }
             Out::Resp(l, ep, p) => {
                 self.pending.push((l, ep, p));

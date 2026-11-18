@@ -122,6 +122,7 @@ fn block(seed: [u8; 32]) -> Vec<Vec<u8>> {
             StepId(1),
             StepKind::Improve,
             Some((LaneId(0), LaneSeq(1))),
+            0,
             Vec::new(),
             &cut,
         )
