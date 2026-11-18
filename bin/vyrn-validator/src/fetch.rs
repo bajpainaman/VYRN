@@ -30,7 +30,8 @@
 //! **Refused** with no answer, counted `bad`: a requester that fails the above, and a RANGE or
 //! BLOCK fetch (only data boxes serve those). **Rate** (reading (d)): one bucket per replica of
 //! `REP_SEQ_DATA_MAX_PPS` = 50k packets/s, 10 ms of tokens; an answer takes one token per packet
-//! and a miss one. A request the bucket cannot cover is counted `limited` and not answered.
+//! and a miss one. A request with no token is counted `limited` and not answered; one with
+//! fewer tokens than variants gets what they buy, and the next resumes after it (reading (i)).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -183,6 +184,8 @@ pub struct PeerServer {
     kept: BTreeMap<(SessionId, u32), Vec<Vec<u8>>>,
     order: VecDeque<(SessionId, u32)>,
     buf: FrameBuf,
+    /// Keys whose variants outnumber the tokens one answer gets: where the next answer starts.
+    resume: BTreeMap<(SessionId, u32), usize>,
 }
 
 impl PeerServer {
@@ -195,6 +198,7 @@ impl PeerServer {
             kept: BTreeMap::new(),
             order: VecDeque::new(),
             buf: FrameBuf::default(),
+            resume: BTreeMap::new(),
         }
     }
 
@@ -275,12 +279,30 @@ impl PeerServer {
             .saturating_add(now.saturating_sub(self.at).saturating_mul(PEER_MAX_PPS))
             .min(cap());
         self.at = now;
-        let need = n.max(1).saturating_mul(SEC);
-        if self.level < need {
+        // One token per payload sent (at least one per answer). An answer that the tokens on hand
+        // cannot cover sends what they buy and the next one resumes after it (reading (i)), so a
+        // key with more variants than a full bucket still gets every one served.
+        let take = usize::try_from((self.level / SEC).min(n.max(1))).unwrap_or(usize::MAX);
+        if take == 0 {
             counts.limited = counts.limited.saturating_add(1);
             return Vec::new();
         }
-        self.level = self.level.saturating_sub(need);
+        let key = (session, pkt_seq);
+        if take < vars.len() {
+            let total = vars.len();
+            let start = self.resume.get(&key).copied().unwrap_or(0) % total;
+            vars.rotate_left(start);
+            vars.truncate(take);
+            if self.resume.len() >= PEER_KEEP {
+                self.resume.clear();
+            }
+            self.resume.insert(key, start.saturating_add(take) % total);
+        } else {
+            self.resume.remove(&key);
+        }
+        let n = u64::try_from(vars.len()).unwrap_or(u64::MAX);
+        let used = n.max(1).saturating_mul(SEC);
+        self.level = self.level.saturating_sub(used);
         let mut hdr = DataHdr {
             kind: Kind::FetchResp,
             book: BookId(0),
@@ -517,6 +539,31 @@ mod tests {
             !srv.serve(&j, PEER, &fetch(1), 40_000, &mut c).is_empty(),
             "40 µs refills 2"
         );
+    }
+
+    /// More variants than a full bucket: each answer sends what its tokens buy and the next
+    /// resumes after it, so two answers cover all of them.
+    #[test]
+    fn variants_past_the_bucket_are_served_over_answers() {
+        let mut j = DataJoin::default();
+        let mut all = Vec::new();
+        for e in 0..200 {
+            for n in 1..=3 {
+                j.put(sid(), 1, pkt_e(n, e));
+                all.push(pkt_e(n, e));
+            }
+        }
+        all.sort_unstable();
+        let mut srv = PeerServer::new(&[a(11)], None);
+        let mut c = Counts::default();
+        let first = packets(&srv.serve(&j, PEER, &fetch(1), 0, &mut c));
+        assert_eq!(first.len(), 500, "a full bucket");
+        let second = packets(&srv.serve(&j, PEER, &fetch(1), BURST_NS, &mut c));
+        let mut got: Vec<_> = first.into_iter().chain(second).collect();
+        got.sort_unstable();
+        got.dedup();
+        assert_eq!(got, all);
+        assert_eq!(c.limited, 0);
     }
 
     /// More variants than one data frame holds go out in several frames, none dropped.
