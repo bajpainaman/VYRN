@@ -1276,8 +1276,9 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             }
             // A gated observer replays at most one block per order-thread turn: the gate
             // releases blocks in bursts, and replaying a burst inline would leave ORDER and
-            // HASH frames unpolled long enough to trip `REP_E_HASHLAG`, which is measured when
-            // a frame is processed (kernel_udp has no RX timestamps yet).
+            // HASH frames unpolled long enough to trip `REP_E_HASHLAG` for the frames still in
+            // the socket (a frame's wait runs from its `rx_ts`, but a burst is only read once
+            // the thread polls).
             if durable.is_some() && !self.replay_dead {
                 return;
             }
@@ -1400,6 +1401,10 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
+/// The most frames `order_thread` holds back for its next poll behind a full burst; past it a
+/// frame goes to the core at once.
+const CARRY_MAX: usize = 4 * RX_BURST;
+
 /// `rxs`: path A's ORDER queue and, with `order_port_b`, path B's. With both, frames go through
 /// [`Paths`] (07 §4.9); with `gate` (an observer) a block replays only once its frames are held
 /// from both (10 §8.2).
@@ -1418,7 +1423,10 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     let mut last_final = 0;
     let t0 = Instant::now();
     let now = || u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let mut burst = [RxPkt::empty(); RX_BURST];
+    let mut bursts = [[RxPkt::empty(); RX_BURST]; 2];
+    // Frames held back to the next poll behind a full burst, and one poll's receive order.
+    let mut carry: Vec<(u64, usize, Vec<u8>)> = Vec::new();
+    let mut order: Vec<(u64, u8, usize, usize)> = Vec::with_capacity(2 * RX_BURST + CARRY_MAX);
     let mut faulted = false;
     let mut stalled = false;
     // Two paths, or path A alone with `[repair]` (reorder and gap repair, 07 §4.9).
@@ -1438,51 +1446,106 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     while !stop.load(Ordering::Acquire) {
         let mut k = 0;
         let mut delivered = 0usize;
-        for (rx, path) in rxs.iter_mut().zip([RepPath::A, RepPath::B]) {
-            let Some(rx) = rx else { continue };
-            let n = rx.poll(&mut burst);
-            k += n;
-            for p in burst.iter().take(n) {
-                let Ok(f) = frame::parse(rx.bytes(p)) else {
-                    continue;
-                };
-                // The sequencer's answer to a Nack for frames its ring no longer holds.
-                if let (Some(t), Some(ps)) = (NackTooOld::decode(f.payload), paths.as_mut()) {
-                    rep_stats[2] = rep_stats[2].saturating_add(1);
-                    ps.too_old(t.path, t.epoch16, t.tenure, t.stream, t.oldest_seq);
-                    continue;
-                }
-                stats.frames.fetch_add(1, Ordering::Relaxed);
-                let mut on = |payload: &[u8]| {
-                    delivered += 1;
-                    let r = core.on_frame(payload, now());
-                    if track
-                        && !matches!(r, Err(FrameErr::OutOfOrder))
-                        && let Some((key, q)) = vyrn_replica::paths::frame_key(payload)
-                    {
-                        frontier.insert(key, q);
-                    }
-                    report(
-                        &mut core,
-                        r,
-                        &mut faulted,
-                        &mut stalled,
-                        stats,
-                        source,
-                        data.as_mut(),
-                    );
-                    if let Some(d) = data.as_mut().filter(|_| track) {
-                        for x in d.pending.iter_mut().filter(|x| x.1.is_none()) {
-                            x.1 = Some(frontier.iter().map(|(k, q)| (*k, *q)).collect());
-                        }
-                    }
-                };
-                match paths.as_mut() {
-                    Some(ps) => ps.rx(path, f.payload, &mut on),
-                    None => on(f.payload),
-                }
+        // `REP_E_HASHLAG` runs from each frame's receive time (07 §3.7): its `rx_ts`
+        // (CLOCK_REALTIME, the kernel's stamp under kernel_udp) moved onto this thread's
+        // monotonic clock by the offset read at this poll, so a frame that waited in the socket
+        // while the thread was descheduled is not counted late. Both paths are polled first and
+        // their frames go to the core in receive order, so a late frame on one path cannot
+        // advance the deadlines past a timely HashRun still unread on the other. A path whose
+        // burst came back full may hold more unread frames, none received before its last one
+        // read: the other path's frames received after that wait, copied, for the next poll
+        // (at most `CARRY_MAX`), and are merged in receive order there.
+        let mut n = [0usize; 2];
+        for (rx, (b, n)) in rxs.iter_mut().zip(bursts.iter_mut().zip(&mut n)) {
+            if let Some(rx) = rx {
+                *n = rx.poll(b);
             }
-            rx.release(n);
+        }
+        let (mono, real) = (now(), realtime_ns());
+        let at_of = |p: &RxPkt| mono.saturating_sub(real.saturating_sub(p.rx_ts().0));
+        let cap = (0..2)
+            .filter(|&i| n[i] == RX_BURST)
+            .filter_map(|i| bursts[i].get(RX_BURST - 1).map(at_of))
+            .min()
+            .unwrap_or(u64::MAX);
+        k += n[0] + n[1];
+        let carried = std::mem::take(&mut carry);
+        // (receive time, 0 for a carried frame else 1, source, index): carried frames first on
+        // a tie, as they were read earlier; the source is 2 for `carried`, else the path.
+        order.clear();
+        order.extend((0..carried.len()).map(|c| (carried[c].0, 0u8, 2usize, c)));
+        for (pi, (b, &m)) in bursts.iter().zip(&n).enumerate() {
+            order.extend(
+                b.iter()
+                    .take(m)
+                    .enumerate()
+                    .map(|(x, p)| (at_of(p), 1, pi, x)),
+            );
+        }
+        order.sort_unstable();
+        for &(at, _, src, x) in &order {
+            let (pi, bytes) = match (src, carried.get(x)) {
+                (2, Some(c)) => (c.1, c.2.as_slice()),
+                _ => (
+                    src,
+                    rxs.get(src)
+                        .and_then(Option::as_ref)
+                        .zip(bursts.get(src).and_then(|b| b.get(x)))
+                        .map_or(&[][..], |(rx, p)| rx.bytes(p)),
+                ),
+            };
+            if at > cap && carry.len() < CARRY_MAX {
+                carry.push((at, pi, bytes.to_vec()));
+                continue;
+            }
+            let path = if pi == 0 { RepPath::A } else { RepPath::B };
+            let Ok(f) = frame::parse(bytes) else {
+                continue;
+            };
+            // The sequencer's answer to a Nack for frames its ring no longer holds.
+            if let (Some(t), Some(ps)) = (NackTooOld::decode(f.payload), paths.as_mut()) {
+                rep_stats[2] = rep_stats[2].saturating_add(1);
+                ps.too_old(t.path, t.epoch16, t.tenure, t.stream, t.oldest_seq);
+                continue;
+            }
+            stats.frames.fetch_add(1, Ordering::Relaxed);
+            // Deadlines stop at the oldest frame `Paths` holds behind a gap (07 §3.7).
+            let hm = paths.as_ref().map_or(u64::MAX, Paths::held_min);
+            let mut on = |payload: &[u8], at: u64| {
+                delivered += 1;
+                // A frame past `cap` that the full carry let through still keeps the deadlines at
+                // `cap`, as its path's unread frames may hold a timely HashRun.
+                let r = core.on_frame_at(payload, at, at.min(hm).min(cap));
+                if track
+                    && !matches!(r, Err(FrameErr::OutOfOrder))
+                    && let Some((key, q)) = vyrn_replica::paths::frame_key(payload)
+                {
+                    frontier.insert(key, q);
+                }
+                report(
+                    &mut core,
+                    r,
+                    &mut faulted,
+                    &mut stalled,
+                    stats,
+                    source,
+                    data.as_mut(),
+                );
+                if let Some(d) = data.as_mut().filter(|_| track) {
+                    for x in d.pending.iter_mut().filter(|x| x.1.is_none()) {
+                        x.1 = Some(frontier.iter().map(|(k, q)| (*k, *q)).collect());
+                    }
+                }
+            };
+            match paths.as_mut() {
+                Some(ps) => ps.rx_at(path, f.payload, at, &mut on),
+                None => on(f.payload, at),
+            }
+        }
+        for (rx, n) in rxs.iter_mut().zip(n) {
+            if let Some(rx) = rx {
+                rx.release(n);
+            }
         }
         // The final height first: payloads polled below are stamped with it on arrival, and a
         // stale one would expire them early (07 §5.4 retention).
@@ -1502,7 +1565,11 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         // them): the deadlines `on_frame` would have checked (REP_E_HASHLAG), whatever the data
         // queue is doing.
         if delivered == 0 {
-            let r = core.tick(now());
+            let hm = paths.as_ref().map_or(u64::MAX, Paths::held_min);
+            // A full burst's unread frames came no later than its last one read (`cap`), even
+            // when the frames read were all duplicates and nothing was delivered.
+            let carried = carry.first().map_or(u64::MAX, |c| c.0);
+            let r = core.tick(now().min(hm).min(carried).min(cap));
             report(
                 &mut core,
                 r,
@@ -1665,6 +1732,14 @@ fn block_line<const N: usize>(b: &BlockInputs<N>, verdict: Verdict) -> String {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// `CLOCK_REALTIME` in ns, the clock of kernel_udp's `rx_ts`.
+fn realtime_ns() -> u64 {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

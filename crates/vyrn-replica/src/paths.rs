@@ -132,7 +132,9 @@ fn due(
 #[derive(Debug)]
 struct Sub {
     next: u64,
-    hold: BTreeMap<u64, Vec<u8>>,
+    /// Each held frame's bytes, receive time, and whether that time is in `Paths::held_at`
+    /// (not once its gap's repair gave up).
+    hold: BTreeMap<u64, (Vec<u8>, u64, bool)>,
     both: u64,
     /// Paths each frame above `both` arrived on (bit A = 1, B = 2), and the bytes of its first
     /// copy, which is the one handed on: another copy counts for its path only if it is the
@@ -179,6 +181,8 @@ pub struct Paths {
     /// delivery-gap repair only.
     two: bool,
     subs: BTreeMap<Key, Sub>,
+    /// The receive times of every held frame, with their counts (for [`Paths::held_min`]).
+    held_at: BTreeMap<u64, u32>,
     /// Datagrams refused by the receive context or [`SUBS_MAX`].
     pub refused: u64,
     /// Copies of frames already handed on, per path.
@@ -186,6 +190,16 @@ pub struct Paths {
     /// Copies whose bytes (`flags` aside) differ from the first copy of their frame, per path.
     /// They count for no path, so a block that needs them stays held.
     pub mismatched: [u64; 2],
+}
+
+/// Takes one frame received at `t` out of `held_at`.
+fn uncount(held_at: &mut BTreeMap<u64, u32>, t: u64) {
+    if let Some(c) = held_at.get_mut(&t) {
+        *c = c.saturating_sub(1);
+        if *c == 0 {
+            held_at.remove(&t);
+        }
+    }
 }
 
 /// Whether two copies are the same frame: equal bytes except `flags`.
@@ -205,6 +219,7 @@ impl Paths {
             senders,
             two: true,
             subs: BTreeMap::new(),
+            held_at: BTreeMap::new(),
             refused: 0,
             dups: [0; 2],
             mismatched: [0; 2],
@@ -217,11 +232,31 @@ impl Paths {
         self
     }
 
+    /// The receive time of the oldest frame held behind a gap (`u64::MAX`: none). Deadlines
+    /// that run on receive time must not pass it: the frame may be a timely HashRun (07 §3.7).
+    pub fn held_min(&self) -> u64 {
+        self.held_at.first_key_value().map_or(u64::MAX, |(t, _)| *t)
+    }
+
     /// One datagram from `path`; `deliver` gets every frame now due, in `frame_seq` order. A
     /// datagram whose header does not parse goes through as is, for the order core to refuse.
     pub fn rx(&mut self, path: Path, frame: &[u8], deliver: &mut impl FnMut(&[u8])) {
+        self.rx_at(path, frame, 0, &mut |f: &[u8], _| deliver(f));
+    }
+
+    /// [`Paths::rx`] for a datagram received at `at`; `deliver` gets each due frame with its
+    /// receive time. A frame that fills a gap counts as received no later than any frame held
+    /// behind it (07 §3.7): it was sent before them, so the time its first copy was lost for
+    /// is not counted against the sequencer, and each held frame keeps its own time.
+    pub fn rx_at(
+        &mut self,
+        path: Path,
+        frame: &[u8],
+        at: u64,
+        deliver: &mut impl FnMut(&[u8], u64),
+    ) {
         let Ok((h, _)) = FrameHeader::parse(frame) else {
-            return deliver(frame);
+            return deliver(frame, at);
         };
         let key = (h.epoch16, h.tenure, h.sender, h.stream);
         let known = self.subs.contains_key(&key);
@@ -260,14 +295,32 @@ impl Paths {
             }
         } else if q > s.next {
             if s.hold.len() < HOLD_MAX {
-                s.hold.insert(q, frame.to_vec());
+                let counted = !s.gap.is_some_and(|g| g.done);
+                s.hold.insert(q, (frame.to_vec(), at, counted));
+                if counted {
+                    let c = self.held_at.entry(at).or_default();
+                    *c = c.saturating_add(1);
+                }
             }
         } else {
-            deliver(frame);
             s.next = s.next.saturating_add(1);
-            while let Some(f) = s.hold.remove(&s.next) {
-                deliver(&f);
+            let mut run = Vec::new();
+            while let Some((f, t, counted)) = s.hold.remove(&s.next) {
+                if counted {
+                    uncount(&mut self.held_at, t);
+                }
+                run.push((f, t));
                 s.next = s.next.saturating_add(1);
+            }
+            // Each frame's time is the earliest of its own and those after it in the run.
+            let mut t = u64::MAX;
+            for f in run.iter_mut().rev() {
+                t = t.min(f.1);
+                f.1 = t;
+            }
+            deliver(frame, at.min(t));
+            for (f, t) in &run {
+                deliver(f, *t);
             }
         }
         // `both` passes only frames already handed on: until then their first copy's bytes
@@ -300,12 +353,20 @@ impl Paths {
                 (s.next, to)
             });
             match due(&mut s.gap, want, now, r) {
-                Some((from, to, true)) => out.push(Ask::Gap {
-                    path: None,
-                    key,
-                    from,
-                    to,
-                }),
+                Some((from, to, true)) => {
+                    // Repair gave up: the held frames no longer hold back the deadlines
+                    // (`held_min`), or a record on another substream could wait forever.
+                    for h in s.hold.values_mut().filter(|h| h.2) {
+                        h.2 = false;
+                        uncount(&mut self.held_at, h.1);
+                    }
+                    out.push(Ask::Gap {
+                        path: None,
+                        key,
+                        from,
+                        to,
+                    });
+                }
                 Some((from, to, false)) => {
                     for &path in paths {
                         out.push(Ask::Nack {
@@ -425,6 +486,23 @@ mod tests {
         out.iter()
             .map(|f| FrameHeader::parse(f).unwrap().0.frame_seq)
             .collect()
+    }
+
+    /// Vercel #213: frames held behind a gap keep their own receive times, and the frame that
+    /// fills the gap counts as received no later than the earliest frame held behind it.
+    #[test]
+    fn a_gap_fill_keeps_each_held_frames_receive_time() {
+        let mut p = Paths::new(BookId(1), 0, 1).one_path();
+        let mut out = Vec::new();
+        let mut d = |f: &[u8], at: u64| out.push((FrameHeader::parse(f).unwrap().0.frame_seq, at));
+        p.rx_at(Path::A, &frame(0, 1), 10, &mut d);
+        p.rx_at(Path::A, &frame(0, 4), 40, &mut d);
+        p.rx_at(Path::A, &frame(0, 3), 30, &mut d);
+        assert_eq!(p.held_min(), 30, "3 and 4 are held");
+        p.rx_at(Path::A, &frame(0, 2), 900, &mut d);
+        assert_eq!(p.held_min(), u64::MAX, "nothing is held");
+        p.rx_at(Path::A, &frame(0, 5), 950, &mut d);
+        assert_eq!(out, [(1, 10), (2, 30), (3, 30), (4, 40), (5, 950)]);
     }
 
     #[test]
@@ -571,7 +649,17 @@ mod tests {
             from: 2,
             to: 3,
         };
+        assert_eq!(
+            p.held_min(),
+            0,
+            "4 holds the deadlines back while repair runs"
+        );
         assert_eq!(asks(&mut p, 210, false), vec![gap]);
+        // Codex #213: a given-up gap no longer holds the deadlines back, nor does a frame
+        // held behind it later.
+        assert_eq!(p.held_min(), u64::MAX);
+        p.rx(Path::A, &frame(0, 5), &mut d);
+        assert_eq!(p.held_min(), u64::MAX);
         assert!(asks(&mut p, 999, false).is_empty(), "reported once");
         // A one-path box asks on A only, and a filled hole asks for nothing.
         let mut q = Paths::new(BookId(1), 0, 1).one_path();

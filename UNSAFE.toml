@@ -18,7 +18,7 @@ max_lines = 200
 [[module]]
 path = "vyrn-nic::sys"
 file = "crates/vyrn-nic/src/sys.rs"
-max_lines = 250
+max_lines = 300
 
 [[module]]
 path = "vyrn-engine::alloc"
