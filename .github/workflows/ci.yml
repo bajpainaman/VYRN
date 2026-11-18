@@ -90,6 +90,26 @@ jobs:
       - name: the SF-24 canary fails INV-DET on every seed that reaches replay
         run: cargo run --locked --release --quiet -p sim-swarm -- --start 1 --seeds 100 --jobs 4 --canary
 
+  e2e-smoke:
+    name: e2e smoke (vyrn-seq, vyrn-validator, replay tap)
+    runs-on: ubuntu-24.04
+    # Bounded three ways: the job, the step's timeout(1), and the harness's per-wait deadline.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/llvm # clang and lld with rustc's LLVM major (11 §4.2)
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Release: a debug validator can take longer than REP_HASHLAG_MAX_NS (1 ms) on one frame.
+      - run: cargo build --locked --release -p vyrn-seq -p vyrn-validator -p e2e-smoke
+      - name: 3 validators, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke)
+        run: timeout 300 target/release/e2e-smoke --validators 3 --wait-s 30 --workload tools/e2e-smoke/wl-smoke-nocross.toml
+      # Known gap: vyrn-seq drops RouteRecords, so replay diverges after crosses. Drop
+      # continue-on-error once the box frames them.
+      - name: 3 validators, WL-SMOKE seed 1 (known gap, does not gate)
+        continue-on-error: true
+        run: timeout 300 target/release/e2e-smoke --validators 3 --wait-s 30
+
   actionlint:
     runs-on: ubuntu-24.04
     steps:

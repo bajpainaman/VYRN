@@ -1,0 +1,77 @@
+# WL-SMOKE-NOCROSS: WL-SMOKE with joins and cancels only (no cross, improve or reduce messages).
+# It keeps clear of RouteRecords, which vyrn-seq does not frame yet (its Rec::Route arm), so its
+# replay check gates CI; WL-SMOKE runs beside it as the known gap (tools/e2e-smoke docs).
+version = 1
+id = "WL-SMOKE-NOCROSS"
+mode = "base"
+book = 7
+epoch16 = 0
+rate_msgs_per_s = 10_000
+
+[book_model]
+mid_tick = 100
+spread_ticks = 2
+depth_lots = 5
+
+# No bursts: base rates unscaled.
+[burst]
+rate_per_s = 0
+window_ns = 1
+mult_ppm = 1_000_000
+base_scale_ppm = 1_000_000
+
+[lifetimes]
+replace_ppm = 115_000
+
+[[lifetimes.row]]
+ppm = 700_000
+lo_ns = 100_000
+hi_ns = 2_000_000
+
+[[lifetimes.row]]
+ppm = 300_000
+lo_ns = 2_000_000
+hi_ns = 50_000_000
+
+[[join_distance]]
+kind = "fixed"
+ppm = 500_000
+d = 0
+
+[[join_distance]]
+kind = "geometric"
+ppm = 500_000
+base = 1
+cap = 6
+p_ppm = 400_000
+
+[[cross_levels]]
+ppm = 800_000
+lo = 1
+hi = 1
+
+[[cross_levels]]
+ppm = 200_000
+lo = 2
+hi = 3
+
+[cross]
+ioc_ppm = 700_000
+day_ppm = 250_000
+fok_ppm = 50_000
+through_ppm = 4_000
+through_qty_pct = 120
+
+[[phase]]
+duration_ns = 600_000_000_000
+rate_ppm = 1_000_000
+
+[[class]]
+kind = "mm"
+enabled = true
+placement = { kind = "dedicated", lane_first = 0, lane_count = 2, sessions_per_lane = 2 }
+skew = { kind = "equal" }
+mix = { join = 600_000, cancel = 400_000, reduce = 0, improve = 0, cross = 0 }
+qty_p_ppm = 300_000
+stp_cancel_newest = true
+packets = { kind = "single", two_ppm = 200_000 }

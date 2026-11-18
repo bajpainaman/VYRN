@@ -1,0 +1,25 @@
+[package]
+name = "e2e-smoke"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "Multi-node end-to-end smoke harness: vyrn-seq, vyrn-validators and a replay tap on one machine."
+
+[dependencies]
+vyrn-types = { workspace = true }
+vyrn-crypto = { workspace = true }
+vyrn-wire = { workspace = true }
+vyrn-cut = { workspace = true }
+vyrn-risk = { workspace = true }
+vyrn-bbo = { workspace = true }
+vyrn-lane = { workspace = true }
+vyrn-engine = { workspace = true }
+vyrn-log = { workspace = true }
+vyrn-replica = { workspace = true }
+vyrn-bench = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true
