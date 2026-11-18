@@ -269,20 +269,21 @@ fn a_session_runs_inside_noise_over_tcp() {
         for (i, c) in l.incoming().take(2).enumerate() {
             let c = c.unwrap();
             c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let r = NoiseStream::accept(c, book, &s, &[0x50 + i as u8; 32]).and_then(|mut c| {
-                serve(
-                    &mut c,
-                    Session::new(book, [7; 32]),
-                    &k2,
-                    &st2,
-                    &w2,
-                    Duration::from_secs(5),
-                    |c, d| {
-                        c.get_mut().set_read_timeout(Some(d))?;
-                        c.get_mut().set_write_timeout(Some(d))
-                    },
-                )
-            });
+            let r =
+                NoiseStream::accept(c, book, &s, &[0x50 + i as u8; 32], None).and_then(|mut c| {
+                    serve(
+                        &mut c,
+                        Session::new(book, [7; 32]),
+                        &k2,
+                        &st2,
+                        &w2,
+                        Duration::from_secs(5),
+                        |c, d| {
+                            c.get_mut().set_read_timeout(Some(d))?;
+                            c.get_mut().set_write_timeout(Some(d))
+                        },
+                    )
+                });
             if i == 1 {
                 // The wrong server key: message 1's tag fails here.
                 let e = r.unwrap_err();
@@ -325,4 +326,66 @@ fn a_session_runs_inside_noise_over_tcp() {
     let bad = vyrn_crypto::x25519::public_key(&[0x45; 32]);
     assert!(NoiseStream::connect(tcp, book, &bad, &[0x61; 32]).is_err());
     server.join().unwrap();
+}
+
+/// The login deadline holds inside Noise: a client that trickles message 1 a byte at a time,
+/// or that finishes the handshake and then sends only empty transport messages, is cut off at
+/// the deadline although no single socket read ever times out.
+#[test]
+fn a_trickling_client_is_cut_off_at_the_deadline() {
+    use std::time::{Duration, Instant};
+    use vyrn_md::dropcopy::noise::Deadline;
+    let book = BookId(7);
+    let (s, spub) = ([0x44; 32], vyrn_crypto::x25519::public_key(&[0x44; 32]));
+    let budget = Duration::from_millis(400);
+    for empties in [false, true] {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (c, _) = l.accept().unwrap();
+            let t0 = Instant::now();
+            let d: Deadline<std::net::TcpStream> = (t0 + budget, |c, t| c.set_read_timeout(t));
+            let r = NoiseStream::accept(c, book, &s, &[0x50; 32], Some(d)).and_then(|mut n| {
+                let mut b = [0u8; 1];
+                n.read_exact(&mut b)
+            });
+            (r.map_err(|e| e.kind()), t0.elapsed())
+        });
+        let mut tcp = std::net::TcpStream::connect(addr).unwrap();
+        let (st, m1) = initiate(book, &spub, &[0x60; 32]).unwrap();
+        let mut f = vec![0, 48];
+        f.extend_from_slice(&m1);
+        let stop = Instant::now() + Duration::from_secs(3);
+        if empties {
+            tcp.write_all(&f).unwrap();
+            let mut m2 = [0u8; 50];
+            tcp.read_exact(&mut m2).unwrap();
+            let mut t = st.finish(&m2[2..].try_into().unwrap()).unwrap();
+            while Instant::now() < stop {
+                let mut out = Vec::new();
+                t.seal(&[], &mut out).unwrap();
+                if tcp.write_all(&out).is_err() {
+                    break;
+                }
+                std::thread::park_timeout(Duration::from_millis(20));
+            }
+        } else {
+            for b in f {
+                if Instant::now() > stop || tcp.write_all(&[b]).is_err() {
+                    break;
+                }
+                std::thread::park_timeout(Duration::from_millis(20));
+            }
+        }
+        let (r, took) = server.join().unwrap();
+        assert_eq!(
+            r.err(),
+            Some(std::io::ErrorKind::TimedOut),
+            "empties {empties}"
+        );
+        assert!(
+            took >= budget && took < budget + Duration::from_millis(300),
+            "empties {empties}: {took:?}"
+        );
+    }
 }

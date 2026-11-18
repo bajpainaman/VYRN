@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use serde::Deserialize;
-use vyrn_md::dropcopy::noise::NoiseStream;
+use vyrn_md::dropcopy::noise::{Deadline, NoiseStream};
 use vyrn_md::dropcopy::ring::{Follower, RingError};
 use vyrn_md::dropcopy::server::{DcStore, Keys, Session, Wake, serve};
 use vyrn_md::dropcopy::wire::DC_LOGIN_TIMEOUT_MS;
@@ -228,7 +228,12 @@ fn run(args: &Args) -> Result<(), String> {
             let r = c
                 .set_read_timeout(Some(login))
                 .and_then(|()| c.set_write_timeout(Some(login)))
-                .and_then(|()| NoiseStream::accept(c, book, &noise, &e))
+                .and_then(|()| {
+                    // Every read before the login, handshake included, ends by the deadline.
+                    let d: Deadline<std::net::TcpStream> =
+                        (start + login, |c, t| c.set_read_timeout(t));
+                    NoiseStream::accept(c, book, &noise, &e, Some(d))
+                })
                 .and_then(|mut c| {
                     let left = login.saturating_sub(start.elapsed());
                     if left.is_zero() {

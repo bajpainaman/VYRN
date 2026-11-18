@@ -311,18 +311,67 @@ pub fn respond(
     ))
 }
 
-fn read_frame<T: Read>(io: &mut T, buf: &mut Vec<u8>) -> std::io::Result<()> {
+/// Sets the read timeout of the underlying stream (`None`: blocking).
+pub type SetTimeout<T> = fn(&mut T, Option<std::time::Duration>) -> std::io::Result<()>;
+
+/// An absolute read deadline and how to cap each underlying read by it.
+pub type Deadline<T> = (std::time::Instant, SetTimeout<T>);
+
+/// Before every underlying read: past the deadline is `TimedOut`, else the read may block at
+/// most until it. So a client that trickles bytes, or sends empty messages, gets no more time
+/// than the deadline in all.
+fn before_read<T>(io: &mut T, d: Option<Deadline<T>>) -> std::io::Result<()> {
+    if let Some((at, set)) = d {
+        let left = at.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        set(io, Some(left))?;
+    }
+    Ok(())
+}
+
+/// A read that failed once the deadline passed reports `TimedOut` (a capped socket read
+/// reports `WouldBlock` on Linux).
+fn timed<T>(e: std::io::Error, d: Option<Deadline<T>>) -> std::io::Error {
+    match d {
+        Some((at, _)) if std::time::Instant::now() >= at => std::io::ErrorKind::TimedOut.into(),
+        _ => e,
+    }
+}
+
+fn read_full<T: Read>(io: &mut T, buf: &mut [u8], d: Option<Deadline<T>>) -> std::io::Result<()> {
+    let mut got = 0;
+    while got < buf.len() {
+        before_read(io, d)?;
+        match io.read(&mut buf[got..]) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(timed(e, d)),
+        }
+    }
+    Ok(())
+}
+
+fn read_frame<T: Read>(
+    io: &mut T,
+    buf: &mut Vec<u8>,
+    d: Option<Deadline<T>>,
+) -> std::io::Result<()> {
     let mut len = [0u8; 2];
-    io.read_exact(&mut len)?;
+    read_full(io, &mut len, d)?;
     buf.resize(usize::from(u16::from_be_bytes(len)), 0);
-    io.read_exact(buf)
+    read_full(io, buf, d)
 }
 
 /// A Noise transport over `T`: `Read` yields the peer's plaintext, each `write` sends one
 /// message. A partial message read before a timeout is kept, so a read after a
-/// `WouldBlock` / `TimedOut` resumes it.
+/// `WouldBlock` / `TimedOut` resumes it. With a [`Deadline`], no read (empty messages
+/// included) waits past it.
 pub struct NoiseStream<T> {
     io: T,
+    deadline: Option<Deadline<T>>,
     t: Transport,
     /// Received bytes of the message being read (length prefix included).
     raw: Vec<u8>,
@@ -333,16 +382,26 @@ pub struct NoiseStream<T> {
 }
 
 impl<T: Read + Write> NoiseStream<T> {
-    /// The server's end: reads message 1, sends message 2.
-    pub fn accept(mut io: T, book: BookId, s: &[u8; 32], e: &[u8; 32]) -> std::io::Result<Self> {
+    /// The server's end: reads message 1, sends message 2. `deadline` bounds the handshake and
+    /// every read after it (the login deadline, 10 §8.5 item 5) until [`NoiseStream::set_deadline`]
+    /// changes it.
+    pub fn accept(
+        mut io: T,
+        book: BookId,
+        s: &[u8; 32],
+        e: &[u8; 32],
+        deadline: Option<Deadline<T>>,
+    ) -> std::io::Result<Self> {
         let mut m1 = Vec::new();
-        read_frame(&mut io, &mut m1)?;
+        read_frame(&mut io, &mut m1, deadline)?;
         let m1: [u8; HANDSHAKE_BYTES] = m1.try_into().map_err(|_| NoiseError::Len)?;
         let (t, m2) = respond(book, s, e, &m1)?;
         let mut f = (HANDSHAKE_BYTES as u16).to_be_bytes().to_vec();
         f.extend_from_slice(&m2);
         io.write_all(&f)?;
-        Ok(Self::new(io, t))
+        let mut st = Self::new(io, t);
+        st.deadline = deadline;
+        Ok(st)
     }
 
     /// The client's end: sends message 1, reads message 2.
@@ -357,7 +416,7 @@ impl<T: Read + Write> NoiseStream<T> {
         f.extend_from_slice(&m1);
         io.write_all(&f)?;
         let mut m2 = Vec::new();
-        read_frame(&mut io, &mut m2)?;
+        read_frame(&mut io, &mut m2, None)?;
         let m2: [u8; HANDSHAKE_BYTES] = m2.try_into().map_err(|_| NoiseError::Len)?;
         Ok(Self::new(io, st.finish(&m2)?))
     }
@@ -365,12 +424,18 @@ impl<T: Read + Write> NoiseStream<T> {
     fn new(io: T, t: Transport) -> Self {
         Self {
             io,
+            deadline: None,
             t,
             raw: Vec::new(),
             plain: Vec::new(),
             pos: 0,
             out: Vec::new(),
         }
+    }
+
+    /// Sets or clears the read deadline.
+    pub fn set_deadline(&mut self, deadline: Option<Deadline<T>>) {
+        self.deadline = deadline;
     }
 
     /// The underlying stream, for its timeouts.
@@ -387,7 +452,9 @@ impl<T: Read + Write> NoiseStream<T> {
         let mut b = [0u8; 4096];
         while self.raw.len() < want {
             let k = (want - self.raw.len()).min(b.len());
-            match self.io.read(&mut b[..k])? {
+            before_read(&mut self.io, self.deadline)?;
+            let d = self.deadline;
+            match self.io.read(&mut b[..k]).map_err(|e| timed(e, d))? {
                 0 if self.raw.is_empty() => return Ok(false),
                 0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
                 n => self.raw.extend_from_slice(&b[..n]),
