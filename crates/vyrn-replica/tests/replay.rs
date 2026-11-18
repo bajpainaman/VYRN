@@ -1246,8 +1246,12 @@ fn the_vx_client_replays_control_steps() {
 /// An auction (05 §8.8) through Control and Uncross steps, then a Seal (08). Four sells of 1 at
 /// 103, 104, 104 (an auction-only one) and 105, four buys of 1 at 107, 106, 106 and 105; the
 /// control role uncrosses Q = 4 at p* = 105, which takes two chunks of at most
-/// `ENG_UNCROSS_CHUNK` = 6 fills. `extra` adds a resting sell at 105 that the uncross leaves.
-fn auction_script(extra: bool) -> Vec<Act> {
+/// `ENG_UNCROSS_CHUNK` = 6 fills. `extra` 1 adds a resting sell at 105 that the uncross leaves;
+/// `extra` 2 adds an auction-only sell of 3 at 105 instead, which the uncross leaves unfilled, so
+/// its lane ends it with `Out { cause: AUCTION }` (05 §8.8 item 6), a cancel of it after the
+/// uncross that finds it ended, and a second auction (Q = 1 at 105) in which that earlier sell
+/// would come first if it were still live.
+fn auction_script(extra: u8) -> Vec<Act> {
     use Side::{Buy, Sell};
     use Tif::{AuctionOnly, Day};
     use vyrn_bbo::{ControlCmd, Phase};
@@ -1293,8 +1297,11 @@ fn auction_script(extra: bool) -> Vec<Act> {
             vec![new(Buy, Day, 106, 1, 7), new(Buy, Day, 105, 1, 8)],
         ),
     ];
-    if extra {
+    if extra == 1 {
         s.push(p(1, 2, 1_400, vec![new(Sell, Day, 105, 3, 9)]));
+    }
+    if extra == 2 {
+        s.push(p(1, 2, 1_400, vec![new(Sell, AuctionOnly, 105, 3, 9)]));
     }
     s.extend([
         Act::Run,
@@ -1309,6 +1316,28 @@ fn auction_script(extra: bool) -> Vec<Act> {
         Act::Poll,
         Act::Run,
         p(0, 1, 5_000, vec![new(Buy, Day, 101, 1, 10)]),
+    ]);
+    if extra == 2 {
+        s.push(p(1, 2, 5_100, vec![cancel(Handle::new(3, 1).unwrap(), 11)]));
+        s.extend([
+            Act::Run,
+            Act::Poll,
+            Act::Run,
+            phase(Phase::Auction, 0, 0),
+            Act::Run,
+            p(0, 1, 6_000, vec![new(Sell, Day, 105, 1, 12)]),
+            p(2, 1, 6_100, vec![new(Buy, Day, 105, 1, 13)]),
+            Act::Run,
+            Act::Poll,
+            phase(Phase::Frozen, 1, TICK_MAX),
+            Act::Run,
+            Act::Cmd(ControlCmd::Uncross {
+                price: vyrn_types::Tick(105),
+                qty: 1,
+            }),
+        ]);
+    }
+    s.extend([
         Act::Run,
         Act::Poll,
         Act::Run,
@@ -1323,15 +1352,15 @@ fn auction_script(extra: bool) -> Vec<Act> {
 /// oracle's `allocate` gives it (`vyrn-vx-oracle`).
 #[test]
 fn the_vx_client_replays_an_uncross_and_a_seal() {
-    for extra in [false, true] {
+    for extra in [0, 1, 2] {
         let (live_j, store, blocks) = blocks_of(&auction_script(extra), &[]);
         let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
         check_same(&live_j, &rep);
         let kinds: Vec<_> = blocks[0].steps.iter().map(|m| m.rec.kind).collect();
         assert_eq!(
             kinds.iter().filter(|k| **k == StepKind::Uncross).count(),
-            2,
-            "two chunks: {kinds:?}"
+            if extra == 2 { 3 } else { 2 },
+            "two chunks, and one in the second auction: {kinds:?}"
         );
         assert_eq!(kinds.last(), Some(&StepKind::Seal), "{kinds:?}");
         // The oracle's allocation, by hand: (lane, client tag of the order, qty), all at 105.
@@ -1348,6 +1377,13 @@ fn the_vx_client_replays_an_uncross_and_a_seal() {
             })
             .collect();
         fills.sort_unstable();
+        if extra == 2 {
+            // The second auction's sell and buy, on lanes 0 and 2.
+            for l in [0, 2] {
+                let i = fills.iter().position(|f| f.0 == l).unwrap();
+                fills.remove(i);
+            }
+        }
         assert_eq!(
             fills,
             vec![
@@ -1363,6 +1399,33 @@ fn the_vx_client_replays_an_uncross_and_a_seal() {
             "buys 107 and 106 on lane 1, 106 and 105 on lane 2; sells 103 and 105 on lane 0, \
              104 and the auction-only 104 on lane 2"
         );
+        // The unfilled auction-only remainder ends at the uncross, before the later cancel.
+        let lane1: Vec<_> = live_j
+            .resp
+            .iter()
+            .filter(|(l, _)| l.0 == 1)
+            .flat_map(|(_, p)| p.records().iter().copied())
+            .filter(|r| {
+                matches!(
+                    r,
+                    vyrn_bbo::Record::Out { .. }
+                        | vyrn_bbo::Record::Reject { .. }
+                        | vyrn_bbo::Record::CancelAck { .. }
+                )
+            })
+            .collect();
+        if extra == 2 {
+            assert!(
+                matches!(
+                    lane1.as_slice(),
+                    [
+                        vyrn_bbo::Record::Out { cause: vyrn_bbo::OUT_AUCTION, qty, .. },
+                        vyrn_bbo::Record::Reject { reason, .. },
+                    ] if qty.0 == 3 && *reason == vyrn_types::RejectReason::TooLate
+                ),
+                "{lane1:?}"
+            );
+        }
         let (j, _) = live07(&auction_script(extra));
         assert_vx_matches(&auction_script(extra), 0..j.recs.len() - 1);
     }
