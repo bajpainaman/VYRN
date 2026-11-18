@@ -81,7 +81,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: actionlint 1.7.12
         run: |
-          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash -o /tmp/dl-actionlint.bash
+          echo "72fa3e45ac20f3c3a512d6747b4fcf719e21f890e8c43e78d48a41fdfb900c4e  /tmp/dl-actionlint.bash" | sha256sum -c --quiet -
+          bash /tmp/dl-actionlint.bash 1.7.12
           ./actionlint -color
 
   deny:
