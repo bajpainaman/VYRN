@@ -16,7 +16,7 @@
 
 use vyrn_bbo::admit::{FixedClock, NeverLate};
 use vyrn_bbo::{
-    Bbo, Cut, CutDelta, Diverge, MAX_LANES, Record, ReplayStep, STEP_CONT, StepEntry, TxEntry,
+    Cut, CutDelta, Diverge, MAX_LANES, Record, ReplayStep, STEP_CONT, StepEntry, TxEntry,
 };
 use vyrn_cut::LaneCutEntry;
 use vyrn_cut::Visibility;
@@ -314,13 +314,6 @@ pub struct WireDiverged {
     pub why: Why,
 }
 
-/// TEMPORARY until `vyrn-bbo` #48 merges: `Bbo::continuing()`, true iff the next step must be a
-/// `CONT` step. With `false`, a 07 log whose sweep continues (a capped forwarded sweep or a capped
-/// `Rescan` batch taker) is refused with `Why::Step(Diverge::Kind)`.
-fn continuing(_bbo: &Bbo) -> bool {
-    false
-}
-
 /// One lane call (07 §7.1 `REP_MERGE` item 1): a packet record with its `MID` records, or a
 /// non-`MID` Advance record alone. `f` is the step it is due at.
 #[derive(Clone, Copy)]
@@ -496,7 +489,8 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             let rs = ReplayStep {
                 kind: w.kind,
                 src: w.src,
-                cont: continuing(&self.bbo),
+                // 07 has no CONT bit: a pending continuation must be the next step (07 §7.1).
+                cont: self.bbo.continuing(),
                 band,
                 cut,
             };

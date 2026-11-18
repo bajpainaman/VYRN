@@ -304,6 +304,44 @@ fn replay_from_07_fields_only_in_canonical_order() {
 }
 
 #[test]
+fn replay_from_07_derives_cont_for_a_capped_sweep() {
+    // 05 §8.5, D14: a sweep stops after ENG_STEP_FILLS = 8 maker fills and continues in a CONT
+    // step. 07 carries no CONT bit, so replay takes it from the BBO core (Bbo::continuing).
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let mut s: Vec<Act> = (1..=9u32)
+        .map(|a| Act::Pkt {
+            l: 0,
+            a,
+            rx_ts: 1_000 * u64::from(a),
+            now: 1_000 * u64::from(a),
+            msgs: vec![new(Sell, Day, 105, 1, a)],
+        })
+        .collect();
+    s.push(Act::Run);
+    s.push(Act::Pkt {
+        l: 1,
+        a: 1,
+        rx_ts: 20_000,
+        now: 20_000,
+        msgs: vec![new(Buy, Day, 105, 9, 99)],
+    });
+    s.push(Act::Run);
+    let (j, store, _, _) = live(&s);
+    let n_cont = steps(&j.recs)
+        .filter(|e| e.flags & vyrn_bbo::STEP_CONT != 0)
+        .count();
+    assert_eq!(n_cont, 1, "9 makers: 8 fills, then one CONT step");
+    let (lanes, ws) = to_wire(&j.recs);
+    let (r, rep) = replay_wire(&lanes, &ws, &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    assert_eq!(
+        steps(&rep.recs).map(|e| e.flags).collect::<Vec<_>>(),
+        steps(&j.recs).map(|e| e.flags).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn replay_from_07_rejects_what_07_carries() {
     let (j, store, _, _) = live(&script());
     let (lanes, steps) = to_wire(&j.recs);
