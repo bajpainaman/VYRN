@@ -125,20 +125,38 @@ impl Server {
         let (session, pkt_seq) = key;
         let n = u64::try_from(self.retain.find(session, pkt_seq).count()).unwrap_or(u64::MAX);
         self.total.refill(self.box_pps, now_ns);
-        let rate = self.session_pps;
-        let s = self
-            .sessions
-            .entry(session)
-            .or_insert_with(|| Bucket::full(rate, now_ns));
-        s.refill(rate, now_ns);
         let need_box = n.max(1).saturating_mul(SEC);
-        let need_session = n.saturating_mul(SEC);
-        if self.total.level < need_box || s.level < need_session {
+        if self.total.level < need_box {
             self.stats.limited = self.stats.limited.saturating_add(1);
             return None;
         }
+        // Only a hit takes a session token, so only a session the lanes authenticated (one with
+        // a retained packet) ever gets a bucket: a miss for a made-up session stores nothing.
+        if n > 0 {
+            let rate = self.session_pps;
+            // A live hit session has a retained packet, so at most `capacity` are live. Past that,
+            // buckets that refilled to full (idle ≥ 10 ms) carry no state and are dropped.
+            if !self.sessions.contains_key(&session)
+                && self.sessions.len() >= self.retain.capacity()
+            {
+                self.sessions.retain(|_, b| {
+                    b.refill(rate, now_ns);
+                    b.level < cap(rate)
+                });
+            }
+            let s = self
+                .sessions
+                .entry(session)
+                .or_insert_with(|| Bucket::full(rate, now_ns));
+            s.refill(rate, now_ns);
+            let need_session = n.saturating_mul(SEC);
+            if s.level < need_session {
+                self.stats.limited = self.stats.limited.saturating_add(1);
+                return None;
+            }
+            s.level = s.level.saturating_sub(need_session);
+        }
         self.total.level = self.total.level.saturating_sub(need_box);
-        s.level = s.level.saturating_sub(need_session);
         let mut hdr = DataHdr {
             kind: Kind::FetchResp,
             book: BookId(0),
@@ -315,5 +333,16 @@ mod tests {
             .count();
         assert_eq!(ok, 500);
         assert_eq!(b.stats.limited, 100);
+        assert!(b.sessions.is_empty(), "misses create no session bucket");
+        // Many distinct hit sessions: idle buckets are pruned at the retention's capacity.
+        let mut c = Server::new(16, vec![R], 50_000, 2_000);
+        for q in 0..200u32 {
+            c.put(kept(100 + q, 1, 1));
+            assert!(
+                c.serve(R, &key(100 + q, 1), u64::from(q) * 20_000_000)
+                    .is_some()
+            );
+            assert!(c.sessions.len() <= 16, "{}", c.sessions.len());
+        }
     }
 }
