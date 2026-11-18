@@ -307,3 +307,112 @@ fn a_running_order_core_takes_its_epoch_fence() {
         vyrn_consensus::Verdict::Invalid
     );
 }
+
+/// The data feed's rejects and stream position: a heartbeat reveals a lost tail frame, a frame of
+/// another book moves the box's position (one `data_seq` per destination over every book) but
+/// stores nothing, a frame from an unconfigured box is refused, and a bad packet inside a good
+/// frame is dropped alone.
+#[test]
+fn data_feed_tracks_each_box_and_refuses_what_is_not_its_own() {
+    use vyrn_data::frame::{DataHdr, Fetch, FrameBuf, Kind};
+    use vyrn_replica::{DataFeed, Fed, FeedErr};
+    let k = [7u8; 16];
+    let req = |session: u32, pkt_seq: u32, book: u16| {
+        let mut out = [0u8; vyrn_types::MAX_REQ_PAYLOAD];
+        let h = vyrn_wire::ReqHeader::new(SessionId(session), pkt_seq, 0, BookId(book), false);
+        let n =
+            vyrn_wire::encode_request(&mut out, h, &[vyrn_wire::Msg::Heartbeat], &k, None).unwrap();
+        out[..n].to_vec()
+    };
+    let frame = |kind, book, data_seq, src, pkts: &[&[u8]]| {
+        let mut b = FrameBuf::default();
+        for p in pkts {
+            assert!(b.push(p));
+        }
+        b.finish(&DataHdr {
+            kind,
+            book: BookId(book),
+            epoch16: 0,
+            data_seq,
+            src,
+        })
+        .to_vec()
+    };
+    let (good, other_book, seq0) = (req(5, 1, 1), req(5, 2, 2), req(5, 0, 1));
+    let mut feed = DataFeed::new(BookId(1), 2, 3);
+    let range = |from, to| {
+        Some(vyrn_replica::Gap {
+            src: 1,
+            dst: 3,
+            from,
+            to,
+        })
+    };
+    let mut j = DataJoin::default();
+    let f = frame(Kind::Data, 1, 1, 1, &[&good, &other_book, &seq0, b"short"]);
+    assert_eq!(
+        feed.on_frame(&mut j, &f, 10),
+        Ok(Fed {
+            stored: 1,
+            dropped: 3,
+            gap: None
+        })
+    );
+    // Box 0 was never heard from; box 1 is silent from 10 + 1 ms.
+    assert_eq!(feed.silent(10 + 999_999).count(), 0);
+    assert_eq!(feed.silent(10 + 1_000_000).collect::<Vec<_>>(), vec![1]);
+    // A heartbeat naming DATA 3 after DATA 1: frames 2 and 3 were lost.
+    let hb = frame(Kind::DataHb, 0, 3, 1, &[]);
+    assert_eq!(feed.on_frame(&mut j, &hb, 20).unwrap().gap, range(2, 3));
+    assert_eq!(
+        feed.on_frame(&mut j, &hb, 30).unwrap().gap,
+        None,
+        "reported once"
+    );
+    assert_eq!(
+        feed.on_frame(&mut j, &frame(Kind::Data, 2, 4, 1, &[&other_book]), 40),
+        Ok(Fed {
+            stored: 0,
+            dropped: 1,
+            gap: None
+        })
+    );
+    let f5 = frame(Kind::Data, 1, 5, 1, &[&good]);
+    assert_eq!(
+        feed.on_frame(&mut j, &f5, 50).unwrap().gap,
+        None,
+        "book 2's DATA 4 is no gap"
+    );
+    assert_eq!(
+        feed.silent(40 + 999_999).count(),
+        0,
+        "book 2 keeps the box alive"
+    );
+    assert_eq!(
+        feed.on_frame(&mut j, &frame(Kind::Data, 1, 1, 2, &[&good]), 40),
+        Err(FeedErr::Src(2))
+    );
+    assert!(matches!(
+        feed.on_frame(&mut j, b"PD", 40),
+        Err(FeedErr::Frame(_))
+    ));
+    let f7 = frame(Kind::Data, 1, 7, 1, &[&good]);
+    assert_eq!(feed.on_frame(&mut j, &f7, 60).unwrap().gap, range(6, 6));
+    // A gap longer than a box's max_range splits into fetches it accepts, oldest first.
+    let g = range(6, 6 + 600).unwrap();
+    let qs: Vec<Fetch> = g.fetches(256).collect();
+    let r3 = |from, to| Fetch::Range { dst: 3, from, to };
+    assert_eq!(qs, vec![r3(6, 261), r3(262, 517), r3(518, 606)]);
+    assert_eq!(g.fetches(0).count(), 601, "max_range 0 is taken as 1");
+    let top = vyrn_replica::Gap {
+        from: u64::MAX - 1,
+        to: u64::MAX,
+        ..g
+    };
+    assert_eq!(
+        top.fetches(1).collect::<Vec<_>>(),
+        vec![r3(u64::MAX - 1, u64::MAX - 1), r3(u64::MAX, u64::MAX)]
+    );
+    let r = packet(5, 1, &good, 0);
+    assert_eq!(j.resolve(&r).map(|x| x.0), Ok(good.as_slice()));
+}
