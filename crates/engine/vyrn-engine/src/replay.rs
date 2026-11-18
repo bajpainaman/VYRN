@@ -7,8 +7,8 @@
 //!   deltas), source, kind (incl. `Shed`, `CONT`) and `Rescan` band from the record (05 §10 rows
 //!   4–5). No clock is read; the cut cores still publish, because `replay_step` reads the
 //!   half-cuts for `Pend` retirement;
-//! - a non-`MID` Advance record of lane `l`: lane `l`'s idle poll, which reads the `LaneCut`
-//!   that the replayed steps wrote;
+//! - a non-`MID` Advance record of lane `l`: lane `l`'s boundary at the `(f, C_f[l])` it logs
+//!   (`f` = its `fills_applied`, `C_f` the replayed step `f`'s cut), as for a `MID` record;
 //! - a packet record (with the `MID` Advance records the lane wrote while processing it): the
 //!   packet, fetched from [`Payloads`], through `vyrn_lane::Lane::replay_packet` with a late
 //!   clock iff `SHED`, its `MID` records as `Mid` boundaries at `(f, C_f[l])` (05 §6.2, §10 row
@@ -823,7 +823,8 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         Ok(())
     }
 
-    /// One replayed lane call: a non-`MID` Advance record is the lane's idle poll; a packet goes
+    /// One replayed lane call: a non-`MID` Advance record is the lane's boundary at its logged
+    /// `(f, C_f[l])`; a packet goes
     /// through `Lane::replay_packet` with `mids` as its boundaries and the routes that `srcs`
     /// (later steps) and `rejected` (its route records) give.
     #[allow(clippy::too_many_arguments)]
@@ -838,11 +839,12 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         sink: &mut S,
     ) -> Result<(), Why> {
         if is_advance(rec) {
-            return if self.poll_lane(l, sink).map_err(Why::Fault)? {
-                Ok(())
-            } else {
-                Err(Why::BadRecord)
-            };
+            // A boundary at the logged `(f, C_f[l])`, like a `MID` record (05 §6.2, F3a). One
+            // that is not after the lane's `fills_applied` logs nothing: the compare reports it.
+            let f = rec.fills_applied;
+            let cut = self.cut_at(f, l).ok_or(Why::StepTooOld)?;
+            let at = LaneCutEntry { step: f, cut };
+            return self.replay_advance(l, at, sink).map_err(Why::Fault);
         }
         let mut ms = [Mid {
             pass: 0,

@@ -36,8 +36,9 @@
 //!   `src = (l, q)`, never by the lane's snapshot (05 §10 rows 1–3, 7). Its route is that
 //!   step's `STEP_CROSS` bit, or, for an op the lane classified and rejected itself, its
 //!   [`Rec::Route`] record (07 §3.6); every other op is a `Join`. A non-`MID` Advance
-//!   record is replayed as the lane's idle poll, which reads the `LaneCut` that the replayed
-//!   step wrote. Every call's output records are checked against the log.
+//!   record is replayed as the lane boundary it logs, at `(fills_applied, C_f[l])` like a `MID`
+//!   record, not as an idle poll on the newest `LaneCut`: live, the poll may have read an older
+//!   one. Every call's output records are checked against the log.
 //!
 //! - **Replay from 07** ([`Engine::replay_wire`]): the replica's entry point. Input is 07's wire
 //!   records only: every lane's `PacketRecord`s in O-order, the block's `RouteRecord`s
@@ -82,8 +83,7 @@
 //!   publishes it. The stream role reads step `s` once the BBO snapshot shows `done_step ≥ s`
 //!   (published after the step's other lines) and polls the BBO core again only after that, so
 //!   a step is never read in part. [`Engine::run`] is quiet when no visible line has work.
-//!   Replay runs a non-`MID` Advance record as the lane's idle poll on the newest `LaneCut`; a
-//!   live poll that read an older `LaneCut` replays as a mismatch (follow-up).
+//!   Replay is exact under the same delays (`tests/sim.rs`).
 //!
 //! Determinism (`INV-DET`): the engine's own choices are the call order and nothing else. It
 //! reads no clock, no ring fill level for a decision, no hash-map order and no float.

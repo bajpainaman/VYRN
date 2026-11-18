@@ -446,6 +446,20 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
         Ok(ran)
     }
 
+    /// Replay of lane `l`'s non-`MID` Advance record: the boundary at `at = (f, C_f[l])` that
+    /// the record names, not an idle poll on the newest `LaneCut`. Live, a poll may have read an
+    /// older `LaneCut` (a delayed backend), and the record logs which one (F3a).
+    pub(crate) fn replay_advance<S: Sink>(
+        &mut self,
+        l: usize,
+        at: LaneCutEntry,
+        sink: &mut S,
+    ) -> Result<(), Fault> {
+        let lane = self.lanes.get_mut(l).ok_or(Fault::NoLane)?;
+        lane.boundary(self.vis, at, None);
+        self.drain(l, sink)
+    }
+
     /// Steps and lane polls until neither has work, at most `rounds` rounds. `true` if quiet.
     pub fn run<C: Clock, S: Sink>(
         &mut self,
