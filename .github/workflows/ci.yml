@@ -83,8 +83,9 @@ jobs:
     timeout-minutes: 40
     # vxc_blake3.x86_64-linux (vx/TOOLCHAIN) was pinned on Debian 13 with HOME=/home/user: vxc
     # embeds its source and target dirs and links the distro's LLVM/MLIR 22 statically, so the job
-    # builds it there. VX-WORKAROUND W-10 (issue to file): vxc reads its checkout (stdlib) and two .so files of its build dir at run
-    # time (FRICTION.md W-10), so the cache holds those with the binary; vx/build.sh checks the hash.
+    # builds it there. VX-WORKAROUND W-10 (issue to file): at run time vxc reads its checkout's
+    # stdlib/ and loads .so files beside it and in its build dir, so the cache holds exactly those
+    # with the binary (not the 1.8 GB target dir); vx/build.sh checks the hash.
     container:
       image: debian:trixie
     env:
@@ -108,11 +109,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            /home/user/.local/src/vx
-            !/home/user/.local/src/vx/target
+            /home/user/.local/src/vx/stdlib
             /home/user/.local/src/vx/target/release/vxc
+            /home/user/.local/src/vx/target/release/*.so
             /home/user/.local/src/vx/target/release/build/vxc/*/out/*.so
-          key: vxc-v2-debian13-x86_64-${{ hashFiles('vx/TOOLCHAIN', 'rust-toolchain.toml') }}
+          key: vxc-v3-debian13-x86_64-${{ hashFiles('vx/TOOLCHAIN', 'rust-toolchain.toml') }}
       - name: build vxc (cache miss)
         if: steps.vxc.outputs.cache-hit != 'true'
         run: .github/scripts/vxc.sh vxc
