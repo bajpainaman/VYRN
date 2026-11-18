@@ -1449,7 +1449,7 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                 // The sequencer's answer to a Nack for frames its ring no longer holds.
                 if let (Some(t), Some(ps)) = (NackTooOld::decode(f.payload), paths.as_mut()) {
                     rep_stats[2] = rep_stats[2].saturating_add(1);
-                    ps.too_old(t.path, t.tenure, t.stream, t.oldest_seq);
+                    ps.too_old(t.path, t.epoch16, t.tenure, t.stream, t.oldest_seq);
                     continue;
                 }
                 stats.frames.fetch_add(1, Ordering::Relaxed);

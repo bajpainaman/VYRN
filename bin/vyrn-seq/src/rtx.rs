@@ -7,8 +7,8 @@
 //! allocates nothing per frame.
 //!
 //! **Nacks** come from the finality listener on `REP_UDP_CTRL` (`finality.rs`) through a bounded
-//! queue ([`NACK_QUEUE`]; a full queue drops the Nack and counts it), and the stream core drains
-//! it between batches. A Nack is served only if its source IPv4 and `port` name one of the
+//! queue ([`NACK_QUEUE`]; a full queue drops the Nack and counts it), and the stream core serves
+//! at most [`NACKS_PER_TURN`] of them between batches. A Nack is served only if its source IPv4 and `port` name one of the
 //! configured replicas on its path (`[replication] order` for A, `order_b` for B), and every
 //! frame goes to that configured address, never to the datagram's source: a forged Nack cannot
 //! reflect frames to a third party (07 §4.10, reading). Each copy has `flags` = the Nack's path
@@ -28,6 +28,8 @@ pub const REP_RTX_RING_BYTES: usize = 64 << 20;
 pub const REP_RTX_MAX_FPS: u64 = 200_000;
 /// Nacks in flight from the listener to the stream core.
 pub const NACK_QUEUE: usize = 1024;
+/// Nacks the stream core serves per turn of its loop.
+pub const NACKS_PER_TURN: usize = 16;
 const FLAGS_AT: usize = 16;
 const BURST_NS: u64 = 10_000_000;
 const SEC: u64 = 1_000_000_000;

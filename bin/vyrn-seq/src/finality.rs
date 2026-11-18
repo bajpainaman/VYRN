@@ -172,35 +172,41 @@ fn listen(
     while !stop.load(Ordering::Acquire) {
         if let Ok((n, from)) = sock.recv_from(&mut buf) {
             // A replica's Nack (07 §4.10): to the stream core, which owns the frame ring.
+            // It does not end the turn: the gate check below runs whatever arrived (Vercel
+            // r4613653820).
             let dgram = buf.get(..n).unwrap_or(&[]);
-            if let (Some(nk), SocketAddr::V4(f)) = (vyrn_log::nack::Nack::decode(dgram), from) {
-                if nacks.try_send((*f.ip(), nk)).is_err() {
+            let nack = match (vyrn_log::nack::Nack::decode(dgram), from) {
+                (Some(nk), SocketAddr::V4(f)) => Some((*f.ip(), nk)),
+                _ => None,
+            };
+            if let Some(req) = nack {
+                if nacks.try_send(req).is_err() {
                     counts.nacks_dropped.fetch_add(1, Ordering::Relaxed);
                 }
-                continue;
-            }
-            let before = l.final_height();
-            let from = match ctrl::decode(buf.get(..n).unwrap_or(&[])) {
-                Ok(Ctrl::Vote(v)) => {
-                    counts.votes.fetch_add(1, Ordering::Relaxed);
-                    l.on_vote(&v).map(|c| c.map(|c| (c.view, "votes")))
-                }
-                Ok(Ctrl::Cert(c)) => l.on_cert(&c).map(|()| Some((c.view, "cert"))),
-                Err(_) => Ok(None),
-            };
-            match from {
-                Ok(Some((view, from))) if l.final_height() > before => {
-                    counts
-                        .final_height
-                        .store(l.final_height().0, Ordering::Release);
-                    println!(
-                        "FINAL height={} view={view} from={from}",
-                        l.final_height().0
-                    );
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    counts.refused.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let before = l.final_height();
+                let from = match ctrl::decode(buf.get(..n).unwrap_or(&[])) {
+                    Ok(Ctrl::Vote(v)) => {
+                        counts.votes.fetch_add(1, Ordering::Relaxed);
+                        l.on_vote(&v).map(|c| c.map(|c| (c.view, "votes")))
+                    }
+                    Ok(Ctrl::Cert(c)) => l.on_cert(&c).map(|()| Some((c.view, "cert"))),
+                    Err(_) => Ok(None),
+                };
+                match from {
+                    Ok(Some((view, from))) if l.final_height() > before => {
+                        counts
+                            .final_height
+                            .store(l.final_height().0, Ordering::Release);
+                        println!(
+                            "FINAL height={} view={view} from={from}",
+                            l.final_height().0
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        counts.refused.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }

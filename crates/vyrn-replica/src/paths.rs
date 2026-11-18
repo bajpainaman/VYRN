@@ -361,13 +361,18 @@ impl Paths {
     }
 
     /// The sequencer no longer holds frames below `oldest` of `(tenure, stream)` (07 §4.10
-    /// `NackTooOld`): a hole of `path` below it is given up at the next [`Paths::poll`].
-    pub fn too_old(&mut self, path: Path, tenure: u8, stream: u8, oldest: u64) {
+    /// `NackTooOld`): a hole of `path` below it is given up at the next [`Paths::poll`]. A
+    /// reply for another epoch is ignored, as [`Paths::rx`] ignores its frames: a delayed one
+    /// reaching a reused port must not give up a hole the current sequencer still holds.
+    pub fn too_old(&mut self, path: Path, epoch16: u16, tenure: u8, stream: u8, oldest: u64) {
+        if epoch16 != self.epoch16 {
+            return;
+        }
         let i = usize::from(path == Path::B);
         for (_, s) in self
             .subs
             .iter_mut()
-            .filter(|(k, _)| k.1 == tenure && k.3 == stream)
+            .filter(|(k, _)| k.0 == epoch16 && k.1 == tenure && k.3 == stream)
         {
             let copy = s.copy.get_mut(i).and_then(Option::as_mut);
             for h in s.gap.as_mut().into_iter().chain(copy) {
@@ -607,6 +612,8 @@ mod tests {
             "voters do not ask for copies"
         );
         asks(&mut p, 0, true);
+        // Another epoch's NackTooOld is ignored: the hole is still Nacked, not given up.
+        p.too_old(Path::B, 1, 0, 0, 5);
         assert_eq!(
             asks(&mut p, 10, true),
             vec![Ask::Nack {
@@ -616,7 +623,7 @@ mod tests {
                 to: 3
             }]
         );
-        p.too_old(Path::B, 0, 0, 5);
+        p.too_old(Path::B, 0, 0, 0, 5);
         assert_eq!(
             asks(&mut p, 11, true),
             vec![Ask::Gap {

@@ -1381,11 +1381,16 @@ impl<T: TxRing> StreamCore<T> {
 }
 
 impl<T: TxRing> StreamCore<T> {
-    /// Serves the Nacks queued since the last turn (07 §4.10, `rtx.rs`). A refused send is
-    /// dropped: the replica asks again.
+    /// Serves up to [`rtx::NACKS_PER_TURN`] queued Nacks (07 §4.10, `rtx.rs`), so a flood of
+    /// them cannot keep this thread from frames, responses and block closure (Vercel
+    /// r4613653838); the rest wait for the next turn, and a full queue drops new ones. A
+    /// refused send is dropped: the replica asks again.
     fn retransmit(&mut self) -> Result<(), String> {
         let now = u64::try_from(self.t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        while let Ok((src, n)) = self.nacks.try_recv() {
+        for _ in 0..rtx::NACKS_PER_TURN {
+            let Ok((src, n)) = self.nacks.try_recv() else {
+                break;
+            };
             self.rtx_out.clear();
             let mut out = core::mem::take(&mut self.rtx_out);
             self.rtx
