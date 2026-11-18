@@ -759,6 +759,60 @@ fn stp_cancel_newest_rejects_before_a_fill_and_outs_after_one() {
 }
 
 #[test]
+fn continuing_is_true_only_while_a_cont_step_is_pending() {
+    // D14: one level or ENG_STEP_FILLS per step; the rest of the sweep is a CONT step.
+    // Forwarded: account 2's asks 1 @ 101 and 1 @ 102; account 1 buys 2 @ 102. Step 1 fills
+    // 101 and is capped; the CONT step fills 102 and ends the sweep.
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    assert!(!bbo.continuing(), "at rest");
+    rest(&mut x, &mut bbo, 1, 10, Side::Sell, 101, 1, 2);
+    rest(&mut x, &mut bbo, 1, 11, Side::Sell, 102, 1, 2);
+    assert!(!bbo.continuing(), "a resting order leaves no continuation");
+    x.forward(1, 20, day(Side::Buy), 102, 2, 1, 0, &[], BIG_DEADLINE);
+    x.publish_cut();
+    let s1 = step_src(&mut x, &mut bbo, 1);
+    assert_eq!(s1.entry.flags & STEP_CONT, 0);
+    assert!(bbo.continuing(), "capped forwarded sweep");
+    let s2 = x.step(&mut bbo, &CLK);
+    assert_eq!(s2.entry.flags & STEP_CONT, STEP_CONT);
+    assert_eq!(
+        s2.fills(),
+        vec![(1, LIQ_MAKER, 102, 1), (1, LIQ_TAKER, 102, 1)]
+    );
+    assert!(!bbo.continuing(), "the CONT step completed the sweep");
+
+    // Rescan: a stale lane-1 CancelOldest buy of 1 @ 102 meets 8 own asks (8 STP kills fill
+    // the cap), then the CONT step fills lane 0's ask.
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    stale_bid_105(&mut x, &mut bbo);
+    rest(&mut x, &mut bbo, 0, 50, Side::Sell, 102, 1, 2);
+    for i in 0..8u64 {
+        x.join(1, 30 + i, day(Side::Sell), 102, 1, 1);
+    }
+    let f = OrderFlags::new(Side::Buy, Tif::Day, false, Stp::CancelOldest);
+    x.join(1, 40, f, 102, 1, 1);
+    x.publish_cut();
+    assert!(!bbo.continuing());
+    let mut capped = false;
+    for _ in 0..16 {
+        let s = x.step(&mut bbo, &CLK);
+        if s.kind() == StepKind::Rescan && s.of(FillKind::Out).len() == 8 {
+            capped = true;
+            break;
+        }
+        assert!(!bbo.continuing(), "{:?}", s.kind());
+    }
+    assert!(capped, "the capped Rescan ran");
+    assert!(bbo.continuing(), "capped Rescan batch taker");
+    let c = x.step(&mut bbo, &CLK);
+    assert_eq!(c.entry.flags & STEP_CONT, STEP_CONT);
+    assert_eq!(c.kind(), StepKind::Rescan);
+    assert!(!bbo.continuing(), "the batch taker finished");
+}
+
+#[test]
 fn stp_spans_pooled_lanes_only() {
     // Account 1 on lanes 1 and 2 (05 §6.9: a pooled acct_ix is pool-wide). Lane 2's ask of 1 @
     // 102; lane 1's CancelNewest buy of 1 @ 102 for account 1. Pooled {1, 2}: Reject STP

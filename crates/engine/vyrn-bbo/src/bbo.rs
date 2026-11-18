@@ -318,6 +318,14 @@ impl Bbo {
         }
     }
 
+    /// `true` iff the next step must be a `CONT` step: a capped forwarded sweep or a capped
+    /// `Rescan` batch taker resumes before any other step (D14, 05 §8.6). Replay of a log that
+    /// carries no `CONT` flag (07's `StepRecord`) sets [`ReplayStep::cont`] from this; while it
+    /// is `true`, [`Bbo::replay_step`] refuses any non-`CONT` step.
+    pub fn continuing(&self) -> bool {
+        self.cont.is_some() || self.rcont.is_some()
+    }
+
     /// Bounds `(B, A)` (05 §8.6, `INV-ENG-4`).
     pub fn bounds(&self) -> (Tick, Tick) {
         (self.bid, self.ask)
