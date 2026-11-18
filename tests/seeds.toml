@@ -5,16 +5,13 @@
 # check it fails today. `known` lists checks with an open engine bug: a swarm seed that fails one
 # of them is reported as known, not failed. When a fix lands, set the seeds' `expect` to "pass"
 # and remove the check from `known`.
-known = [
-  # vyrn-bbo: endless Rescan steps on a one-tick band, no fills, crossed snapshot. Trigger: one
-  # packet whose orders cross each other at one tick on one session (STP none). No faults needed.
-  "BBO-QUIESCE",
-]
+known = []
 
 [[seed]]
 seed = "1e"
+# Required: failed BBO-QUIESCE (vyrn-bbo Rescan livelock, crossed snapshot) before #84; guards that fix.
 faults = ""
-expect = "BBO-QUIESCE"
+expect = "pass"
 
 [[seed]]
 seed = "4"

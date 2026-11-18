@@ -43,9 +43,9 @@
 //!
 //! **Checks** ([`check`]). After every event, on the live run: `INV-CUT-MONO` (each step's cut
 //! is pointwise ≥ the previous step's), step fill cap (`n_fills ≤ STEP_FILL_CAP`),
-//! `INV-UNCROSSED` (BBO snapshot bid < ask or one side empty), shed logged (every `Shed`
+//! `INV-UNCROSSED` (every snapshot a BBO step publishes: bid < ask or one side empty), shed logged (every `Shed`
 //! verdict has a `SHED` packet record), session order (in-stream `resp_seq` strictly increasing
-//! per session). At the end: liveness (every client's packets accepted within
+//! per session, over lane and fill TX responses). At the end: liveness (every client's packets accepted within
 //! [`cluster::HEAL_NS`] after the last fault) and `INV-DET` (every replica's replayed order
 //! stream, lane responses and fill TX packets equal the live run's, byte for byte, with the
 //! physical publication ids `pub_a`/`pub_b` zeroed as `vyrn-engine` specifies). The first

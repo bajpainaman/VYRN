@@ -296,6 +296,10 @@ pub struct Out {
     pub recs: Vec<OwnedRec>,
     pub resp: Vec<(LaneId, RespPkt)>,
     pub tx: Vec<(TxEntry, Vec<Record>)>,
+    /// `(session, resp_seq)` of every response, lane and fill TX, in emission order (for
+    /// SESSION-ORDER). A fill TX entry with `resp_seq` 0 takes its `MakerSeq` number later
+    /// (05 §8.10 rule 2), so it is not listed.
+    pub seqs: Vec<(u32, u32, bool)>,
 }
 
 impl Sink for Out {
@@ -304,9 +308,13 @@ impl Sink for Out {
     }
     fn lane_resp(&mut self, lane: LaneId, p: &RespPkt) {
         self.resp.push((lane, *p));
+        self.seqs.push((p.session.0, p.resp_seq, false));
     }
     fn tx(&mut self, h: &TxEntry, recs: &[Record]) {
         self.tx.push((*h, recs.to_vec()));
+        if h.resp_seq != 0 {
+            self.seqs.push((h.session.0, h.resp_seq, true));
+        }
     }
 }
 
@@ -589,7 +597,8 @@ pub fn run(seed: u64, schedule: &Schedule) -> Report {
     let mut bbo_free = 0u64;
     let mut bbo_pending = false;
     let mut tx_n: u32 = 0;
-    let (mut seen_rec, mut seen_resp) = (0usize, 0usize);
+    let (mut seen_rec, mut seen_seq) = (0usize, 0usize);
+    let mut snaps = Vec::new();
     let mut now = 0u64;
 
     // Sends every copy of one client transmission through the network (SF-01).
@@ -770,7 +779,7 @@ pub fn run(seed: u64, schedule: &Schedule) -> Report {
                         let mut r = Ok(());
                         for _ in 0..QUIESCE_ROUNDS {
                             match e.step(&FixedClock(t), &mut out) {
-                                Ok(Some(_)) => {}
+                                Ok(Some(_)) => snaps.extend(e.snapshot()),
                                 Ok(None) => break,
                                 Err(f) => {
                                     r = Err(f);
@@ -783,14 +792,38 @@ pub fn run(seed: u64, schedule: &Schedule) -> Report {
                         r.err()
                             .map(|f| ("ENGINE-FAULT", format!("BBO fault {f:?}")))
                     }
-                    None => match e.run(&FixedClock(t), &mut out, QUIESCE_ROUNDS) {
-                        Ok(true) => None,
-                        Ok(false) => Some((
+                    // `Engine::run`'s loop (a step, then every lane's poll, until neither has
+                    // work), driven here so that every published snapshot is checked.
+                    None => {
+                        let mut r = Some((
                             "BBO-QUIESCE",
                             format!("no quiescence in {QUIESCE_ROUNDS} step and poll rounds"),
-                        )),
-                        Err(f) => Some(("ENGINE-FAULT", format!("BBO fault {f:?}"))),
-                    },
+                        ));
+                        for _ in 0..QUIESCE_ROUNDS {
+                            let stepped = match e.step(&FixedClock(t), &mut out) {
+                                Ok(s) => s.is_some(),
+                                Err(f) => {
+                                    r = Some(("ENGINE-FAULT", format!("BBO fault {f:?}")));
+                                    break;
+                                }
+                            };
+                            if stepped {
+                                snaps.extend(e.snapshot());
+                            }
+                            match e.poll_lanes(&mut out) {
+                                Ok(0) if !stepped => {
+                                    r = None;
+                                    break;
+                                }
+                                Ok(_) => {}
+                                Err(f) => {
+                                    r = Some(("ENGINE-FAULT", format!("lane fault {f:?}")));
+                                    break;
+                                }
+                            }
+                        }
+                        r
+                    }
                 }
             }
             Ev::Poll if lane_stall_end(faults, t).is_some() => {
@@ -851,17 +884,19 @@ pub fn run(seed: u64, schedule: &Schedule) -> Report {
             }
         }
         seen_rec = out.recs.len();
-        for (_, p) in &out.resp[seen_resp..] {
+        for (session, resp_seq, tx) in &out.seqs[seen_seq..] {
             obs.push(Obs::Resp {
-                session: p.session.0,
-                resp_seq: p.resp_seq,
+                session: *session,
+                resp_seq: *resp_seq,
+                tx: *tx,
             });
         }
-        seen_resp = out.resp.len();
+        seen_seq = out.seqs.len();
         if let Some((session, pkt_seq)) = busy {
             obs.push(Obs::Busy { session, pkt_seq });
         }
-        if let Some(s) = e.snapshot() {
+        // Every snapshot a step of this event published, then the current one.
+        for s in snaps.drain(..).chain(e.snapshot()) {
             obs.push(Obs::Snap {
                 bid: s.bid.0,
                 ask: s.ask.0,

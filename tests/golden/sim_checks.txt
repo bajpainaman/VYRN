@@ -7,7 +7,8 @@
 #   snap <bid> <ask|none>                the BBO snapshot (bid 0 = no bid)
 #   pkt <session> <pkt_seq> <shed 0|1>   a PacketRecord
 #   busy <session> <pkt_seq>             the lane shed this packet (BUSY for every message)
-#   resp <session> <resp_seq>            a response packet; resp_seq 0 = out of stream
+#   resp <session> <resp_seq> [tx]       a response packet; resp_seq 0 = out of stream;
+#                                        tx = sent by fill TX under a lane-reserved number
 
 case cut_monotone
 step 1 0 0:3,1:2
@@ -93,3 +94,22 @@ resp 5 2
 resp 6 7
 resp 5 2
 expect SESSION-ORDER 3
+
+case tx_under_reserved_number
+resp 5 1
+resp 5 3
+resp 5 2 tx
+resp 5 4
+expect ok
+
+case tx_reuses_a_number
+resp 5 1
+resp 5 2
+resp 5 2 tx
+expect SESSION-ORDER 2
+
+case lane_goes_back_after_tx
+resp 5 3 tx
+resp 5 2
+resp 5 1
+expect SESSION-ORDER 2

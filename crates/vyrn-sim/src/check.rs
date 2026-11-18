@@ -11,12 +11,13 @@
 //! | `STEP-FILL-CAP` | `step` | `n_fills` ≤ [`STEP_FILL_CAP`] (01 §14.15 item 6) |
 //! | `INV-UNCROSSED` | `snap` | `bid < ask`, or no bid (0), or no ask (`u32::MAX`) |
 //! | `SHED-LOGGED` | `busy` | an unused `pkt` record with `SHED` for the same session and `pkt_seq` came before it; each record covers one `busy` |
-//! | `SESSION-ORDER` | `resp` | in-stream `resp_seq` (non-zero) is strictly increasing per session |
+//! | `SESSION-ORDER` | `resp` | per session, no in-stream (non-zero) `resp_seq` is used twice, and the lane's own responses carry strictly increasing `resp_seq` |
 //!
-//! `SESSION-ORDER` is weaker than 11 §6.4's "gapless": fill TX packets take `MakerSeq` numbers
-//! that the lane's `resp_seq` count does not show the sim, so gaps are allowed (spec gap, PR).
+//! `SESSION-ORDER` is weaker than 11 §6.4's "gapless". The lane is the only `resp_seq` allocator,
+//! but fill TX sends under numbers the lane reserved earlier (04 P6), so TX numbers may arrive
+//! below a later lane number and the maker range may leave gaps (spec gap, PR).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// No step writes more than this many fill records (01 §14.15 item 6).
 pub const STEP_FILL_CAP: u32 = 64;
@@ -40,8 +41,13 @@ pub enum Obs {
     },
     /// The lane returned `Shed` (`BUSY` for every message) for this packet.
     Busy { session: u32, pkt_seq: u32 },
-    /// A response packet (lane or fill TX) with its `resp_seq` (0 = out of stream).
-    Resp { session: u32, resp_seq: u32 },
+    /// A response packet with its `resp_seq` (0 = out of stream); `tx` = sent by a fill TX
+    /// core under a reserved number, not by the lane.
+    Resp {
+        session: u32,
+        resp_seq: u32,
+        tx: bool,
+    },
 }
 
 /// The first broken check.
@@ -59,7 +65,10 @@ pub struct Checker {
     cut: BTreeMap<u8, u64>,
     /// `SHED` records not yet matched by a `busy`, per `(session, pkt_seq)`.
     shed: BTreeMap<(u32, u32), u32>,
+    /// The newest lane-sent `resp_seq` per session.
     resp: BTreeMap<u32, u32>,
+    /// Every in-stream `(session, resp_seq)` used so far.
+    used: BTreeSet<(u32, u32)>,
     seen: u64,
 }
 
@@ -107,16 +116,28 @@ impl Checker {
                     ));
                 }
             },
-            Obs::Resp { session, resp_seq } => {
+            Obs::Resp {
+                session,
+                resp_seq,
+                tx,
+            } => {
                 if *resp_seq != 0 {
-                    let prev = self.resp.entry(*session).or_insert(0);
-                    if *resp_seq <= *prev {
+                    if !self.used.insert((*session, *resp_seq)) {
                         return Err((
                             "SESSION-ORDER",
-                            format!("session {session} resp_seq {resp_seq} after {prev}"),
+                            format!("session {session} resp_seq {resp_seq} used twice"),
                         ));
                     }
-                    *prev = *resp_seq;
+                    if !*tx {
+                        let prev = self.resp.entry(*session).or_insert(0);
+                        if *resp_seq <= *prev {
+                            return Err((
+                                "SESSION-ORDER",
+                                format!("session {session} lane resp_seq {resp_seq} after {prev}"),
+                            ));
+                        }
+                        *prev = *resp_seq;
+                    }
                 }
             }
         }
@@ -132,7 +153,7 @@ fn num<T: std::str::FromStr>(t: Option<&str>) -> Result<T, String> {
 impl Obs {
     /// Parses one line: `step <id> <n_fills> [lane:seq,...]`, `snap <bid> <ask>`,
     /// `pkt <session> <pkt_seq> <0|1 shed>`, `busy <session> <pkt_seq>`,
-    /// `resp <session> <resp_seq>`. `ask` may be `none` (`u32::MAX`).
+    /// `resp <session> <resp_seq> [tx]`. `ask` may be `none` (`u32::MAX`).
     pub fn parse(line: &str) -> Result<Self, String> {
         let mut t = line.split_whitespace();
         let kind = t.next().ok_or("empty line")?;
@@ -169,6 +190,11 @@ impl Obs {
             "resp" => Self::Resp {
                 session: num(t.next())?,
                 resp_seq: num(t.next())?,
+                tx: match t.next() {
+                    None => false,
+                    Some("tx") => true,
+                    Some(x) => return Err(format!("resp source is tx or absent, not {x:?}")),
+                },
             },
             k => return Err(format!("unknown observation {k:?}")),
         })
