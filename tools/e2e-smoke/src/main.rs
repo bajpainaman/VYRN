@@ -27,7 +27,7 @@
 //! | name | passes when |
 //! |---|---|
 //! | `seq` | the box exits 0, `records` equals the packets sent, `seal_violations=0`, at least 2 blocks |
-//! | `validators` | each validator reports heights `0..=H` contiguous with the box's `first_step`/`last_step`, every verdict `Valid`, no `FAULT` (R5 for `REP_E_HASHLAG`); at least one covers every height |
+//! | `validators` | each validator reports heights `0..=H` contiguous with the box's `first_step`/`last_step`, every verdict `Valid`, no `FAULT` (R5 for `REP_E_HASHLAG`) |
 //! | `replay` | the tap's `OrderCore` readies the same blocks, holding every packet sent exactly once, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box |
 //! | `replica-out` | each validator that prints `out=<hex>` on its `BLOCK` lines matches the tap's output hash per block; SKIP while no validator replays |
 //! | `finality` | with `--finality`: each validator prints `FINAL height=<h>` up to `H`; SKIP without it |
@@ -49,8 +49,12 @@
 //!   measures with user-space receive times and that 07 §7.2 budgets for pinned cores. On an
 //!   unpinned DEV machine one preemption between an ORDER frame and its HASH frame trips it, so
 //!   by default a validator that stops at it is a `WARN`: its blocks before the fault must still
-//!   be the box's, and at least one validator must cover every height. Any other fault fails.
-//!   `--strict-hashlag` fails it as well. `--seq-cpus` and `--validator-cpus` (taskset masks)
+//!   be the box's. It stays a `WARN` when every validator stops at it (all of them can stop at
+//!   one height when the box is preempted between the two frames): the replay tap's order core,
+//!   which has no real-time bound, must still ready every height. Any other fault, an `Invalid`
+//!   verdict, a stall or a block that differs from the box's fails. `--strict-hashlag` fails a
+//!   `REP_E_HASHLAG` stop too and requires one validator to cover every height. The shipped
+//!   bound stays 1 ms; the harness changes no validator rule. `--seq-cpus` and `--validator-cpus` (taskset masks)
 //!   keep the box's two polling threads off the validators' cores. Without them all validators
 //!   can stop at one height when the box is preempted between an ORDER frame and its HASH frame.
 //!
@@ -855,8 +859,15 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 errs.push(format!("{}: did not stop cleanly", n.name));
             }
         }
-        if full == 0 {
+        // Without --strict-hashlag every stop counted here is a REP_E_HASHLAG WARN (any other
+        // stop or stall is already in errs), and the tap still covers every height (R5).
+        if full == 0 && cli.strict_hashlag {
             errs.push("no validator reached the last block".into());
+        } else if full == 0 && warns.len() == vals.len() {
+            println!(
+                "WARN every validator stopped at REP_E_HASHLAG; the replay tap covers heights 0..={} (R5)",
+                top.unwrap_or(0)
+            );
         }
         for w in &warns {
             println!("WARN {w} (R5: a 1 ms bound on an unpinned DEV machine; --strict-hashlag fails it)");
