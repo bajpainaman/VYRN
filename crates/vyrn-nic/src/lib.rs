@@ -230,6 +230,9 @@ pub enum NicError {
     },
     /// For example a NIC on a different NUMA node than its lanes.
     Topology { why: &'static str },
+    /// The linked C shim reports another ABI version than `vyrn_wire::ring::RING_ABI_VERSION`
+    /// (`ffi::check_shim_abi`, 06 §7.5).
+    ShimAbi { shim: u32, expected: u32 },
 }
 
 impl NicError {
@@ -255,6 +258,9 @@ impl fmt::Display for NicError {
             Self::Unsupported { backend, what } => write!(f, "{backend:?} does not support {what}"),
             Self::Config { field, why } => write!(f, "config {field} {why}"),
             Self::Topology { why } => write!(f, "topology: {why}"),
+            Self::ShimAbi { shim, expected } => {
+                write!(f, "C shim ABI version {shim}, this build needs {expected}")
+            }
         }
     }
 }
