@@ -1026,9 +1026,28 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   op would join the book after the CancelAll that already ends it. A CancelAll in a Rescan
   batch after the taker's key, or past C\* in an uncross, is `PBV_E_UNSUPPORTED` like a Cancel.
   **[Reading, 3a]** The test harness opens one session per account per lane, so only the
-  `AcctKill` path is exercised; the client treats both paths the same. A mutant without the pass
-  barrier passes the test: a barrier only changes what a forwarded op's dependencies would be,
-  and dependencies are still outside the subset (item 5).
+  `AcctKill` path is exercised; the client treats both paths the same. A barrier only changes
+  what a forwarded op's dependencies are; `the_vx_client_replays_in_packet_dependencies` (item
+  5) is the test a mutant without it fails.
+- *In-packet dependencies (5).* The lane's `forward` builds the list as `vyrn-lane` does: every
+  earlier unapplied, not explicit Join or Cancel of another order in range of the forwarded op
+  becomes explicit, and the op's `resp_seq` advances by 2. Each one is an `OP_DEP` op-log entry
+  at its own LaneSeq (its version slot for a Join, its leg for a Cancel); the forwarded entry
+  carries a mask of their distances. The BBO applies them in index order before the source, as
+  `Bbo::apply_deps`: in a Frozen book every one, and in a Halted book a Join, gets its reason;
+  a Join rests (`Ack`), and a Cancel ends the order (`CancelAck` of its open quantity, or
+  `TOO_LATE` when none is open). Their records go in the deps packet (`ROLE_DEPS`, the source's
+  `resp_seq`; the source's packet takes the next), which stays in dependency index order: a
+  maker record of a Join dependency rested in the same step goes after that dependency's
+  records while the packet has room, else to its session's maker packet (spec follow-up F8). A
+  Shed step gives every dependency `Reject BUSY`. At B1 a refused Join ends its order (a `BUSY`
+  one is shed) and a Cancel that took effect ends its order. **[Reading, 5]** As in
+  `Bbo::apply_deps`, a dependency's record index is the source's minus its LaneSeq distance
+  (spec follow-up F2: `FwdDep` has no message index), not the message's own index.
+  **[Reading, 5]** A Join dependency that a visible level crosses at the source's cut matches
+  before the source and ends the step, the rest continuing in `CONT` steps (`Bbo::join_dep`);
+  the client stops there with `PBV_E_UNSUPPORTED` (item 5b). So does a Cancel dependency whose
+  order's Join is applied but past the cut, which the client's book has not seen.
 - *Rescan batch takers (2).* The batch taker runs as `Bbo::rescan_finish` does. It must be
   live just after its key, or it is skipped with no status event; an auction-only taker is not
   live outside an uncross. A post-only taker that a visible level crosses ends with a batch
@@ -1087,15 +1106,15 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   boundary, before the Reduce settles, and a Reduce keeps its predecessor's leg. Replace (3b)
   makes the second one observable.
 - *Gap list (the plan).* What `RustReplay` replays and the Vx client does not yet
-  (1, Uncross and Seal, and 2, Rescan batch takers that trade, are done). The order is 5, then 3,
-  then 4: dependencies first, since without them the client fully replays only 3 of the first
-  149 sim-swarm seeds.
+  (1, Uncross and Seal, 2, Rescan batch takers that trade, and 5, in-packet dependencies, are
+  done). With 5 the client fully replays 142 of the first 149 sim-swarm seeds (under each
+  seed's generated fault schedule), up from 3; the other 7 stop with `PBV_E_UNSUPPORTED` at a
+  crossing Join dependency (5b), and none differs.
   3. Replace (keep and new priority); CancelAll (3a) is done.
   4. STP that triggers (currently `PBV_E_UNSUPPORTED` in a forwarded or batch sweep and the FOK
      dry run).
-  5. In-packet dependencies (05 §3.7: Join and Cancel dependencies; the CancelAll and Reduce
-     pass barriers are done in 3a). Done means `vx_golden.rs`'s seed 6f is strict and fails
-     with the LOWVER mask ignored, and a mutant that drops the 3a pass barrier fails a test.
+  5b. A Join dependency that crosses at the source's cut (`Bbo::join_dep`'s sweep and its
+     `CONT` steps).
   6. `engine.client` wiring in `vyrn-validator` (nothing constructs `VxReplay` today).
   7. Then a write-up of what a Vx default (`engine.client = vx`) needs; the default stays `rust`.
 - *Pooled lanes (`AcctTake`, 05 §6.9, 07 §7.1).* `pbv_config` byte 48 is the pool mask,
@@ -1143,12 +1162,8 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   versions live never had. Under a no-mask mutant, sim-swarm seeds 1–300 fail 10/300 with
   INV-DET `NoSnapshot`; seed 6f with faults `drop 31` is pinned in `tests/seeds.toml`.
   `vyrn-sim/tests/vx_golden.rs` frames that seed's live order stream as 07 (`cluster::run_log`)
-  and replays it with `RustReplay` and the Vx client. That log has in-packet dependencies, so
-  until gap item 5 the Vx client stops there with `PBV_E_UNSUPPORTED`, and the test requires a
-  match or UNSUPPORTED, never different bytes. A client that ignores the mask is therefore not
-  caught yet; gap item 5 makes the test strict, and its PR checks that the no-mask mutant fails
-  it. Only 3 of the first 149 swarm seeds fall inside the current subset, and none of them
-  separates the mask. The scripted `tests/replay.rs` checks still compare LOWVER steps byte for
+  and replays it with `RustReplay` and the Vx client, which must give the same output hash. That
+  log has in-packet dependencies (gap item 5); a client that ignores the mask fails it. The scripted `tests/replay.rs` checks still compare LOWVER steps byte for
   byte with `RustReplay`: the band and `snap_lag` scripts at every block boundary, a lane's
   catch-up past the 4095-version window, an evicted version, and the `BadRecord` cases.
 - *Capacity.* The op log (`OPLOG_CAP`) and the forwarded queue (`FWDQ_CAP` = 1024 per lane) are

@@ -2380,3 +2380,106 @@ fn the_vx_client_replays_cancel_all() {
     let (j, _) = live07(&script);
     assert_vx_matches(&script, 0..j.recs.len() - 1);
 }
+
+/// In-packet dependencies (05 §3.7, gap item 5). Lanes 1 and 0 rest asks at 105, lane 0's a
+/// Join. Lane 0's next packet joins a second ask at 105, cancels its first one, and sends a buy
+/// at 106 that crosses: the join and the cancel are its dependencies, applied in index order
+/// before it (a deps packet with the Ack and the CancelAck, the buy's records after them). The
+/// buy trades at 105 with lane 1's ask and the joined one, whose maker record goes in the deps
+/// packet after its Ack and before the CancelAck. The packet after that cancels the
+/// joined ask, already filled, ahead of a buy at 105: a dependency `TOO_LATE`. Last, lane 2
+/// joins an ask at 108 behind its own at 107, reduces the 107 ask and buys at 109: the Reduce
+/// is a pass barrier, so the join is applied first, gets the lane's Ack and is no dependency.
+fn deps_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let p = |l, a, t: u64, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs,
+    };
+    vec![
+        p(1, 1, 1_000, vec![new(Sell, Day, 105, 1, 1)]),
+        p(0, 1, 2_000, vec![new(Sell, Day, 105, 2, 2)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(
+            0,
+            1,
+            3_000,
+            vec![
+                new(Sell, Day, 105, 1, 3),
+                cancel(Handle::new(1, 1).unwrap(), 4),
+                new(Buy, Day, 106, 4, 5),
+            ],
+        ),
+        p(
+            0,
+            1,
+            4_000,
+            vec![
+                cancel(Handle::new(2, 1).unwrap(), 6),
+                new(Buy, Day, 105, 1, 7),
+            ],
+        ),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(2, 1, 5_000, vec![new(Sell, Day, 107, 3, 8)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        p(
+            2,
+            1,
+            6_000,
+            vec![
+                new(Sell, Day, 108, 1, 9),
+                vyrn_wire::Msg::Reduce {
+                    handle: Handle::new(1, 1).unwrap(),
+                    by: vyrn_types::Qty(1),
+                    client_tag: 10,
+                },
+                new(Buy, Day, 109, 1, 11),
+            ],
+        ),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+    ]
+}
+
+#[test]
+fn the_vx_client_replays_in_packet_dependencies() {
+    let script = deps_script();
+    let (live_j, store, blocks) = blocks_of(&script, &[]);
+    let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let (j, _) = live07(&script);
+    let deps: Vec<_> =
+        j.tx.iter()
+            .filter(|(h, _)| h.role == vyrn_bbo::ROLE_DEPS)
+            .map(|(_, r)| r.clone())
+            .collect();
+    assert!(
+        deps.iter()
+            .any(|r| r.iter().any(|x| matches!(x, vyrn_bbo::Record::Fill { .. }))),
+        "a dependency's maker record in its deps packet: {deps:?}"
+    );
+    assert!(
+        deps.iter().any(|r| r.iter().any(|x| matches!(
+            x,
+            vyrn_bbo::Record::Reject {
+                reason: vyrn_types::RejectReason::TooLate,
+                ..
+            }
+        ))),
+        "a dependency TOO_LATE: {deps:?}"
+    );
+    assert_vx_matches(&script, 0..j.recs.len() - 1);
+}
