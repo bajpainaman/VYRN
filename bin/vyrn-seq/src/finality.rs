@@ -81,8 +81,8 @@ pub struct Finality {
 }
 
 impl Finality {
-    /// Binds the CTRL port and starts the thread. `closed` is the number of blocks the stream
-    /// thread has closed (heights start at 0).
+    /// Binds the CTRL port and starts the thread. `closed` is the tenure's first height plus the
+    /// blocks the stream thread has closed: one past the highest closed height.
     #[allow(clippy::too_many_arguments)] // one channel per consumer of the listener
     pub fn start(
         c: &Consensus,
@@ -202,7 +202,15 @@ fn listen(
                 let from = match ctrl::decode(buf.get(..n).unwrap_or(&[])) {
                     Ok(Ctrl::Vote(v)) => {
                         counts.votes.fetch_add(1, Ordering::Relaxed);
-                        l.on_vote(&v).map(|c| c.map(|c| (c.view, "votes")))
+                        l.on_vote(&v).map(|c| {
+                            c.map(|c| {
+                                // Codex r4619319221: a seal finalized by Q votes counts too.
+                                if let Some(tx) = seals.filter(|_| c.seal.is_some()) {
+                                    let _ = tx.send(c.clone());
+                                }
+                                (c.view, "votes")
+                            })
+                        })
                     }
                     Ok(Ctrl::Cert(c)) => l.on_cert(&c).map(|()| {
                         // A verified seal certificate, for a standby (`standby.rs`).

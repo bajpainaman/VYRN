@@ -121,9 +121,11 @@ jobs:
         if: steps.vxc.outputs.cache-hit != 'true'
         run: .github/scripts/vxc.sh vxc
       - run: ln -sfn "$HOME/.local/src/vx/target/release/vxc" "$HOME/.local/bin/vxc"
+      # Before vx/build.sh: a restore from a fallback key (a Cargo.lock change) replaces target/,
+      # which would drop the target/vx libraries the build just wrote.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: vx/build.sh (pinned vxc hash, b3sum-checked libraries)
         run: vx/build.sh
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: the Vx client against RustReplay (tests/replay.rs)
         run: cargo test --locked -p vyrn-replica --test replay
       - name: the Vx oracle's scenarios and the pinned sim seeds

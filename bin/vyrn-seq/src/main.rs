@@ -167,6 +167,9 @@ enum Out {
 
 #[derive(Default)]
 struct Stats {
+    /// The tenure's first height: 0, or a promoted standby's seal height + 1 (Vercel
+    /// r4619307534: the finality gate compares absolute heights).
+    first_height: AtomicU64,
     records: AtomicU64,
     steps: AtomicU64,
     blocks: AtomicU64,
@@ -365,7 +368,12 @@ where
                 home,
                 Epoch(cfg.epoch),
                 vyrn_crypto::ed25519::public_key(&seed),
-                Arc::new(move || st.blocks.load(Ordering::Acquire)),
+                // Heights closed so far, absolute: the tenure's first height plus its blocks.
+                Arc::new(move || {
+                    st.first_height
+                        .load(Ordering::Acquire)
+                        .saturating_add(st.blocks.load(Ordering::Acquire))
+                }),
                 Arc::clone(&stop),
                 nack_tx,
                 seals_tx,
@@ -390,6 +398,11 @@ where
     };
     let writer = writer(cfg, n, seed, promo.as_ref())?;
     let step_base = promo.as_ref().map_or(0, |p| p.header.last_step.0);
+    if let Some(p) = &promo {
+        stats
+            .first_height
+            .store(p.header.height.0.saturating_add(1), Ordering::Release);
+    }
     let tenure = promo.as_ref().map_or(0, |p| p.tenure);
     let r = std::thread::scope(|sc| {
         // However this closure exits, a panic included (stdout closed before `READY` makes

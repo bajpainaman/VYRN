@@ -276,10 +276,16 @@ fn blocks(n: u32) -> Vec<Vec<u8>> {
     blocks_with(&mut writer(), n).0
 }
 
+/// One committee at a time: `cargo test --workspace` runs tests in parallel, and three
+/// committees of four voters at once starve a 2-vCPU CI host (each test needs about 3 GB).
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Four validators of a roster committee on localhost, their CTRL listener socket and ORDER
 /// ports. `extra` is appended to every config (`[failover]`), `dev` sets `dev = true`. With
 /// `data`, each has a data RX queue (`datas`) fed by one data box, `src = 0`, that is the test.
 struct Committee4 {
+    /// Held for the test's life ([`SERIAL`]).
+    _serial: std::sync::MutexGuard<'static, ()>,
     dir: std::path::PathBuf,
     committee: Committee,
     ctrl: UdpSocket,
@@ -293,6 +299,10 @@ fn committee4(tag: &str, dev: bool, extra: &str) -> Committee4 {
 }
 
 fn committee4_with(tag: &str, dev: bool, data: bool, extra: &str) -> Committee4 {
+    // A test that panicked while holding it poisoned it; the next still runs alone.
+    let serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = std::env::temp_dir().join(format!("vyrn-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let seq_key = vyrn_crypto::ed25519::public_key(&SEQ_SEED);
@@ -380,6 +390,7 @@ storage = "{}"
         vals.push(v);
     }
     Committee4 {
+        _serial: serial,
         dir,
         committee,
         ctrl: ctrl_sock,
@@ -392,6 +403,7 @@ storage = "{}"
 #[test]
 fn four_validators_finalize_and_the_listener_learns_it() {
     let Committee4 {
+        _serial: _guard,
         dir,
         committee,
         ctrl: ctrl_sock,
@@ -470,6 +482,7 @@ fn a_silent_sequencer_is_deposed_and_its_prefix_sealed() {
     use vyrn_consensus::{ProposalKind, SealExt};
     // DEV timers on loopback: 300 ms of silence, a 2 s abort window.
     let Committee4 {
+        _serial: _guard,
         dir,
         committee,
         ctrl,
@@ -574,6 +587,7 @@ fn a_silent_sequencer_is_deposed_and_its_prefix_sealed() {
 fn a_late_payload_rebuilds_the_seal_candidate() {
     use vyrn_consensus::ProposalKind;
     let Committee4 {
+        _serial: _guard,
         dir,
         committee,
         ctrl,

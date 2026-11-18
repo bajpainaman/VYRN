@@ -1577,6 +1577,8 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     let track = gate && paths.is_some();
     let mut frontier: std::collections::BTreeMap<vyrn_replica::paths::Key, u64> =
         std::collections::BTreeMap::new();
+    // After a promotion: the only (tenure, sender) whose frames reach the core.
+    let mut live: Option<(u8, u8)> = None;
     while !stop.load(Ordering::Acquire) {
         // 07 §9.5: the seal finalized naming a standby. Its tenure opens above the seal in a new
         // order core (its `TenureStart` anchors on the seal header); the deposed tenure's core
@@ -1584,9 +1586,13 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         if fo
             .as_ref()
             .is_some_and(|f| f.shared.phase() == depose::Phase::Deposed)
-            && let Some((above, _)) = source.promoted()
+            && let Some((above, key)) = source.promoted()
             && let Some(f) = fo.take()
         {
+            // Codex r4619319212: from now on only the promoted box's frames reach the core;
+            // a late tenure-0 frame would poison the new decoder. Tenure 1: one failover per run.
+            let sender = core.view_mut().seq_keys.iter().position(|k| *k == key);
+            live = sender.and_then(|s| u8::try_from(s).ok()).map(|s| (1u8, s));
             println!("DEPOSED_DROPS frames={}", f.dropped);
             let view = core.view_mut().clone();
             match OrderCore::new(core.layout(), view) {
@@ -1647,7 +1653,8 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                         && data.is_some()
                         && f.unavail.is_some_and(|n| n > 0)
                         && f.decision
-                            .is_some_and(|(p, _)| source.final_height() < p.height.0);
+                            // The seal is H* + 1: H* final is not the seal final (Vercel r4619307544).
+                            .is_some_and(|(p, _)| source.final_height() <= p.height.0);
                     if let Some((p, next)) = f.decision.filter(|_| fresh || retry) {
                         let star = vyrn_consensus::BlockSource::header(source, p.height);
                         let join = data
@@ -1771,6 +1778,12 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                 && (h.book, h.epoch16, h.tenure, h.sender) == (ctx.0, ctx.1, 0, 0)
             {
                 last_frame = Some((now(), realtime_ns()));
+            }
+            if let Some(l) = live
+                && vyrn_log::frame::FrameHeader::parse(f.payload)
+                    .is_ok_and(|(h, _)| (h.tenure, h.sender) != l)
+            {
+                continue;
             }
             // The sequencer's answer to a Nack for frames its ring no longer holds.
             if let (Some(t), Some(ps)) = (NackTooOld::decode(f.payload), paths.as_mut()) {
