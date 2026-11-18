@@ -396,6 +396,14 @@ fn data_feed_tracks_each_box_and_refuses_what_is_not_its_own() {
         feed.on_frame(&mut j, b"PD", 40),
         Err(FeedErr::Frame(_))
     ));
+    // A FETCH_RESP needs no configured src: the sequencer answers SeqDataReq as 0xFF.
+    let seq_answer = frame(Kind::FetchResp, 1, (5 << 32) | 3, 0xFF, &[&req(5, 3, 1)]);
+    assert_eq!(feed.on_frame(&mut j, &seq_answer, 40).unwrap().stored, 1);
+    assert_eq!(
+        feed.on_frame(&mut j, &frame(Kind::DataHb, 0, 9, 0xFF, &[]), 40),
+        Err(FeedErr::Src(0xFF)),
+        "a stream frame still does"
+    );
     let f7 = frame(Kind::Data, 1, 7, 1, &[&good]);
     assert_eq!(feed.on_frame(&mut j, &f7, 60).unwrap().gap, range(6, 6));
     // A gap longer than a box's max_range splits into fetches it accepts, oldest first.

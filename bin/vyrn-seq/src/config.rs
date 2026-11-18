@@ -33,6 +33,37 @@ pub struct Config {
     pub epoch_boundary: Option<EpochBoundary>,
     #[serde(default)]
     pub dev_session: Vec<DevSession>,
+    #[serde(default)]
+    pub repair: Option<Repair>,
+}
+
+/// `SeqDataReq` service (07 §5.5 source 3, `repair.rs`). Omitted: the box retains nothing.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Repair {
+    /// The UDP port replicas send KEY fetches to; 0 asks for an ephemeral one (tests).
+    pub port: u16,
+    /// Retained packets: size as peak packet rate × `REP_SEQ_PKT_RETAIN_MS`.
+    #[serde(default = "d_slots")]
+    pub slots: usize,
+    /// `REP_SEQ_DATA_MAX_PPS`.
+    #[serde(default = "d_pps")]
+    pub max_pps: u64,
+    /// `DAV_SESSION_REPAIR_PPS`.
+    #[serde(default = "d_session_pps")]
+    pub session_pps: u64,
+}
+
+fn d_slots() -> usize {
+    1 << 16
+}
+
+fn d_pps() -> u64 {
+    crate::repair::REP_SEQ_DATA_MAX_PPS
+}
+
+fn d_session_pps() -> u64 {
+    crate::repair::DAV_SESSION_REPAIR_PPS
 }
 
 #[derive(Debug, Deserialize)]

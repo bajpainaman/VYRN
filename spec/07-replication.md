@@ -1049,6 +1049,26 @@ fetch, with these sources in order:
 Every fetched packet is checked like a pushed one. Source 3 is the only source of the bytes the
 sequencer actually matched, so it settles every conflict (§5.6).
 
+**`SeqDataReq` bytes (source 3).** The request is the data tier's 32-byte KEY fetch
+(`vyrn-data` frame docs: magic `PF`, kind 1, `session u32, pkt_seq u32`), sent to the
+sequencer's repair port.
+- **Answer.** One `FETCH_RESP` data frame (§5.3) with:
+  - `src` = 0xFF, a value no data box index takes;
+  - `data_seq` = `session << 32 | pkt_seq`;
+  - `book` and `epoch16` of the first variant;
+  - every variant held under 05 §6.10, in arrival order.
+- **Miss.** The same frame with no packets and `book`, `epoch16` 0.
+- **Requester.** Only an address of a configured replica is answered.
+- **Refused without an answer:** RANGE and BLOCK fetches, which only data boxes serve, and
+  malformed requests.
+- **Cost.** An answer takes one `REP_SEQ_DATA_MAX_PPS` token per packet it carries, and a miss
+  takes one. Each packet also takes one `DAV_SESSION_REPAIR_PPS` token of its session. Each bucket
+  holds 10 ms of tokens. A request that either bucket cannot cover gets no answer, and the
+  replica asks again or moves on in the order above.
+- **At the replica.** A replica takes a `FETCH_RESP` from any `src`, so this answer is stored
+  like a data box's, and the join checks it by `pkt_hash` (§5.4). `DATA` and `DATA_HB` still need
+  a configured data box index.
+
 **Withheld copies (draft 0.3, 01 §14.19 C).** Source 3 serves one session at most
 `DAV_SESSION_REPAIR_PPS` = 2,000 packets/s (DAV-2). A voter that resolves more than 16 of a
 session's records from source 3 in 10 ms signs `DataMissing`; Q of them close the session with

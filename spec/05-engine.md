@@ -1486,6 +1486,29 @@ core and when, both of which the log records. ∎
 argument ("each core's `LaneSeq` logs the order") is not enough for an account whose work runs on
 two cores: the cross-core order needs `ver`.
 
+### 6.10 Packet retention for `SeqDataReq`
+
+The sequencer keeps the exact bytes of every packet that has a PacketRecord for
+`REP_SEQ_PKT_RETAIN_MS` = 50 ms, so that it can answer `SeqDataReq` (07 §5.5 source 3, 07 §5.6).
+The packets kept are the lane verdicts `Accepted` and `Shed`.
+
+- **Placement.** Retention is not on a lane core. After each `ingest`, the RX path hands a
+  `Copy` value to the repair thread (control, core 51): `vyrn_engine::retain::Kept {session,
+  pkt_seq, pkt_hash, rx_ts, bytes}`. It goes through an SPSC `vyrn_cut::Ring` allocated before
+  `seal()`. The push never waits and never allocates. On a full ring the copy is lost and counted
+  (`retain_dropped`), and the replica uses another source.
+- **Store** (`vyrn_engine::retain::Retain`). A FIFO of fixed slots, sized as peak packet rate ×
+  50 ms and overwritten oldest first. It has a 4-way set-associative index over `(session,
+  pkt_seq)` with at least eight ways per slot, so a bucket holds a mean of ≤ 0.5 live packets.
+  Both are allocated at construction. A lookup returns every retained variant of the key, oldest
+  first, whose `rx_ts` is within 50 ms of the newest one put.
+  - A packet loses its index entry only when its bucket holds more than four live packets, under
+    0.1% at the design load. Such a packet is a miss.
+  - The bucket hash is murmur3's `fmix64` of `session << 32 | pkt_seq`. It is not keyed, because
+    only packets that passed the MAC and `pkt_seq` checks reach it.
+- **Determinism.** Retention changes no engine state and no output. Replay neither reads it nor
+  rebuilds it.
+
 ## 7. The cut core, settlement, and physical maintenance
 
 ### 7.1 Cut core loop

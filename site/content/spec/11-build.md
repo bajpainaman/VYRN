@@ -151,7 +151,7 @@ isolated, pinned core after `seal()`.
 
 | Binary | Package | Links |
 |---|---|---|
-| `vyrn-seq` | `bin/vyrn-seq` | `vyrn-engine` (live), `vyrn-nic`, `vyrn-log`, `vyrn-consensus` (as a proposer; it never votes, 01 §14.4), `vyrn-epoch`. The warm standby in F2 is the same binary. |
+| `vyrn-seq` | `bin/vyrn-seq` | `vyrn-engine` (live), `vyrn-nic`, `vyrn-log`, `vyrn-consensus` (as a proposer; it never votes, 01 §14.4), `vyrn-epoch`, `vyrn-data` (its frame and fetch codec only, for `SeqDataReq`, 07 §5.5). The warm standby in F2 is the same binary. |
 | `vyrn-replica` | `crates/vyrn-replica` | `vyrn-engine` (replay), `vyrn-log`, `vyrn-consensus`, `vyrn-epoch`, `libvyrn_vx_client` |
 | `vyrn-validator` | `bin/vyrn-validator` | everything in `vyrn-replica`, plus `vyrn-chain` |
 | `vyrn-data` | `crates/vyrn-data` | `vyrn-data`, `vyrn-nic`, `vyrn-log` |
@@ -192,7 +192,8 @@ an engine crate depends on a crate outside `crates/engine/`, other than the allo
             vyrn-consensus ──► vyrn-log, Commonware (consensus, p2p, runtime, cryptography, storage, codec)
             vyrn-data ──► vyrn-log, vyrn-nic
   layer 5   vyrn-epoch ──► vyrn-consensus
-  layer 6   vyrn-replica ──► vyrn-engine, vyrn-consensus, vyrn-epoch, libvyrn_vx_client (Vx, C ABI)
+  layer 6   vyrn-replica ──► vyrn-engine, vyrn-consensus, vyrn-epoch, vyrn-data (frame codec,
+                             03 F7), libvyrn_vx_client (Vx, C ABI)
   layer 7   vyrn-md ──► vyrn-replica
             vyrn-chain ──► vyrn-replica, vyrn-epoch
 

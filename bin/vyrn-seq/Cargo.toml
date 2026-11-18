@@ -7,7 +7,8 @@ license-file.workspace = true
 publish = false
 description = "The sequencer binary: main.rs and config wiring only."
 
-# 11 §1.3 links vyrn-engine (live), vyrn-nic, vyrn-log, vyrn-consensus (proposer) and vyrn-epoch.
+# 11 §1.3 links vyrn-engine (live), vyrn-nic, vyrn-log, vyrn-consensus (proposer), vyrn-epoch and
+# vyrn-data (frame codec only).
 # The engine's lane, BBO, cut, risk and wire types are named here because Engine::new takes a
 # lane constructor (vyrn-engine does not depend on vyrn-risk, 11 §1.4).
 [dependencies]
@@ -22,6 +23,8 @@ vyrn-engine = { workspace = true }
 vyrn-nic = { workspace = true }
 vyrn-log = { workspace = true }
 vyrn-epoch = { workspace = true }
+# The 07 §5.3 data-frame and fetch bytes, for SeqDataReq (07 §5.5 source 3; 11 §1.3).
+vyrn-data = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }

@@ -3738,6 +3738,7 @@ dependencies = [
  "vyrn-consensus",
  "vyrn-crypto",
  "vyrn-cut",
+ "vyrn-data",
  "vyrn-engine",
  "vyrn-epoch",
  "vyrn-lane",

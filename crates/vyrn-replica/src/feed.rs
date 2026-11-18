@@ -21,8 +21,10 @@
 //! position stays. `FETCH_RESP` frames carry no stream position. [`DataFeed::silent`] lists the
 //! boxes heard from once and silent for `REP_DATA_SILENCE_MS` (07 §5.3), for `DataDown{d}`.
 //!
-//! **Rejects** ([`FeedErr`]): a frame that `vyrn_data::frame::decode` refuses, and a `src` beyond
-//! the configured boxes. A rejected frame changes nothing. A data box sends every book it serves
+//! **Rejects** ([`FeedErr`]): a frame that `vyrn_data::frame::decode` refuses, and a `DATA` or
+//! `DATA_HB` frame whose `src` is beyond the configured boxes. A rejected frame changes nothing.
+//! A `FETCH_RESP` is taken from any `src`: a data box, or the sequencer's `SeqDataReq` answer
+//! (`src` 0xFF, 07 §5.5 source 3), whose packets the join checks like any other. A data box sends every book it serves
 //! on one `data_seq` per destination, so a frame of another book still moves the box's position
 //! and liveness; its packets, like any that do not parse or name another book, are dropped and
 //! counted in [`Fed::dropped`].
@@ -122,32 +124,36 @@ impl DataFeed {
         let f = decode(payload).map_err(FeedErr::Frame)?;
         let src = f.hdr.src;
         let (book, me) = (self.book, self.me);
-        let s = self
-            .sources
-            .get_mut(usize::from(src))
-            .ok_or(FeedErr::Src(src))?;
-        let mut fed = Fed::default();
         let announced = match f.hdr.kind {
             Kind::Data | Kind::DataHb => Some(f.hdr.data_seq),
             Kind::FetchResp => None,
         };
-        if let Some(seq) = announced {
-            // DATA n reveals a gap above `high` up to n − 1; DATA_HB n up to n itself.
-            let last_missing = match f.hdr.kind {
-                Kind::Data => seq.saturating_sub(1),
-                _ => seq,
-            };
-            if last_missing > s.high {
-                fed.gap = Some(Gap {
-                    src,
-                    dst: me,
-                    from: s.high.saturating_add(1),
-                    to: last_missing,
-                });
-            }
-            s.high = s.high.max(seq);
+        // A fetch answer may come from any source of 07 §5.5, the sequencer (`src` 0xFF)
+        // included; only a data box's stream needs a configured `src`.
+        let source = self.sources.get_mut(usize::from(src));
+        if source.is_none() && announced.is_some() {
+            return Err(FeedErr::Src(src));
         }
-        s.heard = Some(now);
+        let mut fed = Fed::default();
+        if let Some(s) = source {
+            if let Some(seq) = announced {
+                // DATA n reveals a gap above `high` up to n − 1; DATA_HB n up to n itself.
+                let last_missing = match f.hdr.kind {
+                    Kind::Data => seq.saturating_sub(1),
+                    _ => seq,
+                };
+                if last_missing > s.high {
+                    fed.gap = Some(Gap {
+                        src,
+                        dst: me,
+                        from: s.high.saturating_add(1),
+                        to: last_missing,
+                    });
+                }
+                s.high = s.high.max(seq);
+            }
+            s.heard = Some(now);
+        }
         for p in f.packets() {
             let key = Request::parse(p).ok().and_then(|r| {
                 let h = r.header();
