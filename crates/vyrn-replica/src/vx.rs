@@ -52,16 +52,10 @@ unsafe fn sym<F: Copy>(lib: *mut c_void, name: &CStr) -> Result<F, String> {
 }
 
 impl Client {
-    /// Loads the library at `path`, makes a context over a fresh region for `n` lanes from the
-    /// pbv.h config (64 bytes), account (80 each) and session (32 each) tables, and starts a
-    /// thread per lane and the BBO thread.
-    pub fn start(
-        path: &Path,
-        n: u8,
-        cfg: &[u8],
-        accts: &[u8],
-        sess: &[u8],
-    ) -> Result<Self, String> {
+    /// Loads the library at `path`, makes a context from the pbv.h config (64 bytes), account
+    /// (80 each) and session (32 each) tables over a region sized for the config's lane count,
+    /// and starts a thread per lane and the BBO thread.
+    pub fn start(path: &Path, cfg: &[u8], accts: &[u8], sess: &[u8]) -> Result<Self, String> {
         let c = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
         // SAFETY: `c` is a NUL-terminated path; the library has no initialisers of its own.
         let lib = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
@@ -84,6 +78,8 @@ impl Client {
         if v != ABI_VERSION {
             return Err(format!("client ABI version {v}, shell {ABI_VERSION}"));
         }
+        // The region and threads follow the lane count pbv_new reads (cfg byte 8).
+        let n = cfg.get(8).copied().unwrap_or(0);
         if cfg.len() != 64 || !accts.len().is_multiple_of(80) || !sess.len().is_multiple_of(32) {
             return Err("malformed pbv tables".into());
         }

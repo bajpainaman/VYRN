@@ -172,7 +172,8 @@ typedef struct pbv_ctx pbv_ctx;
  * the Rust shell. It starts with 1 + 4(n + 1) control lines of 16 u64 words; each word has one
  * writer, read and written with acquire/release.
  *   line 0         w0 stop (shell)
- *   line 1 + 4l    lane l in_head: w0 records written (shell)
+ *   line 1 + 4l    lane l in_head (shell): w0 records written, w1 the count w0 reaches once the
+ *                  block's records are all written (an empty ring below it is not exhausted)
  *   line 2 + 4l    lane l in_tail (client): w0 records replayed, w1 the in_head it last saw idle,
  *                  w2 the step its next call waits for, w3 PBV_E_*, w4 the record index (err_at)
  *   line 3 + 4l    lane l out_head: w0 responses written (client)

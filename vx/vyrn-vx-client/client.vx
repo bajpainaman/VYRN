@@ -805,7 +805,8 @@ fn settle_fill(c : *mut Ctx, ln : *mut Lane, leg : u64, taker : bool, q : u64, t
       let rel = sub128(rel_amount(c, sp, rem, bp), rel_amount(c, sp, after, bp), bp);
       (*ac).qr = sub128((*ac).qr, rel, bp);
       (*ac).qf = add128((*ac).qf, sub128(rel, n, bp), bp);
-      (*ac).bf = (*ac).bf + q;
+      let (bf2, o) = (*ac).bf.overflowing_add(q);
+      if o { setbad(bp); } else { (*ac).bf = bf2; }
     } else {
       if q > (*ac).br { setbad(bp); } else { (*ac).br = (*ac).br - q; }
       (*ac).qf = add128((*ac).qf, n, bp);
@@ -1697,6 +1698,9 @@ pub fn pbv_lane_run(c : *mut Ctx, l : u32) -> void {
         }
         if done_step(c) >= wait {
           lane_call(c, li, k);
+          // A failed call is not replayed: the error is published before the tail could
+          // tell the shell the lane is used up.
+          if (*ln).err != 0u64 { continue; }
           (*ln).tail = tail + k;
           st(c, l_in_tail(li), 0i64, (*ln).tail);
           continue;
@@ -1905,7 +1909,10 @@ fn lane_stuck(c : *mut Ctx, l : i64, s : u64) -> bool {
   let head = ld(c, l_in_head(l), 0i64);
   let seen = ld(c, l_in_tail(l), 1i64);
   let need = ld(c, l_in_tail(l), 2i64);
-  return seen == head && need >= s;
+  // An empty ring proves nothing while the shell still has this block's records to write
+  // (in_head w1: the count it will reach).
+  let fed = ld(c, l_in_head(l), 1i64);
+  return seen == head && head >= fed && need >= s;
 }
 
 fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
@@ -2094,24 +2101,61 @@ fn stp_hit(c : *mut Ctx, l : u64, e : *mut LOp, ml : u64, mr : u64) -> bool {
   }
 }
 
-// 05 §8.5 dry_run_fillable, counted up to the taker's open quantity.
+// Resting order i of the book can fill the taker e (opposite side, open, price compatible).
+fn fill_cand(c : *mut Ctx, e : *mut LOp, i : i64) -> bool {
+  unsafe {
+    let b = (*c).bbo;
+    let side = 1u64 - (*e).side;
+    let ml = (*offset_mut((*b).book_l, i)) as u64;
+    let mr = (*offset_mut((*b).book_r, i)) as u64;
+    let o = bord(c, ml, mr);
+    if (*o).side != side || bopen(c, ml, mr) == 0u64 { return false; }
+    return if side == 1u64 { (*o).tick <= (*e).tick } else { (*o).tick >= (*e).tick };
+  }
+}
+
+// Book order i matches before book order j (better price, then PrioKey).
+fn match_before(c : *mut Ctx, i : i64, j : i64) -> bool {
+  unsafe {
+    let b = (*c).bbo;
+    let il = (*offset_mut((*b).book_l, i)) as u64;
+    let ir = (*offset_mut((*b).book_r, i)) as u64;
+    let jl = (*offset_mut((*b).book_l, j)) as u64;
+    let jr = (*offset_mut((*b).book_r, j)) as u64;
+    let oi = bord(c, il, ir);
+    let oj = bord(c, jl, jr);
+    if (*oi).tick != (*oj).tick {
+      return if (*oi).side == 1u64 { (*oi).tick < (*oj).tick } else { (*oi).tick > (*oj).tick };
+    }
+    return key_lt(c, il, ir, jl, jr);
+  }
+}
+
+// 05 §8.5 dry_run_fillable, as Bbo::fillable: makers in matching order until the taker's open
+// quantity is covered. A same-account maker reached before that would trigger STP, which v1
+// does not replay (UNSUPPORTED); one reached only after is never visited.
 fn fillable(c : *mut Ctx, l : u64, e : *mut LOp) -> u64 {
   unsafe {
     let need = bopen(c, l, (*e).root);
-    let side = 1u64 - (*e).side;
     let b = (*c).bbo;
     let mut sum = 0u64;
     for i in 0i64..(*b).n_book {
+      if !fill_cand(c, e, i) { continue; }
       let ml = (*offset_mut((*b).book_l, i)) as u64;
       let mr = (*offset_mut((*b).book_r, i)) as u64;
-      let o = bord(c, ml, mr);
-      if (*o).side != side || bopen(c, ml, mr) == 0u64 { continue; }
-      let ok = if side == 1u64 { (*o).tick <= (*e).tick } else { (*o).tick >= (*e).tick };
-      if !ok { continue; }
-      if stp_hit(c, l, e, ml, mr) { fail_bbo(c, E_UNSUPPORTED); return 0u64; }
+      if stp_hit(c, l, e, ml, mr) {
+        let mut before = 0u64;
+        for j in 0i64..(*b).n_book {
+          if j != i && fill_cand(c, e, j) && match_before(c, j, i) {
+            before = before + bopen(c, (*offset_mut((*b).book_l, j)) as u64,
+                                    (*offset_mut((*b).book_r, j)) as u64);
+          }
+        }
+        if before < need { fail_bbo(c, E_UNSUPPORTED); return 0u64; }
+        continue;
+      }
       sum = sum + bopen(c, ml, mr);
     }
-    let _ = need;
     return sum;
   }
 }
@@ -2214,8 +2258,10 @@ fn init_lane(c : *mut Ctx, l : i64, accts : *const i8, na : i64, sp : *const i8,
     (*ln).next_slot = 1u64;
     (*ln).next_seg = 1u64;
     (*ln).taker_leg = NONE;
-    (*ln).slots = zalloc(sizeof<Slot>() * cap);
-    (*ln).roots = zalloc(sizeof<Root>() * cap);
+    // One spare entry: a New stages its risk fields in slot next_slot before the capacity
+    // check rejects it, and next_slot may equal cap.
+    (*ln).slots = zalloc(sizeof<Slot>() * (cap + 1i64));
+    (*ln).roots = zalloc(sizeof<Root>() * (cap + 1i64));
     (*ln).pend = zalloc(sizeof<Pend>() * PEND_CAP);
     (*ln).b3 = zalloc(sizeof<B3>() * B3_CAP);
     (*ln).ops = zalloc(sizeof<Op>() * 10i64);

@@ -235,6 +235,11 @@ fn read(m: &[Line], at: usize, len: usize, out: &mut Vec<u8>) {
     out.truncate(start.saturating_add(len));
 }
 
+/// A slot that holds a `MID` record (flags at byte 2).
+fn is_mid(b: &[u8]) -> bool {
+    b.get(2).is_some_and(|f| f & PacketFlags::MID != 0)
+}
+
 fn byte(m: &[Line], at: usize) -> usize {
     let mut b = Vec::new();
     read(m, at & !7, 8, &mut b);
@@ -255,7 +260,7 @@ impl<P: Payloads> VxReplay<P> {
     /// Loads the library at `lib` and starts the client in `cfg`'s state.
     pub fn new(lib: &Path, cfg: &VxConfig, payloads: P) -> Result<Self, ReplayError> {
         let (c, a, s) = cfg.tables();
-        let client = Client::start(lib, cfg.n_lanes, &c, &a, &s).map_err(ReplayError)?;
+        let client = Client::start(lib, &c, &a, &s).map_err(ReplayError)?;
         let n = usize::from(cfg.n_lanes);
         Ok(Self {
             client,
@@ -435,19 +440,35 @@ impl<P: Payloads, const N: usize> ReplayEngine<N> for VxReplay<P> {
         let last = blk.header.last_step.0;
         self.lane_out.iter_mut().for_each(Vec::clear);
         self.tx_out.clear();
+        // Tell each lane how far this block's records go, so the BBO never reads a ring the
+        // shell is still filling as exhausted input.
+        for (l, recs) in lanes.iter().enumerate() {
+            let fed = self.in_head[l] + recs.len() as u64;
+            set(self.client.mem(), map.in_head(l), 1, fed);
+        }
         let mut next = vec![0usize; N];
         let mut next_step = 0usize;
         loop {
             let m = self.client.mem();
-            // Feed what fits.
+            // Feed what fits, a packet and its `MID` records at once: the lane takes a call's
+            // records together, so in_head never stops between them.
             for l in 0..N {
                 let tail = word(m, map.in_tail(l), 0);
-                while next[l] < lanes[l].len() && self.in_head[l] - tail < SLOTS {
-                    let at = map.in_base()
-                        + (l * SLOTS as usize + (self.in_head[l] % SLOTS) as usize) * IN_BYTES;
-                    write(m, at, &lanes[l][next[l]]);
-                    next[l] += 1;
-                    self.in_head[l] += 1;
+                while next[l] < lanes[l].len() {
+                    let mut k = 1;
+                    while lanes[l].get(next[l] + k).is_some_and(|b| is_mid(b)) {
+                        k += 1;
+                    }
+                    if self.in_head[l] + k as u64 - tail > SLOTS {
+                        break;
+                    }
+                    for b in &lanes[l][next[l]..next[l] + k] {
+                        let at = map.in_base()
+                            + (l * SLOTS as usize + (self.in_head[l] % SLOTS) as usize) * IN_BYTES;
+                        write(m, at, b);
+                        self.in_head[l] += 1;
+                    }
+                    next[l] += k;
                 }
                 set(m, map.in_head(l), 0, self.in_head[l]);
             }
