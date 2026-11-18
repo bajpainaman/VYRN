@@ -142,10 +142,16 @@ jobs:
           if [ -n "$(git status --porcelain -- content/spec)" ]; then
             git status --short -- content/spec
             git diff -- content/spec
+            echo "::error::Run (cd site && node scripts/sync-spec.mjs && node scripts/diagram-inventory.mjs) and commit; see site/diagrams/STYLE.md if a figure asciiIndex moved."
             exit 1
           fi
       - name: diagrams/inventory.json matches the spec (regenerate, then remap manifests whose asciiIndex moved)
-        run: node scripts/diagram-inventory.mjs && git diff --exit-code -- diagrams/inventory.json
+        run: |
+          node scripts/diagram-inventory.mjs
+          if ! git diff --exit-code -- diagrams/inventory.json; then
+            echo "::error::Run (cd site && node scripts/sync-spec.mjs && node scripts/diagram-inventory.mjs) and commit; see site/diagrams/STYLE.md if a figure asciiIndex moved."
+            exit 1
+          fi
       - name: every figure points at an inventory block
         run: pnpm exec vitest run lib/diagrams.test.ts
 
