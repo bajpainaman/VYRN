@@ -45,6 +45,8 @@ pub struct Config {
     pub store: Store,
     #[serde(default)]
     pub metrics: Metrics,
+    #[serde(default)]
+    pub shards: Shards,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +118,31 @@ impl Default for FetchCfg {
         Self {
             rate: d_rate(),
             burst: d_burst(),
+        }
+    }
+}
+
+/// The cores of the box ([`crate::shards`]): `n` ingest shards (07 §5.2, RSS by session), and
+/// the CPUs to pin to, in the order RX core, sender core, shard 0, …, shard n − 1 (11 §3.6).
+/// Empty `cpus`: no pinning (DEV).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Shards {
+    #[serde(default = "d_shards")]
+    pub n: usize,
+    #[serde(default)]
+    pub cpus: Vec<usize>,
+}
+
+fn d_shards() -> usize {
+    1
+}
+
+impl Default for Shards {
+    fn default() -> Self {
+        Self {
+            n: d_shards(),
+            cpus: Vec::new(),
         }
     }
 }
@@ -195,6 +222,15 @@ impl Config {
         }
         if self.fetch.rate == 0 || self.fetch.burst == 0 {
             return bad("fetch", "rate and burst must be ≥ 1");
+        }
+        if !(1..=64).contains(&self.shards.n) {
+            return bad("shards.n", "must be 1..=64");
+        }
+        if !self.shards.cpus.is_empty() && self.shards.cpus.len() != self.shards.n + 2 {
+            return bad(
+                "shards.cpus",
+                "must be empty or list n + 2 CPUs (rx, sender, shards)",
+            );
         }
         Ok(())
     }

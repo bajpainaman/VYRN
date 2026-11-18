@@ -9,6 +9,12 @@
 //! each, every packet already on its shard's queue: total Mpps across the shards and the speedup
 //! over one. The orb has 2 cores, so N stops there.
 //!
+//! `pipeline N` runs the sharded box (`vyrn_data::shards`) as the binary does: an RX core, N
+//! shard cores and one sender core, each on its own thread, over vyrn-nic's `sim` backend with
+//! every frame already on the ingest queue. It reports Mpps from the first poll until the
+//! sender has drained, and the speedup over N = 1. With N + 2 threads on a 2-core orb the cores
+//! share CPUs, so N = 2 measures the hop overhead, not the scaling a REF box would show.
+//!
 //! DEV numbers: an orb or a laptop is not the REF box (06 §1); compare before and after on one
 //! machine only.
 #![allow(
@@ -177,6 +183,8 @@ fn main() {
         );
     }
 
+    pipeline(hot);
+
     // The ring and its index alone: store one packet and look its key up, ring full.
     let mut ns = Vec::new();
     let mut allocs = 0u64;
@@ -211,4 +219,189 @@ fn main() {
         median(ns),
         2 * RING
     );
+}
+
+/// Frames on the sim ingest queue per `pipeline` round.
+const PIPE: usize = 1 << 15;
+
+fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use vyrn_cut::Hw;
+    use vyrn_data::NodeConfig;
+    use vyrn_data::shards::{self, SenderRing, ShardRing};
+    use vyrn_log::MemStore;
+    use vyrn_nic::frame::{Endpoint, FrameHdr, build};
+    use vyrn_nic::{
+        BackendKind, NicBackend, NicConfig, PortConfig, PortId, RxBind, SimNic, TxClass,
+    };
+    use vyrn_types::LaneId;
+
+    let ep = |last: u8, port: u16| Endpoint {
+        mac: [2, 0, 0, 0, 0, last],
+        ip: std::net::Ipv4Addr::new(10, 0, 0, last),
+        port,
+    };
+    let (me, client) = (ep(1, 19998), ep(9, 4000));
+    let frames: Vec<Vec<u8>> = pkts[..PIPE]
+        .iter()
+        .map(|(len, p)| {
+            let mut b = [0u8; 1514];
+            let n = build(
+                &FrameHdr {
+                    src: client,
+                    dst: me,
+                },
+                &p[..usize::from(*len)],
+                &mut b,
+            )
+            .unwrap();
+            b[..n].to_vec()
+        })
+        .collect();
+    let mut base = 0.0;
+    for n in [1usize, 2] {
+        let mut mpps = Vec::new();
+        let (mut allocs, mut drops) = (0u64, 0u64);
+        for _ in 0..ROUNDS {
+            let mut ncfg = NicConfig::new(
+                BackendKind::Sim,
+                vec![PortConfig {
+                    id: PortId(0),
+                    ip: me.ip,
+                }],
+            );
+            ncfg.rx_slots = PIPE;
+            let mut nic = SimNic::open(&ncfg).unwrap();
+            let bind = |e: Endpoint| RxBind {
+                lane: LaneId(0),
+                port: PortId(0),
+                ip: e.ip,
+                udp_port: e.port,
+            };
+            let ingest = nic.rx_ring(&bind(me)).unwrap();
+            let fetch = nic.rx_ring(&bind(ep(1, 19997))).unwrap();
+            let mut txq = || nic.tx_ring(PortId(0), TxClass::OrderStream).unwrap();
+            let shard_tx = (0..n).map(|_| txq()).collect();
+            let tx = txq();
+            // Two destinations nobody listens on: the sim sends and loses their frames.
+            let dests = vec![ep(2, 20000), ep(3, 20000)];
+            let mut home = cfg();
+            home.ring_slots = PIPE;
+            let node = NodeConfig::new(home, 1, me, dests);
+            let (mut rx, cores, mut sender) = shards::split(&node, ingest, fetch, shard_tx, tx);
+            let addr = std::net::SocketAddrV4::new(me.ip, me.port);
+            for f in &frames {
+                assert!(nic.inject(addr, f, Nanos(0)));
+            }
+            let store = MemStore::default();
+            let mut shard_rings: Vec<ShardRing> = (0..n).map(|_| ShardRing::new(&Hw)).collect();
+            let mut sender_rings: Vec<SenderRing> = (0..=n).map(|_| SenderRing::new(&Hw)).collect();
+            let (mut to_shard, shard_in): (Vec<_>, Vec<_>) = shard_rings
+                .iter_mut()
+                .map(|r| {
+                    let (p, [c]) = r.split().unwrap();
+                    (p, c)
+                })
+                .unzip();
+            let (mut to_sender, mut sender_in): (Vec<_>, Vec<_>) = sender_rings
+                .iter_mut()
+                .map(|r| {
+                    let (p, [c]) = r.split().unwrap();
+                    (p, c)
+                })
+                .unzip();
+            let mut rx_out = to_sender.pop().unwrap();
+            let (rx_done, shards_done) = (AtomicBool::new(false), AtomicUsize::new(0));
+            let go = Barrier::new(n + 2);
+            let drain = |done: &dyn Fn() -> bool, work: &mut dyn FnMut() -> usize| {
+                let mut last = false;
+                loop {
+                    if work() == 0 {
+                        if last {
+                            return;
+                        }
+                        last = done();
+                        std::thread::yield_now();
+                    }
+                }
+            };
+            let (secs, a, stored, dropped) = std::thread::scope(|sc| {
+                let (go, store, rx_done, shards_done) = (&go, &store, &rx_done, &shards_done);
+                let h_rx = sc.spawn(move || {
+                    go.wait();
+                    seal_counting();
+                    let before = violations();
+                    while (rx.counters().rx_pkts as usize) < PIPE {
+                        if rx.poll(Nanos(0), &mut to_shard, &mut rx_out) == 0 {
+                            std::thread::yield_now();
+                        }
+                    }
+                    let a = violations() - before;
+                    unseal();
+                    rx_done.store(true, Ordering::Release);
+                    (a, rx.counters().hop_full)
+                });
+                let hs: Vec<_> = cores
+                    .into_iter()
+                    .zip(shard_in)
+                    .zip(to_sender)
+                    .map(|((mut core, mut input), mut out)| {
+                        sc.spawn(move || {
+                            go.wait();
+                            seal_counting();
+                            let before = violations();
+                            drain(&|| rx_done.load(Ordering::Acquire), &mut || {
+                                let w = core.poll(&mut input, &mut out, store);
+                                core.drain_events().for_each(drop);
+                                w
+                            });
+                            let a = violations() - before;
+                            unseal();
+                            shards_done.fetch_add(1, Ordering::AcqRel);
+                            (a, core.counters().stored)
+                        })
+                    })
+                    .collect();
+                go.wait();
+                let t = Instant::now();
+                seal_counting();
+                let before = violations();
+                drain(&|| shards_done.load(Ordering::Acquire) == n, &mut || {
+                    sender.poll(Nanos(t.elapsed().as_nanos() as u64), &mut sender_in)
+                });
+                let secs = t.elapsed().as_secs_f64();
+                let mut a = violations() - before;
+                unseal();
+                let (ra, dropped) = h_rx.join().unwrap();
+                a += ra;
+                let mut stored = 0;
+                for h in hs {
+                    let (x, s) = h.join().unwrap();
+                    a += x;
+                    stored += s;
+                }
+                // A full shard ring drops at the RX core (shards.rs reading), as a full NIC queue would.
+                assert_eq!(
+                    stored + dropped,
+                    PIPE as u64,
+                    "every packet stored or counted"
+                );
+                (secs, a, stored, dropped)
+            });
+            allocs += a;
+            drops += dropped;
+            mpps.push(stored as f64 / secs / 1e6);
+        }
+        let m = median(mpps);
+        if n == 1 {
+            base = m;
+        }
+        println!(
+            "pipeline {n}  {m:>7.2} Mpps stored  ({:.2}x n = 1, {} threads, median of {ROUNDS}, {PIPE} pkts)  hop_full {}  allocs {allocs}",
+            m / base,
+            n + 2,
+            drops / ROUNDS as u64
+        );
+    }
 }

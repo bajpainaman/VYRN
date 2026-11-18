@@ -17,6 +17,7 @@ vyrn-data = { workspace = true }
 vyrn-nic = { workspace = true }
 vyrn-log = { workspace = true }
 vyrn-wire = { workspace = true }
+vyrn-cut = { workspace = true }
 # The roster codec and K_fetch derivation (08 §9.6); the library stays in layer 4.
 vyrn-epoch = { workspace = true }
 clap = { workspace = true }

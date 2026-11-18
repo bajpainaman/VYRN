@@ -1,7 +1,8 @@
 //! `vyrn-data`, the data box (03 §1, 07 §5; 11 §1.3, §8.4, §10.1), package `bin/vyrn-data-box`:
 //! main.rs and config wiring only. Every decision is made in the library; this file opens the NIC,
-//! the log source and the metrics listener, derives `K_fetch` from the roster, then runs
-//! [`DataNode::poll`] in a loop.
+//! the log source and the metrics listener, derives `K_fetch` from the roster, then runs the
+//! cores of [`vyrn_data::shards`] (an RX core, `[shards] n` ingest shards and one sender), each
+//! on its own thread, pinned when `[shards] cpus` is set.
 //!
 //! # Contract
 //!
@@ -23,12 +24,13 @@
 //! | `[fetch] rate, burst` | per-source fetch limit (defaults 20,000/s, 256) |
 //! | `[store] dirs = [..]` | `FileStore` drives read as the log source; none: an empty `MemStore` |
 //! | `[metrics] listen` | Prometheus text on this address, default `127.0.0.1:9464` (11 §8.4) |
+//! | `[shards] n, cpus` | ingest shards (default 1, at most 64; 07 §5.2 RSS by session); `cpus` empty (no pinning) or `n + 2` CPUs: RX core, sender, shard 0, … |
 //!
 //! A key handle is `env:NAME` (hex in that variable) or, on DEV only, `hex:<32 hex digits>`.
 //!
 //! **Start** (11 §10.1); each step fail-stops with exit code 2 and one line on stderr: load and
 //! check the config → resolve keys → open the log source → open the NIC (ingest, fetch, one TX
-//! queue) → bind metrics → print
+//! queue per shard and one for the sender) → bind metrics → start and pin every core → print
 //!
 //! ```text
 //! READY vyrn-data ingest=<ip:port> fetch=<ip:port> metrics=<ip:port>
@@ -39,24 +41,27 @@
 //! follow-up), written by their own thread from a bounded queue so stdout never blocks the poll
 //! loop (a full queue drops and counts the line), and at exit `STATS stored=<n> data_frames=<n>
 //! heartbeats=<n> duplicate=<n> fetch_unauth=<n> fetch_limited=<n> bad_mac=<n> events_dropped=<n>
-//! events_unprinted=<n> fetch_ring_hit=<n> fetch_log_hit=<n> fetch_miss=<n> fetch_resent=<n>`.
+//! events_unprinted=<n> fetch_ring_hit=<n> fetch_log_hit=<n> fetch_miss=<n> fetch_resent=<n>
+//! hop_full=<n> shards=<n>`, every counter summed over the cores.
 //! A stop waits up to 1 s for queued events to print and counts the rest
 //! in `events_unprinted`, so `EVENT` lines + `events_unprinted` + `events_dropped` = `bad_mac` +
 //! `conflicts`.
 //!
 //! **Metrics.** Every [`vyrn_data::Counters`] field as `vyrn_data_<field>_total`, and
 //! `vyrn_data_events_unprinted_total` (events dropped by the stdout queue), labels `role`,
-//! `home`, `src`. The loop publishes deltas every 100 ms; a std thread serves `GET` on the
-//! listener. *Reading:* 11 §8.4 says a tokio task; one blocking thread does the same job here.
+//! `home`, `src`. Each core publishes its deltas every 100 ms, so a metric is the box's sum; a
+//! std thread serves `GET` on the listener. *Reading:* 11 §8.4 says a tokio task; one blocking thread does the same job here.
 //!
 //! **Control** (stdin, one line each; *reading*: 07 and 08 name no transport for it yet).
 //! `EPOCH <e>` derives `K_fetch` of epochs `e` and `e + 1` from `[roster]` and serves fetches
 //! under either (08 §4.6), dropping older epochs' keys, then prints `FETCH_EPOCHS <e>,<e+1>`. At
 //! start the box holds `[roster] epoch` and the next one, so requesters that move to the next
 //! epoch are served without a restart. A refused or unknown line prints `CONTROL_ERR <why>` on
-//! stderr and changes nothing.
+//! stderr and changes nothing. Lines reach the RX core through a queue of `CONTROL_QUEUE`; while
+//! it is full the stdin reader waits, never a core.
 //!
-//! **Stop.** With `--stop-on-stdin-eof`, closing stdin flushes open frames and prints `STATS`.
+//! **Stop.** With `--stop-on-stdin-eof`, closing stdin stops the RX core; each shard drains its
+//! ring, then the sender drains its rings and flushes open frames, then `STATS` is printed.
 #![forbid(unsafe_code)]
 
 use std::borrow::Cow;
@@ -72,15 +77,17 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::registry::Registry;
+use vyrn_cut::Hw;
 use vyrn_data::config::{Config, hex};
-use vyrn_data::{Counters, DataNode, Event, NodeConfig};
+use vyrn_data::shards::{self, RxCore, SenderRing, ShardRing};
+use vyrn_data::{Counters, Event, NodeConfig};
 use vyrn_log::{BlockStore, FileStore, MemStore};
 use vyrn_nic::frame::Endpoint;
 use vyrn_nic::{
     BackendKind, KernelUdp, NicBackend, NicConfig, PortConfig, PortId, RxBind, TxClass,
 };
 use vyrn_types::{LaneId, Nanos};
-use vyrn_wire::{RxRing, TxRing};
+use vyrn_wire::RxRing;
 
 #[derive(Parser)]
 #[command(version, about = "The VYRN data box")]
@@ -103,7 +110,7 @@ macro_rules! fields {
         $m! {
             rx_pkts, bad_frame, header, book, unknown_session, epoch, bad_mac, duplicate, late, stored,
             conflicts, data_frames, heartbeats, tx_full, events_dropped, fetch_bad, fetch_unauth,
-            fetch_limited, fetch_ring_hit, fetch_log_hit, fetch_miss, fetch_resent, log_bad, redirects,
+            fetch_limited, fetch_ring_hit, fetch_log_hit, fetch_miss, fetch_resent, log_bad, hop_full, redirects,
             redirect_unknown
         }
     };
@@ -141,6 +148,15 @@ impl Exported {
         }
     }
 
+    /// Another publisher of the same metrics, for another core: each core publishes the deltas
+    /// of its own counters, and the exported values are their sums.
+    fn handle(&self) -> Self {
+        Self {
+            counters: self.counters.clone(),
+            last: vec![0; self.counters.len()],
+        }
+    }
+
     fn publish(&mut self, c: &Counters) {
         for ((m, last), (_, v)) in self.counters.iter().zip(&mut self.last).zip(values(c)) {
             m.inc_by(v.wrapping_sub(*last));
@@ -167,6 +183,8 @@ fn serve_metrics(listener: TcpListener, reg: Registry) {
     }
 }
 
+/// Control lines waiting for the RX core; the stdin reader blocks while it is full.
+const CONTROL_QUEUE: usize = 16;
 /// Events waiting for the output thread; more are dropped and counted (`events_unprinted`).
 const EVENT_QUEUE: usize = 4096;
 /// How long a stop waits for the output thread to print what is queued.
@@ -330,11 +348,7 @@ impl KeySource {
 
     /// Installs `K_fetch` of `e` and `e + 1` (08 §4.6: both epochs of a boundary are served),
     /// which evicts any older epoch's keys.
-    fn install<R: RxRing, F: RxRing, T: TxRing, S: BlockStore>(
-        &self,
-        node: &mut DataNode<R, F, T, S>,
-        e: u32,
-    ) -> Result<(), String> {
+    fn install<R: RxRing, F: RxRing>(&self, node: &mut RxCore<R, F>, e: u32) -> Result<(), String> {
         for x in [e, e.saturating_add(1)] {
             node.set_fetch_keys(x, self.derive(x)?)
                 .map_err(|err| err.to_string())?;
@@ -345,10 +359,10 @@ impl KeySource {
 
 /// One control line (cold path). `EPOCH <e>` installs `K_fetch` of e and e + 1 and prints
 /// `FETCH_EPOCHS <a>,<b>`; a refused or unknown line prints `CONTROL_ERR <why>` on stderr.
-fn control<R: RxRing, F: RxRing, T: TxRing, S: BlockStore>(
+fn control<R: RxRing, F: RxRing>(
     line: &str,
     keys: Option<&KeySource>,
-    node: &mut DataNode<R, F, T, S>,
+    node: &mut RxCore<R, F>,
     acks: &std::sync::mpsc::SyncSender<Result<String, String>>,
 ) {
     let mut w = line.split_whitespace();
@@ -392,7 +406,69 @@ fn roster_bytes(path: &Path) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), String> {
+/// Adds every counter of `b` to `a`: the box's totals are the sum over its cores.
+macro_rules! summing {
+    ($($f:ident),*) => {
+        fn add(a: &mut Counters, b: &Counters) {
+            $(a.$f = a.$f.wrapping_add(b.$f);)*
+        }
+    };
+}
+fields!(summing);
+
+/// How often each core publishes its counter deltas.
+const PUBLISH: Duration = Duration::from_millis(100);
+
+/// What every core thread shares.
+struct Shared {
+    t0: Instant,
+    /// The operator asked to stop: the RX core stops taking packets.
+    stop: AtomicBool,
+    /// The RX core pushed its last entry.
+    rx_done: AtomicBool,
+    /// Shards that drained their ring after `rx_done`.
+    shards_done: AtomicU64,
+    /// The first core that could not start (pinning), and the start barrier.
+    failed: std::sync::OnceLock<String>,
+    started: std::sync::Barrier,
+    cpus: Vec<usize>,
+}
+
+impl Shared {
+    fn now(&self) -> Nanos {
+        Nanos(u64::try_from(self.t0.elapsed().as_nanos()).unwrap_or(u64::MAX))
+    }
+
+    /// Pins core `k` (0 RX, 1 sender, 2 + i shard i) when `[shards] cpus` is set, then waits
+    /// for every core and the main thread.
+    fn start(&self, k: usize, name: &str) {
+        if let Some(&cpu) = self.cpus.get(k)
+            && let Err(e) = vyrn_nic::sys::pin_current_thread(cpu)
+        {
+            let _ = self.failed.set(format!("pin {name} to cpu {cpu}: {e}"));
+            self.stop.store(true, Ordering::Release);
+        }
+        self.started.wait();
+    }
+}
+
+/// Polls until `work` returns 0 after `done` was seen, so a core stops only once its inputs
+/// are drained.
+fn drain_loop(done: impl Fn() -> bool, mut work: impl FnMut() -> usize) {
+    let mut last = false;
+    loop {
+        if work() == 0 {
+            if last {
+                return;
+            }
+            last = done();
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), String> {
     let home = cfg.home()?;
     let keys = KeySource::load(cfg)?;
     let fetch_epoch = cfg.roster.as_ref().map_or(0, |r| r.epoch);
@@ -400,6 +476,7 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
         Some(k) => k.derive(fetch_epoch)?,
         None => BTreeMap::new(),
     };
+    let n = cfg.shards.n;
     let ip = cfg.nic.ip;
     let ncfg = NicConfig::new(BackendKind::Kernel, vec![PortConfig { id: PortId(0), ip }]);
     let mut nic = KernelUdp::open(&ncfg).map_err(|e| e.to_string())?;
@@ -415,9 +492,12 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
     let fetch = nic
         .rx_ring(&bind(cfg.nic.fetch_port))
         .map_err(|e| e.to_string())?;
-    let tx = nic
-        .tx_ring(PortId(0), TxClass::OrderStream)
-        .map_err(|e| e.to_string())?;
+    let mut txq = || {
+        nic.tx_ring(PortId(0), TxClass::OrderStream)
+            .map_err(|e| e.to_string())
+    };
+    let shard_tx = (0..n).map(|_| txq()).collect::<Result<Vec<_>, _>>()?;
+    let tx = txq()?;
     let (in_addr, fetch_addr) = (ingest.local_addr(), fetch.local_addr());
 
     let mut ncfg = NodeConfig::new(
@@ -429,9 +509,9 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
     ncfg.fetch_keys = fetch_keys;
     ncfg.fetch_epoch = fetch_epoch;
     (ncfg.fetch_rate, ncfg.fetch_burst) = (cfg.fetch.rate, cfg.fetch.burst);
-    let mut node = DataNode::new(ncfg, ingest, fetch, tx, store);
+    let (mut rx, cores, mut sender) = shards::split(&ncfg, ingest, fetch, shard_tx, tx);
     if let Some(k) = &keys {
-        k.install(&mut node, fetch_epoch)?;
+        k.install(&mut rx, fetch_epoch)?;
     }
 
     let labels = [
@@ -444,7 +524,7 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
             .into_iter()
             .map(|(k, v)| (Cow::Borrowed(k), Cow::Owned(v))),
     );
-    let mut exported = Exported::new(&mut reg);
+    let exported = Exported::new(&mut reg);
     let unprinted_metric = Counter::<u64>::default();
     reg.register(
         "vyrn_data_events_unprinted",
@@ -458,10 +538,19 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
         .spawn(move || serve_metrics(listener, reg))
         .map_err(|e| e.to_string())?;
 
-    let stop = Arc::new(AtomicBool::new(false));
+    let shared = Shared {
+        t0: Instant::now(),
+        stop: AtomicBool::new(false),
+        rx_done: AtomicBool::new(false),
+        shards_done: AtomicU64::new(0),
+        failed: std::sync::OnceLock::new(),
+        started: std::sync::Barrier::new(n + 3),
+        cpus: cfg.shards.cpus.clone(),
+    };
     // Control input on stdin, one line each (crate docs, Control): `EPOCH <e>` moves the fetch
-    // keys to epochs e and e + 1. EOF stops the box with `--stop-on-stdin-eof`.
-    let (ctl_tx, ctl) = std::sync::mpsc::channel::<String>();
+    // keys to epochs e and e + 1. EOF stops the box with `--stop-on-stdin-eof`. The queue is
+    // bounded: a flood of lines blocks the stdin reader, never the RX core.
+    let (ctl_tx, ctl) = std::sync::mpsc::sync_channel::<String>(CONTROL_QUEUE);
     let (acks, acks_rx) = std::sync::mpsc::sync_channel::<Result<String, String>>(16);
     std::thread::Builder::new()
         .name("vyrn-data/control".into())
@@ -478,30 +567,11 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
             }
         })
         .map_err(|e| e.to_string())?;
-    {
-        let stop = Arc::clone(&stop);
-        std::thread::Builder::new()
-            .name("vyrn-data/stdin".into())
-            .spawn(move || {
-                let mut line = String::new();
-                while std::io::stdin()
-                    .lock()
-                    .read_line(&mut line)
-                    .is_ok_and(|n| n > 0)
-                {
-                    let _ = ctl_tx.send(std::mem::take(&mut line));
-                }
-                if stdin_stop {
-                    stop.store(true, Ordering::Release);
-                }
-            })
-            .map_err(|e| e.to_string())?;
-    }
 
     // Events go to stdout from their own thread through a bounded queue, so a slow or stalled
-    // reader of stdout (or a bad-MAC flood) never blocks ingest.
+    // reader of stdout (or a bad-MAC flood) never blocks a shard.
     let (events, events_rx) = std::sync::mpsc::sync_channel::<Event>(EVENT_QUEUE);
-    let (mut unprinted, mut queued) = (0u64, 0u64);
+    let (unprinted, queued) = (AtomicU64::new(0), AtomicU64::new(0));
     let drain = Arc::new(Drain::default());
     {
         let drain = Arc::clone(&drain);
@@ -510,57 +580,172 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
             .spawn(move || print_events(&events_rx, &drain))
             .map_err(|e| e.to_string())?;
     }
-    let mut hand_over = |node_events: std::vec::Drain<'_, Event>, unprinted: &mut u64| {
+    let hand_over = |node_events: std::vec::Drain<'_, Event>| {
         for e in node_events {
             if events.try_send(e).is_ok() {
-                queued = queued.wrapping_add(1);
+                queued.fetch_add(1, Ordering::Relaxed);
             } else {
-                *unprinted = unprinted.wrapping_add(1);
+                unprinted.fetch_add(1, Ordering::Relaxed);
                 unprinted_metric.inc();
             }
         }
     };
-    println!("READY vyrn-data ingest={in_addr} fetch={fetch_addr} metrics={maddr}");
-    let _ = std::io::stdout().flush();
-    let t0 = Instant::now();
-    let mut published = t0;
-    let now = |t0: Instant| Nanos(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));
-    while !stop.load(Ordering::Acquire) {
-        let work = node.poll(now(t0));
-        while let Ok(l) = ctl.try_recv() {
-            control(&l, keys.as_ref(), &mut node, &acks);
+
+    // The hop rings: RX → shard i, shard i → sender, and RX → sender (RANGE) last.
+    let mut shard_rings: Vec<ShardRing> = (0..n).map(|_| ShardRing::new(&Hw)).collect();
+    let mut sender_rings: Vec<SenderRing> = (0..=n).map(|_| SenderRing::new(&Hw)).collect();
+    let (mut to_shard, shard_in): (Vec<_>, Vec<_>) = shard_rings
+        .iter_mut()
+        .filter_map(|r| r.split().map(|(p, [c])| (p, c)))
+        .unzip();
+    let (mut to_sender, mut sender_in): (Vec<_>, Vec<_>) = sender_rings
+        .iter_mut()
+        .filter_map(|r| r.split().map(|(p, [c])| (p, c)))
+        .unzip();
+    let mut rx_out = to_sender.pop().ok_or("no sender ring")?;
+
+    let mut total = Counters::default();
+    std::thread::scope(|sc| -> Result<(), String> {
+        let (shared, store, hand_over) = (&shared, &store, &hand_over);
+        let spawn = |name: String| std::thread::Builder::new().name(name);
+        let rx_core = spawn("vyrn-data/rx".into())
+            .spawn_scoped(sc, {
+                let (mut ex, keys, acks) = (exported.handle(), keys.as_ref(), &acks);
+                move || {
+                    shared.start(0, "rx");
+                    let mut published = Instant::now();
+                    while !shared.stop.load(Ordering::Acquire) {
+                        let work = rx.poll(shared.now(), &mut to_shard, &mut rx_out);
+                        while let Ok(l) = ctl.try_recv() {
+                            control(&l, keys, &mut rx, acks);
+                        }
+                        if published.elapsed() >= PUBLISH {
+                            ex.publish(rx.counters());
+                            published = Instant::now();
+                        }
+                        if work == 0 {
+                            std::thread::yield_now();
+                        }
+                    }
+                    shared.rx_done.store(true, Ordering::Release);
+                    ex.publish(rx.counters());
+                    *rx.counters()
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        let mut shard_threads = Vec::with_capacity(n);
+        for (i, ((mut core, mut input), mut out)) in
+            cores.into_iter().zip(shard_in).zip(to_sender).enumerate()
+        {
+            let mut ex = exported.handle();
+            let t = spawn(format!("vyrn-data/shard{i}"))
+                .spawn_scoped(sc, move || {
+                    shared.start(2 + i, &format!("shard {i}"));
+                    let mut published = Instant::now();
+                    drain_loop(
+                        || shared.rx_done.load(Ordering::Acquire),
+                        || {
+                            let w = core.poll(&mut input, &mut out, store);
+                            // Never block a shard on stdout: a full queue drops and counts.
+                            hand_over(core.drain_events());
+                            if published.elapsed() >= PUBLISH {
+                                ex.publish(core.counters());
+                                published = Instant::now();
+                            }
+                            w
+                        },
+                    );
+                    shared.shards_done.fetch_add(1, Ordering::AcqRel);
+                    ex.publish(core.counters());
+                    *core.counters()
+                })
+                .map_err(|e| e.to_string())?;
+            shard_threads.push(t);
         }
-        // Never block the poll loop on stdout: a full queue drops and counts the line.
-        hand_over(node.drain_events(), &mut unprinted);
-        if published.elapsed() >= Duration::from_millis(100) {
-            exported.publish(node.counters());
-            published = Instant::now();
+        let sender_core = spawn("vyrn-data/sender".into())
+            .spawn_scoped(sc, {
+                let mut ex = exported.handle();
+                move || {
+                    shared.start(1, "sender");
+                    let mut published = Instant::now();
+                    drain_loop(
+                        || shared.shards_done.load(Ordering::Acquire) == n as u64,
+                        || {
+                            let w = sender.poll(shared.now(), &mut sender_in);
+                            if published.elapsed() >= PUBLISH {
+                                ex.publish(sender.counters());
+                                published = Instant::now();
+                            }
+                            w
+                        },
+                    );
+                    sender.flush(shared.now());
+                    ex.publish(sender.counters());
+                    *sender.counters()
+                }
+            })
+            .map_err(|e| e.to_string())?;
+
+        shared.started.wait();
+        if shared.failed.get().is_none() {
+            println!("READY vyrn-data ingest={in_addr} fetch={fetch_addr} metrics={maddr}");
+            let _ = std::io::stdout().flush();
+            // Not scoped: it blocks in read_line until stdin closes, which may be never.
+            let eof = Arc::new(AtomicBool::new(false));
+            let stdin_eof = Arc::clone(&eof);
+            std::thread::Builder::new()
+                .name("vyrn-data/stdin".into())
+                .spawn(move || {
+                    let eof = stdin_eof;
+                    let mut line = String::new();
+                    while std::io::stdin()
+                        .lock()
+                        .read_line(&mut line)
+                        .is_ok_and(|n| n > 0)
+                    {
+                        if ctl_tx.send(std::mem::take(&mut line)).is_err() {
+                            return;
+                        }
+                    }
+                    if stdin_stop {
+                        eof.store(true, Ordering::Release);
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+            while !eof.load(Ordering::Acquire) && !shared.stop.load(Ordering::Acquire) {
+                std::thread::park_timeout(Duration::from_millis(20));
+            }
+            shared.stop.store(true, Ordering::Release);
         }
-        if work == 0 {
-            std::thread::yield_now();
+        let join = |r: std::thread::Result<Counters>| r.map_err(|_| "a core panicked".to_owned());
+        add(&mut total, &join(rx_core.join())?);
+        for t in shard_threads {
+            add(&mut total, &join(t.join())?);
         }
+        add(&mut total, &join(sender_core.join())?);
+        Ok(())
+    })?;
+    if let Some(e) = shared.failed.get() {
+        return Err(e.clone());
     }
-    node.flush(now(t0));
-    hand_over(node.drain_events(), &mut unprinted);
-    drop(hand_over);
     // Give the output thread `DRAIN` to print what is queued, then close it: whatever it has not
     // claimed by then is counted and never printed, so every event is either an EVENT line or in
     // `events_unprinted` (at most one line, the one being written as the process exits, may be
     // cut short).
+    let queued = queued.load(Ordering::Relaxed);
     let deadline = Instant::now() + DRAIN;
     while drain.printed.load(Ordering::Acquire) < queued && Instant::now() < deadline {
         std::thread::yield_now();
     }
     let claimed = drain.claimed.fetch_or(CLOSED, Ordering::AcqRel) & !CLOSED;
     let abandoned = queued.saturating_sub(claimed);
-    unprinted = unprinted.wrapping_add(abandoned);
+    let unprinted = unprinted.load(Ordering::Relaxed).wrapping_add(abandoned);
     unprinted_metric.inc_by(abandoned);
-    let c = *node.counters();
-    exported.publish(&c);
+    let c = total;
     // A closed stdout (the supervisor went away) is not a reason to fail the stop.
     let _ = writeln!(
         std::io::stdout(),
-        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} bad_mac={} events_dropped={} events_unprinted={unprinted} fetch_ring_hit={} fetch_log_hit={} fetch_miss={} fetch_resent={}",
+        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} bad_mac={} events_dropped={} events_unprinted={unprinted} fetch_ring_hit={} fetch_log_hit={} fetch_miss={} fetch_resent={} hop_full={} shards={n}",
         c.stored,
         c.data_frames,
         c.heartbeats,
@@ -572,7 +757,8 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
         c.fetch_ring_hit,
         c.fetch_log_hit,
         c.fetch_miss,
-        c.fetch_resent
+        c.fetch_resent,
+        c.hop_full
     );
     Ok(())
 }

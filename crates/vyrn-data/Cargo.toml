@@ -13,6 +13,8 @@ vyrn-crypto = { workspace = true }
 vyrn-wire = { workspace = true }
 vyrn-log = { workspace = true }
 vyrn-nic = { workspace = true }
+# The SPSC hop rings between the sharded box's cores (shards.rs).
+vyrn-cut = { workspace = true }
 commonware-p2p = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
