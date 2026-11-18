@@ -719,7 +719,7 @@ delay bound of the model (01 §14.0 fact 3):
 | Hops 2–4: proposal, notarize, finalize → `Q_CHAIN` at every voter and at the sequencer | 2.45 | |
 | Vote signature checks | 0.10 | 0.15 under scheme 1 (hybrid, 01 §14.20): the ML-DSA parts run in parallel with the batched Ed25519 parts |
 | **No fault** | **5.31** | was 4.85 with F1 data homes; 6.11 under scheme 1 (+0.05 vote checks, +0.75 because the leader signs its proposal after its `verify`, since the proposal carries `excl_root`; 07 §6.5a) |
-| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault; under scheme 1, 8.91 (margin 0.09 ms to the 9.00 ms gate of `FIN_GATE_BLOCKS` = 8; open question PQ-9, 01 §14.20) |
+| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault; under scheme 1, 8.91 (margin 0.09 ms to the 9.00 ms gate of `FIN_GATE_BLOCKS` = 8, accepted by PQ-9, 01 §14.20; PQ-10 and PQ-11 are open) |
 | or a data box redirect (07 §5.7, 3 ms in place of 0.71) | **7.60** | |
 | or the sequencer is the fault | 07 failover; its seal must be final ≤ 9 ms after the last frame | |
 
@@ -1406,11 +1406,30 @@ Anyone submits an `Evidence` item. Its handling is automatic:
    Each check is deterministic.
 2. Evidence older than `CHN_EVIDENCE_EPOCHS` (42 epochs, 14 days) is rejected. Duplicate evidence
    (the same fault by the same operator) is a no-op.
-2a. **Classical evidence after the switch (01 §14.20 SG7).** From the first chain block of `E_pq`,
-   evidence whose signatures are all scheme 0 (Ed25519 votes, `seq_sig`s, handoff and commit
-   votes of epochs < `E_pq`) slashes or jails only if it, or `EvidenceCommit { hash }` of its
-   encoding, is in a chain block final before `E_pq` began. Otherwise it is verified with the
-   scheme-0 rules, recorded, and changes no bond and no jail. Why: after the switch a quantum
+2a. **Classical evidence after the switch (01 §14.20 SG7).** Evidence is *classical* when **any**
+   signature it relies on is scheme 0: an offending signature in the table below, or a
+   certificate or record that the check uses (a `NodeCert`, a handoff or finalization
+   certificate). An authentic hybrid signature elsewhere in the item does not change that: a
+   genuine hybrid-signed `NodeCert` that certifies a scheme-0 vote key leaves a forged scheme-0
+   vote forgeable. From the first chain block of `E_pq`, classical evidence slashes or jails only
+   if it, or `EvidenceCommit { hash }` of its encoding, is in a chain block final before `E_pq`
+   began. Otherwise it is still verified, each signature under the rules of its own scheme (a
+   hybrid `NodeCert` signature under 01 §14.20 A, a scheme-0 vote under 11 §2.5), and, if valid,
+   recorded; it changes no bond and no jail. `BadPost`'s secp256k1 signature is not a `SigScheme`; PQ-5 covers it (below).
+
+   | Evidence | Offending signatures (the misconduct itself) | Signatures it relies on besides |
+   |---|---|---|
+   | `SeqEquivocation` | `a.seq_sig`, `b.seq_sig` | — |
+   | `DoubleVote` | `a.sig`, `b.sig` | — |
+   | `FenceViolation` | `h.seq_sig` | the `HandoffCert` |
+   | `HandoffWithheld` | the four `HandoffTimeout` signatures | — |
+   | `CrossHomeVote` | `v.sig` | `cert.sig` (the `NodeCert`) |
+   | `DoubleCommit` | `a.sig`, `b.sig` | — |
+   | `Censorship` | the `seq_sig` of every book header in `(lastb(C), h]` | the finalization certificate of `C` |
+   | `WrongExclusion` | the finalization certificate of the block | — (the disclosure is a hash preimage) |
+   | `BadPost` | `sig` (secp256k1, outside SG7) | — |
+
+   Why: after the switch a quantum
    attacker can forge scheme-0 signatures for the old epochs at will, and two forged `DoubleVote`s
    would jail two operators and stop finality (4 of 5 needed) without touching a hybrid key. The
    cost: a fault committed in the last moments of `E_pq − 1` and not committed on chain before the

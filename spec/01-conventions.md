@@ -827,14 +827,14 @@ and the differential tests of 11 §2.5a pass.
   (09 §4.8). [Likely: budgets built from the measured figures; the speculative signing depends on
   open question PQ-3]
 - **The finality gate** keeps `FIN_GATE_BLOCKS` = 8: block h is final ≤ 7.70 ms after it closes
-  (BASE spare 0.30 ms; CHAIN 0.09 ms, see PQ-9; 07 §6.8, 09 §4.6). [Likely]
+  (BASE spare 0.30 ms; CHAIN 0.09 ms, accepted by PQ-9; 07 §6.8, 09 §4.6). [Likely]
 - **The cost of a fixed range.** A header that reaches the leader after it sent its `RangeFix`
   waits for the next view instead of joining the current proposal. Before PQ-8 the cutoff was the
   leader's `verify` completion, so the window in which that happens grows by at most the leader's
   `verify` time (≤ 0.81 ms at the maximum); views and blocks both run at ~1 kHz, so normally the
   leader fixes the range on the arrival of the header it proposes. The 07 §6.6 maxima assume, as
-  before, that a header is in the first proposal after it reaches the leader; B-PQ-2 checks that
-  under scheme 1. [Likely]
+  before, that a header is in the first proposal after it reaches the leader, so they do not yet
+  include the extra view; open question PQ-10 holds it until B-PQ-2 measures it. [Likely]
 - **If speculative signing is not possible**, the leader's notarize and each voter's notarize
   are signed after `verify`, at ≤ 0.75 ms each, and the one-fault maximum becomes ~10.2 ms, above
   `FINALITY_MAX_MS` = 10. Scheme 1 must then not activate until votes run with `PQ_HEDGE` ≥ 4 on
@@ -851,7 +851,7 @@ an epoch boundary.
 | SG4 | Hybrid keys are included at least `CHN_KEY_LEAD_EPOCHS` (4) before `E_pq` and become active at `E_pq` (CHAIN: `NodeCert` with `scheme` = 1 and `valid_from = E_pq`, 09 §2.3; BASE: `REP_Membership` with `epoch_from = E_pq`, 07 §13). A key of one scheme is never in force in an epoch of another. The roster of `EpoConfig(E_pq)` then holds only hybrid keys, and `HandoffCert(E_pq − 1)`, the last certificate signed with scheme 0, certifies them. |
 | SG5 | CHAIN activates `E_pq` by an `Upgrade` with the 72 h timelock and both clients ready (09 §14.2); BASE by an admin record. Both client kinds verify both schemes before any switch is scheduled (U5, 08 §9.4). |
 | SG6 | `pq_anchor` = the hash of `HandoffRecord(E_pq − 1)` goes into every release manifest from the switch on, signed by the hybrid release keys (11 §9.5). A light client or a node syncing from genesis accepts only a history through that record. A quantum attacker who forges an older Ed25519 history cannot also forge the anchor. |
-| SG7 | From `E_pq`, evidence whose signatures are all scheme 0 slashes or jails only if it, or an `EvidenceCommit` of its hash, was final on chain before `E_pq` began (09 §8.1). A quantum attacker can forge old classical signatures, so new classical evidence must not move bonds or jails. |
+| SG7 | From `E_pq`, evidence that relies on any scheme-0 signature (an offending signature or a certificate its check uses, 09 §8.1 item 2a) slashes or jails only if it, or an `EvidenceCommit` of its hash, was final on chain before `E_pq` began. An authentic hybrid signature elsewhere in the item does not exempt it. A quantum attacker can forge old classical signatures, so new classical evidence must not move bonds or jails. |
 
 **F. What cannot be made post-quantum here, and how VYRN handles it.** 09 §6.8 holds the detail.
 
@@ -881,6 +881,7 @@ an epoch boundary.
 | PQ-8 | Remove the voter's notarize misprediction with a proposal range fixed before the proposal arrives? | Yes: the leader's `RangeFix` (07 §6.3, §6.5a). BASE maxima 5.70 / 8.70 ms; `FIN_GATE_BLOCKS` stays 8. In CHAIN the leader still signs after `verify` (PQ-9). `RangeFix` is a hint: voters never reject a proposal for differing from it. |
 | — | Codex review of #51: operator identity keys need an ML-DSA-65 transaction scheme | Adopted: `TxEnvelope.scheme` 3 (09 §4.4). |
 | — | Codex review of #51: forged classical evidence after the switch | Adopted: SG7 (09 §8.1 item 2a). |
+| PQ-9 | CHAIN's one-fault case under scheme 1 is 8.91 ms from block start, 0.09 ms inside the 9.00 ms gate (07 §6.5a, 09 §4.8). Accept that margin, or raise CHAIN's gate, add PQ cores or lag `excl_root`? | Accept the 0.09 ms margin: `FIN_GATE_BLOCKS` stays 8 in CHAIN. B-CHN-3 and B-PQ-2 on CHAIN re-check it; PQ-10 and PQ-11 can still move the number. |
 
 **Open questions for the owner**
 
@@ -891,4 +892,5 @@ an epoch boundary.
 | PQ-5 | The L1 bridge: when does governance deploy the post-quantum bridge and raise `PqAlarm`, and is a 10% daily cap on the old bridge acceptable until then? | at the first Ethereum post-quantum verifier VYRN can afford (09 §6.8) | owner, 09 |
 | PQ-6 | Make key agreement hybrid (X25519 + ML-KEM-768) for session keys and the p2p handshake? | not in this change | owner, 04, 09 |
 | PQ-7 | Release keys on hardware tokens (11 §9.5): which token holds an ML-DSA-65 key? | an HSM with ML-DSA support for the ML-DSA half, the current tokens for the Ed25519 half | owner, 11 |
-| PQ-9 | CHAIN under scheme 1 is 8.91 ms from block start in the one-fault case, 0.09 ms inside the 9.00 ms gate, because the leader can sign its proposal only after `verify` gives `excl_root` (07 §6.5a, 09 §4.8). Accept the 0.09 ms margin, raise CHAIN's `FIN_GATE_BLOCKS` to 9 (margin 1.09 ms), give CHAIN validators 4 PQ cores (leader sign ≤ 0.40 ms, margin 0.44 ms), or commit each range's `excl_root` one view later (no added cost, but a bust verdict becomes final one view after its fill)? | accept the margin; B-CHN-3 and B-PQ-2 on CHAIN decide whether to raise the gate | owner, 07, 09 |
+| PQ-10 | A header that reaches the leader between its `RangeFix` and the end of its `verify` waits a whole extra view (07 §6.3), and the 07 §6.6 maxima do not include that view. How large is the extra view at the maximum, and does it break the 5.70 / 8.70 ms (BASE) or 8.91 ms (CHAIN) budgets? | budget it once B-PQ-2 measures it; if it breaks a budget, let the leader extend its range at `verify` time with one late signature | 07: B-PQ-2 |
+| PQ-11 | In CHAIN, a header late in a view plus the data lag, `verify` and the post-verify leader signature (≤ 0.75 ms) can push an honest proposal past `t_l` = 2 ms, so an honest view can nullify (07 §6.5a). Lengthen CHAIN's `t_l` under scheme 1 (and recompute the one-fault budget), add PQ cores for the CHAIN leader, or lag `excl_root`? | unchanged `t_l`; B-PQ-2 on CHAIN counts honest-leader nullifies | 07, 09: B-PQ-2 |

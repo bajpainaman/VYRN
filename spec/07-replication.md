@@ -1252,7 +1252,8 @@ signs before it knows it will send:
   `excl_root`. In CHAIN the leader therefore proposes ≤ `PQ_SIGN_MAX_US` = 0.75 ms after its
   `verify`, which delays hop 2 by that much; a voter's CHAIN signature (started at its own
   `verify`) is still done before the delayed proposal can arrive. 09 §4.8 carries the 0.75 ms.
-  Open question PQ-9 (01 §14.20) asks how to win it back.
+  The owner accepted the resulting CHAIN margin (PQ-9, 01 §14.20). Whether the post-verify
+  signature can push an honest CHAIN proposal past `t_l` is open question PQ-11.
 - **In BASE, no signature is made after the proposal in the fault-free case.** At the maximum (§6.6) the
   `RangeFix` leaves the leader ≤ 0.05 ms after hop 1 and reaches every voter ≤ 0.85 ms after it,
   so each notarize signature is done ≤ 1.60 ms after hop 1. The proposal cannot leave before the
@@ -2203,8 +2204,8 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | B-REP-4 | Each stream core's load at the peak mix | ≤ 0.50 |
 | B-REP-5 | Sliced Ed25519 sign on core 4: CPU per signature, longest slice | ≤ 12 µs, ≤ 50 ns |
 | B-PQ-1 | Scheme 1 on `REF`: ML-DSA-44 sign with `PQ_HEDGE` = 4 on cores 52–55 and = 2 on a voter, 10⁹ signatures; verify per signature | max ≤ `PQ_SIGN_MAX_US` (400, 750 µs); verify ≤ `PQ_VERIFY_US` |
-| B-PQ-2 | Scheme 1 finality: B-REP-1 with hybrid keys and speculative signing (§6.5a); the frame gate (B-REP-13) and stream-core load (B-REP-4) re-run | BASE max ≤ 5.70 ms no fault, ≤ 8.70 ms one fault, with one `RangeFix` dropped as the injected fault; CHAIN ≤ 8.91 ms from block start with one nullified view, and a forged `RangeFix` never makes a voter reject an honest proposal; B-REP-13 and B-REP-4 pass values unchanged |
-| B-PQ-3 | The switch at `E_pq` in `vyrn-sim`: scheme-0 votes and headers for epoch ≥ `E_pq` injected; forged scheme-0 `DoubleVote` evidence for epoch `E_pq − 1` submitted after the switch, with and without a pre-switch `EvidenceCommit`; history before it replayed | every injected signature rejected; uncommitted classical evidence moves no bond and no jail, committed evidence slashes; replay from genesis bit for bit (01 §14.20 SG1–SG7) |
+| B-PQ-2 | Scheme 1 finality: B-REP-1 with hybrid keys and speculative signing (§6.5a); the frame gate (B-REP-13) and stream-core load (B-REP-4) re-run | BASE max ≤ 5.70 ms no fault, ≤ 8.70 ms one fault, with one `RangeFix` dropped as the injected fault; CHAIN ≤ 8.91 ms from block start with one nullified view, and a forged `RangeFix` never makes a voter reject an honest proposal; also measures the extra view for a header that arrives between `RangeFix` and `verify` (PQ-10) and counts honest CHAIN leaders that miss `t_l` (PQ-11); B-REP-13 and B-REP-4 pass values unchanged |
+| B-PQ-3 | The switch at `E_pq` in `vyrn-sim`: scheme-0 votes and headers for epoch ≥ `E_pq` injected; forged scheme-0 `DoubleVote` evidence for epoch `E_pq − 1`, and a forged scheme-0 `CrossHomeVote` carrying a genuine hybrid-signed `NodeCert`, submitted after the switch with and without a pre-switch `EvidenceCommit`; history before it replayed | every injected signature rejected; uncommitted classical evidence moves no bond and no jail, committed evidence slashes; replay from genesis bit for bit (01 §14.20 SG1–SG7) |
 | B-REP-6 | Sequencer core 50 BLAKE3 load | ≤ 0.60 |
 | B-REP-7 | Replay speed at peak and at average load | ≥ 1.5×, ≥ 10× |
 | B-REP-8 | Promotion time of the standby | ≤ 3 ms |
