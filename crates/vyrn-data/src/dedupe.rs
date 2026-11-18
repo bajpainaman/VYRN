@@ -89,13 +89,15 @@ impl Dedupe {
         self.wins.entry(session).or_default().mark(pkt_seq)
     }
 
-    /// [`Dedupe::mark`], also recording `src` as the session's address when `pkt_seq` is new.
-    /// A repeat or late copy never moves the address: replaying captured bytes from another
-    /// address must not steer the session's `DataRedirect` (07 §5.7). One lookup.
+    /// [`Dedupe::mark`], also recording `src` as the session's address when `pkt_seq` raises
+    /// `hi`. A repeat, a late copy or an out-of-order fill below `hi` never moves the address:
+    /// replayed bytes must not steer the session's `DataRedirect`, and an older packet must not
+    /// replace the address of a newer one (07 §5.7). One lookup.
     pub fn mark_from(&mut self, session: SessionId, pkt_seq: u32, src: Endpoint) -> Seen {
         let w = self.wins.entry(session).or_default();
+        let raises = pkt_seq > w.hi;
         let seen = w.mark(pkt_seq);
-        if seen == Seen::New {
+        if raises {
             w.src = Some(src);
         }
         seen
@@ -144,5 +146,32 @@ mod tests {
         }
         assert_eq!(d.hi(s), Some(1000));
         assert_eq!(d.mark(SessionId(8), 1000), Seen::New, "sessions are apart");
+    }
+
+    /// The address follows the highest `pkt_seq`: a gap filled late, or a repeat, keeps it.
+    #[test]
+    fn the_address_follows_the_highest_pkt_seq() {
+        let at = |last: u8| Endpoint {
+            mac: [0; 6],
+            ip: std::net::Ipv4Addr::new(10, 0, 0, last),
+            port: 1,
+        };
+        let mut d = Dedupe::default();
+        let s = SessionId(1);
+        assert_eq!(d.mark_from(s, 2, at(1)), Seen::New);
+        assert_eq!(
+            d.mark_from(s, 1, at(2)),
+            Seen::New,
+            "fills the gap below hi"
+        );
+        assert_eq!(
+            d.source(s),
+            Some(at(1)),
+            "an older packet keeps the newer address"
+        );
+        assert_eq!(d.mark_from(s, 2, at(3)), Seen::Repeat);
+        assert_eq!(d.source(s), Some(at(1)));
+        assert_eq!(d.mark_from(s, 3, at(4)), Seen::New);
+        assert_eq!(d.source(s), Some(at(4)));
     }
 }

@@ -1125,7 +1125,7 @@ semantics are the same as CHAIN's `excl` rule (09 owns them).
 bytes, a data box sends 24 bytes LE: `magic` u16 0x5244 "DR", `version` u8 1, `down` u8 (d),
 `to` u8 (d'), 3 reserved 0, `session` u32, `resend_from` u32, then `tag` u64 = SipHash-2-4(the
 session's `K_seq` in BASE or `K_com` in CHAIN, bytes 0..16). It goes to the source address of the
-session's newest copy with a new `pkt_seq` and a valid MAC; a duplicate or late copy never moves
+session's copy with the highest `pkt_seq` and a valid MAC; a duplicate, late or out-of-order copy never moves
 that address, so replayed bytes cannot steer a redirect. A box that never heard from a session
 sends it nothing and counts it; another live box has its address. Vectors:
 `tests/golden/vyrn_data_vectors`.
