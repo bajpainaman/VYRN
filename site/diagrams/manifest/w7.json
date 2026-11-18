@@ -1,7 +1,7 @@
 [
   {
     "slug": "08-epochs",
-    "asciiIndex": 0,
+    "ascii": "4e8bead6e822",
     "file": "08-epochs-00",
     "width": 1170.0,
     "height": 514.5,
@@ -9,7 +9,7 @@
   },
   {
     "slug": "08-epochs",
-    "asciiIndex": 1,
+    "ascii": "952a64eca968",
     "file": "08-epochs-01",
     "width": 1193.35,
     "height": 1120.0,
@@ -17,7 +17,7 @@
   },
   {
     "slug": "08-epochs",
-    "asciiIndex": 2,
+    "ascii": "569ff83f537d",
     "file": "08-epochs-02",
     "width": 1153.76,
     "height": 810.0,
@@ -25,7 +25,7 @@
   },
   {
     "slug": "08-epochs",
-    "asciiIndex": 3,
+    "ascii": "8ac48435bb31",
     "file": "08-epochs-03",
     "width": 1197.51,
     "height": 750.0,
@@ -33,7 +33,7 @@
   },
   {
     "slug": "08-epochs",
-    "asciiIndex": 5,
+    "ascii": "9707050dd44e",
     "file": "08-epochs-04",
     "width": 1196.0,
     "height": 596.0,
@@ -41,7 +41,7 @@
   },
   {
     "slug": "08-epochs",
-    "asciiIndex": 6,
+    "ascii": "e2b4ddc475b8",
     "file": "08-epochs-05",
     "width": 1200.0,
     "height": 832.5,
@@ -49,7 +49,7 @@
   },
   {
     "slug": "08-epochs",
-    "asciiIndex": 9,
+    "ascii": "33fbb7fafbda",
     "file": "08-epochs-08",
     "width": 1080.0,
     "height": 1322.0,
@@ -57,7 +57,7 @@
   },
   {
     "slug": "08-epochs",
-    "asciiIndex": 10,
+    "ascii": "96d2333b98cd",
     "file": "08-epochs-09",
     "width": 1200.0,
     "height": 735.0,
@@ -65,7 +65,7 @@
   },
   {
     "slug": "08-epochs",
-    "asciiIndex": 17,
+    "ascii": "170da73c4a88",
     "file": "08-epochs-13",
     "width": 1200.0,
     "height": 1041.5,
@@ -73,7 +73,7 @@
   },
   {
     "slug": "10-accounts-risk-md",
-    "asciiIndex": 1,
+    "ascii": "fee092268428",
     "file": "10-accounts-risk-md-01",
     "width": 1200.0,
     "height": 1060.0,
@@ -81,7 +81,7 @@
   },
   {
     "slug": "10-accounts-risk-md",
-    "asciiIndex": 8,
+    "ascii": "4ad1df654693",
     "file": "10-accounts-risk-md-08",
     "width": 1197.36,
     "height": 796.0,

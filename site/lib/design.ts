@@ -102,23 +102,18 @@ export async function getGrilling(): Promise<Line[]> {
   return (first(nodes, "list", "§10") as List).children.map(leadAndBody);
 }
 
-export type AsciiBlock = { code: Code; asciiIndex: number };
+export type AsciiBlock = { code: Code };
 
-/**
- * The first ASCII block after a heading in a spec chapter, verbatim, with its position among the
- * document's ASCII blocks (the key its drawn figure is filed under).
- */
+/** The first ASCII block after a heading in a spec chapter, verbatim. */
 export async function getAsciiAfter(slug: string, headingPrefix: string): Promise<AsciiBlock> {
   const doc = await requireDoc(slug);
   let seenHeading = false;
-  let index = 0;
   let found: AsciiBlock | undefined;
   visit(doc.tree, (node) => {
     if (found) return EXIT;
     if (node.type === "heading" && plainText(node.children).startsWith(headingPrefix)) seenHeading = true;
     if (node.type !== "code" || (node.lang && node.lang !== "text")) return;
-    if (seenHeading) found = { code: node, asciiIndex: index };
-    index++;
+    if (seenHeading) found = { code: node };
   });
   if (!found) throw new Error(`${doc.file}: no ASCII block after "${headingPrefix}"`);
   return found;

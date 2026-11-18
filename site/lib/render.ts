@@ -7,7 +7,7 @@ import rehypeSlug from "rehype-slug";
 import remarkRehype from "remark-rehype";
 import { unified } from "unified";
 import { visitParents, SKIP } from "unist-util-visit-parents";
-import { figureKey, getFigures, type Figure } from "./diagrams";
+import { asciiHash, figureKey, getFigures, type Figure } from "./diagrams";
 import {
   getChapterSlugs,
   getIdIndex,
@@ -24,8 +24,6 @@ type RenderContext = {
   sections: SectionIndex;
   chapters: Readonly<Record<string, string>>;
   figures: ReadonlyMap<string, Figure>;
-  /** Position of the first ASCII block of this fragment within its whole document. */
-  asciiStart: number;
 };
 
 const NO_LINK_ANCESTORS = new Set(["a", "pre", "h1", "h2", "h3", "h4", "h5", "h6"]);
@@ -100,7 +98,6 @@ function rehypeSpec(ctx: RenderContext) {
 
   return (tree: HastRoot) => {
     const usedRowIds = new Set<string>();
-    let asciiCount = ctx.asciiStart;
 
     visitParents(tree, "element", (node: Element, ancestors) => {
       const parent = ancestors.at(-1);
@@ -144,7 +141,7 @@ function rehypeSpec(ctx: RenderContext) {
           return SKIP;
         }
         node.properties.className = ["ascii"];
-        const figure = ctx.figures.get(figureKey(ctx.slug, asciiCount++));
+        const figure = ctx.figures.get(figureKey(ctx.slug, asciiHash(hastText(node))));
         siblings[at] = figure
           ? figureNode(figure, node)
           : el("div", { className: ["ascii-wrap"], tabIndex: 0, role: "region", ariaLabel: "Diagram" }, [node]);
@@ -223,7 +220,6 @@ export type Rendered = { html: string; toc: TocEntry[] };
 export async function renderNodes(
   nodes: MdRoot | MdNode[],
   slug: string,
-  options: { asciiStart?: number } = {},
 ): Promise<Rendered> {
   const root: MdRoot = Array.isArray(nodes) ? { type: "root", children: nodes } : nodes;
   const [idIndex, sections, chapters, figures] = await Promise.all([getIdIndex(), getSectionIndex(), getChapterSlugs(), getFigures()]);
@@ -232,8 +228,7 @@ export async function renderNodes(
     idIndex: new Map(Object.entries(idIndex)),
     sections,
     chapters,
-    figures: new Map(figures.map((f) => [figureKey(f.slug, f.asciiIndex), f])),
-    asciiStart: options.asciiStart ?? 0,
+    figures: new Map(figures.map((f) => [figureKey(f.slug, f.ascii), f])),
   };
   const processor = unified().use(remarkRehype).use(rehypeSlug).use(rehypeSpec, ctx);
   const hast = (await processor.run(structuredClone(root))) as HastRoot;

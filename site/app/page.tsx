@@ -177,7 +177,7 @@ function shareKind(row: ShareRow): "lane" | "bbo" {
 async function MessageStrip() {
   const shares = await getMessageShares();
   const master = await getAsciiAfter("00-index", "Master diagram");
-  const diagram = await renderNodes([master.code], "00-index", { asciiStart: master.asciiIndex });
+  const diagram = await renderNodes([master.code], "00-index");
   const cells = shares.flatMap((row) => Array.from({ length: Math.round(row.share) }, () => row));
   const toBbo = shares.filter((r) => shareKind(r) === "bbo").reduce((s, r) => s + r.share, 0);
   return (
@@ -262,7 +262,7 @@ async function RateCard() {
 async function FollowTheSun() {
   const handoffs = await getHandoffs();
   const boundaries = await getAsciiAfter("08-epochs", "2.1 Boundaries");
-  const schedule = await renderNodes([boundaries.code], "08-epochs", { asciiStart: boundaries.asciiIndex });
+  const schedule = await renderNodes([boundaries.code], "08-epochs");
   return (
     <div className="grid grid-cols-1 gap-[2px] bg-ink lg:grid-cols-2">
       <div className="bg-pink py-7 pl-7 pr-5 sm:pl-9 sm:pr-8">

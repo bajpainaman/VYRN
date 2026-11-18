@@ -1,4 +1,5 @@
 import "server-only";
+import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { cacheLife } from "next/cache";
@@ -6,13 +7,16 @@ import { cacheLife } from "next/cache";
 /**
  * Drawn versions of spec ASCII diagrams. The spec requires every diagram in ASCII; these figures are
  * shown in addition, never instead. Each is keyed to the ASCII block it redraws by document and by
- * the block's position among that document's ASCII blocks (see scripts/diagram-inventory.mjs).
+ * a hash of the block's text ([`asciiHash`], the `hash` scripts/diagram-inventory.mjs lists), so a
+ * block that moves keeps its figure, and a block whose text changes loses it until someone checks
+ * the drawing still matches and updates the hash.
  * Sources live in `diagrams/*.excalidraw`, exports in `public/diagrams/*.svg`, and each drawing
  * worker's entries in `diagrams/manifest/*.json`.
  */
 export type Figure = {
   slug: string;
-  asciiIndex: number;
+  /** [`asciiHash`] of the ASCII block this figure redraws. */
+  ascii: string;
   /** File stem shared by the .excalidraw source and the .svg export. */
   file: string;
   width: number;
@@ -27,7 +31,7 @@ function isFigure(value: unknown): value is Figure {
   const f = value as Record<string, unknown>;
   return (
     typeof f.slug === "string" &&
-    typeof f.asciiIndex === "number" &&
+    typeof f.ascii === "string" &&
     typeof f.file === "string" &&
     typeof f.width === "number" &&
     typeof f.height === "number" &&
@@ -57,6 +61,11 @@ export async function getFigures(): Promise<Figure[]> {
   return figures;
 }
 
-export function figureKey(slug: string, asciiIndex: number): string {
-  return `${slug}#${asciiIndex}`;
+/** The first 12 hex digits of the SHA-256 of an ASCII block's text, trailing whitespace trimmed. */
+export function asciiHash(text: string): string {
+  return createHash("sha256").update(text.trimEnd()).digest("hex").slice(0, 12);
+}
+
+export function figureKey(slug: string, ascii: string): string {
+  return `${slug}#${ascii}`;
 }

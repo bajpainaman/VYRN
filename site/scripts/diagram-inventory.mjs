@@ -1,5 +1,7 @@
 // Lists every ASCII block per document with the same rule the renderer uses (fenced code with no
-// language, or "text"), so a figure's asciiIndex always points at the block it redraws.
+// language, or "text"). `hash` is lib/diagrams.ts's asciiHash, the key a figure is filed under;
+// asciiIndex and line only help find the block.
+import { createHash } from "node:crypto";
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import remarkParse from "remark-parse";
@@ -22,7 +24,13 @@ for (const [slug, file] of files) {
   visit(tree, (node) => {
     if (node.type === "heading") heading = node.children.map((c) => c.value ?? "").join("");
     if (node.type !== "code" || (node.lang && node.lang !== "text")) return;
-    if (DIAGRAM.test(node.value)) blocks.push({ asciiIndex: index, heading, line: node.position.start.line, ascii: node.value });
+    if (DIAGRAM.test(node.value)) blocks.push({
+        asciiIndex: index,
+        hash: createHash("sha256").update(node.value.trimEnd()).digest("hex").slice(0, 12),
+        heading,
+        line: node.position.start.line,
+        ascii: node.value,
+      });
     index++;
   });
   out[slug] = blocks;

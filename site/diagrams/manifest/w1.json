@@ -1,7 +1,7 @@
 [
   {
     "slug": "design",
-    "asciiIndex": 0,
+    "ascii": "74a24ae6411c",
     "file": "design-00",
     "width": 1200,
     "height": 960,
@@ -9,7 +9,7 @@
   },
   {
     "slug": "00-index",
-    "asciiIndex": 0,
+    "ascii": "ab45404c27be",
     "file": "00-index-00",
     "width": 1200,
     "height": 1130,
@@ -17,7 +17,7 @@
   },
   {
     "slug": "02-requirements",
-    "asciiIndex": 0,
+    "ascii": "e3c6a6edd3aa",
     "file": "02-requirements-00",
     "width": 1200,
     "height": 560,
@@ -25,7 +25,7 @@
   },
   {
     "slug": "02-requirements",
-    "asciiIndex": 1,
+    "ascii": "9ad986328e59",
     "file": "02-requirements-01",
     "width": 1200,
     "height": 700,
@@ -33,7 +33,7 @@
   },
   {
     "slug": "02-requirements",
-    "asciiIndex": 2,
+    "ascii": "2618fcd984e8",
     "file": "02-requirements-02",
     "width": 1200,
     "height": 720,
@@ -41,7 +41,7 @@
   },
   {
     "slug": "02-requirements",
-    "asciiIndex": 3,
+    "ascii": "b0b65f036d70",
     "file": "02-requirements-03",
     "width": 1200,
     "height": 580,

@@ -1,7 +1,7 @@
 [
   {
     "slug": "09-chain",
-    "asciiIndex": 0,
+    "ascii": "d3c9436e253a",
     "file": "09-chain-00",
     "width": 1180,
     "height": 1140,
@@ -9,7 +9,7 @@
   },
   {
     "slug": "09-chain",
-    "asciiIndex": 1,
+    "ascii": "7e5e2d6cdefb",
     "file": "09-chain-01",
     "width": 1120,
     "height": 920,
@@ -17,7 +17,7 @@
   },
   {
     "slug": "09-chain",
-    "asciiIndex": 14,
+    "ascii": "3a6de87bdf79",
     "file": "09-chain-14",
     "width": 1180,
     "height": 800,
@@ -25,7 +25,7 @@
   },
   {
     "slug": "09-chain",
-    "asciiIndex": 20,
+    "ascii": "b39ca0267f27",
     "file": "09-chain-20",
     "width": 1180,
     "height": 1020,
@@ -33,7 +33,7 @@
   },
   {
     "slug": "11-build",
-    "asciiIndex": 0,
+    "ascii": "426b711f6da9",
     "file": "11-build-00",
     "width": 1140,
     "height": 2103,
@@ -41,7 +41,7 @@
   },
   {
     "slug": "11-build",
-    "asciiIndex": 1,
+    "ascii": "2123e487f6cc",
     "file": "11-build-01",
     "width": 1180,
     "height": 1490,
@@ -49,7 +49,7 @@
   },
   {
     "slug": "11-build",
-    "asciiIndex": 4,
+    "ascii": "5f583259eae9",
     "file": "11-build-03",
     "width": 1180,
     "height": 864,
@@ -57,7 +57,7 @@
   },
   {
     "slug": "11-build",
-    "asciiIndex": 5,
+    "ascii": "934b84155c41",
     "file": "11-build-04",
     "width": 1180,
     "height": 1124,
@@ -65,7 +65,7 @@
   },
   {
     "slug": "11-build",
-    "asciiIndex": 6,
+    "ascii": "c49cbafcbefc",
     "file": "11-build-05",
     "width": 1180,
     "height": 780,
@@ -73,7 +73,7 @@
   },
   {
     "slug": "11-build",
-    "asciiIndex": 7,
+    "ascii": "95428e6a6e03",
     "file": "11-build-06",
     "width": 1180,
     "height": 720,
@@ -81,7 +81,7 @@
   },
   {
     "slug": "11-build",
-    "asciiIndex": 9,
+    "ascii": "00b344771fca",
     "file": "11-build-08",
     "width": 1180,
     "height": 740,
@@ -89,7 +89,7 @@
   },
   {
     "slug": "11-build",
-    "asciiIndex": 10,
+    "ascii": "385e90f7943b",
     "file": "11-build-09",
     "width": 1180,
     "height": 780,
