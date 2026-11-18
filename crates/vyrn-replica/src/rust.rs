@@ -105,6 +105,12 @@ impl<'a, V: Visibility, const NA: usize, P: Payloads, R: Responses, S: Sink>
         &self.sink
     }
 
+    /// The payload store and the sink at once, for a sink that reads a block's payloads before
+    /// the block replays (`vyrn_md::SinkStream::prepare`).
+    pub fn payloads_and_sink(&mut self) -> (&P, &mut S) {
+        (&self.payloads, &mut self.sink)
+    }
+
     /// Ends replay and hands back the sink.
     pub fn into_sink(self) -> S {
         self.sink

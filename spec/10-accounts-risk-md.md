@@ -1543,6 +1543,48 @@ buy an earlier copy, and the sequencer cannot see who subscribes. The only sprea
 replication skew and fiber length on bare metal (vendor: tens of ns), and the relay rotation on
 AWS, which gives every subscriber the same average position.
 
+### 7.9 Rebuilding `MBO` from replay output
+
+The observer's replay engine produces 05's outputs (order-stream records, lane responses, fill TX
+packets), not book events. `vyrn-md`'s `SinkStream` is the replay sink that turns them into the
+`MBO` event stream, so `MBO` is a function of the log alone, whatever order the lanes' outputs
+interleave in (07 §7.1 fixes only each lane's order). The rules below are readings of 05 and
+§7.4; each carries its label.
+
+1. **Position.** Lane op `(l, q)` belongs to interval `s − 1`, where `s` is the first step with
+   `C_s[l] ≥ q` (05 §5.1). A forwarded op, named as some step's source, is not a lane op.
+   \[Likely\]
+2. **Effect.** A lane op's effect is read from its response record, matched by `(session,
+   echo_pkt, index)`, and its message: `Ack` of a `New` is `MD_ADD` (side and qty from the
+   message, priority `rx_ts` the lane's running maximum); `CancelAck` of a `Cancel` is
+   `MD_DELETE(1)`; `CancelAck(c)` of a `Reduce` is `MD_REDUCE` to `open − c`, or `MD_DELETE(1)`
+   when `c = open`. A reject or `Out` changes nothing. `open` is the book after step `s − 1`,
+   which is what B2 settles against (05 §7.6). \[Likely\]
+3. **Step records.** Every StepRecord is an `MD_STEP`, Idle and Shed included, so step ids on the
+   step channel stay gapless for `MD_SYNC` and the watermark. §7.4 says "every step that changes
+   the book"; a subscriber skips the ones that change nothing. \[Guessing\]
+4. **Execs.** A step's maker `Fill` records, in TX order, are its `MD_EXEC`s; `ordinal` is that
+   position, since no output carries the BBO's match ordinal. `aggressor` is the opposite of the
+   maker's side. A maker `Out` with cause STP is a step-channel `MD_DELETE(3)`. \[Guessing\]
+5. **Residuals.** A taker `Ack` is a step-channel `MD_ADD` with `via BBO`, of the source's qty
+   less its taker fills over the run of `CONT` steps of that source. `taker oid` is the source's
+   handle, or 0 when the step has none or the source got no handle (`Shed`). \[Likely\]
+6. **Time.** A lane op's `rx_ts` is its packet's priority `rx_ts`, a step's (and its records')
+   the source's, a step without a source the newest so far; each is raised to the newest so far
+   (§7.3 needs `rx_ts` non-decreasing). Lane ops of one interval go out in `(rx_ts, lane,
+   LaneSeq)` order. \[Guessing\]
+7. **Release.** Step `s` is encoded once every op its cut covers has a response (or is
+   forwarded) and all of its `n_tx` TX packets are in; its interval's lane ops go first. A step
+   that covers a local op therefore waits for that lane's next boundary (B2 sends the `Ack` there,
+   `INV-ACK-AFTER-CUT`), which §7.8's 500 ns replay stage has to absorb. Not measured yet.
+   \[Likely\]
+8. **Epoch end.** Lane ops after the last step are not published: no cut orders them, and their
+   acks never leave (`INV-ACK-AFTER-CUT`). \[Likely\]
+
+Not rebuilt yet (`SinkError::Unsupported`): `Replace`, `CancelAll`, dependency TX packets,
+unsolicited lane records (expiry, kills), steps without a source that fill (Rescan, Uncross),
+pooled lanes, and the two cases 07 replay skips today (`MID` Advance records, `SHED` resends).
+
 ## 8. Drop copy (`vyrn-dropcopy`)
 
 `vyrn-dropcopy` gives each account (and each master, for all its sub-accounts) a private stream of
