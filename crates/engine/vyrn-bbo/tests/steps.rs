@@ -697,10 +697,72 @@ fn two_refused_replaces_in_a_row_stay_refused() {
 }
 
 #[test]
+fn stp_cancel_newest_rejects_before_a_fill_and_outs_after_one() {
+    // 04 §6.8 mode 1: an aggressor with no fill yet gets `Reject STP`, detail = the resting
+    // handle; after some fills it gets `Out STP` with qty out = remaining. One lane, account 1.
+    // Case A: own ask 1 @ 102, CancelNewest buy 1 @ 102 (msg index 3) → Reject, maker stays.
+    // Case B: account 2's ask 1 @ 101 and own ask 1 @ 102; CancelNewest buy 3 @ 102. Step 1
+    // fills 1 @ 101 (one level per step, D14); the CONT step meets the own ask → Out STP, qty 2.
+    let f = OrderFlags::new(Side::Buy, Tif::Day, false, Stp::CancelNewest);
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    let own = rest(&mut x, &mut bbo, 1, 10, Side::Sell, 102, 1, 1);
+    let (q, _) = x.forward(1, 20, f, 102, 1, 1, 3, &[], BIG_DEADLINE);
+    x.publish_cut();
+    let s = step_src(&mut x, &mut bbo, 1);
+    assert!(s.fills().is_empty());
+    let ends: Vec<(usize, u8, u16, u32)> = s
+        .events
+        .iter()
+        .filter(|(_, e)| matches!(e.fill_kind(), Some(FillKind::Out | FillKind::Reject)))
+        .map(|(l, e)| (*l, e.kind, e.cause, e.qty))
+        .collect();
+    assert_eq!(
+        ends,
+        vec![(1, FillKind::Reject.code(), RejectReason::Stp.code(), 1)]
+    );
+    assert_eq!(
+        s.role(ROLE_TAKER),
+        vec![vec![Record::Reject {
+            index: 3,
+            reason: RejectReason::Stp,
+            detail: Handle::new(own, vyrn_bbo::mem::MEM_GEN).unwrap().0,
+            client_tag: u32::try_from(q).unwrap() + 1000,
+        }]]
+    );
+    assert_eq!(bbo.bounds().1, Tick(102), "CancelNewest leaves the maker");
+
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    rest(&mut x, &mut bbo, 1, 10, Side::Sell, 101, 1, 2);
+    rest(&mut x, &mut bbo, 1, 11, Side::Sell, 102, 1, 1);
+    let (q, slot) = x.forward(1, 20, f, 102, 3, 1, 3, &[], BIG_DEADLINE);
+    x.publish_cut();
+    let s1 = step_src(&mut x, &mut bbo, 1);
+    assert_eq!(
+        s1.fills(),
+        vec![(1, LIQ_MAKER, 101, 1), (1, LIQ_TAKER, 101, 1)]
+    );
+    let s2 = x.step(&mut bbo, &CLK);
+    assert_eq!(s2.entry.flags & STEP_CONT, STEP_CONT);
+    assert!(s2.fills().is_empty());
+    assert_eq!(
+        s2.role(ROLE_TAKER),
+        vec![vec![Record::Out {
+            index: 3,
+            cause: OUT_STP,
+            handle: Handle::new(slot, vyrn_bbo::mem::MEM_GEN).unwrap(),
+            qty: Qty(2),
+            client_tag: u32::try_from(q).unwrap() + 1000,
+        }]]
+    );
+}
+
+#[test]
 fn stp_spans_pooled_lanes_only() {
     // Account 1 on lanes 1 and 2 (05 §6.9: a pooled acct_ix is pool-wide). Lane 2's ask of 1 @
-    // 102; lane 1's CancelNewest buy of 1 @ 102 for account 1. Pooled {1, 2}: Out STP, no
-    // fill. Dedicated lanes: acct_ix 1 on lane 1 and on lane 2 are different accounts, so
+    // 102; lane 1's CancelNewest buy of 1 @ 102 for account 1. Pooled {1, 2}: Reject STP
+    // (04 §6.8, no fill yet), no fill. Dedicated lanes: acct_ix 1 on lane 1 and on lane 2 are different accounts, so
     // they trade.
     for (pool, trades) in [(0b110u64, false), (0, true)] {
         let mut c = cfg();
@@ -720,12 +782,16 @@ fn stp_spans_pooled_lanes_only() {
             );
         } else {
             assert!(s.fills().is_empty());
-            let outs: Vec<(usize, u16)> = s
-                .of(FillKind::Out)
+            let ends: Vec<(usize, u8, u16)> = s
+                .events
                 .iter()
-                .map(|(l, e)| (*l, e.cause))
+                .filter(|(_, e)| matches!(e.fill_kind(), Some(FillKind::Out | FillKind::Reject)))
+                .map(|(l, e)| (*l, e.kind, e.cause))
                 .collect();
-            assert_eq!(outs, vec![(1, OUT_STP)]);
+            assert_eq!(
+                ends,
+                vec![(1, FillKind::Reject.code(), RejectReason::Stp.code())]
+            );
             assert_eq!(bbo.bounds().1, Tick(102), "CancelNewest leaves the maker");
         }
     }

@@ -18,7 +18,7 @@
 //! admit at commit, then pass 1 (local ops in `LaneSeq` order), classify, forward (pass 2), V9
 //! counter publication and V10 responses. Reject reasons are `vyrn_types::RejectReason`: the lane
 //! issues every reason except the BBO's `IOC_REST`, `STP`, `AUCTION` outs and its own `Reject`
-//! events (`BUSY`, `BOOK_HALTED`, `AUCTION_PHASE`, `TOO_LATE`), which the lane relays.
+//! events (`BUSY`, `BOOK_HALTED`, `AUCTION_PHASE`, `TOO_LATE`, `STP`), which the lane relays.
 //!
 //! Rules the spec leaves open, fixed here and pinned by `tests/`:
 //!

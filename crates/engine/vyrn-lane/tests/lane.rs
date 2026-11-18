@@ -831,16 +831,13 @@ fn pooled_lanes_hand_the_bbo_the_pool_wide_account_index() {
     };
     let (ix, taker) = run(true);
     assert_eq!(ix, 7, "OrderSlot.acct_ix is the pool-wide index");
-    // 04 §6.8 says `Reject STP` (detail = the resting handle) for an aggressor with no fill;
-    // vyrn-bbo answers `Out STP` today, on one lane too. That record is the BBO's (fill TX
-    // core); reported to the bbo owner. What the lane owns: the self-trade is caught.
+    // The resting order is lane 0's slot 1; the taker is lane 1's slot 1.
     assert_eq!(
         taker,
-        vec![Record::Out {
+        vec![Record::Reject {
             index: 0,
-            cause: vyrn_bbo::OUT_STP,
-            handle: Handle::new(1, 1).unwrap(),
-            qty: Qty(1),
+            reason: RejectReason::Stp,
+            detail: Handle::new(1, 1).unwrap().0,
             client_tag: 22
         }]
     );
