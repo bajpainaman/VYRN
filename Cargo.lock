@@ -3668,7 +3668,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vyrn-nic",
- "vyrn-replica",
  "vyrn-types",
 ]
 
