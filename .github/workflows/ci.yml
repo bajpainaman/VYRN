@@ -104,8 +104,8 @@ jobs:
       - run: cargo build --locked --release -p vyrn-seq -p vyrn-validator -p e2e-smoke
       - name: 3 validators, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke)
         run: timeout 300 target/release/e2e-smoke --validators 3 --wait-s 30 --workload tools/e2e-smoke/wl-smoke-nocross.toml
-      # Known gap: vyrn-seq drops RouteRecords, so replay diverges after crosses. Drop
-      # continue-on-error once the box frames them.
+      # Known gap: the lane rejects crossing post-only orders itself (vyrn-risk check.rs, against
+      # 03 ARC-D6), so replay's reject detail can differ. Drop continue-on-error once fixed.
       - name: 3 validators, WL-SMOKE seed 1 (known gap, does not gate)
         continue-on-error: true
         run: timeout 300 target/release/e2e-smoke --validators 3 --wait-s 30

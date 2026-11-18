@@ -51,9 +51,12 @@
 //!   be the box's, and at least one validator must cover every height. Any other fault fails.
 //!   `--strict-hashlag` fails it as well.
 //!
-//! **Known gap.** `vyrn-seq` does not frame `RouteRecord`s yet (its `Rec::Route` arm drops
-//! them), so on `wl-smoke.toml`, whose crosses make lanes write some, replay diverges with
-//! `Step(Kind)` after a cross. `wl-smoke-nocross.toml` keeps clear of them and gates CI.
+//! **Known gap.** `vyrn-risk` (`check.rs`, the post-only check) rejects a post-only `New` that
+//! crosses the lane's snapshot in the lane, with the snapshot's opposite tick as the detail.
+//! 03 ARC-D6 routes that order to the BBO core, because the snapshot version a lane read is not
+//! in the order stream. So when a lane's snapshot lags, replay's `POST_ONLY_WOULD_CROSS` detail
+//! differs from live and `replay` fails on `wl-smoke.toml` for some seeds and timings.
+//! `wl-smoke-nocross.toml` sends no post-only orders and gates CI.
 //!
 //! **Build.** Run release binaries: a debug `vyrn-validator` spends more than
 //! `REP_HASHLAG_MAX_NS` (1 ms) on ORDER frames often enough to raise `REP_E_HASHLAG` in most
@@ -927,10 +930,18 @@ fn run(cli: &Cli) -> Result<bool, String> {
             replayed.sort();
             if live != replayed {
                 let at = live.iter().zip(&replayed).position(|(a, b)| a != b);
+                let show = |v: &[Resp]| {
+                    at.and_then(|i| v.get(i)).map(|(s, q, e, rs)| {
+                        let rs: Vec<String> = rs.iter().map(|r| hex(r)).collect();
+                        format!("session {s:#x} resp_seq {q} echo {e} [{}]", rs.join(" "))
+                    })
+                };
                 return Err(format!(
-                    "responses differ: box sent {}, replay produced {}; first difference at {at:?}",
+                    "responses differ: box sent {}, replay produced {}; first difference at {at:?}: box {:?}, replay {:?}",
                     live.len(),
-                    replayed.len()
+                    replayed.len(),
+                    show(&live),
+                    show(&replayed)
                 ));
             }
             let digest = |v: &[Resp]| {

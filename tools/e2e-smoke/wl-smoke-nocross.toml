@@ -1,6 +1,6 @@
 # WL-SMOKE-NOCROSS: WL-SMOKE with joins and cancels only (no cross, improve or reduce messages).
-# It keeps clear of RouteRecords, which vyrn-seq does not frame yet (its Rec::Route arm), so its
-# replay check gates CI; WL-SMOKE runs beside it as the known gap (tools/e2e-smoke docs).
+# It sends no post-only orders, whose lane-side POST_ONLY_WOULD_CROSS detail replay cannot
+# reproduce yet (03 ARC-D6; tools/e2e-smoke docs), so its replay check gates CI.
 version = 1
 id = "WL-SMOKE-NOCROSS"
 mode = "base"
