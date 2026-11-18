@@ -393,4 +393,18 @@ mod tests {
         let mixed = CommitCert::from_votes(c, &[other, votes[0], votes[1], votes[2]]);
         assert_eq!(mixed.sigs.len(), 3);
     }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Pins `COMMIT_CONTEXT` (09 §17.3): `b3sum --derive-key "vyrn v1 commit"` (BLAKE3 1.8.7 CLI)
+    /// over `encode()`, whose layout `encoding_is_canonical` checks.
+    #[test]
+    fn signing_message_vector() {
+        assert_eq!(
+            hex(&sc(9, Hash([6; 32])).signing_message()),
+            "aa7a16cb3ba34add66aa03e643285dc9f1ebfa08e6c8e26f54c2a87ead782987"
+        );
+    }
 }

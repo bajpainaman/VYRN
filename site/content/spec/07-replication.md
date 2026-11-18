@@ -1364,7 +1364,7 @@ the range when it enters the view, or when the first new header arrives if it ho
 every contiguous header after the parent's `last_height` that it holds at that moment with a valid
 Ed25519 part of `seq_sig`, up to 16. It sends every voter
 `RangeFix { epoch, view, parent_view, first_height, last_height, last_hash }`, signed with the
-Ed25519 half of its vote key under context `"vyrn      v1 rangefix"` (≤ 17 µs), and then runs
+Ed25519 half of its vote key under context `"vyrn v1 rangefix"` (≤ 17 µs), and then runs
 `verify` on exactly that range. An honest leader's proposal in the view is that range or
 nothing: a header that arrives after the fix waits for the next view. **`RangeFix` is a hint, never
 a filter:** a voter never rejects or withholds a vote because a proposal differs from a

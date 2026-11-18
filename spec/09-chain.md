@@ -153,7 +153,7 @@ NodeCert {
     xchg_key:     KexKey,       // 32 B (scheme 0) or 1,216 B (scheme 1): X25519 ‖ ML-KEM-768 (01 §3)
     gx_key:       KexKey,       // GXK (§2.4): the validator box's G-key exchange key, ≠ xchg_key
     client_kind:  u8,           // 0 Rust, 1 Vx
-    sig:          Sig,          // by OIK_op, in OIK's scheme, over ctx "vyrn      v1 nodecert" ‖ fields
+    sig:          Sig,          // by OIK_op, in OIK's scheme, over ctx "vyrn v1 nodecert" ‖ fields
 }
 ```
 
@@ -286,7 +286,7 @@ GenesisRecord {
     bridge:        { l1_chain_id: u64, contract: [u8; 20], deploy_block: u64 },
     sigs:          [(OpIdx, [u8; 64]); 5],   // all 5 OIKs: genesis is 5-of-5
 }
-genesis_hash = BLAKE3(derive_key("vyrn      v1 genesis", canonical_encoding(GenesisRecord)))
+genesis_hash = BLAKE3(derive_key("vyrn v1 genesis", canonical_encoding(GenesisRecord)))
 ```
 
 Genesis is 5-of-5 because no earlier set exists to certify it. Every client is configured with
@@ -338,7 +338,7 @@ Governance is a set of actions signed by 4 of the 5 operator identity keys.
 
 ```
 GovAction {
-    ctx: "vyrn      v1 gov", chain_id: u32, gov_nonce: u64,
+    ctx: "vyrn v1 gov", chain_id: u32, gov_nonce: u64,
     action: GovKind, activation: Epoch,
     sigs: [(OpIdx, [u8; 64]); ≥ 4],      // Ed25519 by OIK
 }
@@ -439,9 +439,12 @@ data node that a client's data copy goes to (§13.3).
 ### 3.4 seq_sig
 
 ```
-seq_sig = Ed25519_sign(SK(s, home(e)),
-                       derive_key("vyrn      v1 seqsig", encode(BlockHeader without seq_sig)))
+seq_sig = Ed25519_sign(SK(s, home(e)), "vyrn      v1 block" ‖ BlockHeader bytes 0..126)
 ```
+
+The signed message is the 18-byte context followed directly by the 126 header bytes before
+`seq_sig` (07 §3.10); there is no `derive_key` step. Under a hybrid scheme each part signs
+`scheme ‖` this message (07 §3.10, 01 §14.20).
 
 One signature per book per millisecond costs about 1,000 signatures per second per book. It runs on
 order-stream core A (core 4, 07 §6.2) in slices, off the 1 µs path. Before it signs height h,
@@ -1642,7 +1645,7 @@ digest_k = BLAKE3(derive_key("vyrn v1 lthash digest", L_k as bytes))
 
 ```
 StateCommit {
-    ctx: "vyrn      v1 commit", chain_id: u32, epoch: Epoch,
+    ctx: "vyrn v1 commit", chain_id: u32, epoch: Epoch,
     height: Height,              // chain height H = second × CHN_COMMIT_BLOCKS
     second: u64,
     log_hash: Hash, smt_root: Hash, orders_lthash: Hash, orders_count: u64,
@@ -1652,7 +1655,7 @@ StateCommit {
     prev: Hash,                  // hash of StateCommit for second − 1
 }
 CommitVote { commit: Hash, op: OpIdx, sig: Ed25519 by VK(op, home(epoch))
-             over derive_key("vyrn      v1 commit", encode(StateCommit)) }
+             over derive_key("vyrn v1 commit", encode(StateCommit)) }
 CommitCert { commit: StateCommit, sigs: [(OpIdx, [u8; 64]); ≥ 4] }
 ```
 
@@ -1697,7 +1700,7 @@ EpochKeys(e) = { epoch: e, home: home(e),
                  seq_keys: [PubKey; 5],                                // SK(i, home(e))
                  jailed: u8 bitmap, seq_op: OpIdx }
 // Each PubKey is the length of sig_scheme (01 §3: 32 or 1,344 B); keys_hash commits to the scheme.
-keys_hash(e) = BLAKE3(derive_key("vyrn      v1 epochkeys", encode(EpochKeys(e))))
+keys_hash(e) = BLAKE3(derive_key("vyrn v1 epochkeys", encode(EpochKeys(e))))
 ```
 
 The `HandoffRecord` of epoch e carries `next_keys = keys_hash(e + 1)` (Request to 01, §18), and the
@@ -1910,8 +1913,8 @@ client order, forge one, censor beyond §7, or move a boundary.
 sample of packets:
 
 ```
-K_sample(e, s) = derive_key("vyrn      v1 sample key", G(e, s).private ‖ le(e) ‖ [s])
-sampled(p)     = BLAKE3(derive_key("vyrn      v1 sample", K_sample(e, s)) ‖ pkt_hash)[0]
+K_sample(e, s) = derive_key("vyrn v1 sample key", G(e, s).private ‖ le(e) ‖ [s])
+sampled(p)     = BLAKE3(derive_key("vyrn v1 sample", K_sample(e, s)) ‖ pkt_hash)[0]
                  < 256 / CHN_FR_SAMPLE                                     // 1 in 64
 ```
 
@@ -2130,12 +2133,18 @@ qty`, where `qty` is the reversed quantity of the original fill.
 | `"vyrn v1 kcom head"`, `"vyrn v1 kcom"` | TESLA chain head; `K_com` per interval |
 | `"vyrn v1 gkey wrap"` | Transport of committee private keys |
 | `"vyrn v1 sample key"`, `"vyrn v1 sample"` | `K_sample`; the FQ sample predicate |
-| `"vyrn v1 vote"`, `"vyrn v1 commit"`, `"vyrn v1 seqsig"` | Consensus votes, commit votes, `seq_sig`. Under a hybrid scheme each part signs `scheme ‖` this message (01 §14.20) |
+| `"vyrn v1 vote"`, `"vyrn v1 commit"` | Consensus votes, commit votes. Under a hybrid scheme each part signs `scheme ‖` this message (01 §14.20) |
+| `"vyrn      v1 block"` | `seq_sig`: prefixes header bytes 0..126 directly, without `derive_key` (§3.4, 07 §3.10) |
 | `"vyrn v1 nodecert"`, `"vyrn v1 gov"`, `"vyrn v1 tx"` | Certificates, governance, items |
 | `"vyrn v1 genesis"`, `"vyrn v1 log"`, `"vyrn v1 epochkeys"` | Genesis hash, log hash, key-table hash |
 | `"vyrn v1 smt leaf"`, `"vyrn v1 smt node"` | SMT hashing |
 | `"vyrn v1 stmt leaf"`, `"vyrn v1 stmt node"` | Statement tree, `ACC_STMT_ROOT` (10 §10) |
 | `"vyrn v1 lthash"`, `"vyrn v1 lthash digest"` | LtHash element and digest |
+
+The padded contexts `"vyrn      v1 <purpose>"` (six spaces after `vyrn`) of `block`, `fetch`,
+`peerfetch`, `proposal`, `silence`, `ready`, `handoff`, `roster`, `force seal` and `reassign` are
+frozen for compatibility, since vectors pin them; every new context uses `"vyrn v1 <purpose>"`, with
+one space. `tools/check-contexts.py` fails CI when spec and code spell a purpose differently.
 
 ### 17.4 Invariants
 

@@ -274,4 +274,23 @@ mod tests {
         y[6] = 0;
         assert_eq!(TxEnvelope::decode(&y), Err(TxError::Malformed), "home 0");
     }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Pins `TX_CONTEXT` (09 §17.3). The message is `b3sum --derive-key "vyrn v1 tx"` (BLAKE3 1.8.7
+    /// CLI) over the unsigned bytes; a context padded after `vyrn` gives a different hash.
+    #[test]
+    fn ed25519_message_vector() {
+        let e = env(SignerRef::Account(AccountId(1)));
+        assert_eq!(
+            hex(&e.unsigned_bytes()),
+            "0110030000010000000500000000000000102700000000000001020300"
+        );
+        assert_eq!(
+            hex(&e.ed25519_message()),
+            "375d4b4dd050ac7047bec9d56b61c25a0f38b4aa29d07af174b6f6935f5169ae"
+        );
+    }
 }
