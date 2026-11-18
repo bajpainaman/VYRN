@@ -1367,8 +1367,9 @@ box the RX core's hop ring to the owning shard):
 4. Ingest wins a shard's ring: the RX core hands a redirect to a shard only while more than half
    of that shard's hop ring is free (`REDIRECT_HEADROOM` = `HOP_RING` / 2 = 2,048 of 4,096).
    Otherwise the redirect waits as in item 1, and the wait is not counted in `hop_full`, which
-   counts only real drops. Client copies arriving during a failover burst therefore always find
-   room.
+   counts only real drops. Queued redirects therefore never take the last half of a ring from
+   client copies; copies alone can still fill it, and a copy that meets a full ring is dropped
+   and counted in `hop_full`, as before.
 
 **Replica side (readings, `bin/vyrn-validator` `failover.rs`).** `DataDown{d}` is 24 bytes,
 little-endian: magic 0x4444, version 1, `d` u8, `voter` u8, 3 zero bytes, `epoch` u32, 4 zero
