@@ -547,7 +547,9 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         if let Some(d) = data.as_mut() {
             d.check(source, now());
         }
-        if k == 0 && dk == 0 {
+        // No ORDER frame this turn: the deadlines `on_frame` would have checked (REP_E_HASHLAG),
+        // whatever the data queue is doing.
+        if k == 0 {
             let r = core.tick(now());
             report(
                 &mut core,
@@ -558,6 +560,8 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                 source,
                 data.as_mut(),
             );
+        }
+        if k == 0 && dk == 0 {
             // kernel_udp only (class E): an idle order thread parks instead of spinning, so
             // several boxes and their voters share a small host. The socket holds what arrives.
             std::thread::park_timeout(IDLE);
