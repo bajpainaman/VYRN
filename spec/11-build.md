@@ -1068,14 +1068,19 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   `PBV_E_UNSUPPORTED`: the Vx book has already applied it, but at C\* it is not visible.
   *Auction-only remainders (05 §8.8 item 6, #193).* The chunk that ends the auction sends each
   lane its C\* in the Uncross event. The lane ends every auction-only order with `ins_seq` ≤
-  C\*[l] and open > 0 with `Out{cause: AUCTION}` for its open quantity, in session slot order and
-  then root creation order. It does this in B2, right after every pending op ≤ C\*[l] has
+  C\*[l] and open > 0 with `Out{cause: AUCTION}` for its open quantity, in session slot order
+  (`session_slot`, not the order `VxConfig` lists sessions) and then root creation order. It does this in B2, right after every pending op ≤ C\*[l] has
   settled and before any later one, as `vyrn-lane` does. The BBO keeps C\* (`adead`, vyrn-bbo
   `State::adead`), so no later uncross sees those orders. `tests/replay.rs` checks this with an
   unfilled auction-only sell, a later cancel of it (TOO_LATE), and a second auction in which that
   sell would otherwise fill first. Mutation check: dropping the end or `adead` fails the test.
   Running the end before the pending ops ≤ C\* still passes, because no script yet has such an
   op pending at the uncross.
+  **[Reading]** The test is the order's current version, as in `vyrn-lane`: a Reduce admitted
+  after C\* but before the uncross boundary makes a version with `ins_seq` > C\*, and both skip
+  the order, so it keeps its reservation and the Reduce is acknowledged. 05 §8.8 item 6 ends the
+  version visible at C\*. This is a known engine divergence, and the client follows `vyrn-lane`
+  until the engine changes.
 - *Gap list (the plan).* What `RustReplay` replays and the Vx client does not yet
   (1, Uncross and Seal, and 2, Rescan batch takers that trade, are done). The order is 5, then 3,
   then 4: dependencies first, since without them the client fully replays only 3 of the first

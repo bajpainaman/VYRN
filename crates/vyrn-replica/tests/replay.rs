@@ -827,11 +827,21 @@ fn vx_replay_on(
     lib: &std::path::Path,
     pool: bool,
 ) -> Result<Vec<VxBlock>, vyrn_replica::ReplayError> {
+    vx_replay_cfg(store, blocks, lib, &vx_config_on(pool))
+}
+
+/// [`vx_replay`] on the client configured as `cfg`.
+fn vx_replay_cfg(
+    store: &Store,
+    blocks: &[BlockInputs<N>],
+    lib: &std::path::Path,
+    cfg: &vyrn_replica::VxConfig,
+) -> Result<Vec<VxBlock>, vyrn_replica::ReplayError> {
     let mut data = DataJoin::default();
     for ((_, s, q, _), b) in &store.0 {
         data.put(*s, *q, b.clone());
     }
-    let mut vx = vyrn_replica::VxReplay::new(lib, &vx_config_on(pool), data)?;
+    let mut vx = vyrn_replica::VxReplay::new(lib, cfg, data)?;
     let mut out = Vec::new();
     for b in blocks {
         let h = vx.replay_block(b)?.output_hash;
@@ -1247,8 +1257,9 @@ fn the_vx_client_replays_control_steps() {
 /// 103, 104, 104 (an auction-only one) and 105, four buys of 1 at 107, 106, 106 and 105; the
 /// control role uncrosses Q = 4 at p* = 105, which takes two chunks of at most
 /// `ENG_UNCROSS_CHUNK` = 6 fills. `extra` 1 adds a resting sell at 105 that the uncross leaves;
-/// `extra` 2 adds an auction-only sell of 3 at 105 instead, which the uncross leaves unfilled, so
-/// its lane ends it with `Out { cause: AUCTION }` (05 §8.8 item 6), a cancel of it after the
+/// `extra` 2 adds an auction-only sell of 3 at 105 instead, and an auction-only buy of 2 at 104 in
+/// another session of the same lane, which the uncross leaves unfilled, so their lane ends them
+/// with `Out { cause: AUCTION }` in session slot order (05 §8.8 item 6), a cancel of the sell after the
 /// uncross that finds it ended, and a second auction (Q = 1 at 105) in which that earlier sell
 /// would come first if it were still live.
 fn auction_script(extra: u8) -> Vec<Act> {
@@ -1278,12 +1289,13 @@ fn auction_script(extra: u8) -> Vec<Act> {
             1_000,
             vec![new(Sell, Day, 103, 1, 1), new(Sell, Day, 105, 1, 2)],
         ),
-        p(
-            1,
-            1,
-            1_100,
-            vec![new(Buy, Day, 107, 1, 3), new(Buy, Day, 106, 1, 4)],
-        ),
+        p(1, 1, 1_100, {
+            let mut m = vec![new(Buy, Day, 107, 1, 3), new(Buy, Day, 106, 1, 4)];
+            if extra == 2 {
+                m.push(new(Buy, AuctionOnly, 104, 2, 14));
+            }
+            m
+        }),
         p(
             2,
             1,
@@ -1318,7 +1330,7 @@ fn auction_script(extra: u8) -> Vec<Act> {
         p(0, 1, 5_000, vec![new(Buy, Day, 101, 1, 10)]),
     ]);
     if extra == 2 {
-        s.push(p(1, 2, 5_100, vec![cancel(Handle::new(3, 1).unwrap(), 11)]));
+        s.push(p(1, 2, 5_100, vec![cancel(Handle::new(4, 1).unwrap(), 11)]));
         s.extend([
             Act::Run,
             Act::Poll,
@@ -1419,12 +1431,22 @@ fn the_vx_client_replays_an_uncross_and_a_seal() {
                 matches!(
                     lane1.as_slice(),
                     [
-                        vyrn_bbo::Record::Out { cause: vyrn_bbo::OUT_AUCTION, qty, .. },
+                        vyrn_bbo::Record::Out { cause: vyrn_bbo::OUT_AUCTION, qty: q1, .. },
+                        vyrn_bbo::Record::Out { cause: vyrn_bbo::OUT_AUCTION, qty: q2, .. },
                         vyrn_bbo::Record::Reject { reason, .. },
-                    ] if qty.0 == 3 && *reason == vyrn_types::RejectReason::TooLate
+                    ] if (q1.0, q2.0) == (2, 3) && *reason == vyrn_types::RejectReason::TooLate
                 ),
                 "{lane1:?}"
             );
+            // A config that lists each lane's sessions in another order changes nothing: the
+            // lane ends remainders in session slot order.
+            if let Some(lib) = vx_lib() {
+                let mut cfg = vx_config_on(false);
+                cfg.sessions.reverse();
+                let vx = vx_replay_cfg(&store, &blocks, &lib, &cfg).unwrap();
+                let (lanes, _) = live_bytes(&live_j);
+                assert_eq!(vx[0].0[1], lanes[1], "lane 1 responses, sessions reversed");
+            }
         }
         let (j, _) = live07(&auction_script(extra));
         assert_vx_matches(&auction_script(extra), 0..j.recs.len() - 1);

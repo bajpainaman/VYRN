@@ -1790,10 +1790,21 @@ fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
 
 // 05 §8.8 item 6 (vyrn-lane end_auction_only): every auction-only order visible at C* with
 // open > 0 is dead; its lane sends Out{cause: AUCTION} for the open quantity. Sessions in slot
-// order, each session's roots in creation order. The record follows every held one.
+// order (vyrn-wire session_slot, the id's low 12 bits, not the config's order), each session's
+// roots in creation order. The record follows every held one.
 fn end_auction_only(c : *mut Ctx, ln : *mut Lane, cs : u64) -> void {
   unsafe {
-    for si in 0i64..(*ln).n_sess {
+    let mut last = U64_MAX;
+    loop {
+      // The next session by slot: one scan per session, once per uncross.
+      let mut si = NONE;
+      let mut bs = U64_MAX;
+      for i in 0i64..(*ln).n_sess {
+        let sl = (*sess(ln, i)).id & 4095u64;
+        if (last == U64_MAX || sl > last) && sl < bs { bs = sl; si = i; } else { }
+      }
+      if si == NONE { break; }
+      last = bs;
       for r in 1u64..(*ln).next_slot {
         let rp = root(ln, r);
         if (*rp).live == 0u64 || (*rp).sess != si || (*rp).ended != 0u64 { continue; }
