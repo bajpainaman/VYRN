@@ -125,6 +125,23 @@ jobs:
       - name: validator 0 path A loses one frame, repaired, finalizes through the last block, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R14)
         run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --drop-path-a 300 --dev-hashlag-us 50000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
 
+  site-diagrams:
+    name: site spec copy and diagram inventory
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The runner's Node and its corepack, pinned to package.json's packageManager (pnpm 10.7.0).
+      - run: corepack enable && pnpm install --frozen-lockfile
+      - name: site/content/spec matches spec/
+        run: node scripts/sync-spec.mjs && git diff --exit-code -- content/spec
+      - name: diagrams/inventory.json matches the spec (regenerate, then remap manifests whose asciiIndex moved)
+        run: node scripts/diagram-inventory.mjs && git diff --exit-code -- diagrams/inventory.json
+      - name: every figure points at an inventory block
+        run: pnpm exec vitest run lib/diagrams.test.ts
+
   actionlint:
     runs-on: ubuntu-24.04
     steps:

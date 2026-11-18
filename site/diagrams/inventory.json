@@ -394,21 +394,21 @@
    "ascii": " half A: lanes 0–24 (cores 8–32)                  CCD 0\n ┌──────────────┐ R_pkt[l], R_hash8[l]           ┌──────────────────────────────────────────┐\n │ lane l       ├───────────────────────────────►│ core 4  stream-A                         │\n │  parse, MAC, │                                │  CTPIO → port A.a, port B.a; sfence      │\n │  risk,       │                                │  released[A]; LaneCut[l ∈ A]             │\n │  classify,   │                                │  block close, signer, HEADER, fence, gate│\n │  encode O,   │ half B: lanes 25–48            ├──────────────────────────────────────────┤\n │  AcctTake,   │ (cores 33–49, pool 56–62)      │ core 7  stream-B                         │\n │  hash batch  ├───────────────────────────────►│  CTPIO → port A.b, port B.b; sfence      │\n └──────┬───────┘                                │  released[B]; LaneCut[l ∈ B]; fence      │\n        │ R_hash32[l]                            └──────▲───────────────▲───────────────────┘\n        └────────────────► core 50 order hasher ◄───────┼─ frame rings  │ R_step (+ need, marks)\n ┌──────────────┐ R_step: one writer, three cursors ────┴───────────────┘\n │ core 2  BBO  │ R_fill_X: fills tagged (s, need_A, need_B), X = the TX core of the recipient's port\n │  step s      ├──────► core 3 TX-A, core 5 TX-B, core 0 TX-C\n └──────────────┘        wait: released[A] ≥ need_A(s) and released[B] ≥ need_B(s), then CTPIO fill\n lanes: every response of op q waits for LaneCut[l].cut ≥ q (written by l's stream core after sfence)"
   },
   {
-   "asciiIndex": 8,
+   "asciiIndex": 9,
    "heading": "5.2 Ingest pipeline",
-   "line": 1018,
+   "line": 1060,
    "ascii": " RX queue (RSS by session) ─► parse header ─► MAC check ─► dedupe ─► full BLAKE3 ─► store ─► fan-out\n   ~12 cores at peak          16 B            K_seq (BASE)  (session,   32 B kept    RAM ring   data frames\n                                              K_com (CHAIN) pkt_seq)    pkt_hash=8   + index    to replicas"
   },
   {
-   "asciiIndex": 14,
+   "asciiIndex": 15,
    "heading": "7.6 Catch-up from snapshot plus log",
-   "line": 1967,
+   "line": 2019,
    "ascii": " t0 ── subscribe to live frames + data; verify and vote at once (votes need no history) ──────────►\n  │\n  ├─ fetch the newest snapshot ≤ the newest RootCert (local NVMe, else peers via REPAIR, else archive)\n  ├─ verify it (§7.5)\n  ├─ fetch finalized blocks snapshot.height+1 .. live, striped by height across all peers\n  │     (block record + cert, §8.2), verify certs and roots, write them to the local journal\n  ├─ replay at max speed; buffer live input; live input already counts toward votes\n  └─ replay lag ≤ REP_LIVE_LAG_MS (10 ms): the replica joins root votes and is \"caught up\""
   },
   {
-   "asciiIndex": 15,
+   "asciiIndex": 16,
    "heading": "8.2 Block journal",
-   "line": 2022,
+   "line": 2074,
    "ascii": "REP_BlockRecord   (4 KiB aligned, on drive h mod 12)\n  off size field\n    0   8  magic \"PBBLK001\"         8 8 height        16 4 epoch     20 1 tenure   21 1 kind (0 normal, 1 seal)\n   22   2  reserved                24 190 BlockHeader (§3.10)\n  214   4  order_len              218 4 hash_len       222 4 data_len 226 4 n_unavail  230 26 reserved\n  256   …  order bytes │ pkt_hash list (8 B × records) │ data bytes (O-order; self-delimiting by count)\n           │ unavailable (session, pkt_seq) list │ pad to 4 KiB"
   }
  ],
@@ -524,37 +524,37 @@
   {
    "asciiIndex": 4,
    "heading": "6. Testing strategy",
-   "line": 1199,
+   "line": 1250,
    "ascii": "   layer                      runs on                 catches\n   ─────────────────────────  ──────────────────────  ─────────────────────────────────────────\n   1 unit + loom + Miri       every PR, all hosts     wrong function, wrong memory ordering, UB\n   2 property (proptest)      every PR, all hosts     engine ≠ oracle on small random books\n   3 differential per msg     every PR + nightly      engine ≠ oracle on 10⁹-message streams\n   4 vyrn-sim                 every PR + swarm        protocol bugs under faults and timing\n   5 fuzzing                  every PR + nightly      panics and wrong verdicts on hostile bytes\n   6 chaos on hardware        nightly staging         what the simulator does not model\n   7 cross-build determinism  nightly + release       compiler, flag and client divergence (B4)"
   },
   {
    "asciiIndex": 5,
    "heading": "6.4 vyrn-sim: the deterministic simulator",
-   "line": 1319,
+   "line": 1370,
    "ascii": "                  vyrn-sim (one thread, virtual time in Nanos, ChaCha8 seeded per component)\n ┌───────────────────────────────────────────────────────────────────────────────────────────┐\n │  event queue (time, seq) ──► scheduler picks the next runnable item, seeded ties          │\n │                                                                                           │\n │  clients ×k ──► sim network (links: latency dist, loss, dup, reorder, partition)          │\n │     (02 workload)        │                                                                │\n │                          ▼                                                                │\n │  box: vyrn-seq  [vyrn-nic::sim queues, PHC model] ─► dedicated lanes + pool ─► cut A, B   │\n │                  ─► BBO ─► TX-A, TX-B, stream-A, stream-B (core map of 01 §10)            │\n │                  each core = Core::poll() step; vyrn-cut Visibility = Sim (seeded delay)  │\n │  box: vyrn-seq standby (F2)  warm, promoted on failover; never votes                      │\n │  box: vyrn-replica ×n      engine = Rust replay, or Vx client through the C ABI           │\n │  box: vyrn-data ×m         payload store and fan-out                                      │\n │  consensus: vyrn-consensus on commonware-runtime::deterministic, same virtual clock       │\n │  disks: in-memory journal with a fault model; clocks: per-box offset, drift, steps        │\n │                                                                                           │\n │  checkers: invariants after every event; oracle diff per message; liveness after heal     │\n └───────────────────────────────────────────────────────────────────────────────────────────┘"
   },
   {
    "asciiIndex": 6,
    "heading": "7.2 Rigs",
-   "line": 1633,
+   "line": 1684,
    "ascii": "  generator boxes                        SUT (vyrn-seq on REF)\n  (vyrn-bench gen, ef_vi TX)\n   G1..G4 ──── fiber ────► [ passive tap ]────────────► port p RX\n                                │ 10% copy\n                                ▼\n                        capture NIC port A ─┐  one NIC, one PHC:\n                                            │  no clock error between A and B\n   G1..G4 ◄─── fiber ───── [ passive tap ]◄─┼──────────── port p TX\n                                │ 10% copy  │\n                                ▼           │\n                        capture NIC port B ─┘ ──► capture host: match request ↔ response\n                                                   by (session, pkt_seq / echo_pkt)"
   },
   {
    "asciiIndex": 7,
    "heading": "8.1 Decision",
-   "line": 2018,
+   "line": 2069,
    "ascii": "  pinned core k (lane, cut, BBO, TX)                     control core\n  ┌───────────────────────────────────┐                 ┌───────────────────────────────┐\n  │ CoreStats   (single writer, 128 B │  Relaxed loads  │ sampler, every 100 ms         │\n  │   lines, Relaxed stores)          │ ──────────────► │  diffs counters + buckets     │\n  │ Histograms  (fixed buckets)       │                 │  → per-window quantiles       │\n  │ TraceRing   (64K × 16 B, shm file)│ ─── on demand ─►│ trace freeze / dump           │\n  └───────────────────────────────────┘                 │ exporter → mgmt NIC (kernel)  │\n                                                        │ tracing logs → journald       │\n  NIC: RX hw timestamp, TX completion timestamp ───────►│ in-box latency of every packet│\n                                                        └───────────────────────────────┘"
   },
   {
    "asciiIndex": 9,
    "heading": "9.1 Stages",
-   "line": 2145,
+   "line": 2196,
    "ascii": " PR opened ─► S1 fast (≤ 15 min) ─► S2 full (≤ 60 min) ─► S3 perf gate (≤ 45 min) ─► merge\n                                                                                     │\n main ─► nightly: S4 long (8 h: fuzz, swarm, B1/B3/B5/B9–B11/B19, chaos) ◄───────────┤\n      ─► weekly:  S5 cluster (B13, B16, B17, B20)                                    │\n tag  ─► S6 release: reproducible builds ×2 ─► compare ─► sign 2-of-3 ─► publish ◄────┘"
   },
   {
    "asciiIndex": 10,
    "heading": "10.3 Rollouts only at epoch boundaries",
-   "line": 2301,
+   "line": 2352,
    "ascii": "  epoch:      TYO active        LDN active        NYC active        TYO active\n  UTC:        00:00 ─────────── 08:00 ─────────── 16:00 ─────────── 00:00\n  LDN boxes:  stage + restart   ◄── runs new ───►\n              as followers      release as home\n              (replay, shadow)\n  NYC boxes:  stage ────────── restart as followers ── runs new as home ──►\n  TYO boxes:  (old release)     stage ──────────── restart as followers ── new as home ──►"
   }
  ],
