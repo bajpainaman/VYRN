@@ -280,6 +280,9 @@ pub struct Lane<'a, V: Visibility, const NA: usize> {
     /// ([`Lane::set_snap_lag_max`], 05 §6.5).
     pub(crate) lag_max: u64,
     pub(crate) pend: std::collections::VecDeque<PendE>,
+    /// `C*` of an uncross whose auction-only remainders B2 has not ended yet (05 §8.8 item 6):
+    /// they end once every pending op at or before it has settled.
+    pub(crate) auction_out: Option<LaneSeq>,
     pub(crate) evbuf: std::collections::VecDeque<vyrn_bbo::FillEvent>,
     pub(crate) fwd: std::collections::VecDeque<FwdOut>,
     pub(crate) out: Outbox,
@@ -416,6 +419,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             },
             lag_max: u64::from(SNAP_LAG_MAX),
             pend: std::collections::VecDeque::with_capacity(n),
+            auction_out: None,
             evbuf: std::collections::VecDeque::with_capacity(ENG_FILL_RING),
             fwd: std::collections::VecDeque::with_capacity(ENG_FWD_RING),
             out: Outbox::new(cfg.out_cap),
@@ -436,7 +440,9 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             acct_ix: (0..u32::try_from(NA).unwrap_or(0)).collect(),
             b3: Vec::with_capacity(4096),
             dep_cancels: Vec::with_capacity(64),
-            emitq: Vec::with_capacity(64),
+            // One `Out AUCTION` per order slot on top of the held events: an uncross can end
+            // every order of the lane in one boundary (05 §8.8 item 6) on the sealed thread.
+            emitq: Vec::with_capacity(64usize.saturating_add(n)),
         }
     }
 

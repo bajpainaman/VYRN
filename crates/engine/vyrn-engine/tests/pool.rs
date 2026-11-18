@@ -472,6 +472,101 @@ fn an_auction_runs_through_control_steps_and_replays() {
     );
 }
 
+/// 05 §8.8 item 6 (#186): after the last uncross chunk, an auction-only order visible at `C*`
+/// with `open > 0` is dead, and its lane ends it with an unsolicited `Out { cause: AUCTION }`
+/// for its open quantity, as the Vx oracle does (`tests/golden/scenarios/09-auction-uncross.scn`,
+/// `out maker auction`). Its reservation is released. `replay_wire` gives the same records.
+#[test]
+fn an_unfilled_auction_only_order_is_out_after_the_uncross() {
+    use Side::{Buy, Sell};
+    use Tif::{AuctionOnly, Day};
+    let cmds = [
+        ControlCmd::Phase {
+            phase: Phase::Auction,
+            lo: Tick(0),
+            hi: Tick(0),
+        },
+        ControlCmd::Phase {
+            phase: Phase::Frozen,
+            lo: Tick(1),
+            hi: Tick(TICK_MAX),
+        },
+        ControlCmd::Uncross {
+            price: Tick(105),
+            qty: 2,
+        },
+        ControlCmd::Phase {
+            phase: Phase::Continuous,
+            lo: Tick(0),
+            hi: Tick(0),
+        },
+    ];
+    let (bbo, mut sh) = new_box();
+    let mut e = engine(bbo, &mut sh);
+    let mut j = Journal::default();
+    assert!(e.command(&cmds[0]));
+    assert!(e.run(&NeverLate, &mut j, 64).unwrap());
+    // The auction-only buy at 100 is below p* = 105, so the uncross does not fill it.
+    let store = feed(
+        &mut e,
+        &[
+            (0, 1, order(Sell, Day, Stp::None, 104, 2, 1)),
+            (1, 1, order(Buy, Day, Stp::None, 106, 2, 2)),
+            (2, 1, order(Buy, AuctionOnly, Stp::None, 100, 3, 3)),
+        ],
+        &mut j,
+    );
+    for c in &cmds[1..] {
+        assert!(e.command(c));
+        assert!(e.run(&NeverLate, &mut j, 64).unwrap());
+    }
+    assert_eq!(fills(&j), 2, "both Day orders fill at p* = 105");
+    let outs = |j: &Journal| -> Vec<(u8, Record)> {
+        j.resp
+            .iter()
+            .flat_map(|(l, p)| p.records().iter().map(move |r| (l.0, *r)))
+            .filter(|(_, r)| matches!(r, Record::Out { .. }))
+            .collect()
+    };
+    let o = outs(&j);
+    assert_eq!(o.len(), 1, "{o:?}");
+    let (lane, rec) = o[0];
+    assert_eq!(lane, 2);
+    let Record::Out {
+        index,
+        cause,
+        qty,
+        client_tag,
+        ..
+    } = rec
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (index, cause, qty, client_tag),
+        (vyrn_bbo::INDEX_MAKER, vyrn_bbo::OUT_AUCTION, Qty(3), 3),
+        "unsolicited Out AUCTION for the open 3"
+    );
+
+    // 07-only replay gives the same records.
+    let (lanes, routes, mut ws) = to_wire(&j.recs);
+    let mut ctl = cmds
+        .iter()
+        .filter(|c| matches!(c, ControlCmd::Phase { .. }));
+    for w in ws.iter_mut().filter(|w| w.1 == StepKind::Control) {
+        w.5 = vyrn_engine::control_payload(ctl.next().unwrap())
+            .unwrap()
+            .to_vec();
+    }
+    let opening = ws.iter().position(|w| w.1 == StepKind::Uncross).unwrap();
+    ws[opening].5 = vyrn_engine::uncross_payload(Tick(105), 2).to_vec();
+    let (r, rep) = replay_wire(&lanes, &routes, &ws, &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    assert_eq!(rep.tx, j.tx);
+    assert_eq!(rep.resp, j.resp);
+    assert_eq!(outs(&rep), o);
+}
+
 /// Replays 07-only blocks (`Engine::replay_wire`) on a fresh box, pooled as `pool` says; each
 /// block is `(packet records, route records, AcctTakes with their packet's index, steps)`.
 type PoolBlock<'a> = (
