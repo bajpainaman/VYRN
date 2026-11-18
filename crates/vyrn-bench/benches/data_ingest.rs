@@ -5,6 +5,10 @@
 //! measured, every session already has its dedupe window, and every packet is new, so each one
 //! runs the whole pipeline: parse, SipHash MAC, dedupe, BLAKE3, store and index.
 //!
+//! `spread N` runs the same packets over N session shards (`vyrn_data::spread`), one thread
+//! each, every packet already on its shard's queue: total Mpps across the shards and the speedup
+//! over one. The orb has 2 cores, so N stops there.
+//!
 //! DEV numbers: an orb or a laptop is not the REF box (06 §1); compare before and after on one
 //! machine only.
 #![allow(
@@ -20,10 +24,11 @@
 
 use std::collections::BTreeMap;
 use std::hint::black_box;
+use std::sync::Barrier;
 use std::time::Instant;
 
 use vyrn_data::ring::Ring;
-use vyrn_data::{DataHome, HomeConfig, Mode};
+use vyrn_data::{DataHome, HomeConfig, Mode, Spread};
 use vyrn_engine::alloc::{SealingAlloc, seal_counting, unseal, violations};
 use vyrn_types::{BookId, Hash, MAX_REQ_PAYLOAD, Nanos, SessionId};
 use vyrn_wire::{Msg, ReqHeader, encode_request};
@@ -105,6 +110,72 @@ fn main() {
         median(ns),
         hot.len()
     );
+
+    // RSS spread: N shards, one thread each, packets pre-routed by session.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut base = 0.0;
+    for n in (1..=cores.min(4)).filter(|n| n.is_power_of_two()) {
+        let mut mpps = Vec::new();
+        let mut allocs = 0u64;
+        for _ in 0..ROUNDS {
+            let mut spread = Spread::new(&cfg(), n);
+            let mut ev = None;
+            let mut queues: Vec<Vec<&[u8]>> = vec![Vec::new(); n];
+            for (len, p) in warm {
+                spread
+                    .ingest_from(&p[..usize::from(*len)], None, Nanos(0), &mut ev)
+                    .unwrap();
+            }
+            for (len, p) in hot {
+                let p = &p[..usize::from(*len)];
+                queues[spread.route(p).unwrap()].push(p);
+            }
+            let shards = spread.into_shards();
+            let go = Barrier::new(n + 1);
+            let mut secs = 0.0f64;
+            let mut violations_run = 0;
+            std::thread::scope(|sc| {
+                let hs: Vec<_> = shards
+                    .into_iter()
+                    .zip(&queues)
+                    .map(|(mut home, q)| {
+                        let go = &go;
+                        sc.spawn(move || {
+                            let mut ev = None;
+                            go.wait();
+                            // The allocator counts per thread, so each shard counts its own loop.
+                            seal_counting();
+                            let before = violations();
+                            let t = Instant::now();
+                            for (i, p) in q.iter().enumerate() {
+                                black_box(home.ingest(p, Nanos(i as u64), &mut ev)).unwrap();
+                            }
+                            let dt = t.elapsed().as_secs_f64();
+                            let a = violations() - before;
+                            unseal();
+                            (dt, a)
+                        })
+                    })
+                    .collect();
+                go.wait();
+                for h in hs {
+                    let (dt, a) = h.join().unwrap();
+                    secs = secs.max(dt);
+                    violations_run += a;
+                }
+            });
+            allocs += violations_run;
+            mpps.push(hot.len() as f64 / secs / 1e6);
+        }
+        let m = median(mpps);
+        if n == 1 {
+            base = m;
+        }
+        println!(
+            "spread {n}    {m:>7.2} Mpps total  ({:.2}x one shard, {cores} cores)  allocs {allocs}",
+            m / base
+        );
+    }
 
     // The ring and its index alone: store one packet and look its key up, ring full.
     let mut ns = Vec::new();

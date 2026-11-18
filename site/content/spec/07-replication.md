@@ -976,6 +976,15 @@ leaves the destination set, and the next standby joins it once it starts warming
                                               K_com (CHAIN) pkt_seq)    pkt_hash=8   + index    to replicas
 ```
 
+**RSS by session (reading, `vyrn-data`).** A data box runs `n` ingest shards, and every session
+belongs to exactly one: shard = ⌊(`session` × 0x9E3779B9 mod 2^32) × n / 2^32⌋. Each shard owns its
+sessions' keys, dedupe windows and a `1/n` share of the ring, so steps 1–5 share no state between
+cores, and dedupe and `CopyConflict` stay exact because every copy of a `(session, pkt_seq)` meets
+the same shard. The NIC cannot hash a UDP payload, so the box steers in software from bytes 0..4
+of the packet (`session`); a packet too short to carry them is a parse failure. Fan-out order is
+per shard: `data_seq` stays per box and destination (§5.4), so shards that share a destination
+serialize their frames through one sender.
+
 1. **Parse.** A packet is valid if `count ∈ 1..=10`, `len = 32 + 16·count`, `reserved = 0`, and
    `book` is a book this home serves. Anything else is dropped and counted.
 2. **MAC.** In BASE, the data box holds `K_seq` (the operator holds all keys) and checks `tag_seq`.
