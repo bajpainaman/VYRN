@@ -136,6 +136,31 @@ llvm_for_vx() {
     "lld-$VX_LLVM" "libmlir-$VX_LLVM-dev" "mlir-$VX_LLVM-tools" "libpolly-$VX_LLVM-dev"
 }
 
+# VX-WORKAROUND W-10 (issue to file): makes vxc's two unsorted build scripts list in name order
+# (see vxc_build). Idempotent; drops their cached build-script output when it patches.
+vxc_sort_build_scripts() {
+  local src="${CARGO_HOME:-$HOME/.cargo}/registry/src"
+  local mlir tbl patched=()
+  mlir="$(ls -d "$src"/*/mlir-sys-220.0.2/build.rs)"
+  tbl="$(ls -d "$src"/*/tblgen-0.9.1/build.rs)"
+  if ! grep -q 'VYRN W-10' "$mlir"; then
+    perl -0pi -e 's~for entry in fs::read_dir\(&directory\)\? \{\n(\s*)if let Some\(name\) = entry\?\.path\(\)\.file_name\(\)~// VYRN W-10: name order.\n$1let mut paths = fs::read_dir(&directory)?.map(|e| e.map(|e| e.path())).collect::<Result<Vec<_>, _>>()?;\n$1paths.sort();\n$1for entry in paths {\n$1if let Some(name) = entry.file_name()~' "$mlir"
+    patched+=(mlir-sys)
+  fi
+  if ! grep -q 'VYRN W-10' "$tbl"; then
+    perl -0pi -e 's{\.map\(\|entry\| entry\.path\(\)\)}{.map(|entry| entry.path()) // VYRN W-10: name order.\n                .collect::<std::collections::BTreeSet<_>>()\n                .into_iter()}' "$tbl"
+    patched+=(tblgen)
+  fi
+  grep -q 'VYRN W-10' "$mlir" && grep -q 'VYRN W-10' "$tbl" || {
+    echo "vxc_sort_build_scripts: mlir-sys or tblgen build.rs did not match" >&2
+    return 1
+  }
+  # Cargo never re-runs a registry crate's build script on a source change.
+  for p in "${patched[@]}"; do
+    cargo clean --release --quiet --target-dir "$VX_SRC/target" -p "$p"
+  done
+}
+
 vxc_build() {
   # No aarch64 Linux release exists for v0.0.4, so build it from the pinned tag on every arch.
   mkdir -p "$LOCAL_BIN" "$(dirname "$VX_SRC")"
@@ -160,6 +185,12 @@ vxc_build() {
     # rustup default), and the registry and toolchain paths remapped. rust-src turns std's
     # /rustc/<commit> paths into sysroot paths, so the last rule (the last match wins) maps them
     # back. The target dir stays $VX_SRC/target: build.rs embeds it.
+    # Two build scripts list a directory unsorted: mlir-sys links every libMLIR*.a of LLVM's
+    # libdir in read_dir order, and tblgen archives cc/lib's sources in that order. read_dir
+    # order differs between filesystems, so static link order, and vxc's code layout, differed
+    # between orbs (a12dedc6… vs da38286d…). Sort both in the extracted registry sources.
+    RUSTUP_TOOLCHAIN="$pin" cargo fetch --locked --quiet
+    vxc_sort_build_scripts
     local sysroot commit
     sysroot="$(rustup run "$pin" rustc --print sysroot)"
     commit="$(rustup run "$pin" rustc -vV | sed -n 's/^commit-hash: //p')"
