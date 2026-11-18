@@ -338,7 +338,8 @@ impl DcStore {
 
 /// Serves one connection to its end (module docs): `HELLO`, the login, then records as the
 /// store grows and a heartbeat every idle `read` timeout. The caller sets the transport's read
-/// timeout to `DC_HEARTBEAT_MS` after the login (`after_login`). Returns when the client
+/// timeout to `DC_LOGIN_TIMEOUT_MS` before calling, so a client that never logs in fails the
+/// login read, and to `DC_HEARTBEAT_MS` after the login (`after_login`). Returns when the client
 /// closes, sends anything after its login, or a write fails.
 /// The store, read-locked; a poisoned lock ends the connection.
 fn read(

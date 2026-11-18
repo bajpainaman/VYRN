@@ -37,6 +37,9 @@ pub const LOGIN_MAGIC: [u8; 4] = *b"VDC1";
 pub const DC_LOGIN_CONTEXT: &[u8] = b"vyrn v1 dropcopy login";
 /// Idle time after which a stream sends a heartbeat (\[Guessing\], config).
 pub const DC_HEARTBEAT_MS: u64 = 100;
+/// Time a connection has to send its login after `HELLO` before the server drops it
+/// (\[Guessing\], config).
+pub const DC_LOGIN_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {

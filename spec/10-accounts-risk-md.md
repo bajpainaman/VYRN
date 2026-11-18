@@ -1736,7 +1736,9 @@ Login (client → server, 128 B)
 
 1. **Authentication.** The server sends `HELLO` with a fresh 32-byte challenge per connection;
    the client answers with one login signed by the signer's account key. A signature over
-   another challenge is refused, so a captured login cannot be replayed.
+   another challenge is refused, so a captured login cannot be replayed. A connection that has
+   not sent its login `DC_LOGIN_TIMEOUT_MS = 5_000` (config) after `HELLO` is dropped, so an
+   unauthenticated client holds no server resources past it.
 2. **Subscription.** An account reads its own stream; a master reads its master stream and each
    sub-account's own stream. Nobody else reads a stream (§8: "each account, and each master").
 3. **Checks**, in order, the first failure a `REJECT` that ends the connection: form (1
