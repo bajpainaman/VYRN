@@ -116,7 +116,7 @@ macro_rules! fields {
             rx_pkts, bad_frame, header, book, unknown_session, epoch, bad_mac, duplicate, late, stored,
             conflicts, data_frames, heartbeats, tx_full, events_dropped, fetch_bad, fetch_unauth,
             fetch_limited, fetch_ring_hit, fetch_log_hit, fetch_miss, fetch_resent, log_bad, hop_full, redirects,
-            redirect_unknown
+            redirect_unknown, redirect_retried, redirect_dropped
         }
     };
 }

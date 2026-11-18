@@ -14,7 +14,9 @@ use vyrn_types::{BookId, Height, Nanos, SessionId};
 use vyrn_wire::TxRing;
 
 use crate::frame::{DataHdr, FetchMsg, FrameBuf, FrameErr, Kind, key_seq};
+use crate::ingest::DataHome;
 use crate::node::{Counters, FetchKeysErr, NodeConfig, bump, pkt_key, split_payloads};
+use crate::redirect::Redirect;
 use crate::ring::Ring;
 
 /// A token bucket in token-nanoseconds: one fetch costs `1e9`, and `rate` tokens/s refill
@@ -385,6 +387,52 @@ pub(crate) fn send_to<T: TxRing>(
     true
 }
 
+/// Sends `r` to the address of its session's newest authenticated copy, tagged under its MAC
+/// key (07 §5.7 step 3). A session `home` never heard from is counted in `redirect_unknown` and
+/// taken as handled: another live box knows its address. False only if `tx` refused it.
+pub(crate) fn send_redirect<T: TxRing>(
+    home: &DataHome,
+    tx: &mut T,
+    wire: &mut [u8; MAX_FRAME_BYTES],
+    c: &mut Counters,
+    me: Endpoint,
+    r: Redirect,
+) -> bool {
+    let (Some(dst), Some(key)) = (home.source(r.session), home.key(r.session)) else {
+        bump(&mut c.redirect_unknown);
+        return true;
+    };
+    let sent = send_to(tx, wire, c, me, dst, &r.seal(key));
+    if sent {
+        bump(&mut c.redirects);
+    }
+    sent
+}
+
+/// [`send_redirect`] for a new redirect, behind any refused ones `pending` holds so a
+/// session's redirects leave in order. A session `home` does not know is counted
+/// (`redirect_unknown`) at once, queued or not, so it never takes a retry slot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_or_queue<T: TxRing>(
+    pending: &mut Pending,
+    home: &DataHome,
+    tx: &mut T,
+    wire: &mut [u8; MAX_FRAME_BYTES],
+    c: &mut Counters,
+    me: Endpoint,
+    r: Redirect,
+) {
+    if pending.is_empty() {
+        if !send_redirect(home, tx, wire, c, me, r) {
+            pending.push(r, c);
+        }
+    } else if home.source(r.session).is_some() && home.key(r.session).is_some() {
+        pending.push(r, c);
+    } else {
+        bump(&mut c.redirect_unknown);
+    }
+}
+
 /// KEY and BLOCK answers (`FETCH_RESP`), from a ring and a [`BlockStore`].
 #[derive(Debug)]
 pub(crate) struct Responder {
@@ -529,5 +577,56 @@ impl Responder {
         }
         let (cb, ce) = cur.unwrap_or((BookId(0), 0));
         self.send(to, cb, ce, height.0, tx, c, cfg);
+    }
+}
+
+/// Redirects a full queue refused (#183 follow-ups): a TX queue on the core that sends them, a
+/// shard's hop ring on the RX core. *Reading (gap: 07 §5.7 step 3 names no queue policy):* a
+/// `DataRedirect` is not repaired by any fetch the way a lost `DATA` frame is, so a refused one
+/// waits here and is retried, oldest first, at the start of the core's next turn, before any new
+/// work; a turn stops retrying at the first refusal, so order is kept and a full queue costs one
+/// refusal per turn. While any wait, the core takes no new fetch datagrams: the failover burst
+/// waits in the NIC's fetch queue and is paced by the full queue's drain. One fetch burst
+/// (`RX_BURST` kind-5 batches) therefore always fits, allocated once; a redirect is dropped and
+/// counted in `redirect_dropped` only past that (an operator list longer than [`Pending::CAP`]).
+#[derive(Debug)]
+pub(crate) struct Pending(std::collections::VecDeque<Redirect>);
+
+impl Default for Pending {
+    fn default() -> Self {
+        Self(std::collections::VecDeque::with_capacity(Self::CAP))
+    }
+}
+
+impl Pending {
+    /// One fetch burst of full kind-5 batches (2,896).
+    pub(crate) const CAP: usize = vyrn_wire::RX_BURST * crate::frame::MAX_BATCH;
+
+    /// Queues `r` for the next turn (`redirect_retried`), or drops it if full.
+    pub(crate) fn push(&mut self, r: Redirect, c: &mut Counters) {
+        if self.0.len() < Self::CAP {
+            self.0.push_back(r);
+            bump(&mut c.redirect_retried);
+        } else {
+            bump(&mut c.redirect_dropped);
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Hands queued redirects to `send`, oldest first, until it refuses one (returns false),
+    /// which stays at the front. Returns how many were taken.
+    pub(crate) fn retry(&mut self, mut send: impl FnMut(Redirect) -> bool) -> usize {
+        let mut n = 0usize;
+        while let Some(&r) = self.0.front() {
+            if !send(r) {
+                break;
+            }
+            self.0.pop_front();
+            n = n.saturating_add(1);
+        }
+        n
     }
 }

@@ -327,4 +327,29 @@ fn shards_forward_one_data_seq_per_dest_and_answer_key_fetches_from_the_owner() 
         |f: fn(&vyrn_data::Counters) -> u64| cores.iter().map(|c| f(c.counters())).sum::<u64>();
     assert_eq!(sum(|c| c.redirects), 3 * sessions.len() as u64);
     assert_eq!(sum(|c| c.fetch_bad), 0);
+
+    // #183 (b): redirects past a full shard ring wait in the RX core's retry queue and are
+    // handed on as the shard drains its ring, a few each turn; none is lost and they leave in
+    // order.
+    let s = sessions[0];
+    let total = shards::HOP_RING as u32 + 100;
+    let asked: Vec<(SessionId, u32)> = (0..total).map(|i| (SessionId(s), i)).collect();
+    assert_eq!(rx.redirect(1, 3, &asked, &mut to_shard), shards::HOP_RING);
+    assert_eq!(rx.counters().redirect_retried, 100);
+    let mut got = vec![];
+    for t in 0..1000u64 {
+        turn!(50 + t);
+        got.extend(drain(&mut client_rx));
+    }
+    let from: Vec<u32> = got
+        .iter()
+        .map(|b| Redirect::open(b, &key(s)).unwrap().resend_from)
+        .collect();
+    assert_eq!(from, (0..total).collect::<Vec<_>>());
+    assert_eq!(rx.counters().redirect_dropped, 0);
+    let shard_retries: u64 = cores
+        .iter()
+        .map(|c| c.counters().redirect_retried + c.counters().redirect_dropped)
+        .sum();
+    assert_eq!(shard_retries, 0, "the shards' TX queues never refused one");
 }

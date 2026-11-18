@@ -35,7 +35,7 @@ use crate::frame::{Fetch, FetchMsg};
 use crate::ingest::{DataHome, Event};
 use crate::node::{Counters, FetchKeysErr, NodeConfig, bump};
 use crate::redirect::Redirect;
-use crate::serve::{Fanout, Gate, Responder, send_to};
+use crate::serve::{Fanout, Gate, Pending, Responder, send_or_queue, send_redirect};
 use crate::spread::{session_of, shard_of};
 
 /// Entries per hop ring.
@@ -112,25 +112,30 @@ fn hop<T: Copy, const N: usize>(p: &mut Producer<'_, T, N, 1, Hw>, v: T, c: &mut
     ok
 }
 
-/// Hands one `(session, resend_from)` of a `down → to` move to the shard that owns the session
-/// (07 §5.7 step 3): the operator line, kind 4 and each kind-5 entry. `false` when its ring is
-/// full (counted in `hop_full`).
-fn redirect_to_owner(
-    shards: &mut [ShardTx<'_>],
-    (down, to): (u8, u8),
-    (session, resend_from): (SessionId, u32),
-    c: &mut Counters,
-) -> bool {
+/// Hands one redirect of a `down → to` move to the shard that owns its session (07 §5.7 step 3):
+/// the operator line, kind 4 and each kind-5 entry. `false` when that shard's ring is full
+/// (counted in `hop_full`).
+fn redirect_to_owner(shards: &mut [ShardTx<'_>], r: Redirect, c: &mut Counters) -> bool {
     let n = shards.len();
-    let r = ToShard::Redirect {
-        down,
-        to,
-        session,
-        resend_from,
+    let to = ToShard::Redirect {
+        down: r.down,
+        to: r.to,
+        session: r.session,
+        resend_from: r.resend_from,
     };
     shards
-        .get_mut(shard_of(session, n))
-        .is_some_and(|q| hop(q, r, c))
+        .get_mut(shard_of(r.session, n))
+        .is_some_and(|q| hop(q, to, c))
+}
+
+/// Hands `r` to its owner, or queues it behind earlier refused ones (the RX core's
+/// [`Pending`]). True if handed on now.
+fn hand(pending: &mut Pending, c: &mut Counters, shards: &mut [ShardTx<'_>], r: Redirect) -> bool {
+    if pending.is_empty() && redirect_to_owner(shards, r, c) {
+        return true;
+    }
+    pending.push(r, c);
+    false
 }
 
 /// The RX core: both RX queues and the fetch gate.
@@ -140,6 +145,9 @@ pub struct RxCore<R: RxRing, F: RxRing> {
     gate: Gate,
     counters: Counters,
     fetches: usize,
+    /// Redirects a full shard ring refused ([`Pending`]): one queue for the box, so a full
+    /// shard holds back the others' too until it drains, and each session's stay in order.
+    pending: Pending,
 }
 
 impl<R: RxRing, F: RxRing> RxCore<R, F> {
@@ -174,8 +182,9 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
     /// 07 §5.7 step 3 on a sharded box: hands each `(session, resend_from)` to the shard that
     /// owns the session, the only one that holds its MAC key and its newest copy's address.
     /// That shard sends `DataRedirect{down → to, resend_from}` on its own TX queue, as
-    /// [`DataNode::redirect`](crate::DataNode::redirect) does. Returns how many were handed on;
-    /// the rest are counted in `hop_full`.
+    /// [`DataNode::redirect`](crate::DataNode::redirect) does. Returns how many were handed on
+    /// now; one a full ring refuses waits in a retry queue ([`Pending`]) for the next
+    /// [`RxCore::poll`] (`redirect_retried`, or `redirect_dropped` if that queue is full).
     pub fn redirect(
         &mut self,
         down: u8,
@@ -185,7 +194,15 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
     ) -> usize {
         sessions
             .iter()
-            .filter(|&&e| redirect_to_owner(shards, (down, to), e, &mut self.counters))
+            .filter(|&&(session, resend_from)| {
+                let r = Redirect {
+                    down,
+                    to,
+                    session,
+                    resend_from,
+                };
+                hand(&mut self.pending, &mut self.counters, shards, r)
+            })
             .count()
     }
 
@@ -198,6 +215,12 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
         sender: &mut SenderTx<'_>,
     ) -> usize {
         let n_shards = shards.len();
+        // Redirects refused last turn go first (#183 (b)).
+        let mut retried = 0;
+        if !self.pending.is_empty() {
+            let c = &mut self.counters;
+            retried = self.pending.retry(|r| redirect_to_owner(shards, r, c));
+        }
         let mut burst = [RxPkt::empty(); RX_BURST];
         let n = self.ingest.poll(&mut burst);
         for p in burst.iter().take(n) {
@@ -222,7 +245,13 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
             }
         }
         self.ingest.release(n);
-        let m = self.fetch.poll(&mut burst);
+        // #183 (b): while redirects wait for a full shard ring, new fetches wait in the NIC's
+        // fetch queue, so the failover burst is paced by the shards' drain, not dropped.
+        let m = if self.pending.is_empty() {
+            self.fetch.poll(&mut burst)
+        } else {
+            0
+        };
         self.fetches = m;
         for p in burst.iter().take(m) {
             let Ok(f) = nic_frame::parse(self.fetch.bytes(p)) else {
@@ -234,8 +263,14 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
                 Some(FetchMsg::One(q)) => q,
                 // Each entry to its owning shard, exactly as a kind-4 REDIRECT.
                 Some(FetchMsg::Batch(b)) => {
-                    for e in b.entries() {
-                        redirect_to_owner(shards, (b.down, b.to), e, &mut self.counters);
+                    for (session, resend_from) in b.entries() {
+                        let r = Redirect {
+                            down: b.down,
+                            to: b.to,
+                            session,
+                            resend_from,
+                        };
+                        hand(&mut self.pending, &mut self.counters, shards, r);
                     }
                     continue;
                 }
@@ -266,12 +301,13 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
                     down,
                     to,
                 } => {
-                    redirect_to_owner(
-                        shards,
-                        (down, to),
-                        (session, resend_from),
-                        &mut self.counters,
-                    );
+                    let r = Redirect {
+                        down,
+                        to,
+                        session,
+                        resend_from,
+                    };
+                    hand(&mut self.pending, &mut self.counters, shards, r);
                     continue;
                 }
             };
@@ -280,7 +316,7 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
             }
         }
         self.fetch.release(m);
-        n.saturating_add(m)
+        n.saturating_add(m).saturating_add(retried)
     }
 }
 
@@ -293,6 +329,8 @@ pub struct ShardCore<T: TxRing> {
     events: Vec<Event>,
     counters: Counters,
     fetches: usize,
+    /// Redirects a full TX queue refused ([`Pending`]).
+    pending: Pending,
 }
 
 impl<T: TxRing> ShardCore<T> {
@@ -324,6 +362,18 @@ impl<T: TxRing> ShardCore<T> {
         self.tx.reap();
         let mut n = 0;
         self.fetches = 0;
+        if !self.pending.is_empty() {
+            let (tx, c, wire, me) = (
+                &mut self.tx,
+                &mut self.counters,
+                &mut self.resp.wire,
+                self.cfg.me,
+            );
+            let home = &self.home;
+            self.fetches = self
+                .pending
+                .retry(|r| send_redirect(home, tx, wire, c, me, r));
+        }
         while n < RX_BURST {
             let Some(e) = rx.pop(&Hw) else { break };
             n += 1;
@@ -378,21 +428,15 @@ impl<T: TxRing> ShardCore<T> {
                     resend_from,
                 } => {
                     self.fetches += 1;
-                    let h = &self.home;
-                    let (Some(dst), Some(key)) = (h.source(session), h.key(session)) else {
-                        bump(&mut self.counters.redirect_unknown);
-                        continue;
-                    };
                     let r = Redirect {
                         down,
                         to,
                         session,
                         resend_from,
                     };
-                    let (tx, c) = (&mut self.tx, &mut self.counters);
-                    if send_to(tx, &mut self.resp.wire, c, self.cfg.me, dst, &r.seal(key)) {
-                        bump(&mut self.counters.redirects);
-                    }
+                    let (tx, c, wire) = (&mut self.tx, &mut self.counters, &mut self.resp.wire);
+                    let (p, h) = (&mut self.pending, &self.home);
+                    send_or_queue(p, h, tx, wire, c, self.cfg.me, r);
                 }
             }
         }
@@ -467,6 +511,7 @@ pub fn split<R: RxRing, F: RxRing, T: TxRing>(
         gate: Gate::new(cfg),
         counters: Counters::default(),
         fetches: 0,
+        pending: Pending::default(),
     };
     let shards = shard_tx
         .into_iter()
@@ -479,6 +524,7 @@ pub fn split<R: RxRing, F: RxRing, T: TxRing>(
             resp: Responder::default(),
             counters: Counters::default(),
             fetches: 0,
+            pending: Pending::default(),
         })
         .collect();
     let sender = SenderCore {
