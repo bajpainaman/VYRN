@@ -1010,10 +1010,31 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   it was Continuous, and an envelope over a version that was not is suspect, as in `Bbo::finish`
   and `Bbo::envelope`. Only a Continuous step other than Rescan widens (B, A) to the envelope
   first. **[Reading, 1a]** A Rescan step replays its logged cut and band. Its batch taker is the
-  first in-band New of `(prev, cut]` in key order: the client sends it `RESTED_DONE` and makes
-  (B, A) exact from `(max(B, band_hi), min(A, band_lo))`. A batch taker that would cross the
-  book, or a Rescan cut that holds a Cancel or Reduce, stops with `PBV_E_UNSUPPORTED`, because
-  the taker's key visibility and capped CONT sweeps are not in v1.
+  first in-band New of `(prev, cut]` in key order.
+- *Rescan batch takers (2).* The batch taker runs as `Bbo::rescan_finish` does. It must be
+  live just after its key, or it is skipped with no status event; an auction-only taker is not
+  live outside an uncross. A post-only taker that a visible level crosses ends with a batch
+  `Reject POST_ONLY_WOULD_CROSS`. Otherwise it sweeps from `min(A, band_lo)` for a buy, or
+  `max(B, band_hi)` for a sell, and sees makers at its key (05 §5.2): an order joined in
+  `C_{s−1}`, or in the batch before the key. The sweep is capped like a forwarded one: one level
+  or `ENG_STEP_FILLS` = 8 fills per step. A taker with open quantity left gets `RESTED_IN_FLIGHT`
+  if its sweep was capped and `RESTED_DONE` otherwise. A capped taker resumes in the next step,
+  which must be a Rescan with no source at the same cut (`PBV_E_KIND`, `PBV_E_CUT`; its band is
+  not read). Its key and `C_{s−1}` are kept, and (B, A) stay as they are until the sweep ends,
+  when they are made exact from `(max(B, band_hi), min(A, band_lo))`. Maker fills have TX
+  packets as in a forwarded sweep. The taker's own Fill, Out and Reject records are the
+  lane's (05 §8.10 rule 4): the lane holds them until the version settles, and holds the
+  taker's Ack while it is in flight (rule B), as `vyrn-lane` does. STP that would act in a batch
+  sweep is still `PBV_E_UNSUPPORTED` (item 4). **[Reading, 2]** A Cancel or Reduce in a Rescan
+  cut that orders after the taker's key stops with `PBV_E_UNSUPPORTED`. The Vx book has
+  already applied it, but at the key it is not visible. Live never logs such a cut:
+  `Bbo::clamp_after_key` cuts below the first op after the key. For the same reason, on a live
+  log key visibility and cut visibility are the same. So the client implements 05 §5.2, but a
+  replay test cannot tell the two apart (a mutant that sees the whole cut passes, as does one
+  that drops the kept `C_{s−1}` in CONT steps). Two other rules are also unobservable in tests:
+  making the bounds exact while the sweep is still capped, and a batch maker past the key
+  (searched, not found). **[Reading, 2]** An auction-only batch taker is skipped with no status
+  event, as Rust's `Sweep::Skipped`; 1a sent it `RESTED_DONE`.
 - *Uncross and Seal (1b).* A Frozen phase step records the frozen cut C\*. The Uncross step
   that opens an uncross takes p\* and Q from its 07 §3.8 payload (#177) and needs a Frozen book
   at C\*, else `PBV_E_MISMATCH`. Each chunk gives at most `ENG_UNCROSS_CHUNK` = 6 `LIQ_AUCTION`
@@ -1028,13 +1049,17 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   past C\* that holds a Cancel or Reduce while an uncross is open stops with
   `PBV_E_UNSUPPORTED`: the Vx book has already applied it, but at C\* it is not visible.
   **[Reading, 1b]** Auction-only remainders are not killed at the uncross, as in `vyrn-lane`
-  and `Bbo` today (their follow-up); the oracle's `OUT_AUCTION` for them is not replayed.
+  and `Bbo` today; the oracle's `OUT_AUCTION` for them is not replayed. **Known divergence**
+  from 05 §2229 item 6, which says every visible auction-only order with open > 0 is dead after
+  the last chunk and the lane ends it with `Out{cause: AUCTION}` at B1 (04 `AUCTION_UNFILLED`).
+  The oracle is right; `vyrn-lane` and `Bbo` are wrong. The engine fix is pending, and the Vx
+  client follows it in its own PR, with a test for an unfilled auction-only remainder. Until
+  then the client matches `RustReplay`.
 - *Gap list (the plan, in order).* What `RustReplay` replays and the Vx client does not yet
-  (1, Uncross and Seal, is done):
-  2. Rescan batch takers that trade: key visibility (05 §5.2), the capped CONT sweep and
-     `RESTED_IN_FLIGHT` (rule B), and post-only batch rejects.
+  (1, Uncross and Seal, and 2, Rescan batch takers that trade, are done):
   3. Replace (keep and new priority) and CancelAll.
-  4. STP that triggers (currently `PBV_E_UNSUPPORTED` in the sweep and the FOK dry run).
+  4. STP that triggers (currently `PBV_E_UNSUPPORTED` in a forwarded or batch sweep and the FOK
+     dry run).
   5. In-packet dependencies (05 §3.7: Join and Cancel dependencies, Reduce barriers).
   6. `engine.client` wiring in `vyrn-validator` (nothing constructs `VxReplay` today).
   7. Then a write-up of what a Vx default (`engine.client = vx`) needs; the default stays `rust`.
