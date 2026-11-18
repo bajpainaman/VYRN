@@ -6,7 +6,7 @@
 
 use crate::source::mem::MemSource;
 use crate::voter::{Timeouts, VoterConfig, config};
-use crate::{Committee, FinalityCert, Genesis, verify_finality_cert};
+use crate::{Committee, FinalityCert, FinalizeVote, Genesis, Listener, verify_finality_cert};
 use commonware_consensus::simplex::{Engine, max_payload_size, scheme::ed25519::Scheme};
 use commonware_cryptography::{blake3::Digest, ed25519};
 use commonware_p2p::simulated::{Config as NetConfig, Link, Network};
@@ -64,6 +64,9 @@ struct Run {
     committee: Committee,
     /// Per voter, every certificate it reported.
     certs: Vec<Vec<FinalityCert>>,
+    /// Certificates the sequencer's listener assembled from the voters' own finalize votes,
+    /// received through their wire form (07 §6.8).
+    listened: Vec<FinalityCert>,
 }
 
 /// Runs an n-voter committee until every live voter holds a certificate at or above `target`.
@@ -127,6 +130,9 @@ fn run(mode: Mode, target: u64, crash: Option<(usize, u64)>) -> Run {
         let quota = Quota::per_second(NonZeroU32::new(1_000_000).unwrap());
         let mut engines = Vec::new();
         let mut receivers = Vec::new();
+        let mut vote_rxs = Vec::new();
+        let mut listener = Listener::new(committee.clone(), EPOCH, genesis.height);
+        let mut listened = Vec::new();
         for (i, voter) in voters.iter().enumerate() {
             let pk = keys
                 .iter()
@@ -138,7 +144,7 @@ fn run(mode: Mode, target: u64, crash: Option<(usize, u64)>) -> Run {
             let cert = control.register(1, quota).await.unwrap();
             let resolver = control.register(2, quota).await.unwrap();
             let vctx = ctx.child("voter").with_attribute("index", i);
-            let (cfg, rx) = config(
+            let (cfg, out) = config(
                 vctx.child("app"),
                 control,
                 VoterConfig {
@@ -153,7 +159,8 @@ fn run(mode: Mode, target: u64, crash: Option<(usize, u64)>) -> Run {
             )
             .unwrap();
             engines.push(Engine::new(vctx.child("engine"), cfg).start(vote, cert, resolver));
-            receivers.push(rx);
+            receivers.push(out.certs);
+            vote_rxs.push(out.votes);
         }
 
         let mut certs: Vec<Vec<FinalityCert>> = vec![Vec::new(); n];
@@ -162,6 +169,15 @@ fn run(mode: Mode, target: u64, crash: Option<(usize, u64)>) -> Run {
             for (i, rx) in receivers.iter_mut().enumerate() {
                 while let Ok(c) = rx.try_recv() {
                     certs[i].push(c);
+                }
+            }
+            for rx in &mut vote_rxs {
+                while let Ok(v) = rx.try_recv() {
+                    let v = FinalizeVote::decode(&v.encode()).unwrap();
+                    // Late votes for a final view, or Ahead after a long gap, are fine here.
+                    if let Ok(Some(c)) = listener.on_vote(&v) {
+                        listened.push(c);
+                    }
                 }
             }
             let top = |i: usize| {
@@ -192,14 +208,20 @@ fn run(mode: Mode, target: u64, crash: Option<(usize, u64)>) -> Run {
                 == 0
             {}
         }
-        Run { committee, certs }
+        Run {
+            committee,
+            certs,
+            listened,
+        }
     })
 }
 
 /// Every certificate verifies offline, and no two voters finalize different proposals in one view.
 fn check(run: &Run) {
     let mut by_view: BTreeMap<u64, Hash> = BTreeMap::new();
-    for c in run.certs.iter().flatten() {
+    // The listener learned finality from votes alone, and agrees with the voters.
+    assert!(!run.listened.is_empty(), "the listener never reached Q");
+    for c in run.certs.iter().flatten().chain(&run.listened) {
         assert_eq!(verify_finality_cert(c, &run.committee), Ok(()));
         assert!(c.sigs.len() >= run.committee.quorum());
         let d = c.proposal.digest();

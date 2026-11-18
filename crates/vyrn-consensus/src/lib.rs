@@ -11,6 +11,8 @@
 //! | Who may vote | [`Committee`] (the voters of `REP_Membership`) | 07 §13.1, 01 §14.4 |
 //! | What a certificate proves, checked offline | [`FinalityCert`], [`verify_finality_cert`] | 07 §6.5 |
 //!
+//! The sequencer's side is [`observer`]: its finality listener and the finality gate (07 §6.8).
+//!
 //! [`voter`] wires these into `commonware-consensus` Simplex (07 §6.3) for one voter, and
 //! [`silence`] detects a silent sequencer (07 §9.1); [`tail`] signs what each voter holds and
 //! computes the prefix and seal of a deposed tenure (07 §9.2–9.5). The sequencer is never a voter: a
@@ -20,6 +22,7 @@
 
 pub mod cert;
 pub mod membership;
+pub mod observer;
 pub mod proposal;
 pub mod silence;
 pub mod source;
@@ -28,6 +31,7 @@ pub mod voter;
 
 pub use cert::{CertErr, FinalityCert, NAMESPACE, verify_finality_cert};
 pub use membership::{Committee, CommitteeErr, VoterOrder};
+pub use observer::{FinalizeVote, Gate, GateAction, Listener, VoteErr};
 pub use proposal::{Proposal, ProposalErr, ProposalKind};
 pub use source::{BlockSource, Genesis, LogSource, Verdict};
 pub use tail::{Prefix, Reporter, SealExt, Silence, Tail, TailErr, TailReport};
