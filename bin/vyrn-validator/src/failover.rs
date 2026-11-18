@@ -56,6 +56,8 @@ pub const REDIRECT_ROUNDS: u8 = 3;
 const FIRST_HOME: u8 = 0;
 /// REDIRECTs sent per [`GOSSIP_EVERY_NS`] to each live box (reading): 12 800/s with bursts of
 /// 128, under `vyrn-data`'s default fetch bucket.
+/// Limit (07 §5.7, open): the first round of `n` sessions takes `n / 12 800` s, so above about
+/// 1 200 sessions per home box it can outlast the clients' 100 ms retention (04 DR4).
 pub const REDIRECT_BATCH: usize = 128;
 
 /// Who a peer's `DataDown` may come from (module docs).

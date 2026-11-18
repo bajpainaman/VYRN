@@ -1273,7 +1273,13 @@ fetch bucket (`vyrn-data` defaults: burst 256, 20 000/s). `resend_from` is the s
 payload one replica repaired before finality may be held by no other; if it holds none, it is one
 past the highest `pkt_seq` in a final block. Shed records count toward neither. A session the replica first
 releases after the home moved gets its own rounds then, from its lowest `pkt_seq` in that block,
-with `down` its first home and `to` the current one, since it has followed no move. `REP_DATA_SILENCE_MS`
+with `down` its first home and `to` the current one, since it has followed no move.
+*Limit (open):* one REDIRECT carries one session, so the first round of `n` sessions takes
+`n / 12 800` s at this pace, and at most `n / 20 000` s at the box's whole fetch bucket. Clients
+keep sent packets for `REP_CLIENT_RETAIN_MS` = 100 ms (04 DR4), so with about 2 ms of detection a
+home box with more than about 1 200 sessions can have clients drop packets sent when it failed
+before their redirect arrives. Lifting it needs a decision this reading does not make: a
+multi-session REDIRECT, a REDIRECT budget separate from the fetch bucket, or a longer DR4 window. `REP_DATA_SILENCE_MS`
 is 1 ms. A DEV validator may raise it (`[data] silence_us`) for an unpinned host.
 
 **Backup addresses (interim reading).** Step 3 needs every live box to know the affected
