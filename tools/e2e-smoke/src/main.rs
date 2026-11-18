@@ -33,7 +33,7 @@
 //! | `finality` | with `--finality` (default 4 validators, a DEV roster as in `bin/vyrn-validator/tests/committee.rs`, `[consensus]` in every validator and the box): while the box still runs, the box's listener (`FINAL height=<h> ... from=<votes\|cert>`) and every validator that did not stop print `FINAL` through the box's last block. A validator's `OUT_OF_ORDER`, `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT` line fails `validators`; `REP_E_HASHLAG` follows R5 and R6. SKIP without it |
 //! | `dropcopy` | with `--dropcopy` (needs `--data` and `--finality`): an observer (`vyrn-validator`, `role = "observer"`, data destination `n + 1`, in the box's order list on both paths (R12) and every validator's `[consensus] observers`) replays every block into its output ring and finalizes from the validators' certificates; `vyrn-dropcopy` serves the ring over Noise, and one client per session logs in to its account's stream. Each stream's served records, without stage markers, equal an in-process `DropCopy` over the tap's `RustReplay` byte for byte, with gapless seqs, and end in a `DC_FINAL`; every record with a `resp_seq` (acks, cancels, outs, taker fills) names a response packet the client received (10 §8.3). It prints a DEV timing of those records after their response packets (R9); SKIP without it |
 //! | `failover` | with `--data-kill` (R13): the home data box is killed mid-run, the validators reach Q `DataDown`s and REDIRECT, the backup admits a sealed one and redirects every session, and every session moves copy 2; SKIP without it |
-//! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed reports no gap or rejected frame, and that join is the one `replay` reads; SKIP without `--data` |
+//! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed has no rejected frame and no gap left unrepaired (R14), and that join is the one `replay` reads; SKIP without `--data` |
 //!
 //! **Readings** (the spec does not settle these; PR body):
 //! - R1. The box publishes no output hash. The reference for "replay matches the sequencer" is
@@ -45,7 +45,7 @@
 //! - R2. The tap's engine is built the way `vyrn-seq` builds its DEV engine (`EnginePlan`,
 //!   `engine_loop`), copied here. A drift between the two shows as a replay failure.
 //! - R3. With `--data`, the tap's `DataJoin` is filled only from `vyrn-data`'s frames through
-//!   `vyrn_replica::DataFeed` (the tap is destination 0). Without it, the join gets copy 2 from
+//!   `vyrn_replica::DataFeed` (the tap is destination 0), and gaps by RANGE fetch (R14). Without it, the join gets copy 2 from
 //!   the client in process. With `--data` the validators are destinations 1..=n: each reads its
 //!   data RX queue, checks `data_root` (vote-rule item 3), fetches gaps from the node, and
 //!   replays (`[replay]`, the box's engine and sessions), so `replica-out` runs. Without it they
@@ -104,6 +104,17 @@
 //!   every validator's KEY fetches for the lost packets, goes silent long enough to be marked
 //!   down too; at 100 ms redirects arrive after about 114 ms and the check fails. Four sessions sit far below 07 §5.7's ~1 200-session bound, which
 //!   `bin/vyrn-validator` `failover.rs` pins in a unit test instead.
+//! - R14. The tap repairs its own data gaps, as a replica does (07 §5.5 source 1): a gap its
+//!   `DataFeed` reports in box `src`'s `data_seq` is asked for by `Fetch::Range{dst: 0}` at
+//!   that box's fetch address, the box resends those `DATA` frames to the tap, and a seq still
+//!   missing after `TAP_REASK` (20 ms) is asked for again until the run stops. `data` fails only
+//!   on a gap never repaired. Without this a single frame lost to the tap (a UDP receive
+//!   overflow while its thread is descheduled on a loaded host) failed `data` and `replay`
+//!   (`Missing`) though the box held it. *Reading* (harness): only unkeyed boxes are asked; a
+//!   keyed box would count the tap's plain fetch in `fetch_unauth` (R7, R11), and the DEV
+//!   roster gives the tap no `K_fetch`, so under `--keyed` a tap gap still fails. `--tap-loss N`
+//!   relays the tap's data socket and drops every N-th datagram; `data` then also needs the
+//!   relay to have dropped and the tap to have repaired at least one frame.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -270,6 +281,11 @@ struct Cli {
     /// the validators, which still have path A, finish.
     #[arg(long, value_name = "N")]
     drop_path_b: Option<u64>,
+    /// Relay the tap's data socket and drop every N-th datagram the data box sends it (R14;
+    /// needs --data, not --keyed): the tap must repair its gaps by RANGE fetch, as a replica
+    /// does.
+    #[arg(long, value_name = "N")]
+    tap_loss: Option<u64>,
     /// Add a backup data box and kill the home box mid-run: the validators reach Q DataDowns
     /// and REDIRECT, and the client moves copy 2 (R13; needs --keyed).
     #[arg(long)]
@@ -621,6 +637,105 @@ struct DataBoxNode {
     idx: usize,
     ingest: SocketAddrV4,
     fetch: SocketAddrV4,
+}
+
+/// The tap's data path (R3, R14): its join, filled through `DataFeed` from the data boxes'
+/// frames, and what that took.
+struct DataTap {
+    join: DataJoin,
+    frames: usize,
+    stored: u64,
+    /// Frames the tap asked for again by RANGE fetch and got.
+    repaired: u64,
+    /// Rejected frames, dropped packets and the gaps never repaired.
+    errs: Vec<String>,
+}
+
+/// R14: how long a gap's RANGE fetch may go unanswered before the tap asks again.
+const TAP_REASK: Duration = Duration::from_millis(20);
+
+/// The tap's data socket until `stop`: every frame goes through a `DataFeed` (destination 0 of
+/// `n_boxes` boxes), and when `fetch` names the boxes' fetch addresses (unkeyed boxes, R14) a
+/// gap in box `src`'s `data_seq` is fetched from `fetch[src]` by RANGE, re-asked every
+/// `TAP_REASK` until its frames arrive, as a replica does (07 §5.5 source 1).
+fn data_tap(
+    sock: UdpSocket,
+    n_boxes: u8,
+    fetch: Vec<SocketAddrV4>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<DataTap> {
+    std::thread::spawn(move || {
+        let mut t = DataTap {
+            join: DataJoin::default(),
+            frames: 0,
+            stored: 0,
+            repaired: 0,
+            errs: Vec::new(),
+        };
+        let mut feed = DataFeed::new(BookId(BOOK), n_boxes, 0);
+        // (src, data_seq) still missing → when it was last asked for.
+        let mut pending: BTreeMap<(u8, u64), Instant> = BTreeMap::new();
+        let ask = |src: u8, from: u64, to: u64| {
+            if let Some(a) = fetch.get(usize::from(src)) {
+                let f = vyrn_data::frame::Fetch::Range { dst: 0, from, to };
+                let _ = sock.send_to(&f.encode(), a);
+            }
+        };
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(5)));
+        let mut buf = [0u8; 65536];
+        while !stop.load(Ordering::Acquire) {
+            if let Ok(k) = sock.recv(&mut buf) {
+                let b = buf.get(..k).unwrap_or_default();
+                t.frames += 1;
+                if let Ok(f) = vyrn_data::frame::decode(b)
+                    && f.hdr.kind == vyrn_data::frame::Kind::Data
+                    && pending.remove(&(f.hdr.src, f.hdr.data_seq)).is_some()
+                {
+                    t.repaired += 1;
+                }
+                match feed.on_frame(&mut t.join, b, 0) {
+                    Ok(fed) => {
+                        t.stored += u64::from(fed.stored);
+                        if fed.dropped > 0 {
+                            t.errs.push(format!("{} packets dropped", fed.dropped));
+                        }
+                        if let Some(g) = fed.gap {
+                            let now = Instant::now();
+                            pending.extend((g.from..=g.to).map(|q| ((g.src, q), now)));
+                            for q in g.fetches(256) {
+                                if let vyrn_data::frame::Fetch::Range { from, to, .. } = q {
+                                    ask(g.src, from, to);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => t.errs.push(e.to_string()),
+                }
+            }
+            let now = Instant::now();
+            for (&(src, q), at) in pending.iter_mut() {
+                if now.duration_since(*at) >= TAP_REASK {
+                    ask(src, q, q);
+                    *at = now;
+                }
+            }
+        }
+        // The runs never repaired, per box.
+        let mut run: Option<(u8, u64, u64)> = None;
+        for &(src, q) in pending.keys().chain([&(u8::MAX, u64::MAX)]) {
+            run = match run {
+                Some((s, a, b)) if s == src && b.checked_add(1) == Some(q) => Some((s, a, q)),
+                r => {
+                    if let Some((s, a, b)) = r {
+                        t.errs
+                            .push(format!("gap {a}..={b} of box {s} not repaired"));
+                    }
+                    Some((src, q, q))
+                }
+            };
+        }
+        t
+    })
 }
 
 /// The order frames the tap received, until `stop`.
@@ -1151,6 +1266,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
     if cli.drop_path_b.is_some_and(|n| n == 0) || (cli.drop_path_b.is_some() && !cli.dropcopy) {
         return Err("--drop-path-b needs --dropcopy and N >= 1".into());
     }
+    if cli.tap_loss.is_some_and(|n| n < 2) || (cli.tap_loss.is_some() && (!cli.data || cli.keyed)) {
+        return Err("--tap-loss needs --data, no --keyed, and N >= 2 (R14)".into());
+    }
     if cli.data_shards == 0 || (cli.data_shards > 1 && !cli.data) {
         return Err("--data-shards needs --data and N >= 1".into());
     }
@@ -1221,10 +1339,23 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // tap's data socket and every validator's data port (07 §5.1, §5.2). It starts first, so
     // the validators' configs can name its fetch address; their data ports are picked here.
     let mut relay_h = None;
+    let mut tap_relay_h = None;
     let data_node = if cli.data {
         let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
         sock.set_read_timeout(timeout).map_err(|e| e.to_string())?;
         let mut dests = vec![sock.local_addr().map_err(|e| e.to_string())?.to_string()];
+        // R14: the tap's frames go through a lossy relay.
+        if let (Some(every), Some(d)) = (cli.tap_loss, dests.first_mut()) {
+            let port = sock.local_addr().map_err(|e| e.to_string())?.port();
+            let (addr, h) = relay(
+                port,
+                |n, every| n.is_multiple_of(every),
+                every,
+                Arc::clone(&stop_tap),
+            )?;
+            *d = addr.to_string();
+            tap_relay_h = Some(h);
+        }
         dests.extend(val_data.iter().map(|p| format!("127.0.0.1:{p}")));
         // --keyed (R7): validator 0's frames go through the lossy relay.
         if cli.keyed
@@ -1272,7 +1403,15 @@ fn run(cli: &Cli) -> Result<bool, String> {
         }
         // Read from now on: the node heartbeats every destination while the validators start,
         // and an unread socket would overflow and drop the first DATA frames.
-        Some((boxes, tap(sock, Arc::clone(&stop_tap))))
+        // R14: unkeyed boxes take the tap's plain RANGE fetches; a keyed box would count them
+        // in fetch_unauth (R7, R11), so under --keyed a tap gap is not repaired.
+        let fetch = if cli.keyed {
+            Vec::new()
+        } else {
+            boxes.iter().map(|b| b.fetch).collect()
+        };
+        let n = u8::try_from(boxes.len()).map_err(|e| e.to_string())?;
+        Some((boxes, data_tap(sock, n, fetch, Arc::clone(&stop_tap))))
     } else {
         None
     };
@@ -1726,8 +1865,12 @@ fn run(cli: &Cli) -> Result<bool, String> {
     stop_tap.store(true, Ordering::Release);
     stop_cl.store(true, Ordering::Release);
     let frames = tap_h.join().map_err(|_| "tap thread")?;
-    let data_frames = match data_h {
+    let mut data_frames = match data_h {
         Some(h) => Some(h.join().map_err(|_| "data tap thread")?),
+        None => None,
+    };
+    let tap_dropped = match tap_relay_h {
+        Some(h) => Some(h.join().map_err(|_| "tap relay thread")?),
         None => None,
     };
     let relay_dropped = match relay_h {
@@ -1735,34 +1878,20 @@ fn run(cli: &Cli) -> Result<bool, String> {
         None => None,
     };
     // The tap's join: DATA frames through DataFeed with --data, else copy 2 in process (R3).
-    let mut join = DataJoin::default();
-    let mut feed_errs = Vec::new();
-    let mut fed_stored = 0u64;
-    match &data_frames {
-        Some(fs) => {
-            let n_boxes = u8::try_from(data_boxes.len()).map_err(|e| e.to_string())?;
-            let mut feed = DataFeed::new(BookId(BOOK), n_boxes, 0);
-            for f in fs {
-                match feed.on_frame(&mut join, f, 0) {
-                    Ok(fed) => {
-                        fed_stored += u64::from(fed.stored);
-                        if fed.dropped > 0 {
-                            feed_errs.push(format!("{} packets dropped", fed.dropped));
-                        }
-                        if let Some(g) = fed.gap {
-                            feed_errs.push(format!("gap {}..={}", g.from, g.to));
-                        }
-                    }
-                    Err(e) => feed_errs.push(e.to_string()),
-                }
-            }
-        }
+    let (mut join, feed_errs, fed_stored) = match data_frames.as_mut() {
+        Some(t) => (
+            std::mem::take(&mut t.join),
+            std::mem::take(&mut t.errs),
+            t.stored,
+        ),
         None => {
+            let mut join = DataJoin::default();
             for p in &pkts {
                 join.put(p.session, p.pkt_seq, p.bytes.clone());
             }
+            (join, Vec::new(), 0)
         }
-    }
+    };
     let got = cl_h.join().map_err(|_| "client thread")?;
 
     let mut rep = Report(true);
@@ -2213,11 +2342,19 @@ fn run(cli: &Cli) -> Result<bool, String> {
             if !feed_errs.is_empty() {
                 errs.push(format!("feed: {}", feed_errs.join(", ")));
             }
+            let repaired = data_frames.as_ref().map_or(0, |t| t.repaired);
+            if let Some(dropped) = tap_dropped
+                && (dropped == 0 || repaired == 0)
+            {
+                errs.push(format!(
+                    "--tap-loss: the relay dropped {dropped} frames and the tap repaired {repaired}; both must be > 0 (R14)"
+                ));
+            }
             if errs.is_empty() {
                 Ok(format!(
-                    "vyrn-data stored {} packets, {} data frames (DATA and DATA_HB) fed {fed_stored} packets into the replay join; {st}",
+                    "vyrn-data stored {} packets, {} data frames (DATA and DATA_HB) fed {fed_stored} packets into the replay join, {repaired} frames repaired by RANGE fetch; {st}",
                     pkts.len(),
-                    data_frames.as_ref().map_or(0, Vec::len)
+                    data_frames.as_ref().map_or(0, |t| t.frames)
                 ))
             } else {
                 Err(errs.join("; "))
