@@ -12,7 +12,7 @@
 //! | [`OldSeq`] | §4.2 | Active → Deciding → Armed → Sealing → Sealed(S) → Follower; a hold returns to Active |
 //! | [`OldReplica`] | §4.3 | Voting → WaitFinal → Replayed → Signed → Fenced(S) → Follower; or Voting → ForceSeal → Fenced(S) |
 //! | [`NewReplica`] | §4.4 | Follower → Preparing → Collecting → Voting → Activated; Collecting → Faulty → Follower |
-//! | [`NewSeq`] | §4.5 | Follower → Preparing → Collect → Apply(S′) → Live; a mismatch re-specs to Apply(S) |
+//! | [`NewSeq`] | §4.5 | Follower → Preparing → Collect → Apply(S′) → Uncross → Live (on Q `EpoArmed`); S′ ≠ S re-specs; a force-sealed epoch goes Collect → Uncross on the root at S |
 //!
 //! Signed messages: [`EpoForceSeal`] (each voter of `R_e`, vote key) and [`EpoReassign`]
 //! (operator keys). Their bodies and contexts are spec gaps, listed on each type.
@@ -280,22 +280,41 @@ impl NewReplica {
     }
 }
 
-/// The new sequencer (§4.5); the standby runs the same machine without client traffic.
+/// The phase of the new sequencer (§4.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NewSeq {
+pub enum NewSeqPhase {
     Follower,
     Preparing,
     /// From T by its own PTP clock: queue-ack, stream `PacketRecord`s, propose window blocks.
-    /// `cert` holds S and the root comparison if cert(e, S) arrived before the replay reached S′.
+    /// `cert` is S once cert(e, S) is verified, before the replay reached it.
     Collect {
-        cert: Option<(StepId, bool)>,
+        cert: Option<StepId>,
     },
-    /// The speculative replay reached the `Seal` step S′; lanes apply window ops against it.
-    Apply(StepId),
-    /// Activation: window closed, `Uncross` step U ran, lanes catching up then live.
+    /// The speculative replay executed the `Seal` step S′; lanes apply window ops against it.
+    /// `cert` is S once cert(e, S) is verified and S == S′.
+    Apply {
+        s_prime: StepId,
+        cert: Option<StepId>,
+    },
+    /// S′ ≠ S, or the first root comparison at S failed (§10.1, §10.5): undo to the last final
+    /// block, replay the certified log to S, re-apply.
+    Respec(StepId),
+    /// The roots at S are equal: the window closes and U runs, but the first auction fill waits
+    /// for `EpoArmed` from Q members of `R_{e+1}`.
+    Uncross,
+    /// The first auction fill may leave: lanes catch up, then go live.
     Live,
     /// The root at S still differs after a re-spec: stop; the standby activates (§10.4).
     Faulty,
+}
+
+/// The new sequencer (§4.5); the standby runs the same machine without client traffic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewSeq {
+    pub phase: NewSeqPhase,
+    /// `EpoArmed` from Q members of `R_{e+1}` is held. It may arrive before this box has
+    /// verified the certificate itself.
+    pub armed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,55 +323,85 @@ pub enum NewSeqEv {
     T,
     /// The speculative replay executed the `Seal` step S′.
     ReplaySeal(StepId),
-    /// cert(e, S) verified; `root_equal` is this box's `state_root` and `log_hash` at S against
-    /// the record's.
-    Cert {
+    /// cert(e, S) verified (§5.4 checks 1–4).
+    Cert(StepId),
+    /// This box has executed S (by the speculative replay, the re-spec, or, after a force seal
+    /// with no `Seal` step, by replaying the certified log to S) and compared its `state_root`
+    /// and `log_hash` with the record's.
+    RootAt {
         s: StepId,
-        root_equal: bool,
+        equal: bool,
     },
+    /// `EpoArmed` from Q members of `R_{e+1}`.
+    ArmedQuorum,
 }
 
 impl NewSeq {
-    /// `Apply(S)` after a mismatch is the re-spec of §4.5: undo to the last final block, replay
-    /// the certified log to S, re-apply. A second mismatch is [`NewSeq::Faulty`].
+    pub const FOLLOWER: Self = Self {
+        phase: NewSeqPhase::Follower,
+        armed: false,
+    };
+
     pub fn on(self, ev: NewSeqEv) -> Result<Self, RoleErr> {
         use NewSeqEv as E;
-        Ok(match (self, ev) {
-            (Self::Follower, E::PrepLead) => Self::Preparing,
-            (Self::Preparing, E::T) => Self::Collect { cert: None },
-            (Self::Collect { cert: None }, E::Cert { s, root_equal }) => Self::Collect {
-                cert: Some((s, root_equal)),
-            },
-            (Self::Collect { cert: None }, E::ReplaySeal(sp)) => Self::Apply(sp),
-            (
-                Self::Collect {
-                    cert: Some((s, eq)),
+        use NewSeqPhase as P;
+        let to = |phase| {
+            Ok(Self {
+                phase,
+                armed: self.armed,
+            })
+        };
+        // §4.5: a first root mismatch re-specs from the certified log; only a mismatch after
+        // the re-spec makes the box faulty.
+        let root = |equal: bool, s: StepId, respec: bool| match (equal, respec, self.armed) {
+            (false, false, _) => P::Respec(s),
+            (false, true, _) => P::Faulty,
+            (true, _, false) => P::Uncross,
+            (true, _, true) => P::Live,
+        };
+        match (self.phase, ev) {
+            (P::Follower, E::PrepLead) => to(P::Preparing),
+            (P::Preparing, E::T) => to(P::Collect { cert: None }),
+            (P::Collect { cert: None }, E::Cert(s)) => to(P::Collect { cert: Some(s) }),
+            (P::Collect { cert: None }, E::ReplaySeal(sp)) => to(P::Apply {
+                s_prime: sp,
+                cert: None,
+            }),
+            (P::Collect { cert: Some(s) }, E::ReplaySeal(sp))
+            | (
+                P::Apply {
+                    s_prime: sp,
+                    cert: None,
                 },
-                E::ReplaySeal(sp),
-            ) => activate(s, eq, sp),
-            (Self::Apply(sp), E::Cert { s, root_equal }) => activate(s, root_equal, sp),
-            (s, e) => return Err(illegal(&s, &e)),
-        })
-    }
-}
-
-fn activate(s: StepId, root_equal: bool, s_prime: StepId) -> NewSeq {
-    match (s == s_prime, root_equal) {
-        (true, true) => NewSeq::Live,
-        // S′ ≠ S: the tail was wrong or incomplete; re-spec from the certified log.
-        (false, _) => NewSeq::Apply(s),
-        // S == S′ and the root differs: this box's replay is wrong.
-        (true, false) => NewSeq::Faulty,
-    }
-}
-
-/// The re-spec case of [`NewSeq`]: after `Apply(S)` the caller re-applies and reports the root
-/// again; equal roots go live, else the box is faulty.
-pub fn respec_result(root_equal: bool) -> NewSeq {
-    if root_equal {
-        NewSeq::Live
-    } else {
-        NewSeq::Faulty
+                E::Cert(s),
+            ) => to(if s == sp {
+                P::Apply {
+                    s_prime: sp,
+                    cert: Some(s),
+                }
+            } else {
+                P::Respec(s)
+            }),
+            // A force-sealed epoch has no `Seal` step: the box replays the certified log to S.
+            (P::Collect { cert: Some(s) }, E::RootAt { s: at, equal })
+            | (P::Apply { cert: Some(s), .. }, E::RootAt { s: at, equal })
+                if at == s =>
+            {
+                to(root(equal, s, false))
+            }
+            (P::Respec(s), E::RootAt { s: at, equal }) if at == s => to(root(equal, s, true)),
+            (P::Collect { .. } | P::Apply { .. } | P::Respec(_) | P::Uncross, E::ArmedQuorum) => {
+                Ok(Self {
+                    phase: if self.phase == P::Uncross {
+                        P::Live
+                    } else {
+                        self.phase
+                    },
+                    armed: true,
+                })
+            }
+            (_, e) => Err(illegal(&self, &e)),
+        }
     }
 }
 
@@ -679,43 +728,76 @@ mod tests {
     #[test]
     fn new_sequencer_activates_respecs_or_fails() {
         use NewSeqEv as E;
-        let collect = NewSeq::Follower.on(E::PrepLead).and_then(|s| s.on(E::T));
-        assert_eq!(collect, Ok(NewSeq::Collect { cert: None }));
-        let c = NewSeq::Collect { cert: None };
-        // Replay first, then cert; and cert first, then replay: both activate.
+        use NewSeqPhase as P;
+        let run = |evs: &[NewSeqEv]| {
+            evs.iter()
+                .try_fold(NewSeq::FOLLOWER, |s, e| s.on(*e))
+                .map(|s| s.phase)
+        };
+        let start = [E::PrepLead, E::T];
+        let s9 = StepId(9);
+        let ok = E::RootAt { s: s9, equal: true };
+        // Replay first or cert first: both reach Uncross, and only Q EpoArmed opens Live.
         assert_eq!(
-            c.on(E::ReplaySeal(StepId(9))).and_then(|s| s.on(E::Cert {
-                s: StepId(9),
-                root_equal: true
-            })),
-            Ok(NewSeq::Live)
+            run(&[&start[..], &[E::ReplaySeal(s9), E::Cert(s9), ok]].concat()),
+            Ok(P::Uncross)
         );
         assert_eq!(
-            c.on(E::Cert {
-                s: StepId(9),
-                root_equal: true
-            })
-            .and_then(|s| s.on(E::ReplaySeal(StepId(9)))),
-            Ok(NewSeq::Live)
+            run(&[
+                &start[..],
+                &[E::Cert(s9), E::ReplaySeal(s9), ok, E::ArmedQuorum]
+            ]
+            .concat()),
+            Ok(P::Live)
         );
-        // S′ beyond S (§10.1): re-spec to the certified S.
+        // EpoArmed may arrive before this box verified the cert.
         assert_eq!(
-            NewSeq::Apply(StepId(11)).on(E::Cert {
-                s: StepId(9),
-                root_equal: false
-            }),
-            Ok(NewSeq::Apply(StepId(9)))
+            run(&[
+                &start[..],
+                &[E::ArmedQuorum, E::ReplaySeal(s9), E::Cert(s9), ok]
+            ]
+            .concat()),
+            Ok(P::Live)
         );
-        assert_eq!(respec_result(true), NewSeq::Live);
-        // Same S, different root: this box is wrong.
+        // Force seal: no Seal step; the box replays the certified log to S.
         assert_eq!(
-            NewSeq::Apply(StepId(9)).on(E::Cert {
-                s: StepId(9),
-                root_equal: false
-            }),
-            Ok(NewSeq::Faulty)
+            run(&[&start[..], &[E::Cert(s9), ok, E::ArmedQuorum]].concat()),
+            Ok(P::Live)
         );
-        assert!(NewSeq::Preparing.on(E::ReplaySeal(StepId(9))).is_err());
+        // S′ beyond S (§10.1): re-spec to S, then the root decides.
+        let respec = [&start[..], &[E::ReplaySeal(StepId(11)), E::Cert(s9)]].concat();
+        assert_eq!(run(&respec), Ok(P::Respec(s9)));
+        assert_eq!(run(&[&respec[..], &[ok]].concat()), Ok(P::Uncross));
+        let bad = E::RootAt {
+            s: s9,
+            equal: false,
+        };
+        assert_eq!(run(&[&respec[..], &[bad]].concat()), Ok(P::Faulty));
+        // Same S, different root: re-spec first; faulty only if the root still differs.
+        let same = [&start[..], &[E::ReplaySeal(s9), E::Cert(s9), bad]].concat();
+        assert_eq!(run(&same), Ok(P::Respec(s9)));
+        assert_eq!(run(&[&same[..], &[bad]].concat()), Ok(P::Faulty));
+        assert_eq!(
+            run(&[&same[..], &[ok, E::ArmedQuorum]].concat()),
+            Ok(P::Live)
+        );
+        // A root at another step, or before the cert, is refused.
+        assert!(run(&[&start[..], &[E::ReplaySeal(s9), ok]].concat()).is_err());
+        assert!(
+            run(&[
+                &start[..],
+                &[
+                    E::Cert(s9),
+                    E::RootAt {
+                        s: StepId(8),
+                        equal: true
+                    }
+                ]
+            ]
+            .concat())
+            .is_err()
+        );
+        assert!(run(&[E::PrepLead, E::ReplaySeal(s9)]).is_err());
     }
 
     #[test]

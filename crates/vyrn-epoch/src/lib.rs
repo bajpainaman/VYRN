@@ -77,10 +77,10 @@ pub use ready::{EpoGo, EpoHold, EpoReady, GoErr, READY_CONTEXT, ReadyPool, SEQ_M
 pub use roles::{
     EPO_ACTIVATE_ALARM_MS, EPO_HALT_COLLECT_MS, EPO_REASSIGN_MIN_S, EPO_SEAL_GRACE_MS,
     EPO_SEAL_GUARD_MS, EPO_SEAL_SLACK_US, EpoForceSeal, EpoReassign, FORCE_SEAL_CONTEXT,
-    FailoverKind, ForceSealPool, HighWater, NewReplica, NewReplicaEv, NewSeq, NewSeqEv, OldReplica,
-    OldReplicaEv, OldSeq, OldSeqEv, REASSIGN_CONTEXT, RoleErr, SealErr, WinHead,
-    activate_alarm_due, failover_kind, force_seal_due, halt_due, idle_lane_seals, lane_seals,
-    may_sign_reassign, reassign_open, respec_result, win_head,
+    FailoverKind, ForceSealPool, HighWater, NewReplica, NewReplicaEv, NewSeq, NewSeqEv,
+    NewSeqPhase, OldReplica, OldReplicaEv, OldSeq, OldSeqEv, REASSIGN_CONTEXT, RoleErr, SealErr,
+    WinHead, activate_alarm_due, failover_kind, force_seal_due, halt_due, idle_lane_seals,
+    lane_seals, may_sign_reassign, reassign_open, win_head,
 };
 pub use schedule::{
     Boundary, EpoConfig, ScheduleErr, ScheduleRecord, Timetable, default_home, slot_start,
