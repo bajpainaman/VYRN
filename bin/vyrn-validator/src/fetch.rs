@@ -638,6 +638,7 @@ mod tests {
             pkt_hash: PktHash(u64::from_le_bytes(h.0[..8].try_into().unwrap())),
             first_lane_seq: LaneSeq(1),
             fills_applied: StepId(0),
+            snap_lag: 0,
         };
         let recs = [LaneRec::Pkt(rec)];
         let mut j = DataJoin::default();
