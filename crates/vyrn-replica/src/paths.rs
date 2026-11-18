@@ -33,8 +33,11 @@ impl Path {
 
 /// Frames held ahead of `next`, per substream; past it a copy is dropped (DEV: no repair).
 const HOLD_MAX: usize = 1 << 14;
-/// Frames tracked above `both`, per substream; past it `both` stops (a path is down).
-const SEEN_MAX: usize = 1 << 20;
+/// Frames tracked above `both`, per substream, each with its first copy's bytes; past it
+/// `both` stops (a path is down).
+const SEEN_MAX: usize = 1 << 16;
+/// `flags`, the only header byte the two copies may differ in (07 §3.2, INV-REP-3).
+const FLAGS_AT: usize = 16;
 
 /// `(epoch16, tenure, sender, stream)`.
 pub type Key = (u16, u8, u8, u8);
@@ -44,8 +47,10 @@ struct Sub {
     next: u64,
     hold: BTreeMap<u64, Vec<u8>>,
     both: u64,
-    /// Paths each frame above `both` arrived on (bit A = 1, B = 2).
-    seen: BTreeMap<u64, u8>,
+    /// Paths each frame above `both` arrived on (bit A = 1, B = 2), and the bytes of its first
+    /// copy, which is the one handed on: another copy counts for its path only if it is the
+    /// same frame.
+    seen: BTreeMap<u64, (u8, Vec<u8>)>,
 }
 
 impl Default for Sub {
@@ -59,6 +64,12 @@ impl Default for Sub {
     }
 }
 
+/// A frame's substream and `frame_seq`, if its header parses.
+pub fn frame_key(frame: &[u8]) -> Option<(Key, u64)> {
+    let (h, _) = FrameHeader::parse(frame).ok()?;
+    Some(((h.epoch16, h.tenure, h.sender, h.stream), h.frame_seq))
+}
+
 /// What a block needs on both paths: each substream's last frame handed on when it was ready.
 pub type Mark = Vec<(Key, u64)>;
 
@@ -67,6 +78,18 @@ pub struct Paths {
     subs: BTreeMap<Key, Sub>,
     /// Copies of frames already handed on, per path.
     pub dups: [u64; 2],
+    /// Copies whose bytes (`flags` aside) differ from the first copy of their frame, per path.
+    /// They count for no path, so a block that needs them stays held.
+    pub mismatched: [u64; 2],
+}
+
+/// Whether two copies are the same frame: equal bytes except `flags`.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .enumerate()
+            .all(|(i, (x, y))| i == FLAGS_AT || x == y)
 }
 
 impl Paths {
@@ -81,9 +104,25 @@ impl Paths {
             .entry((h.epoch16, h.tenure, h.sender, h.stream))
             .or_default();
         let q = h.frame_seq;
-        if q > s.both && s.seen.len() < SEEN_MAX {
-            *s.seen.entry(q).or_default() |= path.bit();
-            while s.seen.first_key_value() == Some((&s.both.saturating_add(1), &3)) {
+        if q > s.both {
+            let fresh = s.seen.len() < SEEN_MAX;
+            match s.seen.get_mut(&q) {
+                Some((bits, first)) if same(first, frame) => *bits |= path.bit(),
+                Some(_) => {
+                    if let Some(m) = self.mismatched.get_mut(usize::from(path == Path::B)) {
+                        *m = m.saturating_add(1);
+                    }
+                }
+                None if fresh => {
+                    s.seen.insert(q, (path.bit(), frame.to_vec()));
+                }
+                None => {}
+            }
+            while s
+                .seen
+                .first_key_value()
+                .is_some_and(|(k, v)| *k == s.both.saturating_add(1) && v.0 == 3)
+            {
                 s.seen.pop_first();
                 s.both = s.both.saturating_add(1);
             }
@@ -205,6 +244,22 @@ mod tests {
         assert!(!p.durable(&m), "stream 1 frame 2 only on path A");
         p.rx(Path::B, &frame(1, 2), &mut d);
         assert!(p.durable(&m));
+        // A copy with other bytes is not the frame: it counts for no path.
+        let m2 = {
+            let mut forged = frame(0, 4);
+            *forged.last_mut().unwrap() ^= 0xff;
+            p.rx(Path::A, &frame(0, 4), &mut d);
+            p.rx(Path::B, &with_flags(&forged, FrameFlags::PATH_B), &mut d);
+            p.mark()
+        };
+        assert!(!p.durable(&m2), "path B's frame 4 has other bytes");
+        assert_eq!(p.mismatched, [0, 1]);
+        p.rx(
+            Path::B,
+            &with_flags(&frame(0, 4), FrameFlags::PATH_B),
+            &mut d,
+        );
+        assert!(p.durable(&m2));
         // A substream the mark does not name is not waited for; one it names but never saw is.
         p.rx(Path::A, &frame(2, 1), &mut d);
         assert!(p.durable(&m));

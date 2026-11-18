@@ -952,7 +952,17 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
     fn check(&mut self, source: &consensus::Source, now: u64, durable: Option<&Paths>) {
         while let Some((b, m)) = self.pending.front() {
             let h = b.header.height;
-            if durable.is_some_and(|p| m.as_ref().is_none_or(|m| !p.durable(m))) {
+            let held = !self.replay_dead
+                && durable.is_some_and(|p| m.as_ref().is_none_or(|m| !p.durable(m)));
+            if held && self.pending.len() >= OBS_MAX_UNFINAL {
+                // Held this long, the path will not come back without repair: stop replaying,
+                // so the blocks below release their payloads instead of piling up.
+                println!(
+                    "DURABLE_FAULT height={} {OBS_MAX_UNFINAL} blocks wait for both paths",
+                    h.0
+                );
+                self.replay_dead = true;
+            } else if held {
                 // A path lost one of its frames (no repair yet, 07 §4.10): printed once, after
                 // REP_PATH_DOWN_MS, so a held block is visible.
                 match self.durable_wait {
@@ -1128,8 +1138,13 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     let mut faulted = false;
     let mut stalled = false;
     let mut paths = rxs[1].is_some().then(Paths::default);
+    // The newest frame handed to the order core per substream: a block's mark is its value
+    // when the block becomes ready (`report` queues it), not at the end of the poll.
+    let mut frontier: std::collections::BTreeMap<vyrn_replica::paths::Key, u64> =
+        std::collections::BTreeMap::new();
     while !stop.load(Ordering::Acquire) {
         let mut k = 0;
+        let mut delivered = 0usize;
         for (rx, path) in rxs.iter_mut().zip([RepPath::A, RepPath::B]) {
             let Some(rx) = rx else { continue };
             let n = rx.poll(&mut burst);
@@ -1140,6 +1155,10 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                 };
                 stats.frames.fetch_add(1, Ordering::Relaxed);
                 let mut on = |payload: &[u8]| {
+                    delivered += 1;
+                    if let Some((key, q)) = vyrn_replica::paths::frame_key(payload) {
+                        frontier.insert(key, q);
+                    }
                     let r = core.on_frame(payload, now());
                     report(
                         &mut core,
@@ -1150,6 +1169,11 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                         source,
                         data.as_mut(),
                     );
+                    if let Some(d) = data.as_mut() {
+                        for x in d.pending.iter_mut().filter(|x| x.1.is_none()) {
+                            x.1 = Some(frontier.iter().map(|(k, q)| (*k, *q)).collect());
+                        }
+                    }
                 };
                 match paths.as_mut() {
                     Some(ps) => ps.rx(path, f.payload, &mut on),
@@ -1157,15 +1181,6 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                 }
             }
             rx.release(n);
-        }
-        // Blocks that became ready above need what was handed on so far (or less) on both paths.
-        if let Some(d) = data.as_mut()
-            && d.pending.iter().any(|x| x.1.is_none())
-        {
-            let m = paths.as_ref().map(Paths::mark).unwrap_or_default();
-            for x in d.pending.iter_mut().filter(|x| x.1.is_none()) {
-                x.1 = Some(m.clone());
-            }
         }
         // The final height first: payloads polled below are stamped with it on arrival, and a
         // stale one would expire them early (07 §5.4 retention).
@@ -1181,9 +1196,10 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             d.check(source, now(), paths.as_ref().filter(|_| gate));
             d.finals();
         }
-        // No ORDER frame this turn: the deadlines `on_frame` would have checked (REP_E_HASHLAG),
-        // whatever the data queue is doing.
-        if k == 0 {
+        // No ORDER frame reached the core this turn (none arrived, or `Paths` only buffered
+        // them): the deadlines `on_frame` would have checked (REP_E_HASHLAG), whatever the data
+        // queue is doing.
+        if delivered == 0 {
             let r = core.tick(now());
             report(
                 &mut core,

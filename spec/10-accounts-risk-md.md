@@ -1750,7 +1750,8 @@ carries its label.
 13. **Durability gate.** The observer takes both replication paths, one port each (07 §4.9),
     and hands each frame to its order core once, in `frame_seq` order. A copy counts for the
     path of the port it arrived on, not for its `flags.bit0`, so one path carrying both copies
-    attests nothing. It replays a block only once every frame of every substream, up to what
+    attests nothing, and only when its bytes, `flags` aside, equal the copy handed on (07 §3.2,
+    INV-REP-3): a different frame under the same `frame_seq` counts for neither path. It replays a block only once every frame of every substream, up to what
     it had handed on when the block became ready, has arrived on both paths. That covers the
     block's frames, and at most a few later ones of the other substream. So it sends a record
     only when it holds the step's frames from both paths (§8.2), and `flags.bit2` stays 1. An
