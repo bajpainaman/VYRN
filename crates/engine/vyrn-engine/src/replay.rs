@@ -454,18 +454,41 @@ fn next_call(recs: Recs<'_>, lane: LaneId, from: usize) -> Option<(usize, Result
 /// A packet whose ops are not all decided by this block (07 §7.1 item 3): one of them is above
 /// the block's last cut, so a step of a later block may still name it as a source. It is
 /// carried unless a step left in this block names one of its ops, which must be replayed now.
-fn undecided(c: &Call, final_cut: LaneSeq, later: &[WireStep<'_>]) -> bool {
+///
+/// `n_ops` bounds the packet's ops that a step can name: its messages other than Heartbeat and
+/// ResendReq, which take no `LaneSeq` (05 §3.1), so a packet's `count` overstates them. (After a
+/// header reject they do take one, but then no op is forwarded.)
+fn undecided(c: &Call, n_ops: u64, final_cut: LaneSeq, later: &[WireStep<'_>]) -> bool {
     let r = &c.rec;
-    if is_advance(r) || r.count == 0 || r.flags & PacketFlags::SHED != 0 {
+    if is_advance(r) || n_ops == 0 || r.flags & PacketFlags::SHED != 0 {
         return false;
     }
     let lo = r.first_lane_seq.0;
-    let hi = lo.saturating_add(u64::from(r.count));
+    let hi = lo.saturating_add(n_ops);
     let named = later
         .iter()
         .filter_map(|w| w.src)
         .any(|(l, q)| l == r.lane && lo <= q.0 && q.0 < hi);
     hi.saturating_sub(1) > final_cut.0 && !named
+}
+
+/// The messages of a request that take a `LaneSeq` when its header is accepted: all but
+/// Heartbeat and ResendReq, as `Lane::packet` assigns them. 0 if the request does not parse.
+fn routable_ops(bytes: &[u8]) -> u64 {
+    let Ok(req) = vyrn_wire::Request::parse(bytes) else {
+        return 0;
+    };
+    let n = req
+        .raw_msgs()
+        .iter()
+        .filter(|m| {
+            !matches!(
+                vyrn_wire::Msg::decode(m),
+                Ok(vyrn_wire::Msg::Heartbeat) | Ok(vyrn_wire::Msg::ResendReq { .. })
+            )
+        })
+        .count();
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
@@ -758,7 +781,11 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 if c.f >= s {
                     break;
                 }
-                if undecided(&c, final_cut.get(l).copied().unwrap_or(LaneSeq(0)), later) {
+                let n_ops = payloads
+                    .get(&c.rec)
+                    .map_or(u64::from(c.rec.count), routable_ops);
+                let cut_l = final_cut.get(l).copied().unwrap_or(LaneSeq(0));
+                if undecided(&c, n_ops, cut_l, later) {
                     if let Some(h) = held.get_mut(l) {
                         *h = true;
                     }

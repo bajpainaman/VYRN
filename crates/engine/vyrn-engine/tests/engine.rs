@@ -624,6 +624,38 @@ fn replay_takes_the_logged_route_not_a_newer_snapshot() {
 }
 
 #[test]
+fn replay_from_07_does_not_count_session_only_messages_as_ops() {
+    // Codex P1 on #66: a packet's `count` includes Heartbeat/ResendReq, which take no LaneSeq.
+    // [Heartbeat, Sell @ 110] takes one LaneSeq and no step names it, so the block settles it;
+    // counting two ops held it back and the step covering its one op failed with Order.
+    use Side::Sell;
+    use Tif::Day;
+    let s = vec![
+        Act::Pkt {
+            l: 0,
+            a: 1,
+            rx_ts: 1_000,
+            now: 1_000,
+            msgs: vec![new(Sell, Day, 105, 1, 11)],
+        },
+        Act::Run,
+        Act::Pkt {
+            l: 1,
+            a: 1,
+            rx_ts: 2_000,
+            now: 2_000,
+            msgs: vec![vyrn_wire::Msg::Heartbeat, new(Sell, Day, 110, 1, 21)],
+        },
+        Act::Run,
+    ];
+    let (j, store, _, _) = live(&s);
+    let (lanes, routes, steps) = to_wire(&j.recs);
+    let (r, _, carried) = replay_blocks(&[(&lanes, &routes, &steps)], &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    assert_eq!(carried, 0);
+}
+
+#[test]
 fn replay_rejects_a_changed_record_at_its_index() {
     let (j, store, _, _) = live(&script());
     // A packet record whose fills_applied differs from the replayed lane's.
