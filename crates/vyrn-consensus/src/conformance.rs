@@ -10,9 +10,10 @@
 use crate::Committee;
 use crate::cert::{CertErr, FinalityCert, verify_finality_cert};
 use crate::proposal::{Proposal, ProposalKind};
+use crate::tail::{SealExt, seal_digest, seal_header, seal_proposal};
 use std::fmt::Write as _;
 use vyrn_log::block::{encode_header, header_hash, sign_header};
-use vyrn_types::{BlockHeader, BookId, Epoch, Hash, Height, Mode, StepId};
+use vyrn_types::{BlockHeader, BookId, Epoch, Hash, Height, Mode, SessionId, StepId};
 
 const PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/vectors/finality_cert.txt");
 
@@ -73,7 +74,7 @@ fn generate() -> String {
     };
 
     let mut out = String::from(
-        "# vyrn-consensus conformance vectors (spec/07-replication.md §3.10, §6.3, §6.5).\n\
+        "# vyrn-consensus conformance vectors (spec/07-replication.md §3.10, §6.3, §6.5, §9.4).\n\
          # Voter i (0-based) has Ed25519 seed [i+1; 32]; the sequencer has seed [0x99; 32].\n\
          # Every line is `key = value`; hex is lowercase, no prefix.\n\n",
     );
@@ -85,14 +86,30 @@ fn generate() -> String {
     let _ = writeln!(out, "proposal = {}", hex(&proposal.encode()));
     let _ = writeln!(out, "digest = {}", hex(&proposal.digest().0));
 
-    let sign = |mode: Mode, signers: &[u8], view: u64| {
+    // The seal of the tenure deposed after `h` (07 §9.4): heights 101..=102, the signed header
+    // and the seal header, with one unavailable packet.
+    let sh = seal_header(&h, StepId(515), Hash([0x44; 32]), Hash([0x55; 32]));
+    let seal = seal_proposal(Epoch(7), Height(101), &sh, Hash([0x66; 32])).unwrap();
+    let ext = SealExt {
+        end_frame_seq: [900, 901],
+        next_seq: 1,
+        next_tenure: 1,
+        unavail: vec![(SessionId(0x0102_0304), 77)],
+    };
+    let _ = writeln!(out, "\ncase = seal");
+    let _ = writeln!(out, "seal_header = {}", hex(&encode_header(&sh)));
+    let _ = writeln!(out, "proposal = {}", hex(&seal.encode()));
+    let _ = writeln!(out, "seal_ext = {}", hex(&ext.encode()));
+    let _ = writeln!(out, "digest = {}", hex(&seal_digest(&seal, &ext).0));
+
+    let sign_any = |mode: Mode, signers: &[u8], view: u64, proposal, seal: Option<SealExt>| {
         let mut c = FinalityCert {
             epoch: Epoch(7),
             view,
             parent_view: view - 1,
             proposal,
             sigs: Vec::new(),
-            seal: None,
+            seal,
         };
         let msg = c.message();
         c.sigs = signers
@@ -101,6 +118,7 @@ fn generate() -> String {
             .collect();
         (mode, c)
     };
+    let sign = |mode, signers: &[u8], view| sign_any(mode, signers, view, proposal, None);
     let mut cases = vec![
         ("base_quorum", sign(Mode::Base, &[0, 1, 3], 42)),
         ("chain_quorum", sign(Mode::Chain, &[0, 1, 2, 4], 42)),
@@ -114,6 +132,23 @@ fn generate() -> String {
     let (m, mut wrong_view) = sign(Mode::Base, &[0, 1, 2], 42);
     wrong_view.view = 43;
     cases.push(("base_signed_other_view", (m, wrong_view)));
+    // A seal certificate: its REP_SealExt follows the entries, and the signers signed the seal
+    // digest (07 §6.5, §9.4).
+    cases.push((
+        "base_seal_quorum",
+        sign_any(Mode::Base, &[1, 2, 3], 44, seal, Some(ext.clone())),
+    ));
+    // The same signers over a REP_SealExt with another next_seq: the bytes they signed differ.
+    let (m, mut other_ext) = sign_any(Mode::Base, &[1, 2, 3], 44, seal, Some(ext.clone()));
+    other_ext.seal = Some(SealExt {
+        next_seq: 2,
+        ..ext.clone()
+    });
+    cases.push(("base_seal_other_ext", (m, other_ext)));
+    // Signatures over the bare proposal digest, as a kind-0 certificate would carry: refused.
+    let (m, mut plain) = sign_any(Mode::Base, &[1, 2, 3], 44, seal, None);
+    plain.seal = Some(ext.clone());
+    cases.push(("base_seal_signed_without_ext", (m, plain)));
 
     for (name, (mode, c)) in cases {
         let _ = writeln!(out, "\ncase = {name}");
@@ -155,6 +190,9 @@ fn file_verdicts_are_the_spec_verdicts() {
         ("base_unknown_voter", "unknown_voter"),
         ("base_repeated_voter", "order"),
         ("base_signed_other_view", "bad_sig"),
+        ("base_seal_quorum", "ok"),
+        ("base_seal_other_ext", "bad_sig"),
+        ("base_seal_signed_without_ext", "bad_sig"),
     ];
     let text = generate();
     for (name, want) in expected {

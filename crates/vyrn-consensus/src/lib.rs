@@ -15,7 +15,8 @@
 //!
 //! The sequencer's side is [`observer`]: its finality listener and the finality gate (07 §6.8).
 //!
-//! [`voter`] wires these into `commonware-consensus` Simplex (07 §6.3) for one voter, and
+//! [`voter`] wires these into `commonware-consensus` Simplex (07 §6.3) for one voter, with the
+//! seal of a deposed tenure (07 §9.4), and
 //! [`silence`] detects a silent sequencer (07 §9.1); [`tail`] signs what each voter holds and
 //! computes the prefix and seal of a deposed tenure (07 §9.2–9.5). The sequencer is never a voter: a
 //! [`Committee`] refuses a `seq_key` among its voters, and [`voter::config`] refuses a key that
@@ -37,7 +38,7 @@ pub use evidence::{EvidenceErr, FaultKind, SeqEquivocation, VoterFault};
 pub use membership::{Committee, CommitteeErr, VoterOrder};
 pub use observer::{FinalizeVote, Gate, GateAction, Listener, VoteErr};
 pub use proposal::{Proposal, ProposalErr, ProposalKind};
-pub use source::{BlockSource, Genesis, LogSource, Verdict};
+pub use source::{BlockSource, Genesis, LogSource, Seal, Verdict};
 pub use tail::{Prefix, Reporter, SealExt, Silence, Tail, TailErr, TailReport};
 
 #[cfg(test)]
