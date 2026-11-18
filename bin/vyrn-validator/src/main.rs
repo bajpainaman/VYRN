@@ -18,7 +18,7 @@
 //! | `[cores] order` | REF core of the order core (07 §7.2 core 3); reported, not pinned |
 //! | `[membership] seq_keys = ["<hex>"]` | `REP_Membership`'s `seq_key` per sequencer index (07 §13.1); public keys, so they may sit in the file |
 //! | `[keys] vote, node` | vote key handle; `node` (the p2p identity) defaults to `vote`. Only `env:NAME` (seed hex) resolves, and only with `[consensus]` |
-//! | `[nic] data_port`, `[data] boxes = ["ip:port"], me, max_range, xchg, seq_repair = "ip:port", seq_box = 0, [[data.peer]] voter, addr` | optional: the data RX queue (07 §5.4); `boxes[i]` is data box `src = i`, `me` this replica's index in their destination lists; with `xchg` (needs `[consensus]`) every fetch to `boxes[d]` is sealed under `K_fetch(e, me, d)` (08 §9.6). `[[data.peer]]` are the other replicas (roster voter index, `[nic] data_port`) and `seq_repair` is `vyrn-seq` box `seq_box`'s `[repair]` port: 07 §5.5 sources 2 and 3 (`fetch.rs`), sealed too with `xchg`. Without `[data]` vote-rule item 3 is not checked (DEV) |
+//! | `[nic] data_port`, `[data] boxes = ["ip:port"], me, max_range, xchg, seq_repair = "ip:port", seq_box = 0, silence_us = 1000, [[data.peer]] voter, addr` | optional: the data RX queue (07 §5.4); `boxes[i]` is data box `src = i`, `me` this replica's index in their destination lists; with `xchg` (needs `[consensus]`) every fetch to `boxes[d]` is sealed under `K_fetch(e, me, d)` (08 §9.6). `[[data.peer]]` are the other replicas (roster voter index, `[nic] data_port`) and `seq_repair` is `vyrn-seq` box `seq_box`'s `[repair]` port: 07 §5.5 sources 2 and 3 (`fetch.rs`), sealed too with `xchg`. Without `[data]` vote-rule item 3 is not checked (DEV) |
 //! | `dev = false` | `true` marks a DEV validator: only then may `[replay] hashlag_us` differ from 1000 |
 //! | `[replay] tick_min, tick_max, win_center, slot_cap, hashlag_us, [[replay.session]] lane, slot, account, k_seq, quote, base` | optional, needs `[data]`: replay of every block that passes item 3 on `vyrn-engine` (`replay.rs`), built from the sequencer's `[engine]` and `[[dev_session]]` (no state snapshot encoding yet). `hashlag_us` (DEV only, default 1000 = the spec's 1 ms, 07 §3.7) is the `REP_E_HASHLAG` bound, for unpinned DEV hosts |
 //! | `[consensus] roster, roster_hash, genesis_hash, home, seq_order, observers, delta_ms, storage` | optional: the Simplex voter (`consensus.rs`); committee and peers from the roster file (08 §9.6), checked against `roster_hash`; `membership.seq_keys[0]` must be the roster's primary `seq_key` |
@@ -63,6 +63,12 @@
 //! `FINALITY_FAULT height=<h> ...` and replay stops. A ring or adapter error prints
 //! `REPLAY_FAULT height=<h> output ring: <why>` and replay stops. Not wired here: the epoch's
 //! end (`DC_EOD`; this build serves one epoch), settlement, and `MBO` publication.
+//! **Data box failure** (07 §5.7 steps 1–3, `failover.rs`, with `[data]` and `[consensus]`): a
+//! box silent for `[data] silence_us` (1000; other values DEV only) is gossiped as `DataDown` to
+//! the `[[data.peer]]`s; at Q votes it prints `DATA_DOWN box=<d> votes=<n> quorum=<q>`, and if it
+//! is the sessions' home every live box gets a sealed REDIRECT per session
+//! (`REDIRECT_SENT down=<d> to=<d'> sessions=<n> boxes=<n>`). Exit prints `FAILOVER down_sent=
+//! down_heard= down_bad= effective= redirects=`.
 //! **Control** (stdin, one line each; *reading*: 07 and 08 name no transport for it yet).
 //! `EPOCH <e>` re-derives every `K_fetch` of a keyed `[data]` for epoch `e` (07 §5.5 Epoch
 //! boundary); once the order thread has installed the keys it prints `FETCH_EPOCH <e>`. A
@@ -93,14 +99,15 @@ use vyrn_replica::{
 };
 
 mod consensus;
+mod failover;
 mod fetch;
 mod replay;
 use vyrn_consensus::Verdict;
-use vyrn_log::Layout;
+use vyrn_log::{LaneRec, Layout};
 use vyrn_nic::frame;
 use vyrn_nic::{BackendKind, KernelUdp, NicBackend, NicConfig, PortConfig, PortId, RxBind};
 use vyrn_replica::{EpochView, FrameErr, OrderCore};
-use vyrn_types::{BookId, Epoch, Hash, Height, LaneId, PubKey, StepId};
+use vyrn_types::{BookId, Epoch, Hash, Height, LaneId, PacketFlags, PubKey, StepId};
 use vyrn_wire::{RX_BURST, RxPkt, RxRing};
 
 #[derive(Parser)]
@@ -172,6 +179,10 @@ struct Data {
     /// The largest RANGE fetch a data box accepts, in frames.
     #[serde(default = "d_range")]
     max_range: u64,
+    /// `REP_DATA_SILENCE_MS` in µs (07 §5.7 step 1, `failover.rs`): other than 1000 only with
+    /// `dev = true`, for unpinned DEV hosts.
+    #[serde(default = "d_silence_us")]
+    silence_us: u64,
     /// This voter's X25519 secret (`env:NAME`), the private half of its roster `xchg_key`:
     /// with it every fetch to `boxes[d]` is sealed under `K_fetch(e, me, d)` (07 §5.5, 08
     /// §9.6). Needs `[consensus]`. Without it fetches go unsealed, which only an open-mode
@@ -187,6 +198,10 @@ struct Data {
 struct Peer {
     voter: u8,
     addr: std::net::SocketAddrV4,
+}
+
+fn d_silence_us() -> u64 {
+    1000
 }
 
 fn d_range() -> u64 {
@@ -285,6 +300,16 @@ impl Config {
         }
         if c.replay.is_some() && c.data.is_none() {
             return bad("replay", "needs [data]: replay reads the blocks' payloads");
+        }
+        match c.data.as_ref().map(|d| d.silence_us) {
+            Some(0) => return bad("data.silence_us", "must be at least 1"),
+            Some(us) if us != 1000 && !c.dev => {
+                return bad(
+                    "data.silence_us",
+                    "other than 1000 (07 §5.7) is DEV only: set dev = true on a DEV validator",
+                );
+            }
+            _ => {}
         }
         match c.replay.as_ref().and_then(|r| r.hashlag_us) {
             Some(0) => return bad("replay.hashlag_us", "must be at least 1"),
@@ -491,6 +516,9 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
             let sources = fetch::Sources::new(boxes, peers, seq);
             let peer_addrs: Vec<SocketAddrV4> = d.peer.iter().map(|p| p.addr).collect();
             let keys = ks.as_ref().map_or_else(Vec::new, |k| k.boxes.clone());
+            let open_down = ks
+                .as_ref()
+                .is_some_and(|k| k.peers.iter().any(Option::is_none));
             let peer = fetch::PeerServer::new(&peer_addrs, ks.map(|k| k.serve));
             if let Some((kr, _)) = ring {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -522,6 +550,16 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                 tips: VecDeque::new(),
                 replayed: None,
                 rekey: rekey.take(),
+                failover: plan.as_ref().map(|p| {
+                    failover::Failover::new(
+                        n,
+                        u8::try_from(p.me).unwrap_or(u8::MAX),
+                        p.committee.quorum(),
+                        cfg.epoch,
+                        d.silence_us.saturating_mul(1000),
+                    )
+                }),
+                open_down,
             })
         }
         None => None,
@@ -721,6 +759,10 @@ struct DataRx<const N: usize, R> {
     tips: VecDeque<(Height, Hash)>,
     /// Observer: the newest replayed height.
     replayed: Option<Height>,
+    /// With `[consensus]`: data box failure, 07 §5.7 steps 1–3 (`failover.rs`).
+    failover: Option<failover::Failover>,
+    /// DEV, keyed: some peer has no usable roster key, so its `DataDown`s come with tag 0.
+    open_down: bool,
     /// Keyed: the key sets `EPOCH <e>` derived, applied at the next poll.
     rekey: Option<std::sync::mpsc::Receiver<(u32, KeySet)>>,
     /// Observer: the block waiting for both paths' frames, and since when (`u64::MAX`: reported).
@@ -872,8 +914,12 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             let mut acks = Vec::new();
             for (e, ks) in rekeyed {
                 self.sources.set_keys(&ks.boxes, &ks.peers, ks.seq);
+                self.open_down = ks.peers.iter().any(Option::is_none);
                 self.peer.set_keys(ks.serve);
                 self.keys = ks.boxes;
+                if let Some(f) = self.failover.as_mut() {
+                    f.epoch = e;
+                }
                 acks.push(e);
             }
             // Acked only once installed: a box may drop the old epoch's keys after it.
@@ -898,6 +944,22 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                     .serve(join, to, f.payload, now, &mut self.sources.counts)
                 {
                     let _ = self.repair.send_to(&r, to);
+                }
+                continue;
+            }
+            // A peer's `DataDown{d}` (07 §5.7 step 1).
+            if f.payload.get(..2) == Some(&failover::MAGIC.to_le_bytes()[..]) {
+                if let Some(fo) = self.failover.as_mut() {
+                    match failover::DataDown::parse(f.payload) {
+                        Some((m, body, tag))
+                            if self
+                                .peer
+                                .authentic(f.hdr.src.ip, &body, tag, self.open_down) =>
+                        {
+                            fo.heard(m);
+                        }
+                        _ => fo.counts.down_bad = fo.counts.down_bad.saturating_add(1),
+                    }
                 }
                 continue;
             }
@@ -952,7 +1014,67 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 self.fetches.pop_front();
             }
         }
+        self.failover(now);
         k + answers
+    }
+
+    /// 07 §5.7: gossips this replica's `DataDown`s, and once one is effective for the sessions'
+    /// home sends every live box each session's REDIRECT (`failover.rs`).
+    fn failover(&mut self, now: u64) {
+        let Some(fo) = self.failover.as_mut() else {
+            return;
+        };
+        let silent: Vec<u8> = self.feed.silent_for(now, fo.silence_ns).collect();
+        for m in fo.silent(&silent, now) {
+            for t in self.sources.peers() {
+                let _ = self
+                    .repair
+                    .send_to(&m.encode(t.key.as_ref()), std::net::SocketAddr::V4(t.addr));
+                fo.counts.down_sent = fo.counts.down_sent.saturating_add(1);
+            }
+        }
+        let (newly, due) = fo.step(now);
+        for (d, votes) in newly {
+            println!("DATA_DOWN box={d} votes={votes} quorum={}", fo.quorum());
+        }
+        if due.is_empty() {
+            return;
+        }
+        let join = Self::join(&mut self.join, &mut self.replay);
+        let mut unresolved = std::collections::BTreeMap::new();
+        for (b, _) in &self.pending {
+            for r in &b.lanes {
+                let LaneRec::Pkt(p) = r else { continue };
+                if p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) != 0
+                    || join.resolve(p).is_ok()
+                {
+                    continue;
+                }
+                let e = unresolved.entry(p.session).or_insert(p.pkt_seq);
+                *e = (*e).min(p.pkt_seq);
+            }
+        }
+        let list = fo.resend_from(&unresolved);
+        let live: Vec<usize> = (0..self.boxes.len()).filter(|&b| fo.live(b)).collect();
+        for (down, to) in due {
+            for &b in &live {
+                for &(session, resend_from) in &list {
+                    let q = Fetch::Redirect {
+                        session,
+                        resend_from,
+                        down,
+                        to,
+                    };
+                    send(&self.repair, &self.boxes, &self.keys, &q, b);
+                    fo.counts.redirects = fo.counts.redirects.saturating_add(1);
+                }
+            }
+            println!(
+                "REDIRECT_SENT down={down} to={to} sessions={} boxes={}",
+                list.len(),
+                live.len()
+            );
+        }
     }
 
     /// Item 3 for the pending blocks, in height order: a block whose payloads are all joined
@@ -964,6 +1086,10 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
     /// With `durable` (an observer), a block also waits until every frame through its [`Mark`]
     /// arrived on both paths (10 §8.2), so the drop copy's `flags.bit2` holds.
     fn check(&mut self, source: &consensus::Source, now: u64, durable: Option<&Paths>) {
+        // `final_height` is 0 before the first certificate too: height 0 waits for one above it.
+        if let (Some(fo), f @ 1..) = (self.failover.as_mut(), source.final_height()) {
+            fo.finalized(f);
+        }
         while let Some((b, m)) = self.pending.front() {
             let h = b.header.height;
             let held = !self.replay_dead
@@ -1006,6 +1132,17 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             let Some((b, _)) = self.pending.pop_front() else {
                 return;
             };
+            if let Some(fo) = self.failover.as_mut() {
+                fo.released(
+                    h.0,
+                    b.lanes.iter().filter_map(|r| match r {
+                        LaneRec::Pkt(p) if p.flags & PacketFlags::ADVANCE == 0 => {
+                            Some((p.session, p.pkt_seq))
+                        }
+                        _ => None,
+                    }),
+                );
+            }
             // Every path below releases the block's payloads: peers may still ask for them.
             self.peer
                 .keep(Self::join(&mut self.join, &mut self.replay), &b.lanes);
@@ -1241,6 +1378,13 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             "FETCH box={} peer={} seq={} served={} missed={} limited={} bad={}",
             c.boxes, c.peer, c.seq, c.served, c.missed, c.limited, c.bad
         );
+        if let Some(f) = d.failover.as_ref() {
+            let c = f.counts;
+            println!(
+                "FAILOVER down_sent={} down_heard={} down_bad={} effective={} redirects={}",
+                c.down_sent, c.down_heard, c.down_bad, c.effective, c.redirects
+            );
+        }
     }
     data.as_mut()
         .map(|d| DataRx::<N, D>::join(&mut d.join, &mut d.replay).evictions())

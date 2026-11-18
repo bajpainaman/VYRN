@@ -174,9 +174,14 @@ impl DataFeed {
     /// The data boxes heard from at least once and silent for [`REP_DATA_SILENCE_NS`] at `now`
     /// (07 §5.7 step 1: each is a `DataDown{d}` to gossip).
     pub fn silent(&self, now: u64) -> impl Iterator<Item = u8> + '_ {
+        self.silent_for(now, REP_DATA_SILENCE_NS)
+    }
+
+    /// [`DataFeed::silent`] with another silence bound, in ns (a DEV host's).
+    pub fn silent_for(&self, now: u64, silence_ns: u64) -> impl Iterator<Item = u8> + '_ {
         self.sources.iter().zip(0u8..).filter_map(move |(s, i)| {
             s.heard
-                .filter(|&t| now.saturating_sub(t) >= REP_DATA_SILENCE_NS)
+                .filter(|&t| now.saturating_sub(t) >= silence_ns)
                 .map(|_| i)
         })
     }

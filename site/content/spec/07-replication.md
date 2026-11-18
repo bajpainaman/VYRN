@@ -1251,6 +1251,32 @@ one-fault model, not a safety fault. A Q-of-replicas rule at the box is deferred
 rate. The box's operator line (`REDIRECT <down> <to> <session>:<resend_from>,…`, DEV) does the
 same for a list.
 
+**Replica side (readings, `bin/vyrn-validator` `failover.rs`).** `DataDown{d}` is 24 bytes,
+little-endian: magic 0x4444, version 1, `d` u8, `voter` u8, 3 zero bytes, `epoch` u32, 4 zero
+bytes, then a SipHash-2-4 tag over bytes 0..16 under the sender's peer `K_fetch` toward the
+receiver. It goes to each `[[data.peer]]`'s data port, as a peer fetch does, and is checked as one.
+An unkeyed (DEV) sender's tag is 0. A keyed DEV replica also takes tag 0 from a configured peer
+whose roster key is unusable, because it sends that peer unsealed fetches. A replica regossips
+every 10 ms while `d` is not effective. It counts distinct voters, itself included, and keeps each
+vote for the run: 07 names no withdrawal. A `DataDown` tagged `e − 1`, `e` or `e + 1` counts,
+because peers cross an epoch boundary one at a time (the peer-key window, §5.5). Until a session's
+`KeyBundle` reaches the replica, every session's `KeyBundle.data` list is the replica's `[data]
+boxes` in order, with its home at entry 0 (DEV). The replica sends one REDIRECT per session to
+every live box, sealed under that box's `K_fetch`, in 3 rounds 10 ms apart, because UDP can lose
+any one. `resend_from` is the replica's lowest unresolved `pkt_seq` of the session in the blocks
+it holds; if it holds none, it is one past the highest `pkt_seq` it released. `REP_DATA_SILENCE_MS`
+is 1 ms. A DEV validator may raise it (`[data] silence_us`) for an unpinned host.
+
+**Backup addresses (interim reading).** Step 3 needs every live box to know the affected
+sessions' addresses, but only the home box receives copy 2. Until this is settled, a client sends
+copy 2 of each session's first packet to every box in its `KeyBundle.data` list. The backups store
+it, deduped like any copy, and learn the source address. Limit: a backup knows only that first
+packet's address, so it cannot redirect a client that changed its address afterwards; it counts
+such a session as unknown. This depends on #153's PQ-13 (A), a standing backup data copy, which
+the user has not decided. If PQ-13 (A) is approved, backups receive every copy and know the newest
+address, which supersedes this reading. If it is rejected, box-to-box address sharing goes to the
+data tier's owner instead.
+
 Effect: fills and acks are unaffected. Blocks that reference the affected sessions cannot be voted
 until their data arrives. Finality stalls for those blocks for ≤ 1 + 0.5 + 1 + 0.5 = **3 ms**
 (budget) and then catches up (§6.7).
