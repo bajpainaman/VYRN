@@ -87,10 +87,15 @@ fn serves_a_replica_exports_metrics_and_stops() {
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
     client.send_to(&out[..n], &ingest).unwrap();
 
-    // The 5 µs batch timer sends the frame without a flush.
+    // The 5 µs batch timer sends the frame without a flush. An idle destination gets DATA_HB
+    // every 100 µs, so heartbeats sent before the packet arrived are skipped.
     let mut buf = [0u8; 2048];
-    let got = replica.recv(&mut buf).unwrap();
-    let d = frame::decode(&buf[..got]).unwrap();
+    let d = loop {
+        let got = replica.recv(&mut buf).unwrap();
+        if frame::decode(&buf[..got]).unwrap().hdr.kind != Kind::DataHb {
+            break frame::decode(&buf[..got]).unwrap();
+        }
+    };
     assert_eq!((d.hdr.kind, d.hdr.src, d.hdr.data_seq), (Kind::Data, 1, 1));
     assert_eq!(d.packets().collect::<Vec<_>>(), vec![&out[..n]]);
 
@@ -130,6 +135,19 @@ fn refuses_open_mode_outside_dev() {
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("open-mode fetches are DEV only"));
+    // A hex: key outside DEV is refused without printing it.
+    let leaky = dir.join("leaky.toml");
+    let text = std::fs::read_to_string(config(&dir, dest, false, true))
+        .unwrap()
+        .replace(
+            "env:VYRN_DATA_TEST_KSEQ",
+            "hex:abababababababababababababababab",
+        );
+    std::fs::write(&leaky, text).unwrap();
+    let o = cmd(&leaky).stdin(Stdio::null()).output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(err.contains("DEV only") && !err.contains("abab"), "{err}");
     let mut child = cmd(&config(&dir, dest, true, false))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

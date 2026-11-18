@@ -193,10 +193,11 @@ impl Config {
             let v = std::env::var(var).map_err(|_| format!("key {handle:?}: {var} is not set"))?;
             return hex(v.trim());
         }
+        // The handle itself is never echoed: outside `env:` it may be the secret.
         match handle.strip_prefix("hex:") {
             Some(h) if self.dev => hex(h),
-            Some(_) => Err(format!("key {handle:?}: hex: keys are DEV only")),
-            None => Err(format!("key {handle:?}: must be env:NAME or hex:…")),
+            Some(_) => Err("a hex: key handle is DEV only".into()),
+            None => Err("a key handle must be env:NAME or hex:…".into()),
         }
     }
 
