@@ -398,6 +398,7 @@ where
                         order_tx,
                         resp_tx,
                         replicas,
+                        path_b_down: vec![false; replicas_b.len()],
                         replicas_b,
                         path_b: Vec::new(),
                         src: ip,
@@ -1103,6 +1104,9 @@ struct StreamCore<T: TxRing> {
     /// Path B's replicas, and the buffer their `PATH_B` copy is built in.
     replicas_b: Vec<SocketAddrV4>,
     path_b: Vec<u8>,
+    /// Per path B replica: a send to it failed and has not succeeded since (`PATH_B_DOWN`
+    /// printed once per outage).
+    path_b_down: Vec<bool>,
     src: Ipv4Addr,
     k_out: Vec<(SessionId, [u8; 16])>,
     epoch16: u16,
@@ -1327,8 +1331,17 @@ impl<T: TxRing> StreamCore<T> {
             if let Some(b) = self.path_b.get_mut(FLAGS_AT) {
                 *b = FrameFlags::PATH_B;
             }
-            for r in &self.replicas_b {
-                send(&mut self.order_tx, self.src, dst(r), &self.path_b)?;
+            // Path B is the redundant copy: trading continues on path A alone (07 §4.9), so a
+            // refused B send is reported, not returned.
+            for (r, down) in self.replicas_b.iter().zip(self.path_b_down.iter_mut()) {
+                match send(&mut self.order_tx, self.src, dst(r), &self.path_b) {
+                    Ok(()) => *down = false,
+                    Err(e) if !*down => {
+                        *down = true;
+                        println!("PATH_B_DOWN {r}: {e}");
+                    }
+                    Err(_) => {}
+                }
             }
         }
         Ok(())

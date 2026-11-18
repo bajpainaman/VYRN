@@ -152,32 +152,33 @@ impl Paths {
                 }
                 None => {}
             }
-            while s
-                .seen
-                .first_key_value()
-                .is_some_and(|(k, v)| *k == s.both.saturating_add(1) && v.0 == 3)
-            {
-                s.seen.pop_first();
-                s.both = s.both.saturating_add(1);
-            }
         }
         if q < s.next || s.hold.contains_key(&q) {
             if let Some(d) = self.dups.get_mut(usize::from(path == Path::B)) {
                 *d = d.saturating_add(1);
             }
-            return;
-        }
-        if q > s.next {
+        } else if q > s.next {
             if s.hold.len() < HOLD_MAX {
                 s.hold.insert(q, frame.to_vec());
             }
-            return;
-        }
-        deliver(frame);
-        s.next = s.next.saturating_add(1);
-        while let Some(f) = s.hold.remove(&s.next) {
-            deliver(&f);
+        } else {
+            deliver(frame);
             s.next = s.next.saturating_add(1);
+            while let Some(f) = s.hold.remove(&s.next) {
+                deliver(&f);
+                s.next = s.next.saturating_add(1);
+            }
+        }
+        // `both` passes only frames already handed on: until then their first copy's bytes
+        // stay in `seen`, so the copy that is handed on is compared with them, even one that
+        // arrives after both paths' copies were dropped by a full hold.
+        while s
+            .seen
+            .first_key_value()
+            .is_some_and(|(k, v)| *k == s.both.saturating_add(1) && *k < s.next && v.0 == 3)
+        {
+            s.seen.pop_first();
+            s.both = s.both.saturating_add(1);
         }
     }
 
@@ -286,6 +287,48 @@ mod tests {
             &mut d,
         );
         assert_eq!(out.borrow().last().unwrap()[24..], frame(0, last)[24..]);
+    }
+
+    /// CodeRabbit #167: both paths' copies of a frame past a full hold leave it in `seen` only;
+    /// once the gap closes, `both` must not pass it before it is handed on, or a third copy
+    /// with other bytes would go out uncompared.
+    #[test]
+    fn both_never_passes_a_frame_not_yet_handed_on() {
+        let mut p = Paths::new(BookId(1), 0, 1);
+        let out = std::cell::RefCell::new(Vec::new());
+        let mut d = |f: &[u8]| out.borrow_mut().push(f.to_vec());
+        let last = HOLD_MAX as u64 + 2;
+        for q in 2..=last {
+            p.rx(Path::A, &frame(0, q), &mut d);
+            p.rx(
+                Path::B,
+                &with_flags(&frame(0, q), FrameFlags::PATH_B),
+                &mut d,
+            );
+        }
+        p.rx(Path::A, &frame(0, 1), &mut d);
+        p.rx(
+            Path::B,
+            &with_flags(&frame(0, 1), FrameFlags::PATH_B),
+            &mut d,
+        );
+        assert_eq!(out.borrow().len(), HOLD_MAX + 1);
+        assert!(
+            !p.durable(&vec![((0, 0, 0, 0), last)]),
+            "`last` not handed on"
+        );
+        let mut forged = frame(0, last);
+        *forged.last_mut().unwrap() ^= 0xff;
+        p.rx(Path::A, &forged, &mut d);
+        assert_eq!(
+            out.borrow().len(),
+            HOLD_MAX + 1,
+            "forged copy not handed on"
+        );
+        assert_eq!(p.mismatched, [1, 0]);
+        p.rx(Path::A, &frame(0, last), &mut d);
+        assert_eq!(out.borrow().last().unwrap(), &frame(0, last));
+        assert!(p.durable(&p.mark()));
     }
 
     #[test]
