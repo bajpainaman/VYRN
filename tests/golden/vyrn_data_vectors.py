@@ -20,6 +20,16 @@ Line formats (space-separated; '-' for an empty list):
   dedupe    <name> <pkt_seq,...> <verdict,...>   (verdicts: New Repeat Late; one session)
 """
 import struct
+import json
+import sys
+
+JSON = sys.argv[1:] == ["--json"]          # the same vectors as JSON (tests/golden/README.md)
+
+
+def say(*a, **k):
+    if not JSON:
+        print(*a, **k)
+
 
 DATA_MAGIC = 0x4450
 FETCH_MAGIC = 0x4650
@@ -122,8 +132,15 @@ def hx(b):
     return b.hex()
 
 
+DOC = {"source": "tests/golden/vyrn_data_vectors.py", "vectors": []}
+
+
+def add(kind, name, **f):
+    DOC["vectors"].append({"kind": kind, "name": name, **f})
+
+
 def main():
-    print("# " + __doc__.strip().splitlines()[0])
+    say("# " + __doc__.strip().splitlines()[0])
     p1 = bytes(range(48))          # a 1-message request's length
     p2 = bytes(range(100, 133))    # odd length: one pad byte
     p3 = bytes([0xAA] * 192)       # MAX_REQ_PAYLOAD
@@ -137,7 +154,9 @@ def main():
     for name, kind, book, e16, seq, src, pkts in ok:
         f = data_frame(kind, book, e16, seq, src, pkts)
         pk = ",".join(hx(p) for p in pkts) or "-"
-        print(f"data_ok {name} {kind} {book} {e16} {seq} {src} {pk} {hx(f)}")
+        say(f"data_ok {name} {kind} {book} {e16} {seq} {src} {pk} {hx(f)}")
+        add("data_ok", name, frame_kind=kind, book=book, epoch16=e16, data_seq=seq, src=src,
+            packets=[hx(p) for p in pkts], hex=hx(f))
     good = data_frame(1, 3, 9, 1, 2, [p1])
     err = [
         ("short", good[:23], "Short"),
@@ -158,11 +177,17 @@ def main():
         ("hb_with_packet", data_frame(2, 0, 0, 1, 2, [p1]), "HbBody"),
     ]
     for name, f, why in err:
-        print(f"data_err {name} {hx(f)} {why}")
-    print(f"fetch_ok key key 305419896 7 {hx(key(0x12345678, 7))}")
-    print(f"fetch_ok range range 2 10 20 {hx(rng(2, 10, 20))}")
-    print(f"fetch_ok block block 1099511627776 {hx(block(1 << 40))}")
-    print(f"fetch_ok redirect redirect 4294967295 5 0 7 {hx(resend(0xFFFFFFFF, 5, 0, 7))}")
+        say(f"data_err {name} {hx(f)} {why}")
+        add("data_err", name, hex=hx(f), reason=why)
+    for name, fields, b in [
+        ("key", {"session": 0x12345678, "pkt_seq": 7}, key(0x12345678, 7)),
+        ("range", {"dst": 2, "from": 10, "to": 20}, rng(2, 10, 20)),
+        ("block", {"height": 1 << 40}, block(1 << 40)),
+        ("redirect", {"session": 0xFFFFFFFF, "resend_from": 5, "down": 0, "to": 7},
+         resend(0xFFFFFFFF, 5, 0, 7)),
+    ]:
+        say(f"fetch_ok {name} {name} {' '.join(map(str, fields.values()))} {hx(b)}")
+        add("fetch_ok", name, fetch=name, **fields, hex=hx(b))
     bad = [
         ("short", key(1, 1)[:31], "Short"),
         ("long", key(1, 1) + b"\x00", "Short"),
@@ -178,11 +203,13 @@ def main():
         ("redirect_to_8", resend(1, 1, 0, 8), "Position"),
     ]
     for name, b, why in bad:
-        print(f"fetch_err {name} {hx(b)} {why}")
+        say(f"fetch_err {name} {hx(b)} {why}")
+        add("fetch_err", name, hex=hx(b), reason=why)
     kf = bytes(range(0x40, 0x50))
     for name, b in [("key", key(0x12345678, 7)), ("range", rng(2, 10, 20)),
                     ("block", block(1 << 40)), ("redirect", resend(9, 4, 1, 2))]:
-        print(f"fetch_auth {name} {hx(kf)} {hx(b)} {hx(seal(b, kf))}")
+        say(f"fetch_auth {name} {hx(kf)} {hx(b)} {hx(seal(b, kf))}")
+        add("fetch_auth", name, key=hx(kf), plain=hx(b), sealed=hx(seal(b, kf)))
     good = seal(key(1, 1), kf)
     for name, b, why in [
         ("bad_tag", good[:39] + bytes([good[39] ^ 1]), "Tag"),
@@ -190,7 +217,8 @@ def main():
         ("plain", key(1, 1), "Short"),
         ("tagged_bad_body", seal(fetch(9, bytes(24)), kf), "Kind"),
     ]:
-        print(f"fetch_auth_err {name} {hx(kf)} {hx(b)} {why}")
+        say(f"fetch_auth_err {name} {hx(kf)} {hx(b)} {why}")
+        add("fetch_auth_err", name, key=hx(kf), hex=hx(b), reason=why)
     kr = bytes(range(0x60, 0x70))
 
     def redirect(down, to, session, frm, key=kr, magic=0x5244, version=1, reserved=b"\x00" * 3):
@@ -199,7 +227,10 @@ def main():
         return seal(body, key)
 
     for name, args in [("first", (1, 3, 5, 1)), ("wide", (4, 0, 0xFFFFFFFF, 0x80000001))]:
-        print(f"redirect {name} {hx(kr)} {' '.join(map(str, args))} {hx(redirect(*args))}")
+        say(f"redirect {name} {hx(kr)} {' '.join(map(str, args))} {hx(redirect(*args))}")
+        down, to, session, frm = args
+        add("redirect", name, key=hx(kr), down=down, to=to, session=session, resend_from=frm,
+            hex=hx(redirect(*args)))
     good = redirect(1, 2, 7, 9)
     for name, b, why in [
         ("bad_tag", good[:23] + bytes([good[23] ^ 1]), "Tag"),
@@ -209,7 +240,8 @@ def main():
         ("version", redirect(1, 2, 7, 9, version=2), "Version"),
         ("reserved", redirect(1, 2, 7, 9, reserved=b"\x00\x01\x00"), "Reserved"),
     ]:
-        print(f"redirect_err {name} {hx(kr)} {hx(b)} {why}")
+        say(f"redirect_err {name} {hx(kr)} {hx(b)} {why}")
+        add("redirect_err", name, key=hx(kr), hex=hx(b), reason=why)
     cases = [
         ("in_order", [1, 2, 3, 4]),
         ("repeat_and_reorder", [1, 3, 2, 3, 1, 5, 4]),
@@ -218,8 +250,11 @@ def main():
         ("jump_clears", [1, 2, 1000, 2, 745, 744, 1000]),
     ]
     for name, seqs in cases:
-        print(f"dedupe {name} {','.join(map(str, seqs))} {','.join(window(seqs))}")
+        say(f"dedupe {name} {','.join(map(str, seqs))} {','.join(window(seqs))}")
+        add("dedupe", name, pkt_seqs=seqs, verdicts=window(seqs))
 
 
 if __name__ == "__main__":
     main()
+    if JSON:
+        print(json.dumps(DOC, indent=1))
