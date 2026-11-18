@@ -5,12 +5,16 @@
 //! every configured data box (no session-to-data-home map yet). Each further `REP_DATA_WAIT_US`
 //! without it moves to the next source: 2, one peer replica in round-robin order
 //! (`PeerDataFetch`), then 3, the sequencer's repair port (`SeqDataReq`), then back to 1. A
-//! source that is not configured is skipped. Every missing key has its own escalation, so a
-//! burst of lost packets reaches source 3 within one escalation, not one after another: the
-//! sequencer retains a packet only `REP_SEQ_PKT_RETAIN_MS` = 50 ms (07 §5.5, reading (j)).
+//! source that is not configured is skipped. Every missing key has its own escalation. The
+//! front block's first missing key escalates alone until it is [`Sources::stuck`] (its boxes
+//! and a peer missed it: it was lost at its box); then every key the pending blocks miss
+//! escalates at once, so a burst of lost packets reaches source 3 within one escalation, not
+//! one after another: the sequencer retains a packet only `REP_SEQ_PKT_RETAIN_MS` = 50 ms
+//! (07 §5.5, reading (j)). A replica catching up, whose data is still arriving by RANGE, keeps
+//! asking for one key.
 //! A round ([`Sources::begin_round`], [`Sources::end_round`]) asks at most [`FETCH_KEYS_MAX`]
-//! keys, from the front block on, forgets the keys it no longer names, and runs at most every
-//! [`ROUND_NS`].
+//! keys, from the front block on, keeps the timers of up to [`FETCH_SCAN_MAX`], forgets the
+//! keys it no longer names, and runs at most every [`ROUND_NS`].
 //!
 //! **`PeerDataFetch`** (reading (a), accepted). The request is the same KEY fetch as `DataFetch`
 //! and `SeqDataReq`. A replica answers on its data port, so `[[data.peer]]` lists the peers'
@@ -56,9 +60,13 @@ pub const PEER_KEEP: usize = 16_384;
 /// `REP_SEQ_DATA_MAX_PPS`, reused as each replica's peer-serving rate (reading (d)).
 const PEER_MAX_PPS: u64 = 50_000;
 const BURST_NS: u64 = 10_000_000;
-/// Missing keys one round of [`Sources`] escalates at once (reading (j)): a burst this size
+/// Missing keys one round of [`Sources`] asks for at most (reading (j)): a burst this size
 /// reaches source 3 in one escalation, a longer one in turns of this many.
 pub const FETCH_KEYS_MAX: usize = 128;
+/// Missing keys one round tracks at most: each keeps its timer while it waits for a turn
+/// ([`Sources::touch`]), so a key past [`FETCH_KEYS_MAX`] is not forgotten (CodeRabbit
+/// r4618053807).
+pub const FETCH_SCAN_MAX: usize = 4096;
 /// The least time between two rounds, so a replica far behind (catching up from a restart) does
 /// not rescan its pending blocks on every poll.
 pub const ROUND_NS: u64 = 100_000;
@@ -98,6 +106,8 @@ struct Esc {
     /// The stage asked last (`None`: not asked yet), and since when.
     last: Option<Stage>,
     at: u64,
+    /// When it was first seen missing.
+    since: u64,
     /// The round that last named it.
     round: u64,
     /// Its own peer cursor, so each key turns through every peer whatever the other keys do
@@ -178,6 +188,39 @@ impl Sources {
         true
     }
 
+    /// Whether `(session, pkt_seq)` has been missing so long that its data boxes and a peer
+    /// were asked and missed (2 × `REP_DATA_WAIT_US`): then it was lost at its box, and so may
+    /// the packets after it be, so every missing key is escalated at once (reading (j)). A
+    /// replica catching up, whose data is in flight, does not get there.
+    pub fn stuck(&self, session: SessionId, pkt_seq: u32, now: u64) -> bool {
+        self.missing
+            .get(&(session, pkt_seq))
+            .is_some_and(|x| now.saturating_sub(x.since) >= REP_DATA_WAIT_NS.saturating_mul(2))
+    }
+
+    /// Names `(session, pkt_seq)` in this round without asking for it: its timer starts (or
+    /// keeps running) and it is not forgotten, so it is asked as soon as a round has room.
+    pub fn touch(&mut self, session: SessionId, pkt_seq: u32, now: u64) {
+        let round = self.round;
+        match self.missing.get_mut(&(session, pkt_seq)) {
+            Some(x) => x.round = round,
+            None => {
+                let peer = self.next_peer;
+                self.next_peer = self.next_peer.wrapping_add(1);
+                self.missing.insert(
+                    (session, pkt_seq),
+                    Esc {
+                        last: None,
+                        at: now,
+                        since: now,
+                        round,
+                        peer,
+                    },
+                );
+            }
+        }
+    }
+
     /// Ends a round: keys it did not name (joined, or released) are forgotten.
     pub fn end_round(&mut self) {
         let r = self.round;
@@ -198,6 +241,7 @@ impl Sources {
                 Esc {
                     last: None,
                     at: now,
+                    since: now,
                     round,
                     peer,
                 },
@@ -531,9 +575,21 @@ mod tests {
         let mut s = Sources::new(vec![t(1)], vec![t(11)], Some(t(21)));
         assert!(s.begin_round(4 * w));
         s.end_round();
+        // A key is stuck once its boxes and a peer had their wait.
+        assert!(s.begin_round(5 * w));
+        assert!(s.due(k, 9, 5 * w).is_empty());
+        assert!(!s.stuck(k, 9, 7 * w - 1));
+        assert!(s.stuck(k, 9, 7 * w));
+        s.end_round();
         // Rounds are at least ROUND_NS apart.
-        assert!(!s.begin_round(4 * w + ROUND_NS - 1));
-        assert!(s.begin_round(4 * w + ROUND_NS));
+        assert!(!s.begin_round(5 * w + ROUND_NS - 1));
+        assert!(s.begin_round(5 * w + ROUND_NS));
+        // A touched key keeps its timer through the round without being asked (CodeRabbit
+        // r4618053807): it is due once named again.
+        s.touch(k, 9, 5 * w + ROUND_NS);
+        s.end_round();
+        assert!(s.begin_round(8 * w));
+        assert_eq!(s.due(k, 9, 8 * w), vec![t(1)]);
     }
 
     /// A keyed target gets the 40-byte form that opens under its key; an unkeyed one the 32.

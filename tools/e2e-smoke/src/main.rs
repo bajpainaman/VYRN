@@ -236,8 +236,12 @@
 //!   missed=67240`). Validators now escalate every missing key at once (`fetch.rs` reading (j)).
 //!   The tap, which replays like a replica, KEY-fetches from the unkeyed sequencer each packet the
 //!   client sent that its join still lacks 2 ms on (`TAP_SEQ_WAIT`), again every 2 ms; under
-//!   `--keyed` (R8) the box would refuse its plain fetch, so it does not ask. The `data` line
-//!   prints `tap_seq_asked=`.
+//!   `--keyed` (R8) the box would refuse its plain fetch, so it does not ask, and `--copy2-gap`
+//!   is refused. *Ruled-style, as R1, for the box's count only:* `data` lets the box store fewer
+//!   than it was sent by at most its ingest socket's kernel drop count (`/proc/net/udp`, read
+//!   before it stops; without it, none), since a socket overflow at the box is the loss replicas
+//!   must repair; the replicas' stall is never tolerated (`validators`, `replay`). The `data` line
+//!   prints `tap_seq_asked=` and `box_sock_drops=`.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -2373,6 +2377,10 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .iter()
         .map(|&i| nodes.0.get(i).map_or(0, |n| n.lines.len()))
         .collect();
+    // R19: the kernel's receive drops at the checked box's ingest socket, read while it is open.
+    let box_drops = data_ingest
+        .filter(|_| backup.is_none())
+        .and_then(|a| udp_drops(a.port()));
     let data_ok =
         data_check_idx.map(|i| nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
     let seq_node = nodes.0.get(seq).ok_or("seq")?;
@@ -3092,9 +3100,16 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
             // R13: the backup stores only what reached it; `replay` checks the join holds every
             // packet.
+            // R19: the box may be short by at most its socket's measured drops (without that
+            // count, not at all); every replica still has to fetch what it lacks.
             let want = pkts.len().saturating_sub(cli.copy2_gap.unwrap_or(0).min(pkts.len() / 2 + pkts.len() % 2)) as u64;
-            if backup.is_none() && stored != Some(want) {
-                errs.push(format!("stored {stored:?} != {want} packets sent to it"));
+            let short_ok = stored.is_some_and(|s| {
+                s <= want && want.saturating_sub(s) <= box_drops.unwrap_or(0)
+            });
+            if backup.is_none() && !short_ok {
+                errs.push(format!(
+                    "stored {stored:?} of {want} packets sent to it, box_sock_drops={box_drops:?}"
+                ));
             }
             // #120: EVENT lines + events_unprinted + events_dropped = bad_mac + copy conflicts.
             // The client sends one byte-identical copy under the right key, so all are 0.
@@ -3154,7 +3169,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
             if errs.is_empty() {
                 Ok(format!(
-                    "vyrn-data stored {} packets, {} data frames (DATA and DATA_HB) fed {fed_stored} packets into the replay join, {repaired} frames repaired by RANGE fetch, tap_seq_asked={seq_asked} (R19); {st}",
+                    "vyrn-data stored {} packets, {} data frames (DATA and DATA_HB) fed {fed_stored} packets into the replay join, {repaired} frames repaired by RANGE fetch, tap_seq_asked={seq_asked} box_sock_drops={box_drops:?} (R19); {st}",
                     pkts.len(),
                     data_frames.as_ref().map_or(0, |t| t.frames)
                 ))
