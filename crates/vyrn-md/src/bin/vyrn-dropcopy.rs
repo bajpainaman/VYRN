@@ -25,7 +25,7 @@ use std::time::Duration;
 use clap::Parser;
 use serde::Deserialize;
 use vyrn_md::dropcopy::server::{DcStore, Keys, Session, serve};
-use vyrn_md::dropcopy::wire::{DC_HEARTBEAT_MS, DC_LOGIN_TIMEOUT_MS};
+use vyrn_md::dropcopy::wire::DC_LOGIN_TIMEOUT_MS;
 use vyrn_types::{AccountId, BookId};
 
 #[derive(Parser)]
@@ -107,15 +107,15 @@ fn run(args: &Args) -> Result<(), String> {
         let sess = Session::new(book, challenge(&secret, n, peer));
         std::thread::spawn(move || {
             let _ = c.set_nodelay(true);
-            // An unauthenticated connection gets DC_LOGIN_TIMEOUT_MS to log in, then is dropped.
-            if c.set_read_timeout(Some(Duration::from_millis(DC_LOGIN_TIMEOUT_MS)))
-                .is_err()
-            {
-                return;
-            }
-            let r = serve(&mut c, sess, &keys, &store, |c| {
-                let _ = c.set_read_timeout(Some(Duration::from_millis(DC_HEARTBEAT_MS)));
-            });
+            // An unauthenticated connection has DC_LOGIN_TIMEOUT_MS in all to log in.
+            let r = serve(
+                &mut c,
+                sess,
+                &keys,
+                &store,
+                Duration::from_millis(DC_LOGIN_TIMEOUT_MS),
+                |c, t| c.set_read_timeout(Some(t)),
+            );
             tracing::debug!(%peer, ?r, "connection closed");
         });
     }

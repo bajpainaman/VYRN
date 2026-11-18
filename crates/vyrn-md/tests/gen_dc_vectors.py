@@ -133,11 +133,12 @@ class Model:
         self.released = 0
         self.finals = []
         self.run = None
+        self.rel = 0  # release step of the records being emitted
         self.out = []  # (acct, master, seq, bytes)
 
     @staticmethod
     def new_stream():
-        return dict(seq=0, canon=[], fresh=False, fills=0, bb=0, bs=0, qb=0, qs=0, fees=0, msg=0)
+        return dict(seq=0, canon=[], unfinal=[], fills=0, bb=0, bs=0, qb=0, qs=0, fees=0, msg=0)
 
     def targets(self, acct):
         t = [(acct, 0)]
@@ -153,7 +154,8 @@ class Model:
         s["seq"] += 1
         if b[0] not in (FINAL, SETTLED):
             s["canon"].append(b)
-            s["fresh"] = True
+            if not s["unfinal"] or s["unfinal"][-1] != self.rel:
+                s["unfinal"].append(self.rel)
         self.out.append((sid[0], sid[1], s["seq"], b))
 
     def emit(self, acct, kind, side, taker, ordinal, step, sess, rs, handle, tick, qty, tag, f):
@@ -174,6 +176,7 @@ class Model:
             self.push(sid, b)
 
     def lane_op(self, lane, seq, sess, rs, msg, r):
+        self.rel = self.released + 1
         acct = self.sess.get(sess)
         if r[0] == "ack":
             _, idx, h, tick, tag = r
@@ -201,6 +204,7 @@ class Model:
 
     def step(self, step, kind, flags, src, tx):
         self.released = step
+        self.rel = step
         if src is not None:
             self.step_src(step, kind, flags, src, tx)
         self.flush(False)
@@ -277,10 +281,14 @@ class Model:
     def flush(self, all_):
         while self.finals and (all_ or self.finals[0][1] <= self.released):
             h, s = self.finals.pop(0)
+            # DC_FINAL(s) to every stream with a record released at a step <= s that no
+            # earlier DC_FINAL covers.
             for sid in sorted(self.streams):
-                if self.streams[sid]["fresh"]:
+                u = self.streams[sid]["unfinal"]
+                if u and u[0] <= s:
+                    while u and u[0] <= s:
+                        u.pop(0)
                     self.push(sid, stage(FINAL, sid[0], s, h))
-                    self.streams[sid]["fresh"] = False
 
     def finish(self, bal):
         self.flush(True)
@@ -354,6 +362,14 @@ CROSS_CASE = [
         ((TAKER_ROLE, 2, S21, 2), ("ack", 0, h(2), 99, 42)),
     ]),
     ("final", 3, 6),
+]
+LATE_FINAL_CASE = [
+    ("op", 0, 1, S01, 1, ("new", 1, 105, 2, 11), ("ack", 0, h(1), 105, 11)),
+    ("step", 1, "idle", 0, None, []),
+    ("op", 0, 2, S01, 2, ("new", 1, 106, 1, 12), ("ack", 0, h(2), 106, 12)),
+    ("step", 2, "idle", 0, None, []),
+    ("final", 1, 1),
+    ("final", 2, 2),
 ]
 BAL = {101: (1000, 20, 7, 0), 102: (5, 0, 3, 1), 201: (77, 0, 0, 0)}
 
@@ -439,6 +455,7 @@ def main(out_dir):
     ]
     m0 = run_case(lines, "cross", 1_000, CROSS_CASE, BAL)
     m1 = run_case(lines, "quiet", 10, [], {})
+    run_case(lines, "late_final", 10, LATE_FINAL_CASE, {})
     # Sessions over a store of epoch 5 (case cross, ended) and epoch 6 (case quiet, open).
     E0, E1 = 5, 6
     seeds = {101: bytes([1]) * 32, 102: bytes([2]) * 32, 900: bytes([9]) * 32,

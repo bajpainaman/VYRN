@@ -1697,10 +1697,13 @@ carries its label.
    reserved, 0), summed over a master's accounts; 3 the hash (`n` canonical records before it,
    then their BLAKE3 hash at bytes 16–47). Message fees are each accepted forwarded `New`'s class
    fee (§5.3), once, at its first step; joins pay 0 and a shed pays nothing (§3.11). Summed over
-   the account streams, the fees equal the lanes' `fee_acc` (§5.5). \[Guessing\]
-7. **`DC_FINAL`.** One per final block, after every step up to its last step is released, on
-   every stream that got a canonical record since its last `DC_FINAL`; `step` = the block's last
-   step, bytes 24–31 its `Height`. \[Likely\]
+   the account streams, the fees equal the lanes' `fee_acc` (§5.5). A master's balances that
+   do not fit a u64 are an error (`DcError::Overflow`), never clamped. \[Guessing\]
+7. **`DC_FINAL`.** One per final block, after every step up to its last step `s` is released,
+   on every stream holding a canonical record released at a step ≤ `s` that no earlier
+   `DC_FINAL` covers (a lane op is released with the step that closes its interval); `step` =
+   `s`, bytes 24–31 the block's `Height`. Records of a later block that were released before an
+   earlier block became final still get the later block's `DC_FINAL`. \[Likely\]
 8. **Streams.** One per account and one per master. A record goes to its account's stream, to its
    master's stream, and, for a master's own orders, to both of the master's. Each stream has its
    own seq, from 1 per epoch. \[Likely\]
@@ -1736,9 +1739,10 @@ Login (client → server, 128 B)
 
 1. **Authentication.** The server sends `HELLO` with a fresh 32-byte challenge per connection;
    the client answers with one login signed by the signer's account key. A signature over
-   another challenge is refused, so a captured login cannot be replayed. A connection that has
-   not sent its login `DC_LOGIN_TIMEOUT_MS = 5_000` (config) after `HELLO` is dropped, so an
-   unauthenticated client holds no server resources past it.
+   another challenge is refused, so a captured login cannot be replayed. A connection whose
+   128 login bytes are not all in `DC_LOGIN_TIMEOUT_MS = 5_000` (config) after `HELLO` is
+   dropped, however slowly they trickle in, so an unauthenticated client holds no server
+   resources past it.
 2. **Subscription.** An account reads its own stream; a master reads its master stream and each
    sub-account's own stream. Nobody else reads a stream (§8: "each account, and each master").
 3. **Checks**, in order, the first failure a `REJECT` that ends the connection: form (1
@@ -1749,7 +1753,9 @@ Login (client → server, 128 B)
    previous epoch's stream ends with `END(last seq)` and the current epoch's follows from seq 1.
    An idle stream sends `HEARTBEAT(last seq sent)` every `DC_HEARTBEAT_MS = 100` (config), so a
    client sees a gap or a stall at the next frame; it recovers by reconnecting with `from` =
-   its last seq + 1. Anything the client sends after its login ends the connection.
+   its last seq + 1. Anything the client sends after its login ends the connection. A session
+   whose epoch leaves the replay window before it caught up gets `REJECT(5)` and is closed; it
+   rebuilds from the statement (§10).
 
 ## 9. Surveillance
 

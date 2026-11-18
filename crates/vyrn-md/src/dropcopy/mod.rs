@@ -145,8 +145,8 @@ struct Stream {
     quote_sold: u64,
     fees: i64,
     msg_fees: u64,
-    /// A record since the last `DC_FINAL`.
-    fresh: bool,
+    /// Release steps of canonical records no `DC_FINAL` covers yet, ascending, deduplicated.
+    unfinal: VecDeque<u64>,
 }
 
 impl Stream {
@@ -162,7 +162,7 @@ impl Stream {
             quote_sold: 0,
             fees: 0,
             msg_fees: 0,
-            fresh: false,
+            unfinal: VecDeque::new(),
         }
     }
 }
@@ -186,6 +186,8 @@ pub struct DropCopy<O: DcOut> {
     streams: BTreeMap<StreamId, Stream>,
     orders: BTreeMap<(u8, u32), Resting>,
     released: StepId,
+    /// The release step of the records being emitted: the step whose release carries them.
+    rel: u64,
     finals: VecDeque<(Height, StepId)>,
     /// The source of the last step and its taker fills so far (a `CONT` run).
     taker_acc: Option<((LaneId, LaneSeq), u32)>,
@@ -260,6 +262,7 @@ impl<O: DcOut> DropCopy<O> {
             streams,
             orders: BTreeMap::new(),
             released: StepId(0),
+            rel: 0,
             finals: VecDeque::new(),
             taker_acc: None,
             out,
@@ -301,23 +304,36 @@ impl<O: DcOut> DropCopy<O> {
             return Err(e);
         }
         self.flush_finals(true);
-        let ids: Vec<StreamId> = self.streams.keys().copied().collect();
-        for id in ids {
-            let mut b = Balances::default();
-            for (a, x) in &self.accts {
-                let member = if id.master {
-                    *a == id.account || x.master == Some(id.account)
-                } else {
-                    *a == id.account
-                };
-                if member {
-                    let c = balances(*a);
-                    b.quote_free = b.quote_free.saturating_add(c.quote_free);
-                    b.quote_resv = b.quote_resv.saturating_add(c.quote_resv);
-                    b.base_free = b.base_free.saturating_add(c.base_free);
-                    b.base_resv = b.base_resv.saturating_add(c.base_resv);
+        // Each account's balance once, into its own stream and its master's (10 §8.4 item 6).
+        let mut bal: BTreeMap<StreamId, Balances> = BTreeMap::new();
+        for (a, x) in &self.accts {
+            let c = balances(*a);
+            let own = StreamId {
+                account: *a,
+                master: false,
+            };
+            let mine = StreamId {
+                account: *a,
+                master: true,
+            };
+            let master = x.master.map(|m| StreamId {
+                account: m,
+                master: true,
+            });
+            for id in [Some(own), Some(mine), master].into_iter().flatten() {
+                if self.streams.contains_key(&id) {
+                    let b = bal.entry(id).or_default();
+                    let add = |x: u64, y: u64| x.checked_add(y).ok_or(DcError::Overflow);
+                    b.quote_free = add(b.quote_free, c.quote_free)?;
+                    b.quote_resv = add(b.quote_resv, c.quote_resv)?;
+                    b.base_free = add(b.base_free, c.base_free)?;
+                    b.base_resv = add(b.base_resv, c.base_resv)?;
                 }
             }
+        }
+        let ids: Vec<StreamId> = self.streams.keys().copied().collect();
+        for id in ids {
+            let b = bal.get(&id).copied().unwrap_or_default();
             let Some(s) = self.streams.get(&id) else {
                 continue;
             };
@@ -352,6 +368,8 @@ impl<O: DcOut> DropCopy<O> {
         }
     }
 
+    /// Sends each due `DC_FINAL(s)` to every stream holding a record released at a step ≤ `s`
+    /// that no earlier `DC_FINAL` covers (10 §8.4 item 7).
     fn flush_finals(&mut self, all: bool) {
         while let Some(&(h, s)) = self.finals.front() {
             if !all && s > self.released {
@@ -361,15 +379,17 @@ impl<O: DcOut> DropCopy<O> {
             let ids: Vec<StreamId> = self
                 .streams
                 .iter()
-                .filter(|(_, x)| x.fresh)
+                .filter(|(_, x)| x.unfinal.front().is_some_and(|r| *r <= s.0))
                 .map(|(k, _)| *k)
                 .collect();
             for id in ids {
+                if let Some(x) = self.streams.get_mut(&id) {
+                    while x.unfinal.front().is_some_and(|r| *r <= s.0) {
+                        x.unfinal.pop_front();
+                    }
+                }
                 let r = DcRecord::stage(DcType::Final, id.account, s, h);
                 self.push(id, &r);
-                if let Some(x) = self.streams.get_mut(&id) {
-                    x.fresh = false;
-                }
             }
         }
     }
@@ -408,7 +428,9 @@ impl<O: DcOut> DropCopy<O> {
         if !r.kind().is_stage() {
             s.hasher.update(&r.0);
             s.n += 1;
-            s.fresh = true;
+            if s.unfinal.back() != Some(&self.rel) {
+                s.unfinal.push_back(self.rel);
+            }
         }
         self.out.push(id, s.seq, r);
     }
@@ -461,6 +483,8 @@ impl<O: DcOut> DropCopy<O> {
     }
 
     fn on_lane_op(&mut self, op: &TapOp) -> Result<(), DcError> {
+        // A lane op is released with the step that closes its interval.
+        self.rel = self.released.0.saturating_add(1);
         let account = self.sessions.get(&op.session).copied();
         let key = |h: Handle| (op.lane.0, h.0);
         let base = |kind, side, handle: Handle, tick, qty, client_tag, index| DcOrder {
@@ -551,6 +575,7 @@ impl<O: DcOut> DropCopy<O> {
 
     fn on_step(&mut self, st: &TapStep<'_>) -> Result<(), DcError> {
         self.released = st.step;
+        self.rel = st.step.0;
         let Some(src) = st.src else {
             if st.tx.iter().any(|(_, r)| !matches!(r, Resp::Reject { .. })) {
                 return Err(DcError::Unsupported("records of a step without a source"));

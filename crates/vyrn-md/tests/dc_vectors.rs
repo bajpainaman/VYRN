@@ -268,7 +268,7 @@ fn blocks(kind: &str) -> Vec<Vec<&'static str>> {
 #[test]
 fn streams_match_the_vectors() {
     let cases = blocks("case ");
-    assert_eq!(cases.len(), 2);
+    assert_eq!(cases.len(), 3);
     for c in &cases {
         run_case(&c[1..]);
     }
@@ -345,4 +345,109 @@ fn sessions_match_the_vectors() {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn own(a: u32) -> StreamId {
+    StreamId {
+        account: AccountId(a),
+        master: false,
+    }
+}
+
+/// A session that falls behind the replay window is told so and closed, not left idle.
+#[test]
+fn a_session_whose_epoch_is_evicted_is_rejected() {
+    let seed = [1u8; 32];
+    let mut keys = Keys::new();
+    keys.add(AccountId(1), vyrn_crypto::ed25519::public_key(&seed), None);
+    let mut store = DcStore::new();
+    store.begin_epoch(Epoch(1));
+    store.push(own(1), 1, &DcRecord::eod(AccountId(1), 0, [0; 5]));
+    let ch = [9u8; 32];
+    let mut sess = Session::new(BOOK, ch);
+    let login = Login {
+        master: false,
+        book: BOOK,
+        account: AccountId(1),
+        epoch: Epoch(1),
+        from: 1,
+        signer: AccountId(1),
+        challenge: ch,
+    };
+    let acc = sess.login(&login.encode_signed(&seed), &keys, &store);
+    assert_eq!(acc.kind, vyrn_md::dropcopy::wire::FrameKind::Accept);
+    assert_eq!(sess.poll(&store, 10).len(), 1);
+    store.begin_epoch(Epoch(2));
+    store.begin_epoch(Epoch(3));
+    let f = sess.poll(&store, 10);
+    assert_eq!(f.len(), 1);
+    assert_eq!(
+        f[0].reason(),
+        Some(vyrn_md::dropcopy::wire::RejectReason::Epoch)
+    );
+    assert!(sess.closed());
+    assert!(sess.tick().is_none(), "no heartbeat for a closed session");
+}
+
+/// A login dripped one byte at a time cannot outlast the login deadline.
+#[test]
+// The client paces its drip with a sleep; nothing on a control thread here.
+#[allow(clippy::disallowed_methods)]
+fn a_slow_login_is_cut_off_at_the_deadline() {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let client = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(addr).unwrap();
+        let mut hello = [0u8; FRAME_BYTES];
+        c.read_exact(&mut hello).unwrap();
+        for _ in 0..40 {
+            if c.write_all(&[0]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+    let (mut s, _) = l.accept().unwrap();
+    let store = std::sync::RwLock::new(DcStore::new());
+    let t = Instant::now();
+    let r = vyrn_md::dropcopy::server::serve(
+        &mut s,
+        Session::new(BOOK, [0; 32]),
+        &Keys::new(),
+        &store,
+        Duration::from_millis(300),
+        |c, d| c.set_read_timeout(Some(d)),
+    );
+    let took = t.elapsed();
+    assert!(r.is_err(), "{r:?}");
+    assert!(took < Duration::from_millis(1_000), "{took:?}");
+    drop(s);
+    client.join().unwrap();
+}
+
+/// Master balances that do not fit u64 are an error, not a clamped EOD.
+#[test]
+fn master_balance_overflow_is_an_error() {
+    let acct = |a: u32| DcAccount {
+        account: AccountId(a),
+        master: Some(AccountId(9)),
+        sessions: vec![SessionId(a)],
+        taker_ppm: 0,
+        maker_ppm: 0,
+        msg_fee_improve: 0,
+        msg_fee_cross: 0,
+    };
+    let cfg = DcConfig {
+        book: BOOK,
+        tick_size: 1,
+        accounts: vec![acct(1), acct(2)],
+    };
+    let dc = DropCopy::new(&cfg, Recs::new());
+    let r = dc.finish(|_| Balances {
+        quote_free: u64::MAX,
+        ..Balances::default()
+    });
+    assert_eq!(r.err(), Some(vyrn_md::dropcopy::DcError::Overflow));
 }

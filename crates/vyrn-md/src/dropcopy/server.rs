@@ -238,7 +238,8 @@ impl Session {
     }
 
     /// Every frame due now: the records from the session's next seq on, and `END` and the next
-    /// epoch's records when a previous epoch's stream is used up. At most `max` frames.
+    /// epoch's records when a previous epoch's stream is used up. At most `max` frames. A
+    /// session whose epoch left the replay window gets `REJECT(Epoch)` and is closed.
     pub fn poll(&mut self, store: &DcStore, max: usize) -> Vec<Frame> {
         let mut out = Vec::new();
         while out.len() < max {
@@ -250,6 +251,12 @@ impl Session {
             else {
                 break;
             };
+            if store.get(epoch).is_none() {
+                // The session fell behind the replay window: it cannot resume here.
+                out.push(Frame::reject(self.book, epoch, RejectReason::Epoch));
+                self.state = State::Closed;
+                break;
+            }
             let recs = store.records(epoch, stream);
             if let Some(r) = usize::try_from(next - 1).ok().and_then(|i| recs.get(i)) {
                 out.push(Frame::record(self.book, epoch, next, r));
@@ -336,11 +343,6 @@ impl DcStore {
     }
 }
 
-/// Serves one connection to its end (module docs): `HELLO`, the login, then records as the
-/// store grows and a heartbeat every idle `read` timeout. The caller sets the transport's read
-/// timeout to `DC_LOGIN_TIMEOUT_MS` before calling, so a client that never logs in fails the
-/// login read, and to `DC_HEARTBEAT_MS` after the login (`after_login`). Returns when the client
-/// closes, sends anything after its login, or a write fails.
 /// The store, read-locked; a poisoned lock ends the connection.
 fn read(
     s: &std::sync::RwLock<DcStore>,
@@ -349,29 +351,56 @@ fn read(
         .map_err(|_| std::io::Error::other("store lock poisoned"))
 }
 
+/// Serves one connection to its end (module docs): `HELLO`, the login, then records as the
+/// store grows and a heartbeat every idle read timeout. `timeout` sets the transport's read
+/// timeout: the time left of `login_timeout` before each login read, so a client that sends
+/// its login slowly or not at all is dropped when it runs out, then `DC_HEARTBEAT_MS`. Returns
+/// when the client closes, sends anything after its login, the session closes, or I/O fails.
 pub fn serve<S: std::io::Read + std::io::Write>(
     io: &mut S,
     mut sess: Session,
     keys: &Keys,
     store: &std::sync::RwLock<DcStore>,
-    after_login: impl FnOnce(&mut S),
+    login_timeout: std::time::Duration,
+    mut timeout: impl FnMut(&mut S, std::time::Duration) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     use std::io::ErrorKind;
+    let deadline = std::time::Instant::now() + login_timeout;
     let hello = sess.hello(&*read(store)?);
     io.write_all(&hello.encode())?;
     let mut login = [0; LOGIN_BYTES];
-    io.read_exact(&mut login)?;
+    let mut got = 0;
+    while got < LOGIN_BYTES {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(ErrorKind::TimedOut.into());
+        }
+        timeout(io, left)?;
+        match io.read(&mut login[got..]) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
     let first = sess.login(&login, keys, &*read(store)?);
     io.write_all(&first.encode())?;
     if sess.closed() {
         return Ok(());
     }
-    after_login(io);
+    timeout(
+        io,
+        std::time::Duration::from_millis(super::wire::DC_HEARTBEAT_MS),
+    )?;
     let mut byte = [0; 1];
     loop {
         let frames = sess.poll(&*read(store)?, 256);
         for f in &frames {
             io.write_all(&f.encode())?;
+        }
+        if sess.closed() {
+            io.flush()?;
+            return Ok(());
         }
         if !frames.is_empty() {
             io.flush()?;
