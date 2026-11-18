@@ -47,6 +47,7 @@ fn pkt(lane: u8, session: u32, seq: u32, first: u64, count: u8) -> PacketRecord 
         pkt_hash: PktHash(0xA000 + first),
         first_lane_seq: LaneSeq(first),
         fills_applied: StepId(0),
+        snap_lag: 0,
     }
 }
 
@@ -112,6 +113,7 @@ fn frames_decode_and_headers_chain() {
         pkt_hash: PktHash(0),
         first_lane_seq: LaneSeq(4),
         fills_applied: StepId(1),
+        snap_lag: 0,
     };
     frames.extend(w.packet(adv, None).unwrap());
     let (f0, h0) = w.close_block().unwrap();

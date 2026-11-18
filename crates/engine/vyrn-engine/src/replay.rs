@@ -125,6 +125,9 @@ pub enum Why {
     /// A response differs from the response log, or the log holds responses replay did not
     /// produce.
     Response,
+    /// The snapshot version a packet record's `snap_lag` names was never published, or replay
+    /// no longer holds it ([`crate::REPLAY_SNAP_HIST`] versions, 07 §7.1).
+    NoSnapshot,
     /// 07 §7.1 `REP_MERGE` cannot order the inputs (`REP_E_ORDER`): a step's cut covers an op its
     /// lane has not replayed, or a lane record is due at a step the input does not hold.
     Order,
@@ -448,6 +451,7 @@ const NO_REC: PacketRecord = PacketRecord {
     pkt_hash: vyrn_types::PktHash(0),
     first_lane_seq: LaneSeq(0),
     fills_applied: StepId(0),
+    snap_lag: 0,
 };
 
 /// The carried records followed by one block's records, indexed as one sequence.
@@ -526,6 +530,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         log: &mut R,
         sink: &mut S,
     ) -> Result<(), Diverged> {
+        self.track_snapshots();
         let mut buf = core::mem::take(&mut self.scratch);
         let r = self.replay_in(recs, payloads, log, sink, &mut buf);
         buf.clear();
@@ -564,6 +569,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         log: &mut R,
         sink: &mut S,
     ) -> Result<(), WireDiverged> {
+        self.track_snapshots();
         let mut buf = core::mem::take(&mut self.scratch);
         let carry = core::mem::take(&mut self.carry);
         let mut next = core::mem::take(&mut self.carry_next);
@@ -780,7 +786,9 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 if let Some(x) = cur.get_mut(l) {
                     *x = i;
                 }
-                if c.f >= s {
+                // Due once its step's fills are in, and once the replayed BBO has published the
+                // snapshot it was classified against (its `snap_lag`, 07 §7.1).
+                if c.f >= s || self.snap_due(l, &c.rec).is_none() {
                     break;
                 }
                 let at = |why| WireDiverged {
@@ -829,6 +837,21 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         Ok(())
     }
 
+    /// The snapshot packet record `rec` of lane `l` names, `snap_base + snap_lag`, once the
+    /// replayed BBO has published it; always `Some` for an Advance or `SHED` record, which
+    /// classify nothing.
+    fn snap_due(&self, l: usize, rec: &PacketRecord) -> Option<vyrn_cut::Snapshot> {
+        let lane = self.lanes.get(l)?;
+        if is_advance(rec) || rec.flags & PacketFlags::SHED != 0 {
+            return Some(vyrn_cut::Snapshot::default());
+        }
+        let v = lane.snap_base().saturating_add(u64::from(rec.snap_lag));
+        if v > self.snap_now {
+            return None;
+        }
+        self.snap_of(v)
+    }
+
     /// The arena's tick range: a `Rescan` with no band covers all of it (05 §10).
     fn tick_range(&self) -> Option<(Tick, Tick)> {
         let c = self.views.first()?.config();
@@ -868,8 +891,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             // A boundary at the logged `(f, C_f[l])`, like a `MID` record (05 §6.2, F3a). One
             // that is not after the lane's `fills_applied` logs nothing: the compare reports it.
             let f = rec.fills_applied;
-            let cut = self.cut_at(f, l).ok_or(Why::StepTooOld)?;
-            let at = LaneCutEntry { step: f, cut };
+            let at = self.cut_at(f, l).ok_or(Why::StepTooOld)?;
             return self.replay_advance(l, at, sink).map_err(Why::Fault);
         }
         if rec.flags & PacketFlags::SHED != 0 {
@@ -886,7 +908,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             at: LaneCutEntry::default(),
         }; MAX_MIDS];
         for (d, m) in ms.iter_mut().zip(mids) {
-            let cut = self.cut_at(m.fills_applied, l).ok_or(Why::StepTooOld)?;
+            let at = self.cut_at(m.fills_applied, l).ok_or(Why::StepTooOld)?;
             *d = Mid {
                 pass: if m.flags & PacketFlags::PASS2 != 0 {
                     2
@@ -894,11 +916,13 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     1
                 },
                 next: m.first_lane_seq,
-                at: LaneCutEntry {
-                    step: m.fills_applied,
-                    cut,
-                },
+                at,
             };
+        }
+        // The snapshot the live lane classified this packet against (05 §6.5, 07 §7.1).
+        let snap = self.snap_due(l, rec).ok_or(Why::NoSnapshot)?;
+        if let Some(x) = self.lanes.get_mut(l) {
+            x.restore_snapshot(snap);
         }
         let mut routes = [(LaneSeq(0), Route::Join); MAX_ROUTES];
         let n_route = routes_of(routes_in, rec, &mut routes);

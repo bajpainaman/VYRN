@@ -459,7 +459,7 @@ pub fn hex(b: &[u8]) -> String {
 pub fn rec_line(r: &OwnedRec) -> String {
     match r {
         OwnedRec::Packet(p) => format!(
-            "P lane={} count={} flags={} session={} pkt_seq={} rx_ts={} pkt_hash={:016x} first={} fills_applied={}",
+            "P lane={} count={} flags={} session={} pkt_seq={} rx_ts={} pkt_hash={:016x} first={} fills_applied={} snap_lag={}",
             p.lane.0,
             p.count,
             p.flags,
@@ -468,7 +468,8 @@ pub fn rec_line(r: &OwnedRec) -> String {
             p.rx_ts.0,
             p.pkt_hash.0,
             p.first_lane_seq.0,
-            p.fills_applied.0
+            p.fills_applied.0,
+            p.snap_lag
         ),
         OwnedRec::Route(x) => format!(
             "R lane={} lane_seq={} cross={}",

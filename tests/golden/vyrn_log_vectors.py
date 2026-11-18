@@ -120,7 +120,7 @@ print()
 # Step: Cross from lane 7, src op = new cut[7]; half-cut A moves lanes 3, 7, 12 by 2, 10, 1.
 out("ex311.sections", hx(
     "07 01"            # LaneRun tag lane 7, k = 1
-    " 0a ac02 8008"    # h = count 10; slot 300; zigzag(512)
+    " 0a ac02 8008 00" # h = count 10; slot 300; zigzag(512); snap_lag 0
     " 40 01"           # StepRun, m = 1
     " 50 00 07 00"     # Cross | HOME | SPARSE; gap 0; src 7; zigzag(0)
     " 88100000"        # bitmap of 25 lanes: bits 3, 7, 12
@@ -128,7 +128,7 @@ out("ex311.sections", hx(
 # The same step as an Improve whose lane classified it Cross (STP left no fill): the src byte
 # carries StepRecord.flags CROSS in bit 7 (07 §3.8), 0x80 | lane 7.
 out("ex311.cross_route.sections", hx(
-    "07 01 0a ac02 8008"
+    "07 01 0a ac02 8008 00"
     " 40 01"
     " 51 00 87 00"     # Improve | HOME | SPARSE; gap 0; src 0x87 = CROSS | lane 7; zigzag(0)
     " 88100000 02 0a 01"))
@@ -136,24 +136,28 @@ out("ex311.cross_route.sections", hx(
 # rejected by the lane. h = CROSS (bit 7) | back 2 (10 - 8); slot 4098 = LEB 82 20.
 out("ex311.route.sections", hx(
     "07 02"            # LaneRun tag lane 7, k = 2
-    " 0a ac02 8008"    # the packet record above
+    " 0a ac02 8008 00" # the packet record above
     " 82 8220"))       # RouteRecord: h = 0x80 | 2; slot REP_SLOT_ROUTE
 # back 10 >= count 10, and a reserved h bit (0x10): both REP_E_COUNT.
-out("ex311.bad_route_back.sections", hx("07 02 0a ac02 8008 8a 8220"))
-out("ex311.bad_route_bits.sections", hx("07 02 0a ac02 8008 12 8220"))
+out("ex311.bad_route_back.sections", hx("07 02 0a ac02 8008 00 8a 8220"))
+out("ex311.bad_route_bits.sections", hx("07 02 0a ac02 8008 00 12 8220"))
 # MID Advance record (07 §3.6, 05 §6.2) after lane 7's packet (LaneSeqs 1..10, next 11): a
 # LaneCut boundary before pass 1 of op 8, at step 1. h = FA_NZ | MID (bit 4); slot 4096 = LEB
 # 80 20; rx_ts +0; fills +1; back = 11 - 8 = 3. With PASS2 (bit 7) it runs before pass 2.
-out("ex311.mid.sections", hx("07 02 0a ac02 8008 50 8020 00 01 03"))
-out("ex311.mid_pass2.sections", hx("07 02 0a ac02 8008 d0 8020 00 01 03"))
+out("ex311.mid.sections", hx("07 02 0a ac02 8008 00 50 8020 00 01 03"))
+out("ex311.mid_pass2.sections", hx("07 02 0a ac02 8008 00 d0 8020 00 01 03"))
 # back 0: before a trailing Heartbeat or ResendReq, which takes no LaneSeq (05 §3.1).
-out("ex311.mid_end.sections", hx("07 02 0a ac02 8008 50 8020 00 01 00"))
+out("ex311.mid_end.sections", hx("07 02 0a ac02 8008 00 50 8020 00 01 00"))
 # back 11 > count 10, PASS2 without MID, LSEQ_EXC on an Advance record: all REP_E_COUNT.
-out("ex311.bad_mid_back.sections", hx("07 02 0a ac02 8008 50 8020 00 01 0b"))
-out("ex311.bad_mid_pass2.sections", hx("07 02 0a ac02 8008 c0 8020 00 01"))
-out("ex311.bad_mid_lseq.sections", hx("07 02 0a ac02 8008 70 8020 00 01 03"))
+out("ex311.bad_mid_back.sections", hx("07 02 0a ac02 8008 00 50 8020 00 01 0b"))
+out("ex311.bad_mid_pass2.sections", hx("07 02 0a ac02 8008 00 c0 8020 00 01"))
+out("ex311.bad_mid_lseq.sections", hx("07 02 0a ac02 8008 00 70 8020 00 01 03"))
+# snap_lag (05 §6.5): the packet record above classified 300 versions after its
+# fills_applied step's snapshot (LEB ac02); 65536 (LEB 808004) does not fit u16, REP_E_RANGE.
+out("ex311.snap_lag.sections", hx("07 01 0a ac02 8008 ac02"))
+out("ex311.bad_snap_lag.sections", hx("07 01 0a ac02 8008 808004"))
 # src byte bit 6 set (0x47): no lane of the half, REP_E_CUT.
-out("ex311.bad_src_bit6.sections", hx("07 01 0a ac02 8008 40 01 51 00 47 00 88100000 02 0a 01"))
+out("ex311.bad_src_bit6.sections", hx("07 01 0a ac02 8008 00 40 01 51 00 47 00 88100000 02 0a 01"))
 print()
 
 # ---------------------------------------------------------------- one block on two substreams
@@ -168,8 +172,8 @@ ts = hx("44") + struct.pack("<IBBQQ", 1000, 0, 0, 1, 100) + PREV + lane_base * 2
 bind_a = hx("43 00 05") + struct.pack("<I", 0x00301007) + hx("01")  # lane 0 slot 5, next 1
 lane0 = hx(
     "00 02"            # LaneRun lane 0, k = 2
-    " 03 05 f80a"      # count 3, slot 5, pkt_seq 1 (expected), rx_ts +700
-    " 11 05 c701 05")  # count 1 | SEQ_EXC, slot 5, rx_ts -100, pkt_seq 5 (expected 2)
+    " 03 05 f80a 00"   # count 3, slot 5, pkt_seq 1 (expected), rx_ts +700, snap_lag 0
+    " 11 05 c701 05 02")  # count 1 | SEQ_EXC, slot 5, rx_ts -100, pkt_seq 5 (expected 2), snap_lag 2
 lane1 = hx("01 01 40 8020 00 01")  # lane 1: FA_NZ Advance (slot 4096), rx_ts +0, fills +1
 step_a = hx(
     "40 02"
@@ -182,7 +186,7 @@ bind_b = hx("43 03 00") + struct.pack("<I", 0x00007003) + hx("01")  # lane 3 slo
 lane3 = hx(
     "03 02"
     " 00 8120 09 01"   # AcctTake: h 0, slot 4097, account 9, ver 1
-    " 02 00 64")       # count 2, slot 0, pkt_seq 1, rx_ts +50
+    " 02 00 64 00")    # count 2, slot 0, pkt_seq 1, rx_ts +50, snap_lag 0
 step_b = hx("40 01 a6 01 00 02")   # Control cut-only | DENSE | OTHER; gap 1 (step 2); +0, +2
 mark_b = hx("42 64 02 02 02")      # height 100; last_step 2; bounds: lane 3 +2
 order_b = bind_b + lane3 + step_b + mark_b

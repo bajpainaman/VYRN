@@ -1441,6 +1441,7 @@ mod tests {
             pkt_hash: PktHash(5),
             first_lane_seq: LaneSeq(1),
             fills_applied: StepId(0),
+            snap_lag: 0,
         };
         w.packet(p, Some(vyrn_types::Hash([1; 32]))).unwrap();
         assert!(

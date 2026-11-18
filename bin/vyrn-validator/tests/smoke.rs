@@ -114,6 +114,7 @@ fn block(seed: [u8; 32]) -> Vec<Vec<u8>> {
         pkt_hash: vyrn_crypto::pkt_hash(body),
         first_lane_seq: LaneSeq(1),
         fills_applied: StepId(0),
+        snap_lag: 0,
     };
     let mut frames = w.packet(p, Some(vyrn_crypto::hash::hash(body))).unwrap();
     let cut = [LaneSeq(1), LaneSeq(0)];

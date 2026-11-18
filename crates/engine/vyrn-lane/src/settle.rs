@@ -42,6 +42,17 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
         self.has_work(lc).then_some(lc)
     }
 
+    /// A `LaneCut` newer than `fills_applied` whose step is visible (`done_step ≥` it), work or
+    /// not: the catch-up boundary of [`Self::process_packet`].
+    pub(crate) fn catch_up_due(&mut self, vis: &V) -> Option<LaneCutEntry> {
+        let lc = self.io.lane_cut.try_read(vis)?;
+        if lc.step <= self.fills_applied {
+            return None;
+        }
+        let snap = self.io.snapshot.try_read(vis)?;
+        (snap.done_step >= lc.step).then_some(lc)
+    }
+
     fn has_work(&self, lc: LaneCutEntry) -> bool {
         let ev = self.evbuf.front().is_some_and(|e| e.step <= lc.step);
         let c = lc.cut.min(self.applied);
@@ -69,6 +80,12 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
     pub fn boundary(&mut self, vis: &V, at: LaneCutEntry, mid: Option<(u8, LaneSeq)>) {
         if at.step <= self.fills_applied {
             return;
+        }
+        // The base of later packets' `snap_lag` (05 §6.5). Inside a packet (a MID) the packet
+        // keeps the snapshot it was accepted with.
+        self.f_snap = at.snap;
+        if mid.is_none() && at.snap.version > self.snap.version {
+            self.snap = at.snap;
         }
         self.buffer_events(vis);
         // B1.
@@ -126,6 +143,7 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
             pkt_hash: PktHash(0),
             first_lane_seq: first,
             fills_applied: at.step,
+            snap_lag: 0,
         }));
         self.publish_counter(vis);
     }

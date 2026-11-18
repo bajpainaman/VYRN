@@ -276,24 +276,31 @@ impl Words<2> for Floor {
 }
 
 /// `LaneCut[l]` (05 §4.15). Writer: the stream core of `l`'s half, after step `step` is framed.
-/// Reader: lane `l`. The 16-B single-copy-atomic form of 05 needs SIMD stores that safe Rust
-/// cannot express, so this is the spec's fallback: a per-entry seqlock.
+/// Reader: lane `l`. `snap` is the BBO snapshot of step `step` (`done_step = step`). At its
+/// boundary at `step` the lane takes `snap.version` as the base of its packets' `snap_lag`, and
+/// `snap` itself if newer than its own (05 §6.5), so replay rebuilds both from `(f, C_f[l])`
+/// alone (07 §7.1). The 16-B single-copy-atomic
+/// form of 05 needs SIMD stores that safe Rust cannot express, so this is the spec's fallback: a
+/// per-entry seqlock.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LaneCutEntry {
     pub step: StepId,
     pub cut: LaneSeq,
+    pub snap: Snapshot,
 }
 
-impl Words<2> for LaneCutEntry {
+impl Words<6> for LaneCutEntry {
     #[inline]
-    fn to_words(&self) -> [u64; 2] {
-        [self.step.0, self.cut.0]
+    fn to_words(&self) -> [u64; 6] {
+        let [s0, s1, s2, s3] = self.snap.to_words();
+        [self.step.0, self.cut.0, s0, s1, s2, s3]
     }
     #[inline]
-    fn from_words([step, cut]: [u64; 2]) -> Self {
+    fn from_words([step, cut, s0, s1, s2, s3]: [u64; 6]) -> Self {
         Self {
             step: StepId(step),
             cut: LaneSeq(cut),
+            snap: Snapshot::from_words([s0, s1, s2, s3]),
         }
     }
 }
@@ -303,7 +310,7 @@ pub type SnapshotLine<V> = Published<Snapshot, 4, V>;
 /// `CutPub[h]`: one per half; written by cut core A (core 1) or B (core 6), read by the BBO.
 pub type HalfCut<V> = PubRing<HalfCutVal, HALF_CUT_WORDS, V>;
 pub type BboFloor<V> = Published<Floor, 2, V>;
-pub type LaneCut<V> = Published<LaneCutEntry, 2, V>;
+pub type LaneCut<V> = Published<LaneCutEntry, 6, V>;
 
 #[cfg(not(loom))]
 const _: () = {

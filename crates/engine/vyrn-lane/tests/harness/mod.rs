@@ -5,7 +5,7 @@
 //! - the **cut cores** (05 §4.13): copy each lane's `CounterLine` (`seq`, `snap_ver`, `f_lo`)
 //!   into its half-cut entry;
 //! - the **stream core** (05 §4.15): after a step is in the `StepLog`, write every lane's
-//!   `LaneCut = (f, C_f[l])`, `C_f[l]` being the lane's last cut delta;
+//!   `LaneCut = (f, C_f[l], snapshot of f)`, `C_f[l]` being the lane's last cut delta;
 //! - the **snapshot fan-out**: copy the BBO's `SnapshotLine` into each lane's line. A test can
 //!   *hold* a lane: its line keeps the snapshot it has and it runs no idle polls until its next
 //!   packet, which it classifies against that older snapshot (05 §2.5). The hold ends after the
@@ -404,8 +404,10 @@ impl Rig<'_> {
         self.hold[l] = true;
     }
 
-    /// Lane `l`'s snapshot line holds `s` until its next packet (a held lane, 05 §2.5).
+    /// Lane `l`'s snapshot is `s`, and its snapshot line holds `s` until its next packet (a
+    /// held lane, 05 §2.5).
     pub fn pin_snapshot(&mut self, l: usize, s: &Snapshot) {
+        self.lanes[l].restore_snapshot(*s);
         self.lane_snaps[l].publish(&Hw, s);
         self.hold[l] = true;
     }
@@ -484,13 +486,14 @@ impl Rig<'_> {
             for rec in &self.log[l][self.seen.1[l]..] {
                 t.push(match rec {
                     LogRec::Packet(r) => format!(
-                        "  log {l} {:#x} pkt={} count={} flags={:#x} first={} fills_applied={}",
+                        "  log {l} {:#x} pkt={} count={} flags={:#x} first={} fills_applied={} snap_lag={}",
                         r.session.0,
                         r.pkt_seq,
                         r.count,
                         r.flags,
                         r.first_lane_seq.0,
-                        r.fills_applied.0
+                        r.fills_applied.0,
+                        r.snap_lag
                     ),
                     LogRec::Route(r) => {
                         format!("  route {l} seq={} cross={}", r.lane_seq.0, r.cross)
@@ -605,12 +608,16 @@ impl Rig<'_> {
                 tx.push((h, recs));
             }
         }
+        // The step's snapshot (`done_step = entry.step`), which a lane takes at its boundary.
+        let snap = self.snap.try_read(&Hw).unwrap();
+        assert_eq!(snap.done_step, entry.step);
         for l in 0..N {
             self.lane_cuts[l].publish(
                 &Hw,
                 &LaneCutEntry {
                     step: entry.step,
                     cut: self.cut[l],
+                    snap,
                 },
             );
         }

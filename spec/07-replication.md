@@ -230,6 +230,7 @@ rx_ts     ZigZag LEB128 of (rx_ts − prev_rx_ts) as i64
 [LSEQ_EXC] LEB128 (first_lane_seq − next_lane_seq)             // > 0; lane ops that are not packets
 [MID]     LEB128 back = next_lane_seq − first_lane_seq          // MID Advance record only; 0 ≤ back ≤ count
 [SEQ_EXC] LEB128 pkt_seq                                       // absolute; never in an Advance record
+[PKT]     LEB128 snap_lag                                      // packet record without SHED only; ≤ u16::MAX
 ```
 
 Decoding rebuilds the full logical record of 01 §6.6:
@@ -268,12 +269,14 @@ fn decode_pkt(l: LaneId, d: &mut LaneDec, r: &mut Reader) -> Rec {   // Rec::Pkt
     if advance {
         let flags = ADVANCE | if mid { MID } else { 0 } | if mid && shed { PASS2 } else { 0 };
         return Rec::Pkt(PacketRecord { lane: l, count: 0, flags, session: 0, pkt_seq: 0,
-                              rx_ts, pkt_hash: PktHash(0), first_lane_seq, fills_applied });
+                              rx_ts, pkt_hash: PktHash(0), first_lane_seq, fills_applied, snap_lag: 0 });
     }
     let pkt_seq = if h & 0x10 != 0 { r.leb_u32() } else { d.slot_next_pkt_seq[slot] };
     d.slot_next_pkt_seq[slot] = pkt_seq + 1;
+    let snap_lag = if shed { 0 } else { r.leb_u16() };
     let rec = PacketRecord { lane: l, count, flags: if shed { SHED } else { 0 }, session: d.slot_session[slot],
-                             pkt_seq, rx_ts, pkt_hash: PktHash::PENDING, first_lane_seq, fills_applied };
+                             pkt_seq, rx_ts, pkt_hash: PktHash::PENDING, first_lane_seq, fills_applied,
+                             snap_lag };
     d.awaiting_hash.push(rec.r#ref());                           // shed packets are hashed, not joined
     Rec::Pkt(rec)
 }
@@ -480,14 +483,15 @@ unchanged.
 
 ```
 LaneRun   07 01                    tag lane 7, k = 1
-  record  0A AC 02 80 08           h = count = 10; slot 300 = AC 02; zigzag(512) = 1024 = 80 08
+  record  0A AC 02 80 08 00        h = count = 10; slot 300 = AC 02; zigzag(512) = 1024 = 80 08;
+                                   snap_lag 0
 StepRun   40 01                    tag, m = 1
   step    50 00 07 00              Cross 0 | HOME (1<<4) | SPARSE (2<<5), OTHER 0; gap 0; src 7; zigzag(0)
           88 10 00 00              half A bitmap: bits 3, 7 (0x88), bit 12 (0x10); 25 lanes = 4 bytes
           02 0A 01                 deltas for lanes 3, 7, 12
 ```
 
-All of it is on substream A, because lane 7 is in half A and half B did not move. That is 20 bytes
+All of it is on substream A, because lane 7 is in half A and half B did not move. That is 21 bytes
 for one packet of 10 messages and one cross. 01's logical records hold 43 B and 410 B respectively
 (the cut alone is 49 × 8 B).
 
@@ -533,7 +537,7 @@ pair of replication ports on one leaf, one per substream (06 §2.3); the table s
 
 | Item | Rate | Bytes each | MB/s per path |
 |---|---|---|---|
-| PacketRecord O-part | 100M/s | 6.0 | 600 |
+| PacketRecord O-part, with `snap_lag` (1 B when < 128) | 100M/s | 7.0 | 700 |
 | `AcctTake` (pooled lanes) | ≤ 3M/s | 7 | 20 |
 | `RouteRecord` (one per op classified `Cross` or `Improve`) | ≤ 30M/s | 3 | 90 |
 | LaneRun headers | 12M frames × ~5 lanes | 2 | 120 |
@@ -546,11 +550,12 @@ pair of replication ports on one leaf, one per substream (06 §2.3); the table s
 | HASH frame overhead (9000 B frames) | ~0.1M/s | 90 | 9 |
 | HEADER, BlockMark, HEARTBEAT, SessionBind | ~25k/s | ≤ 220 | < 1 |
 | HEADER_PQ (scheme 1 only, 01 §14.20) | 1k/s per book | ~2,540 | 2.5 |
-| **Total per path** | | | **3,400 MB/s ≈ 27.2 Gbps** (3,403 under scheme 1) |
+| **Total per path** | | | **3,500 MB/s ≈ 28.0 Gbps** (3,503 under scheme 1) |
 
-Record payload (O + H + steps) is 2.33 GB/s ≈ 18.6 Gbps. Frame overhead is the rest, and it falls
+Record payload (O + H + steps) is 2.43 GB/s ≈ 19.4 Gbps. Frame overhead is the rest, and it falls
 when flushes coalesce under load (§4.5). On the sequencer each path is two 100GbE ports at ≤ 14%
-each; at a replica each path is one port at ≤ 28%, carrying both substreams. Replicas send
+each; at a replica each path is one port at ≤ 28%, carrying both substreams. `snap_lag` (05 §6.5)
+added 1 B per packet record (+100 MB/s, +0.8 Gbps per path). Replicas send
 the sequencer ≤ 1 Mbps of acks and NACKs.
 
 Other links at peak (budget):
@@ -1575,6 +1580,17 @@ comparing their outputs. One case needs 05's op-level scheduler (05 §10) and is
 `REP_MERGE`: a packet whose `MID` boundary at step `f` follows an op of the same packet that
 `cut_f` already covers. A lane call cannot stop mid-packet for a step, so a replica rejects such a
 record with `REP_E_ORDER` until 05 defines a split lane call.
+
+**Snapshot history (05 §6.5).** Replay keeps the snapshot of each version the replayed BBO
+publishes, in a ring of `REPLAY_SNAP_HIST` = `ENG_SNAP_HIST` = 4096 versions, and
+`LaneCut` gives each replay lane `base`, the version of its `fills_applied` step. Before a packet
+record, the lane restores version `v = base + snap_lag` and classifies the packet against it. The
+record is *due* (item 2 above) only once `v` is published as well as once `f(r) < s`. A lane's
+snapshot never moves back, so a later record of the lane never needs an older version than an
+earlier one, and the wait never blocks another lane's record. A `v` that the ring no longer
+holds (more than 4096 versions older than the newest when the record is due) is a divergence
+(`Why::NoSnapshot` in `vyrn-engine`). The lag itself is bounded by `u16::MAX` (05 §6.5 rule 3);
+the ring is the tighter bound and is the one `band_env` already uses (05 §8.6).
 
 **Fields replay derives.** 07's `StepRecord` carries the kind, the source with its `CROSS`
 route bit (§3.8), the cut and the kind payload; the lane's route records (§3.6) carry the route

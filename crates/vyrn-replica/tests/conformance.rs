@@ -109,6 +109,7 @@ fn pkt(lane: u8, session: u32, count: u8, flags: u8) -> Section {
             pkt_hash: PktHash(0),
             first_lane_seq: LaneSeq(1),
             fills_applied: StepId(0),
+            snap_lag: 0,
         })],
     }
 }

@@ -257,6 +257,9 @@ pub struct Lane<'a, V: Visibility, const NA: usize> {
     pub(crate) phase: Phase,
     pub(crate) band: (Tick, Tick),
     pub(crate) snap: Snapshot,
+    /// The snapshot step `fills_applied` published: its version is the base of `snap_lag`, and
+    /// a packet is never classified against an older one (05 §6.5).
+    pub(crate) f_snap: Snapshot,
     pub(crate) pend: std::collections::VecDeque<PendE>,
     pub(crate) evbuf: std::collections::VecDeque<vyrn_bbo::FillEvent>,
     pub(crate) fwd: std::collections::VecDeque<FwdOut>,
@@ -387,6 +390,10 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                 ask: NO_ASK,
                 ..Snapshot::default()
             },
+            f_snap: Snapshot {
+                ask: NO_ASK,
+                ..Snapshot::default()
+            },
             pend: std::collections::VecDeque::with_capacity(n),
             evbuf: std::collections::VecDeque::with_capacity(ENG_FILL_RING),
             fwd: std::collections::VecDeque::with_capacity(ENG_FWD_RING),
@@ -504,13 +511,33 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         self.jpos = self.jpos.wrapping_add(1);
     }
 
-    /// Refreshes the lane's snapshot (05 §6.5: every later op uses this version or newer).
+    /// Refreshes the lane's snapshot (05 §6.5: every later op uses this version or newer),
+    /// unless its `snap_lag` would pass `u16::MAX`.
     pub(crate) fn refresh_snapshot(&mut self, vis: &V) {
         if let Some(s) = self.io.snapshot.try_read(vis)
             && s.version >= self.snap.version
+            && s.version.saturating_sub(self.f_snap.version) <= u64::from(u16::MAX)
         {
             self.snap = s;
         }
+    }
+
+    /// `snap_lag` of a packet accepted now: `snap.version` minus the version of step
+    /// `fills_applied` (≥ 0: accept never keeps a snapshot older than `f_snap`).
+    fn snap_lag(&self) -> u16 {
+        u16::try_from(self.snap.version.saturating_sub(self.f_snap.version)).unwrap_or(u16::MAX)
+    }
+
+    /// The version step `fills_applied` published, the base of the next packet's `snap_lag`:
+    /// replay classifies that packet against version `snap_base() + snap_lag` (07 §7.1).
+    pub fn snap_base(&self) -> u64 {
+        self.f_snap.version
+    }
+
+    /// Sets the lane's snapshot: replay restores the one a packet's `snap_lag` names before the
+    /// packet (07 §7.1), and tests pin one. The live path never calls this.
+    pub fn restore_snapshot(&mut self, s: Snapshot) {
+        self.snap = s;
     }
 
     // -----------------------------------------------------------------------------------------
@@ -611,6 +638,16 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             *d = Some(*m);
         }
         self.scripted = !mids.is_empty();
+        // A lane so far behind that the newest snapshot's `snap_lag` would pass `u16::MAX` first
+        // takes a boundary at the newest framed step (an Advance record), so it never saturates.
+        if !self.scripted
+            && self.io.snapshot.try_read(vis).is_some_and(|s| {
+                s.version.saturating_sub(self.f_snap.version) > u64::from(u16::MAX)
+            })
+            && let Some(lc) = self.catch_up_due(vis)
+        {
+            self.boundary(vis, lc, None);
+        }
         let r = self.packet(vis, p, clock);
         self.mids = [None; 20];
         self.scripted = false;
@@ -781,7 +818,13 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         }
         let prio_ts = p.rx_ts.max(self.last_prio_ts);
         self.last_prio_ts = prio_ts;
-        self.refresh_snapshot(vis);
+        // Replay restored the logged snapshot before the packet (07 §7.1).
+        if self.forced.is_none() {
+            self.refresh_snapshot(vis);
+        }
+        if self.snap.version < self.f_snap.version {
+            self.snap = self.f_snap;
+        }
         // V9 (header) and V10 (packet buckets): every message gets the reject.
         let hdr = req.check_header().err().map(|e| rej(e.reason, e.detail));
         let hdr = hdr.or_else(|| (s.book != h.book()).then(|| rej(RejectReason::BadBook, 0)));
@@ -816,6 +859,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             pkt_hash: p.pkt_hash,
             first_lane_seq: LaneSeq(self.seq.0.saturating_add(1)),
             fills_applied: self.fills_applied,
+            snap_lag: self.snap_lag(),
         }));
         self.n_ops = 0;
         self.cur_sess = si;
@@ -939,6 +983,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             pkt_hash: p.pkt_hash,
             first_lane_seq: first,
             fills_applied: self.fills_applied,
+            snap_lag: 0,
         }));
     }
 

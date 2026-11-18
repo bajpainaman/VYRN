@@ -14,6 +14,8 @@
 //! (each lane in O-order, lanes interleaved), the route records in any order, and the steps in
 //! StepId order. The engine merges them by 07 §7.1 `REP_MERGE` and carries the lane records a
 //! block does not settle into the next call (`Engine::carried`).
+//! Each packet is classified against the snapshot its `snap_lag` names (05 §6.5), so replay
+//! matches the live lane even when the price band binds.
 //!
 //! **Output.** Every order-stream record, lane response and fill TX packet the engine produces
 //! goes to the sink `S`, and responses are checked against `R` (`vyrn_engine::NoResponses` for

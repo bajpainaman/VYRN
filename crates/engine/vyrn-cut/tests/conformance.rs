@@ -124,12 +124,23 @@ fn half_cut_offsets_are_05_4_13() {
 }
 
 #[test]
-fn lane_cut_is_step_then_cut() {
+fn lane_cut_is_step_then_cut_then_the_steps_snapshot() {
     let e = LaneCutEntry {
         step: StepId(3),
         cut: LaneSeq(4),
+        snap: Snapshot {
+            version: 7,
+            bid: Tick(90),
+            ask: Tick(105),
+            done_step: StepId(3),
+            win_center: Tick(100),
+            phase: 1,
+            flags: 2,
+        },
     };
-    assert_eq!(e.to_words(), [3, 4]);
+    let w = [3, 4, 7, 90 | 105 << 32, 3, 100 | 1 << 32 | 2 << 40];
+    assert_eq!(e.to_words(), w);
+    assert_eq!(LaneCutEntry::from_words(w), e);
 }
 
 #[test]
@@ -159,7 +170,7 @@ impl Backend for Sim {
 
 /// A reader sees a whole publication, eventually the newest, and never goes back.
 fn contract<V: Backend>(vis: &V) {
-    let line: Published<LaneCutEntry, 2, V> = Published::new(vis, &LaneCutEntry::default());
+    let line: Published<LaneCutEntry, 6, V> = Published::new(vis, &LaneCutEntry::default());
     let mut seen = 0u64;
     for k in 1..=200u64 {
         line.publish(
@@ -167,10 +178,15 @@ fn contract<V: Backend>(vis: &V) {
             &LaneCutEntry {
                 step: StepId(k),
                 cut: LaneSeq(k * 10),
+                snap: Snapshot {
+                    version: k * 10,
+                    ..Snapshot::default()
+                },
             },
         );
         if let Some(r) = line.try_read(vis) {
             assert_eq!(r.cut.0, r.step.0 * 10, "torn");
+            assert_eq!(r.snap.version, r.cut.0, "torn");
             assert!(r.step.0 >= seen, "went back");
             seen = r.step.0;
         }

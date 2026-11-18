@@ -140,6 +140,7 @@ fn packet(session: u32, pkt_seq: u32, bytes: &[u8], flags: u8) -> PacketRecord {
         pkt_hash: PktHash(u64::from_le_bytes(h.0[..8].try_into().unwrap())),
         first_lane_seq: LaneSeq(1),
         fills_applied: StepId(0),
+        snap_lag: 0,
     }
 }
 

@@ -391,6 +391,92 @@ fn the_script_reaches_every_case() {
     assert_eq!(hb.count, 1, "{hb:?}");
 }
 
+/// A lane reads the BBO snapshot only at its boundaries (05 §6.5, 07 §7.1 `REP_MERGE` item 2).
+/// Band scripts for `snap_lag` (05 §6.5, 07 §7.1): lane 2 takes no boundary after its last
+/// fill step, then classifies a buy at 300 against the newest snapshot, many versions after
+/// the one its `fills_applied` step published. Replay must use the logged version, not that
+/// step's.
+///
+/// `ask_kept`: no later step clears the ask at 105, so live the band binds (edge 210) and the
+/// buy is `BAD_TICK`; the snapshot of lane 2's step 0 has no ask, so a replay that used it
+/// would accept. Otherwise a Depletion step clears the ask first, so live accepts the buy, and a
+/// replay that used lane 2's step-3 snapshot (ask 105) would reject it.
+fn snap_lag_script(ask_kept: bool) -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let p = |l, a, rx_ts, now, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts,
+        now,
+        msgs,
+    };
+    if ask_kept {
+        return vec![
+            p(0, 1, 1_000, 1_000, vec![new(Sell, Day, 105, 1, 1)]),
+            Act::Run,
+            p(1, 1, 2_000, 2_000, vec![new(Buy, Day, 105, 1, 2)]),
+            Act::Step(None),
+            Act::Poll,
+            p(2, 1, 3_000, 3_000, vec![new(Buy, Day, 300, 1, 3)]),
+            Act::Run,
+        ];
+    }
+    vec![
+        p(0, 1, 1_000, 1_000, vec![new(Sell, Day, 105, 1, 1)]),
+        Act::Run,
+        // Lane 2's bid settles at a boundary whose snapshot has ask 105.
+        p(2, 1, 2_000, 2_000, vec![new(Buy, Day, 90, 1, 2)]),
+        Act::Run,
+        // A buy empties the ask; the steps after it publish a snapshot with no ask.
+        p(1, 1, 3_000, 3_000, vec![new(Buy, Day, 105, 1, 3)]),
+        Act::Run,
+        Act::Poll,
+        p(2, 2, 4_000, 4_000, vec![new(Buy, Day, 300, 1, 4)]),
+        Act::Run,
+    ]
+}
+
+#[test]
+fn replay_classifies_each_packet_against_its_logged_snapshot() {
+    for ask_kept in [true, false] {
+        let script = snap_lag_script(ask_kept);
+        let (live_j, _) = live07(&script);
+        let lane2 = |j: &Journal| {
+            j.recs
+                .iter()
+                .filter_map(|r| match r {
+                    OwnedRec::Packet(p) if p.lane.0 == 2 && p.count > 0 => Some(*p),
+                    _ => None,
+                })
+                .next_back()
+                .unwrap()
+        };
+        assert!(lane2(&live_j).snap_lag > 0, "{:?}", lane2(&live_j));
+        let bad_tick = live_j.resp.iter().any(|(l, p)| {
+            l.0 == 2
+                && p.records().iter().any(|r| {
+                    matches!(
+                        r,
+                        vyrn_bbo::Record::Reject {
+                            reason: vyrn_types::RejectReason::BadTick,
+                            detail: 210,
+                            ..
+                        }
+                    )
+                })
+        });
+        assert_eq!(bad_tick, ask_kept, "{:#?}", live_j.resp);
+        for cuts in std::iter::once(vec![]).chain((0..live_j.recs.len() - 1).map(|at| vec![at])) {
+            let (live_j, store, blocks) = blocks_of(&script, &cuts);
+            let (rep, _) = replay(&live_j, &store, &blocks).unwrap_or_else(|e| {
+                panic!("ask_kept {ask_kept}, blocks split after {cuts:?}: {e}")
+            });
+            check_same(&live_j, &rep);
+        }
+    }
+}
+
 #[test]
 fn blocks_split_anywhere_replay_the_same() {
     let (j, _) = live07(&script());
