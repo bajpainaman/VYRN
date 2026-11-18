@@ -868,6 +868,8 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
     }
 
     /// 05 §6.8: `Reject BUSY` per message in one packet, a `SHED` record, `pkt_seq` unchanged.
+    /// The packet keeps its LaneSeqs and its `pkt_hash` (07 §3.5, §3.6: it is hashed and joined),
+    /// so a resend of the same `pkt_seq` takes new ones.
     fn answer_busy(&mut self, vis: &V, si: u16, req: &Request<'_>, p: RxIn<'_>) {
         let _ = vis;
         let Some(s) = self.sess.get_mut(si) else {
@@ -876,6 +878,8 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         let rs = s.next_resp;
         s.next_resp = s.next_resp.wrapping_add(1);
         let first = LaneSeq(self.seq.0.saturating_add(1));
+        let count = req.header().count;
+        self.seq = LaneSeq(self.seq.0.saturating_add(u64::from(count)));
         let mut r = RespPkt::new(s.id, rs, req.header().pkt_seq.get(), Gate::Packet(first));
         for (ix, raw) in req.raw_msgs().iter().enumerate() {
             let tag = tag_of(raw);
@@ -890,12 +894,12 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         self.out.resp(r);
         self.out.log(LogRec::Packet(PacketRecord {
             lane: self.cfg.lane,
-            count: req.header().count,
+            count,
             flags: PacketFlags::SHED,
             session: sid,
             pkt_seq: req.header().pkt_seq.get(),
             rx_ts: p.rx_ts,
-            pkt_hash: PktHash(0),
+            pkt_hash: p.pkt_hash,
             first_lane_seq: first,
             fills_applied: self.fills_applied,
         }));

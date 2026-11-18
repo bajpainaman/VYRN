@@ -451,8 +451,8 @@ fn deadline_admission_at_the_threshold() {
     assert_eq!(x.send_at(0, 1, 10_000, 10_462, &m, &[]), Rx::Shed);
     assert_eq!(
         x.lanes[0].seq(),
-        LaneSeq(0),
-        "a shed packet takes no LaneSeq"
+        LaneSeq(1),
+        "a shed packet keeps its LaneSeqs (07 §3.5)"
     );
     assert_eq!(
         x.records(0, 1),
@@ -465,11 +465,14 @@ fn deadline_admission_at_the_threshold() {
     );
     let p = packets(&x, 0);
     assert_eq!(p[0].flags, PacketFlags::SHED);
-    assert_eq!(p[0].pkt_hash, vyrn_types::PktHash(0));
-    // The client resends the same pkt_seq; on time now.
+    assert_eq!(p[0].first_lane_seq, LaneSeq(1));
+    assert_ne!(p[0].pkt_hash, vyrn_types::PktHash(0), "hashed and joined");
+    // The client resends the same pkt_seq; on time now. It takes the next LaneSeq.
     assert_eq!(x.send_at(0, 1, 20_000, 20_461, &m, &[]), Rx::Accepted);
-    assert_eq!(x.lanes[0].seq(), LaneSeq(1));
-    assert_eq!(packets(&x, 0)[1].pkt_seq, p[0].pkt_seq);
+    assert_eq!(x.lanes[0].seq(), LaneSeq(2));
+    let q = packets(&x, 0);
+    assert_eq!(q[1].pkt_seq, p[0].pkt_seq);
+    assert_eq!(q[1].first_lane_seq, LaneSeq(2));
 }
 
 /// Lane 1 crosses lane 0's ask; the BBO runs the step but lane 0 has not applied it. Lane 0 then
