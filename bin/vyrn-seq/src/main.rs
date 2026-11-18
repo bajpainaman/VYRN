@@ -16,7 +16,7 @@
 //! | `[engine] dedicated, pooled = 0, tick_min, tick_max, win_center, slot_cap` | lanes and book window |
 //! | `[nic] backend, ip, port_base` | `kernel_udp` or `sim`; lane `l` listens on `port_base + l` (0: ephemeral) |
 //! | `[cores] pin = false, engine, stream, seal` | `pin = true` pins the engine and stream threads to `engine` and `stream` (both required); a failed pin fail-stops before `READY`; `seal` is `abort`, `count` or `off` |
-//! | `[replication] order = ["ip:port", ...], block_ms` | where ORDER, HASH and HEADER frames go; block period |
+//! | `[replication] order = ["ip:port", ...], order_b = [...], block_ms` | where ORDER, HASH and HEADER frames go on path A and, flagged `PATH_B`, on path B (optional; 07 §3.1); block period |
 //! | `[keys] seq` | the `seq_key` handle (Ed25519 seed) |
 //! | `[epoch_boundary] next, t_ns, to_home, seq_index` | optional: per-lane `EpochNotice` triggers (08 §2.4) |
 //! | `[[dev_session]] lane, slot, account, k_seq, k_out, quote, base` | DEV only: sessions opened at start |
@@ -96,6 +96,7 @@ use vyrn_engine::alloc::SealingAlloc;
 use vyrn_engine::{Engine, Fault, Rec, Shared, Sink};
 use vyrn_epoch::{Boundary, EpochNotice, Notifier};
 use vyrn_lane::{ArenaConfig, Gate, Lane, PathTable, RespPkt, Rx, RxIn, SessionSpec};
+use vyrn_log::frame::FrameFlags;
 use vyrn_log::stream::has_src;
 use vyrn_log::{Ident, LaneBase, Layout, SeqWriter, TenureStart};
 use vyrn_nic::frame::{self, Endpoint, FrameHdr};
@@ -380,6 +381,7 @@ where
             let (stats, stop, ready) = (Arc::clone(&stats), Arc::clone(&stop), ready_tx.clone());
             let (stream_done, engine_done) = (&stream_done, &engine_done);
             let replicas = cfg.replication.order.clone();
+            let replicas_b = cfg.replication.order_b.clone();
             let epoch16 = Epoch(cfg.epoch).low16();
             let (pin, stream_core, stream_pin) = (cfg.cores.pin, cfg.cores.stream, &stream_pin);
             std::thread::Builder::new()
@@ -396,6 +398,8 @@ where
                         order_tx,
                         resp_tx,
                         replicas,
+                        replicas_b,
+                        path_b: Vec::new(),
                         src: ip,
                         k_out,
                         epoch16,
@@ -1096,6 +1100,9 @@ struct StreamCore<T: TxRing> {
     order_tx: T,
     resp_tx: T,
     replicas: Vec<SocketAddrV4>,
+    /// Path B's replicas, and the buffer their `PATH_B` copy is built in.
+    replicas_b: Vec<SocketAddrV4>,
+    path_b: Vec<u8>,
     src: Ipv4Addr,
     k_out: Vec<(SessionId, [u8; 16])>,
     epoch16: u16,
@@ -1294,20 +1301,37 @@ impl<T: TxRing> StreamCore<T> {
         Ok(true)
     }
 
+    /// Sends each frame on path A, then its `PATH_B` copy on path B (07 §3.1, D4): both before
+    /// the responses they release.
     fn ship(&mut self, frames: &[Vec<u8>]) -> Result<(), String> {
+        let dst = |r: &SocketAddrV4| Endpoint {
+            mac: [0; 6],
+            ip: *r.ip(),
+            port: r.port(),
+        };
         for f in frames {
             for r in &self.replicas {
-                let dst = Endpoint {
-                    mac: [0; 6],
-                    ip: *r.ip(),
-                    port: r.port(),
-                };
-                send(&mut self.order_tx, self.src, dst, f)?;
+                send(&mut self.order_tx, self.src, dst(r), f)?;
+            }
+            if self.replicas_b.is_empty() {
+                continue;
+            }
+            // Only `flags` differs between the copies (07 §3.2, INV-REP-3).
+            self.path_b.clear();
+            self.path_b.extend_from_slice(f);
+            if let Some(b) = self.path_b.get_mut(FLAGS_AT) {
+                *b = FrameFlags::PATH_B;
+            }
+            for r in &self.replicas_b {
+                send(&mut self.order_tx, self.src, dst(r), &self.path_b)?;
             }
         }
         Ok(())
     }
 }
+
+/// `flags`' offset in a log frame header (`vyrn_log::frame`).
+const FLAGS_AT: usize = 16;
 
 /// Whether frames already returned by `w` cover what `gate` waits for on `lane`.
 fn gate_open(w: &SeqWriter, lane: LaneId, gate: Gate) -> bool {

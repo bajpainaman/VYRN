@@ -4,7 +4,7 @@
 //!
 //! **Invocation.** `e2e-smoke [--bin-dir DIR] [--validators K] [--packets P] [--rate R]
 //! [--seed S] [--wait-s T] [--seq-cpus L] [--validator-cpus L] [--strict-hashlag] [--finality]
-//! [--data] [--dropcopy]`. `DIR` holds `vyrn-seq`, `vyrn-validator`, (with `--data`) `vyrn-data` and (with
+//! [--data] [--dropcopy] [--two-path] [--drop-path-b N]`. `DIR` holds `vyrn-seq`, `vyrn-validator`, (with `--data`) `vyrn-data` and (with
 //! `--dropcopy`) `vyrn-dropcopy` (default: this binary's directory). Exit 0 when every enabled check passes, 1 when one fails,
 //! 2 when the run could not start. Every wait has a deadline of `T` seconds (default 30): the
 //! harness never blocks on a child, a socket or a pipe without one, and kills every child it
@@ -31,7 +31,7 @@
 //! | `replay` | the tap's `OrderCore` readies the same blocks, holding every packet sent exactly once, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box |
 //! | `replica-out` | with `--data` every validator replays (`[replay]`) and its `out=<hex>` on each `BLOCK` line equals the tap's output hash of that block; one stopped at `REP_E_HASHLAG` is compared on the blocks it printed (R5); SKIP while no validator replays |
 //! | `finality` | with `--finality` (default 4 validators, a DEV roster as in `bin/vyrn-validator/tests/committee.rs`, `[consensus]` in every validator and the box): while the box still runs, the box's listener (`FINAL height=<h> ... from=<votes\|cert>`) and every validator that did not stop print `FINAL` through the box's last block. A validator's `OUT_OF_ORDER`, `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT` line fails `validators`; `REP_E_HASHLAG` follows R5 and R6. SKIP without it |
-//! | `dropcopy` | with `--dropcopy` (needs `--data` and `--finality`): an observer (`vyrn-validator`, `role = "observer"`, data destination `n + 1`, in the box's order list and every validator's `[consensus] observers`) replays every block into its output ring and finalizes from the validators' certificates; `vyrn-dropcopy` serves the ring over Noise, and one client per session logs in to its account's stream. Each stream's served records, without stage markers, equal an in-process `DropCopy` over the tap's `RustReplay` byte for byte, with gapless seqs, and end in a `DC_FINAL`; every record with a `resp_seq` (acks, cancels, outs, taker fills) names a response packet the client received (10 §8.3). It prints a DEV timing of those records after their response packets (R9); SKIP without it |
+//! | `dropcopy` | with `--dropcopy` (needs `--data` and `--finality`): an observer (`vyrn-validator`, `role = "observer"`, data destination `n + 1`, in the box's order list on both paths (R12) and every validator's `[consensus] observers`) replays every block into its output ring and finalizes from the validators' certificates; `vyrn-dropcopy` serves the ring over Noise, and one client per session logs in to its account's stream. Each stream's served records, without stage markers, equal an in-process `DropCopy` over the tap's `RustReplay` byte for byte, with gapless seqs, and end in a `DC_FINAL`; every record with a `resp_seq` (acks, cancels, outs, taker fills) names a response packet the client received (10 §8.3). It prints a DEV timing of those records after their response packets (R9); SKIP without it |
 //! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed reports no gap or rejected frame, and that join is the one `replay` reads; SKIP without `--data` |
 //!
 //! **Readings** (the spec does not settle these; PR body):
@@ -73,6 +73,13 @@
 //!   its `K_fetch`, then the data box and the primary `vyrn-seq` box each get `EPOCH 1` and drop
 //!   epoch 0's keys. `data` then needs `fetch_unauth = 0`, so every fetch of the run was sealed
 //!   under an epoch-1 key, and `seq-repair` (R8) needs the seq box to refuse epoch 0's key.
+//! - R12. Path B (07 §3.1). The observer always takes path B (`[nic] order_port_b`, which it
+//!   requires) and `vyrn-seq` sends it `PATH_B` copies (`[replication] order_b`); with
+//!   `--two-path` every validator does too, and every check above then runs over the deduplicated
+//!   two-path stream. `--drop-path-b N` relays the observer's path B and drops its `N`-th
+//!   datagram: the `dropcopy` check then requires that the observer print `DURABLE_WAIT
+//!   height=h`, replay exactly blocks `0..h`, and that the box went past `h`. Its drop copy is
+//!   not compared then: it holds what the observer could not attest (10 §8.2).
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -218,6 +225,15 @@ struct Cli {
     /// The vyrn-data node's ingest shards (`[shards] n`, R10; needs --data).
     #[arg(long, value_name = "N", default_value_t = 1)]
     data_shards: usize,
+    /// Send ORDER frames on path B too (`[replication] order_b`), to every validator's
+    /// `order_port_b` (R12). The observer always has path B (it requires it).
+    #[arg(long)]
+    two_path: bool,
+    /// Relay the observer's path B and drop its N-th datagram (needs --dropcopy, R12): the
+    /// observer must hold the block that frame belongs to and replay nothing from it on, while
+    /// the validators, which still have path A, finish.
+    #[arg(long, value_name = "N")]
+    drop_path_b: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -426,6 +442,40 @@ fn field<'a>(l: &'a str, k: &str) -> Option<&'a str> {
         .find_map(|f| f.strip_prefix(k)?.strip_prefix('='))
 }
 
+/// R12 (`--drop-path-b`): path B lost one of the observer's frames, so the observer holds the
+/// block it belongs to (`DURABLE_WAIT height=h`) and replays exactly the blocks below it, while
+/// the box went past it.
+fn durable_hold(n: &Node, dropped: u64, top: Option<u64>) -> Result<String, String> {
+    if dropped != 1 {
+        return Err(format!("the relay dropped {dropped} datagrams, not 1"));
+    }
+    let h: u64 = line(n, "DURABLE_WAIT height=")
+        .and_then(|v| v.parse().ok())
+        .ok_or("no DURABLE_WAIT: the observer did not hold a block")?;
+    let replayed: Vec<u64> = blocks(n).iter().map(|b| b.0.0).collect();
+    if replayed != (0..h).collect::<Vec<_>>() {
+        return Err(format!(
+            "held at {h} but replayed {} blocks, last {:?}",
+            replayed.len(),
+            replayed.last()
+        ));
+    }
+    match top {
+        Some(t) if t > h => Ok(format!(
+            "path B dropped 1 frame; the observer held block {h} and replayed only 0..{h} of 0..={t}"
+        )),
+        _ => Err(format!("held at {h}, but the box's last block is {top:?}")),
+    }
+}
+
+/// `"a", "b"`: a TOML array's items.
+fn quoted(xs: &[String]) -> String {
+    xs.iter()
+        .map(|a| format!("\"{a}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// `(height, first_step, last_step)` and the whole line of every `BLOCK` line.
 fn blocks(n: &Node) -> Vec<((u64, u64, u64), &str)> {
     n.lines
@@ -540,10 +590,13 @@ fn tap(sock: UdpSocket, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<Vec<Ve
     })
 }
 
-/// `--keyed` (R7): a UDP relay to `127.0.0.1:port` that drops every `LOSS_EVERY`-th datagram,
-/// until `stop`. Returns its address and, on join, how many it dropped.
+/// A UDP relay to `127.0.0.1:port` that drops the datagrams `drop` picks by their 1-based
+/// count, until `stop`: `--keyed` (R7) drops every `LOSS_EVERY`-th, `--drop-path-b` (R12) one.
+/// Returns its address and, on join, how many it dropped.
 fn relay(
     port: u16,
+    drop: fn(u64, u64) -> bool,
+    arg: u64,
     stop: Arc<AtomicBool>,
 ) -> Result<(SocketAddr, std::thread::JoinHandle<u64>), String> {
     let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
@@ -556,7 +609,7 @@ fn relay(
         while !stop.load(Ordering::Acquire) {
             if let Ok(k) = sock.recv(&mut buf) {
                 n += 1;
-                if n.is_multiple_of(LOSS_EVERY) {
+                if drop(n, arg) {
                     dropped += 1;
                 } else {
                     let _ = sock.send_to(buf.get(..k).unwrap_or_default(), ("127.0.0.1", port));
@@ -736,6 +789,7 @@ impl Report {
 fn seq_config(
     dir: &Path,
     order: &[String],
+    order_b: &[String],
     sessions: &[Sess],
     cons: Option<&Cons>,
     repair: Option<u16>,
@@ -767,16 +821,14 @@ seal = "count"
 
 [replication]
 order = [{}]
+order_b = [{}]
 block_ms = 5
 
 [keys]
 seq = "env:VYRN_E2E_SEQ_SEED"
 "#,
-        order
-            .iter()
-            .map(|a| format!("\"{a}\""))
-            .collect::<Vec<_>>()
-            .join(", ")
+        quoted(order),
+        quoted(order_b)
     );
     for x in sessions {
         s.push_str(&format!(
@@ -848,6 +900,7 @@ fn validator_config(
     hashlag_us: Option<u64>,
     keyed: bool,
     observer: Option<(&Path, SocketAddrV4)>,
+    order_b: bool,
 ) -> Result<PathBuf, String> {
     let key = hex(&vyrn_crypto::ed25519::public_key(&SEQ_SEED));
     let data_port = data.and_then(|(_, ps, _)| ps.get(i).copied()).unwrap_or(0);
@@ -869,6 +922,7 @@ fn validator_config(
     } else {
         ""
     };
+    let port_b = if order_b { "order_port_b = 0\n" } else { "" };
     let mut s = format!(
         r#"{dev}schema = 1
 protocol = 1
@@ -882,7 +936,7 @@ lanes = {LANES}
 backend = "kernel_udp"
 ip = "127.0.0.1"
 order_port = 0
-data_port = {data_port}
+{port_b}data_port = {data_port}
 
 [membership]
 seq_keys = ["{key}"]
@@ -1025,6 +1079,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
             "--dropcopy needs --data and --finality: the observer replays and finalizes".into(),
         );
     }
+    if cli.drop_path_b.is_some_and(|n| n == 0) || (cli.drop_path_b.is_some() && !cli.dropcopy) {
+        return Err("--drop-path-b needs --dropcopy and N >= 1".into());
+    }
     if cli.data_shards == 0 || (cli.data_shards > 1 && !cli.data) {
         return Err("--data-shards needs --data and N >= 1".into());
     }
@@ -1101,7 +1158,12 @@ fn run(cli: &Cli) -> Result<bool, String> {
         if cli.keyed
             && let (Some(d), Some(&p)) = (dests.get_mut(1), val_data.first())
         {
-            let (addr, h) = relay(p, Arc::clone(&stop_tap))?;
+            let (addr, h) = relay(
+                p,
+                |n, every| n.is_multiple_of(every),
+                LOSS_EVERY,
+                Arc::clone(&stop_tap),
+            )?;
             *d = addr.to_string();
             relay_h = Some(h);
         }
@@ -1155,6 +1217,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 cli.dev_hashlag_us,
                 keyed,
                 None,
+                cli.two_path,
             )?;
             let mut c = command(
                 &bin_dir.join("vyrn-validator"),
@@ -1182,6 +1245,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 cli.dev_hashlag_us,
                 false,
                 Some((&ring, ctrl)),
+                true,
             )?;
             let mut c = command(
                 &bin_dir.join("vyrn-validator"),
@@ -1220,6 +1284,25 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 .map(str::to_owned)
         })
         .collect();
+    // Path B (R12): every replica that printed ORDER_B; with --drop-path-b the observer's goes
+    // through a relay that drops one datagram.
+    let stop_relay = Arc::new(AtomicBool::new(false));
+    let mut pathb_h = None;
+    let mut order_b = Vec::new();
+    for &i in vals.iter().chain(&obs) {
+        let Some(b) = nodes.0.get(i).and_then(|n| line(n, "ORDER_B order=")) else {
+            continue;
+        };
+        match cli.drop_path_b {
+            Some(k) if obs == Some(i) => {
+                let to: SocketAddrV4 = b.parse().map_err(|e| format!("ORDER_B {b}: {e}"))?;
+                let (addr, h) = relay(to.port(), |n, k| n == k, k, Arc::clone(&stop_relay))?;
+                order_b.push(addr.to_string());
+                pathb_h = Some(h);
+            }
+            _ => order_b.push(b.to_owned()),
+        }
+    }
 
     let tap_sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     tap_sock
@@ -1237,7 +1320,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
     let cl_recv = cl_sock.try_clone().map_err(|e| e.to_string())?;
 
-    let cfg = seq_config(&dir, &order, &sessions, cons.as_ref(), seq_repair)?;
+    let cfg = seq_config(&dir, &order, &order_b, &sessions, cons.as_ref(), seq_repair)?;
     let mut c = command(&bin_dir.join("vyrn-seq"), cli.seq_cpus.as_deref());
     c.arg("--config")
         .arg(cfg)
@@ -1378,6 +1461,16 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // --dropcopy: the observer replays and finalizes through the last block, then every
     // client stream ends in a DC_FINAL (10 §8.4 item 7); only then does it stop.
     let obs_wait = match obs {
+        // R12: the observer holds the block whose frame path B lost; nothing drains.
+        Some(o) if cli.drop_path_b.is_some() => {
+            let r = nodes.wait(&rx, Instant::now() + wait, "observer DURABLE_WAIT", |ns| {
+                ns.get(o).is_some_and(|n| {
+                    stopped(n).is_some() || line(n, "DURABLE_WAIT height=").is_some()
+                })
+            });
+            let ok = nodes.stop(o, &rx, Instant::now() + wait).unwrap_or(false);
+            Some(r.map(|()| ok))
+        }
         Some(o) => {
             let r = nodes.wait(
                 &rx,
@@ -1412,6 +1505,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
         None => None,
     };
     stop_dc.store(true, Ordering::Release);
+    stop_relay.store(true, Ordering::Release);
+    let pathb_dropped = pathb_h.map(|h| h.join().unwrap_or(0));
     let mut dc_got = Vec::new();
     let mut dc_errs = Vec::new();
     for (g, h) in dc_clients {
@@ -1846,6 +1941,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 (_, Some(f)) => Err(format!("observer: {f}")),
                 (Err(e), None) => Err(e),
                 (Ok(false), None) => Err("observer did not stop cleanly".into()),
+                (Ok(true), None) if let Some(d) = pathb_dropped => durable_hold(n, d, top),
                 (Ok(true), None) if !dc_errs.is_empty() => Err(dc_errs.join("; ")),
                 (Ok(true), None) => dropcopy::check(&dc_got, &resp_times, &dc_inproc),
             }

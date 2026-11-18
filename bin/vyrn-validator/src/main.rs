@@ -14,7 +14,7 @@
 //! | `schema = 1`, `protocol = 1` | must match this release |
 //! | `role = "validator"` or `"observer"`, `mode = "BASE"`, `book`, `epoch` | the book and epoch served (`EpochView`); an observer is described below |
 //! | `lanes` | the sequencer box's lane count, one substream (07 §2.2); 1–4, 8, 11 or 49 |
-//! | `[nic] backend = "kernel_udp", ip, order_port` | where ORDER, HASH and HEADER frames arrive (0: ephemeral) |
+//! | `[nic] backend = "kernel_udp", ip, order_port, order_port_b` | where ORDER, HASH and HEADER frames arrive on path A and (optional, required for an observer) path B (0: ephemeral). With both, each frame is handed to the order core once, in `frame_seq` order (07 §4.9, `vyrn_replica::Paths`) |
 //! | `[cores] order` | REF core of the order core (07 §7.2 core 3); reported, not pinned |
 //! | `[membership] seq_keys = ["<hex>"]` | `REP_Membership`'s `seq_key` per sequencer index (07 §13.1); public keys, so they may sit in the file |
 //! | `[keys] vote, node` | vote key handle; `node` (the p2p identity) defaults to `vote`. Only `env:NAME` (seed hex) resolves, and only with `[consensus]` |
@@ -27,7 +27,8 @@
 //! (`vyrn_replica::OrderCore`) over the config's `EpochView` → open the NIC queues → start the
 //! order thread and, with `[consensus]`, the voter thread → print `DATA rx=<ip:port>` (with
 //! `[data]`), `CONSENSUS voter=<i> repl=<ip:port>` (with `[consensus]`) and
-//! `READY vyrn-validator order=<ip:port>` on stdout.
+//! `ORDER_B order=<ip:port>` (with `order_port_b`) and `READY vyrn-validator order=<ip:port>` on
+//! stdout.
 //!
 //! **Threads.** `order` (07 §7.2 core 3): polls the queue, runs `OrderCore::on_frame` and the
 //! `REP_E_HASHLAG` timer, and for each ready block prints
@@ -48,7 +49,10 @@
 //! fetches it sent to each 07 §5.5 source, and peers' fetches it served (`fetch.rs`).
 //!
 //! **Observer** (`role = "observer"`, 03 §4.5: the same binary, without c3's votes). It needs
-//! `[replay]`, `[consensus]` and `[observer] ring, ring_cap, ctrl`, and refuses `[keys]`.
+//! `[replay]`, `[consensus]`, `[observer] ring, ring_cap, ctrl` and `[nic] order_port_b`, and
+//! refuses `[keys]`. It replays a block only once every frame handed on through it arrived on
+//! both paths (10 §8.2: the drop copy's durability bit); a block held `REP_PATH_DOWN_MS` (100 ms)
+//! for a frame one path lost prints `DURABLE_WAIT height=<h>` once.
 //! Replay's sink is `vyrn_md::SinkStream` tapped into the output ring at `ring` (10 §8.6,
 //! `ring_cap` data bytes, default 64 MiB), which `vyrn-dropcopy` reads. `[consensus]` gives the
 //! roster only (no voter starts): it binds `ctrl`, where the validators send their finalize votes and certificates
@@ -84,7 +88,9 @@ use serde::Deserialize;
 use vyrn_chain as _;
 use vyrn_data::frame::Fetch;
 use vyrn_replica::feed::Gap;
-use vyrn_replica::{BlockInputs, DataErr, DataFeed, DataJoin, Evictions};
+use vyrn_replica::{
+    BlockInputs, DataErr, DataFeed, DataJoin, Evictions, Mark, Path as RepPath, Paths,
+};
 
 mod consensus;
 mod fetch;
@@ -194,6 +200,8 @@ struct Nic {
     ip: Ipv4Addr,
     order_port: u16,
     #[serde(default)]
+    order_port_b: Option<u16>,
+    #[serde(default)]
     data_port: u16,
 }
 
@@ -255,6 +263,12 @@ impl Config {
                 return bad(
                     "role",
                     "observer needs [observer], [replay] and [consensus] (its finality)",
+                );
+            }
+            if c.nic.order_port_b.is_none() {
+                return bad(
+                    "nic.order_port_b",
+                    "is required for an observer: it replays only frames held from both paths (10 §8.2)",
                 );
             }
         } else if c.observer.is_some() {
@@ -415,6 +429,19 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
     // Keyed `[data]`: the `EPOCH <e>` control line's key derivation, and where its keys go.
     let mut control = None;
     let mut rekey = None;
+    let rx_b = match cfg.nic.order_port_b {
+        Some(udp_port) => Some(
+            nic.rx_ring(&RxBind {
+                lane: LaneId(2),
+                port: PortId(0),
+                ip,
+                udp_port,
+            })
+            .map_err(|e| e.to_string())?,
+        ),
+        None => None,
+    };
+    let addr_b = rx_b.as_ref().map(|r| r.local_addr());
     let data = match &cfg.data {
         Some(d) => {
             let drx = nic
@@ -481,6 +508,7 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                 replay: None,
                 replay_dead: false,
                 pending: VecDeque::new(),
+                durable_wait: None,
                 rx: drx,
                 repair,
                 boxes: d.boxes.clone(),
@@ -531,9 +559,10 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
     let stop = Arc::new(AtomicBool::new(false));
     let order = {
         let (stats, stop, source) = (Arc::clone(&stats), Arc::clone(&stop), source.clone());
+        let gate = cfg.observer();
         std::thread::Builder::new()
             .name("vyrn-validator/order".into())
-            .spawn(move || order_thread(core, rx, data, &source, &stop, &stats))
+            .spawn(move || order_thread(core, [Some(rx), rx_b], data, gate, &source, &stop, &stats))
             .map_err(|e| e.to_string())?
     };
     let observer = match observe {
@@ -577,6 +606,9 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
         .order
         .map_or_else(|| "unpinned".into(), |c| c.to_string());
     println!("LAYOUT order={core_of} control=main");
+    if let Some(b) = addr_b {
+        println!("ORDER_B order={b}");
+    }
     println!("READY vyrn-validator order={addr}");
     let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
     {
@@ -648,8 +680,9 @@ struct DataRx<const N: usize, R> {
     replay: Option<Box<replay::Replay>>,
     /// Replay diverged or a block's data faulted: later blocks are no longer replayed.
     replay_dead: bool,
-    /// Ready blocks whose ORDER part passed, waiting for their payloads (item 3).
-    pending: VecDeque<BlockInputs<N>>,
+    /// Ready blocks whose ORDER part passed, waiting for their payloads (item 3), each with
+    /// the frames it needs on both paths before an observer replays it.
+    pending: VecDeque<(BlockInputs<N>, Option<Mark>)>,
     rx: R,
     /// Fetches go out on this socket and their answers come back to it: a data box answers a
     /// KEY fetch to the fetch's source address (07 §5.5), and a `kernel_udp` TX ring sends from
@@ -676,6 +709,8 @@ struct DataRx<const N: usize, R> {
     replayed: Option<Height>,
     /// Keyed: the key sets `EPOCH <e>` derived, applied at the next poll.
     rekey: Option<std::sync::mpsc::Receiver<(u32, KeySet)>>,
+    /// Observer: the block waiting for both paths' frames, and since when (`u64::MAX`: reported).
+    durable_wait: Option<(Height, u64)>,
 }
 
 /// Every `K_fetch` a keyed validator seals or serves fetches under in one epoch (07 §5.5,
@@ -788,6 +823,9 @@ fn control_line(
         _ => Err(format!("unknown control line {:?}", line.trim())),
     }
 }
+
+/// 07 §4.9 `REP_PATH_DOWN_MS`: how long a block waits on one path before `DURABLE_WAIT`.
+const REP_PATH_DOWN_NS: u64 = 100_000_000;
 
 /// Observer: the most replayed blocks that may wait for finality, and the most certified tips
 /// that may wait for replay, before replay stops. Far above
@@ -908,9 +946,26 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
     /// `REP_DATA_WAIT_US` after it was first seen missing is fetched by key, from each of 07
     /// §5.5's sources in turn (`fetch.rs`), so a lost RANGE request or reply, or a data box that
     /// lacks it, does not stall the queue.
-    fn check(&mut self, source: &consensus::Source, now: u64) {
-        while let Some(b) = self.pending.front() {
+    ///
+    /// With `durable` (an observer), a block also waits until every frame through its [`Mark`]
+    /// arrived on both paths (10 §8.2), so the drop copy's `flags.bit2` holds.
+    fn check(&mut self, source: &consensus::Source, now: u64, durable: Option<&Paths>) {
+        while let Some((b, m)) = self.pending.front() {
             let h = b.header.height;
+            if durable.is_some_and(|p| m.as_ref().is_none_or(|m| !p.durable(m))) {
+                // A path lost one of its frames (no repair yet, 07 §4.10): printed once, after
+                // REP_PATH_DOWN_MS, so a held block is visible.
+                match self.durable_wait {
+                    Some((w, _)) if w != h => self.durable_wait = Some((h, now)),
+                    Some((_, t)) if now.saturating_sub(t) >= REP_PATH_DOWN_NS => {
+                        println!("DURABLE_WAIT height={}", h.0);
+                        self.durable_wait = Some((h, u64::MAX));
+                    }
+                    Some(_) => {}
+                    None => self.durable_wait = Some((h, now)),
+                }
+                return;
+            }
             match Self::join(&mut self.join, &mut self.replay).check(b) {
                 Err(DataErr::Missing { session, pkt_seq }) => {
                     let to = self.sources.due(session, pkt_seq, now);
@@ -924,7 +979,7 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                     self.replay_dead = true;
                 }
             }
-            let Some(b) = self.pending.pop_front() else {
+            let Some((b, _)) = self.pending.pop_front() else {
                 return;
             };
             // Every path below releases the block's payloads: peers may still ask for them.
@@ -1053,10 +1108,15 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
+/// `rxs`: path A's ORDER queue and, with `order_port_b`, path B's. With both, frames go through
+/// [`Paths`] (07 §4.9); with `gate` (an observer) a block replays only once its frames are held
+/// from both (10 §8.2).
+#[allow(clippy::too_many_arguments)]
 fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     mut core: OrderCore<N, View>,
-    mut rx: R,
+    mut rxs: [Option<R>; 2],
     mut data: Option<DataRx<N, D>>,
+    gate: bool,
     source: &consensus::Source,
     stop: &AtomicBool,
     stats: &Stats,
@@ -1067,25 +1127,46 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     let mut burst = [RxPkt::empty(); RX_BURST];
     let mut faulted = false;
     let mut stalled = false;
+    let mut paths = rxs[1].is_some().then(Paths::default);
     while !stop.load(Ordering::Acquire) {
-        let k = rx.poll(&mut burst);
-        for p in burst.iter().take(k) {
-            let Ok(f) = frame::parse(rx.bytes(p)) else {
-                continue;
-            };
-            stats.frames.fetch_add(1, Ordering::Relaxed);
-            let r = core.on_frame(f.payload, now());
-            report(
-                &mut core,
-                r,
-                &mut faulted,
-                &mut stalled,
-                stats,
-                source,
-                data.as_mut(),
-            );
+        let mut k = 0;
+        for (rx, path) in rxs.iter_mut().zip([RepPath::A, RepPath::B]) {
+            let Some(rx) = rx else { continue };
+            let n = rx.poll(&mut burst);
+            k += n;
+            for p in burst.iter().take(n) {
+                let Ok(f) = frame::parse(rx.bytes(p)) else {
+                    continue;
+                };
+                stats.frames.fetch_add(1, Ordering::Relaxed);
+                let mut on = |payload: &[u8]| {
+                    let r = core.on_frame(payload, now());
+                    report(
+                        &mut core,
+                        r,
+                        &mut faulted,
+                        &mut stalled,
+                        stats,
+                        source,
+                        data.as_mut(),
+                    );
+                };
+                match paths.as_mut() {
+                    Some(ps) => ps.rx(path, f.payload, &mut on),
+                    None => on(f.payload),
+                }
+            }
+            rx.release(n);
         }
-        rx.release(k);
+        // Blocks that became ready above need what was handed on so far (or less) on both paths.
+        if let Some(d) = data.as_mut()
+            && d.pending.iter().any(|x| x.1.is_none())
+        {
+            let m = paths.as_ref().map(Paths::mark).unwrap_or_default();
+            for x in d.pending.iter_mut().filter(|x| x.1.is_none()) {
+                x.1 = Some(m.clone());
+            }
+        }
         // The final height first: payloads polled below are stamped with it on arrival, and a
         // stale one would expire them early (07 §5.4 retention).
         if let Some(d) = data.as_mut() {
@@ -1097,7 +1178,7 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         }
         let dk = data.as_mut().map_or(0, |d| d.poll(now()));
         if let Some(d) = data.as_mut() {
-            d.check(source, now());
+            d.check(source, now(), paths.as_ref().filter(|_| gate));
             d.finals();
         }
         // No ORDER frame this turn: the deadlines `on_frame` would have checked (REP_E_HASHLAG),
@@ -1159,7 +1240,7 @@ fn report<const N: usize, D: RxRing>(
             (Verdict::Valid, Some(d)) => {
                 // Its records reference their payloads from now on (07 §5.4 retention).
                 DataRx::<N, D>::join(&mut d.join, &mut d.replay).reference(&b);
-                d.pending.push_back(b);
+                d.pending.push_back((b, None));
             }
             (Verdict::Valid, None) => source.valid(h),
             (Verdict::Pending, _) => {}

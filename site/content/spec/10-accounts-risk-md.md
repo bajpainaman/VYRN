@@ -1747,6 +1747,17 @@ carries its label.
     fee. The engine has no route op yet, so the shell hands it over at its interval position.
     \[Guessing\]
 
+13. **Durability gate.** The observer takes both replication paths, one port each (07 §4.9),
+    and hands each frame to its order core once, in `frame_seq` order. A copy counts for the
+    path of the port it arrived on, not for its `flags.bit0`, so one path carrying both copies
+    attests nothing. It replays a block only once every frame of every substream, up to what
+    it had handed on when the block became ready, has arrived on both paths. That covers the
+    block's frames, and at most a few later ones of the other substream. So it sends a record
+    only when it holds the step's frames from both paths (§8.2), and `flags.bit2` stays 1. An
+    observer without path B does not start. A block held `REP_PATH_DOWN_MS` (07 §4.9) for a
+    frame one path lost is reported (`DURABLE_WAIT`) and stays held: repair (07 §4.10) is not
+    built yet, and the drop copy waits rather than send a record it cannot attest. \[Likely\]
+
 Not rebuilt yet: every case `SinkStream` leaves `Unsupported` (§7.9).
 
 ### 8.5 Session wire, authentication and subscription
