@@ -409,6 +409,30 @@ pub(crate) fn send_redirect<T: TxRing>(
     sent
 }
 
+/// [`send_redirect`] for a new redirect, behind any refused ones `pending` holds so a
+/// session's redirects leave in order. A session `home` does not know is counted
+/// (`redirect_unknown`) at once, queued or not, so it never takes a retry slot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_or_queue<T: TxRing>(
+    pending: &mut Pending,
+    home: &DataHome,
+    tx: &mut T,
+    wire: &mut [u8; MAX_FRAME_BYTES],
+    c: &mut Counters,
+    me: Endpoint,
+    r: Redirect,
+) {
+    if pending.is_empty() {
+        if !send_redirect(home, tx, wire, c, me, r) {
+            pending.push(r, c);
+        }
+    } else if home.source(r.session).is_some() && home.key(r.session).is_some() {
+        pending.push(r, c);
+    } else {
+        bump(&mut c.redirect_unknown);
+    }
+}
+
 /// KEY and BLOCK answers (`FETCH_RESP`), from a ring and a [`BlockStore`].
 #[derive(Debug)]
 pub(crate) struct Responder {

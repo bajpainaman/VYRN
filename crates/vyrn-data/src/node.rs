@@ -15,7 +15,7 @@ use vyrn_wire::{RX_BURST, RxPkt, RxRing, TxRing};
 use crate::frame::{Fetch, FetchMsg, MAX_BATCH};
 use crate::ingest::{DataHome, Event, HomeConfig, Reject};
 use crate::redirect::Redirect;
-use crate::serve::{Fanout, Gate, Pending, Responder, send_redirect};
+use crate::serve::{Fanout, Gate, Pending, Responder, send_or_queue, send_redirect};
 
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -405,12 +405,8 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
                 session,
                 resend_from,
             };
-            // Behind earlier refused ones, so a session's redirects leave in order.
-            let (tx, c) = (&mut self.tx, &mut self.counters);
-            let wire = &mut self.resp.wire;
-            if !self.pending.is_empty() || !send_redirect(&self.home, tx, wire, c, self.cfg.me, r) {
-                self.pending.push(r, &mut self.counters);
-            }
+            let (tx, c, wire) = (&mut self.tx, &mut self.counters, &mut self.resp.wire);
+            send_or_queue(&mut self.pending, &self.home, tx, wire, c, self.cfg.me, r);
         }
     }
 

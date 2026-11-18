@@ -727,6 +727,11 @@ fn redirects_a_full_tx_queue_refuses_are_retried_next_turn_in_order() {
     assert_eq!(k.redirect_retried, cap, "the retry queue fills");
     assert!(k.redirect_dropped > 0);
     assert_eq!(k.redirects + k.redirect_retried + k.redirect_dropped, 1000);
+    // A session the box never heard from is counted unknown, never queued (Vercel on #194).
+    r.node.redirect(0, 2, &[(SessionId(9), 1)]);
+    let k2 = *r.node.counters();
+    assert_eq!(k2.redirect_unknown, k.redirect_unknown + 1);
+    assert_eq!(k2.redirect_dropped, k.redirect_dropped);
     let mut got = drain_rx(&mut c);
     let sent_now = got.len() as u64;
     assert_eq!(sent_now, k.redirects);

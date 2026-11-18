@@ -35,7 +35,7 @@ use crate::frame::{Fetch, FetchMsg};
 use crate::ingest::{DataHome, Event};
 use crate::node::{Counters, FetchKeysErr, NodeConfig, bump};
 use crate::redirect::Redirect;
-use crate::serve::{Fanout, Gate, Pending, Responder, send_redirect};
+use crate::serve::{Fanout, Gate, Pending, Responder, send_or_queue, send_redirect};
 use crate::spread::{session_of, shard_of};
 
 /// Entries per hop ring.
@@ -428,13 +428,9 @@ impl<T: TxRing> ShardCore<T> {
                         session,
                         resend_from,
                     };
-                    // Behind earlier refused ones, so a session's redirects leave in order.
                     let (tx, c, wire) = (&mut self.tx, &mut self.counters, &mut self.resp.wire);
-                    if !self.pending.is_empty()
-                        || !send_redirect(&self.home, tx, wire, c, self.cfg.me, r)
-                    {
-                        self.pending.push(r, &mut self.counters);
-                    }
+                    let (p, h) = (&mut self.pending, &self.home);
+                    send_or_queue(p, h, tx, wire, c, self.cfg.me, r);
                 }
             }
         }
