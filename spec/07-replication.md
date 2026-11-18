@@ -1407,9 +1407,10 @@ sessions.
 
 **Backup addresses (interim reading).** Step 3 needs every live box to know the affected
 sessions' addresses, but only the home box receives copy 2. Until this is settled, a client sends
-copy 2 of each session's first packet to every box in its `KeyBundle.data` list. The backups store
-it, deduped like any copy, and learn the source address. Limit: a backup knows only that first
-packet's address, so it cannot redirect a client that changed its address afterwards; it counts
+copy 2 of each session's first 4 packets to every box in its `KeyBundle.data` list (ruled: 4, not
+1, so one lost datagram does not leave a backup without the address). The backups store them,
+deduped like any copy, and learn the source address. Limit: a backup knows only those first
+packets' address, so it cannot redirect a client that changed its address afterwards; it counts
 such a session as unknown. This depends on #153's PQ-13 (A), a standing backup data copy, which
 the user has not decided. If PQ-13 (A) is approved, backups receive every copy and know the newest
 address, which supersedes this reading. If it is rejected, box-to-box address sharing goes to the

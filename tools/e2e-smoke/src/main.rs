@@ -90,7 +90,8 @@
 //! - R13. `--data-kill` (needs `--keyed`): a backup `vyrn-data` box (`src = 1`, roster data
 //!   box 1 with `BOX1_XCHG`, the same destinations) runs beside the home box, and every validator
 //!   lists both (`[data] boxes`) with a DEV `silence_us` of `KILL_SILENCE_US`. The client sends
-//!   each session's first copy 2 to both (07 §5.7 interim reading) and the rest to the home box,
+//!   copy 2 of each session's first `FIRST_COPIES` (4) packets to both (07 §5.7 interim
+//!   reading, ruled) and the rest to the home box,
 //!   which the harness kills after 2/5 of the packets. `failover` needs every running validator's
 //!   `DATA_DOWN box=0` at quorum, no `DATA_DOWN box=1` while the backup runs, validator 0's
 //!   sealed `REDIRECT_SENT down=0 to=1` (only it holds a `K_fetch`, R7), the backup's
@@ -141,13 +142,16 @@
 //!   50.3 ms, Q DataDowns and every first-round batch sent by 51 ms, all of them at the backup
 //!   by 51–55 ms; the backup then sends its per-entry `DataRedirect`s at about 50 per ms (one
 //!   shard core, 16 per turn, sharing the CPUs), so the last live session's first redirect
-//!   reaches the client at about 82 ms; the client applies each within 2.6 ms. The backup's
+//!   reaches the client at about 82 ms (76.5 ms in CI); the client applies each within 2.6 ms.
+//!   *Ruled:* that this passes DR4's design bound on detection plus fan-out is a DEV figure of
+//!   a 2-vCPU host (50 ms DEV detection, the backup's sending CPU-bound), not a protocol miss;
+//!   07's `REP_DATA_SILENCE_MS` is 1 ms. The backup's
 //!   refused redirects are retried since #194 (`redirect_retried`), and `failover` needs
-//!   `redirect_dropped` = 0. Two losses still fail a run on a 2-vCPU orb, both outside this
-//!   rule: an ingest packet meeting the shard ring the redirect burst fills (`hop_full`), and a
-//!   lost first copy at the backup's socket. Either costs the backup a session's address, since
-//!   it learns it from one first copy (07 §5.7 interim reading), so that session never moves;
-//!   CI runs R15 with `continue-on-error`.
+//!   `redirect_dropped` = 0, and `redirect_unknown` = 0. A backup learned a session's address
+//!   from one first copy, so one lost to a full shard ring (`hop_full`) or the socket left the
+//!   session unmovable; the client now sends four (R13), and ingest winning the shard ring over
+//!   queued redirects is `vyrn-data`'s. CI runs R15 with `continue-on-error` until both are on
+//!   main.
 //!   The client opens a `DataRedirect` with the key of the session in its bytes 8..12: trying
 //!   every session's key fell behind a burst of 1 600 redirects and moved half the sessions.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
@@ -236,6 +240,9 @@ const SEQ_XCHG: [u8; 32] = [0x7c; 32];
 const BOX1_XCHG: [u8; 32] = [0x8d; 32];
 /// `--data-kill` (R13): the validators' DEV `[data] silence_us`, for an unpinned host.
 const KILL_SILENCE_US: u64 = 50_000;
+/// R13 (07 §5.7 interim reading, ruled): copy 2 of each session's first this many packets also
+/// goes to every backup box, so one lost datagram does not cost a backup the session's address.
+const FIRST_COPIES: usize = 4;
 /// `--data-kill` (R13): the client keeps a sent packet this long (`REP_CLIENT_RETAIN_MS`, 04
 /// DR4), then discards it.
 const CLIENT_RETAIN: Duration = Duration::from_millis(100);
@@ -1740,8 +1747,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
         _ => None,
     };
 
-    // Send, paced by send_ns. R13 (--data-kill): each session's first copy 2 also goes to the
-    // backup box (07 §5.7 interim reading), the home box is killed after `kill_at` packets, and
+    // Send, paced by send_ns. R13 (--data-kill): copy 2 of each session's first
+    // `FIRST_COPIES` packets also goes to the backup box (07 §5.7 interim reading), the home box is killed after `kill_at` packets, and
     // a session's first redirect from it (DR2) moves its copy 2 and resends its retained bytes
     // from `resend_from` (DR3).
     let kill_at = backup.map(|_| pkts.len() * 2 / 5);
@@ -1749,7 +1756,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let mut moved: BTreeMap<SessionId, Redirect> = BTreeMap::new();
     let mut redirects_heard = 0u64;
     let mut resent = 0u64;
-    let mut first_sent = std::collections::BTreeSet::new();
+    let mut first_sent: BTreeMap<SessionId, usize> = BTreeMap::new();
     // R13 (04 DR4): each packet's send time; the client resends only what it still retains.
     let mut sent_at: Vec<Instant> = Vec::with_capacity(pkts.len());
     // Packets a redirect asked for that the client had discarded: `lost` were sent to the dead
@@ -1836,8 +1843,12 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
         }
         if let Some(b) = backup
-            && first_sent.insert(p.session)
             && home != Some(b.ingest)
+            && {
+                let n = first_sent.entry(p.session).or_default();
+                *n += 1;
+                *n <= FIRST_COPIES
+            }
         {
             cl_sock
                 .send_to(&p.bytes, b.ingest)
