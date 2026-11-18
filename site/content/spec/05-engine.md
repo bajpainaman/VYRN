@@ -2563,7 +2563,7 @@ A replica runs `vyrn-engine` with the same lane, BBO and settlement code. Three 
 **Routes (10 M8).** Lane risk charges a `New` or new-priority `Replace` by its route before it
 forwards or rejects it, so replay must give pass 1 the live route, not one derived from the step
 kind or the replayed snapshot. The lane writes a `RouteRecord` for every op it classifies `Cross`
-or `Improve`, forwarded or rejected by itself (for example `POST_ONLY_WOULD_CROSS`), in pass 1,
+or `Improve`, forwarded or rejected by itself (for example by a cross bucket), in pass 1,
 into its order ring after the packet's `PacketRecord`. The route travels with its packet: the
 `StepRecord` that names a forwarded op can fall in a later block. `StepRecord.flags.CROSS`
 repeats a forwarded op's route, and `replay_step` checks it. `vyrn-lane`'s

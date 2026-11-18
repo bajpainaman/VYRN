@@ -268,13 +268,8 @@ impl Risk<'_> {
         let msg_fee = self.acct.fees.msg_fee(charge);
         let fee_mul = self.acct.fees.fee_mul;
         let bal = reserved(self.bal, m, n, fee_mul, u128::from(msg_fee))?;
-        if m.post_only && route == Route::Cross {
-            let opp = match m.side {
-                Side::Buy => self.snap.ask,
-                Side::Sell => self.snap.bid,
-            };
-            return Err(rej(RejectReason::PostOnlyWouldCross, opp.0));
-        }
+        // A post-only order the snapshot calls a cross is forwarded: whether it crosses is the BBO
+        // core's decision against the live book (03 ARC-D6, 05 §2.4), so it replays exactly.
         let fee_acc = self
             .book
             .fee_acc

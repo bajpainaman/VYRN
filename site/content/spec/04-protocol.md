@@ -327,7 +327,7 @@ reject reason. The order is fixed, so replicas reproduce the same reason.
 | M5 | Book phase allows the message (§6.9) | `BOOK_HALTED`, `AUCTION_PHASE` |
 | M6 | Field checks of the type (§6) | `BAD_TICK`, `BAD_QTY`, `UNKNOWN_HANDLE`, `TOO_LATE`, `SIDE_MISMATCH`, `BAD_SEQ` |
 | M7 | Risk (`10-accounts-risk-md.md`): order count, then exposure, then balance | `RISK_ORDER_COUNT`, `RISK_POSITION`, `RISK_CREDIT` |
-| M8 | Classify against the lane's snapshot (join, improve, cross); post-only check; BBO bucket (§9) | `POST_ONLY_WOULD_CROSS`, `RATE_LIMIT` |
+| M8 | Classify against the lane's snapshot (join, improve, cross); BBO bucket (§9). A post-only order the snapshot calls a cross is routed to the BBO core, which decides it (03 ARC-D6) | `RATE_LIMIT` |
 | M9 | Apply: a lane-local op, or a push to the BBO-core ring | — (later outcomes in §6) |
 
 Budget per message (01 §14.2): M1–M8 and the forward push are pass 1, `LANE_PASS1_NS` = 5 ns. M9
@@ -994,7 +994,6 @@ Validation, in M-order (§3.3; 10 §3.1 gives the full order with the rate bucke
 | resting orders of the account ≥ its limit; the lane's slot pool is full | `RISK_ORDER_COUNT` | the limit; `RSK_D_LANE_FULL` (5) |
 | open exposure on that side would pass its limit (v2 only; v1 spot has no such limit, 10 §3.1) | `RISK_POSITION` | the limit |
 | reservation (buy: `R_buy(qty, tick)` plus the message fee in quote; sell: `qty` in base and the message fee in quote, 10 §3.2) > free balance | `RISK_CREDIT` | `RSK_CREDIT_QUOTE` (1) or `RSK_CREDIT_BASE` (2): the asset that is short |
-| post-only and the order crosses the lane's snapshot | `POST_ONLY_WOULD_CROSS` | opposite best tick of the snapshot |
 
 Routing after validation:
 
@@ -1012,8 +1011,11 @@ Notes:
 - `IOC` and `FOK` always go to the BBO core, even if they look non-marketable against the lane's
   snapshot. A snapshot can be stale in the unsafe direction after an improve, and an IOC must
   trade against the true book. They are charged as crosses (§9).
-- A post-only improve can reach the BBO core and find that the true book crosses it. The BBO core
-  rejects it with `POST_ONLY_WOULD_CROSS`. If a rescan (`05-engine.md`) finds a resting post-only
+- A post-only order goes to the BBO core when the lane's snapshot classifies it as an improve or a
+  cross (03 ARC-D6). The BBO core rejects it with `POST_ONLY_WOULD_CROSS` if the true book
+  crosses it, with detail the best opposite tick of the true book, and rests it otherwise. The
+  lane never decides it against the snapshot, whose version is not logged, so replay reproduces
+  the outcome and the detail. If a rescan (`05-engine.md`) finds a resting post-only
   order as the aggressor, that order ends with `Out` cause `POST_ONLY`, after its `Ack`.
 - A taker gets one `Fill` per price level, best level first (01 §6.4). The remainder of a `Day`
   order rests at its own limit `tick`, and its `Ack` carries that tick.
@@ -1071,7 +1073,6 @@ and **leaves the old order untouched**:
 | new `qty` = 0 (use `Cancel`); or same tick, same `total`, same flags | `BAD_QTY` (detail 0, or `PROTO_D_NO_CHANGE`; the new order's risk checks give 10's `RSK_D_*`, §8) |
 | invalid flag combination | `BAD_TYPE` (`PROTO_D_FLAGS`) |
 | risk of the new reservation, net of the old one | `RISK_*` |
-| post-only crosses the lane's snapshot | `POST_ONLY_WOULD_CROSS` |
 
 Then one of two cases:
 
@@ -1343,7 +1344,7 @@ out-of-stream (`resp_seq` 0, not accepted, the client resends the same logical c
 | 7 | `RISK_POSITION` | in | M7 | the limit | reduce exposure |
 | 8 | `RISK_ORDER_COUNT` | in | M7 | the limit | cancel orders first |
 | 9 | `RATE_LIMIT` | in | V10, M1, M8 | bucket id: 1–7 are 04's, 8–11 are 10's (§9.1) | slow down; the bucket refills on `rx_ts` time |
-| 10 | `POST_ONLY_WOULD_CROSS` | in | M8 (lane), BBO core | opposite best tick seen | reprice |
+| 10 | `POST_ONLY_WOULD_CROSS` | in | BBO core (03 ARC-D6) | best opposite tick of the true book | reprice |
 | 11 | `FOK_UNFILLABLE` | in | BBO core | qty available at or better than the limit (capped) | — |
 | 12 | `UNKNOWN_HANDLE` | in | M6 | 0 | check the client's handle table |
 | 13 | `TOO_LATE` | in | M6, BBO core | `PROTO_D_FILLED`, `_CANCELED`, `_OUT` | the order already ended; its records precede this one |

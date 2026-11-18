@@ -537,7 +537,7 @@ the first message; column **M** marks the per-message work that must fit `RSK_PA
 | 9 | Notional `≤ max_notional` | M6 | M | `BAD_QTY` | `RSK_D_NOTIONAL` (`RSK_D_OVERFLOW` if it overflows) |
 | 10 | `open_orders < max_open_orders`, then a free slot in the lane's pool for the book (§3.4) | M7 | M, packet-local count | `RISK_ORDER_COUNT` | the limit; `RSK_D_LANE_FULL` |
 | 11 | Balance covers reservation + message fee of the charged route (§3.2, §5.3) | M7 | M | `RISK_CREDIT` | `RSK_CREDIT_QUOTE` 1, `RSK_CREDIT_BASE` 2: the asset that is short |
-| 12 | Post-only that the classification (05) calls a cross | M8 | M (05's cost) | `POST_ONLY_WOULD_CROSS` | best opposite tick of the snapshot |
+| 12 | Post-only that the classification (05) calls a cross: no lane check. It is charged and forwarded as a cross, and the BBO core decides it against the true book (03 ARC-D6, 05 §2.4) | M8 | — | — | — |
 | 13 | BBO-routed only: `BBO` bucket of the session, then of the account (04 §9.1); then a cross takes `cross_bucket` and the lane cross bucket, an improve the lane improve bucket (§3.8) | M8 | P refill, M 1 decrement | `RATE_LIMIT` | 3, 6 (04 §9.1); `RSK_BUCKET_CROSS` 9, `_LANE_CROSS` 10, `_LANE_IMPROVE` 11 |
 
 The order is 04 §3.3's M1–M8, which is the client-visible contract; this table places 10's
@@ -846,7 +846,7 @@ fn risk_new(l: &mut Lane, a: &AcctRisk, k: &mut PktRisk, m: &NewMsg, snap: &Snap
             nb.quote_free -= msg_fee;
         }
     }
-    if m.post_only && route == Route::Cross { return Err(rej(POST_ONLY_WOULD_CROSS, snap.opp(m.side))); }
+    // check 12: a post-only cross is forwarded; the BBO core decides it (03 ARC-D6)
     match charge {                                                       // check 13, all or none
         Route::Join => {}
         Route::Improve => {                       // 04's BBO buckets (ids 3, 6) are tested first
