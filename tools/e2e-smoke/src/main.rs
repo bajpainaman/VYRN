@@ -5,7 +5,7 @@
 //! **Invocation.** `e2e-smoke [--bin-dir DIR] [--validators K] [--packets P] [--rate R]
 //! [--seed S] [--wait-s T] [--seq-cpus L] [--validator-cpus L] [--strict-hashlag] [--finality]
 //! [--data] [--dropcopy] [--two-path] [--drop-path-b N] [--keyed] [--data-shards N] [--data-kill]
-//! [--kill-voter]`. `DIR` holds `vyrn-seq`, `vyrn-validator`, (with `--data`) `vyrn-data` and (with
+//! [--kill-voter] [--restart-voter] [--restart-immediate] [--restart-hashlag-us US]`. `DIR` holds `vyrn-seq`, `vyrn-validator`, (with `--data`) `vyrn-data` and (with
 //! `--dropcopy`) `vyrn-dropcopy` (default: this binary's directory). Exit 0 when every enabled check passes, 1 when one fails,
 //! 2 when the run could not start. Every wait has a deadline of `T` seconds (default 30): the
 //! harness never blocks on a child, a socket or a pipe without one, and kills every child it
@@ -34,6 +34,7 @@
 //! | `finality` | with `--finality` (default 4 validators, a DEV roster as in `bin/vyrn-validator/tests/committee.rs`, `[consensus]` in every validator and the box): while the box still runs, the box's listener (`FINAL height=<h> ... from=<votes\|cert>`) and every validator that did not stop print `FINAL` through the box's last block. A validator's `OUT_OF_ORDER`, `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT` line fails `validators`; `REP_E_HASHLAG` follows R5 and R6. SKIP without it |
 //! | `dropcopy` | with `--dropcopy` (needs `--data` and `--finality`): an observer (`vyrn-validator`, `role = "observer"`, data destination `n + 1`, in the box's order list on both paths (R12) and every validator's `[consensus] observers`) replays every block into its output ring and finalizes from the validators' certificates; `vyrn-dropcopy` serves the ring over Noise, and one client per session logs in to its account's stream. Each stream's served records, without stage markers, equal an in-process `DropCopy` over the tap's `RustReplay` byte for byte, with gapless seqs, and end in a `DC_FINAL`; every record with a `resp_seq` (acks, cancels, outs, taker fills) names a response packet the client received (10 §8.3). It prints a DEV timing of those records after their response packets (R9); SKIP without it |
 //! | `failover` | with `--data-kill` (R13): the home data box is killed mid-run, the validators reach Q `DataDown`s and REDIRECT, the backup admits a sealed one and redirects every session, and every session moves copy 2; SKIP without it |
+//! | `voter-restart` | with `--restart-voter` (R17): the killed victim restarts from its own config and journal without `--fresh` (no `FRESH_JOURNAL` line), and no node reports a `VOTER_FAULT` naming its voter index (unproven: no injected equivocation, R17). `validators`, `replica-out` and `finality` hold it, as `validator-<n−1>r`, to every block and `FINAL` through the end; SKIP without it |
 //! | `voter-kill` | with `--kill-voter` (R16): at half the packets, once it has finalized a height, the last validator is killed; its blocks were the box's, and the box finalizes through the block holding the first packet sent after the victim was reaped (cut after it died), with the `n − 1` left. `finality` then needs the box and every running validator through the last block, with Q of the whole committee; SKIP without it |
 //! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed has no rejected frame and no gap left unrepaired (R14), and that join is the one `replay` reads; SKIP without `--data` |
 //!
@@ -189,6 +190,20 @@
 //!   and the box's `FINAL` lines are not ordered against the kill (another thread reads them).
 //!   The victim's lines are read through its reader's EOF mark before they are checked. Not with `--data-kill`, whose DR4 timing the
 //!   pause would skew.
+//! - R17. `--restart-voter` (needs `--kill-voter`, not `--two-path`): the R16 victim restarts at
+//!   3/4 of the packets, or right after it is reaped with `--restart-immediate`, so it replays
+//!   its journal in the view it was voting in when it died. It gets the same config, journal
+//!   and vote key, and binds the ORDER port it printed before (the box still sends there).
+//!   DEV: the restarted validator catches up from frame 1 through the repair backlog, so it lags
+//!   from that backlog, not from hashing. `--restart-hashlag-us` gives it alone a harness-only
+//!   catch-up bound; every other replica keeps `--dev-hashlag-us` (CI: 20 ms) under
+//!   `--strict-hashlag`, and its own `REP_E_HASHLAG` past that bound still fails the run. CI runs
+//!   200 ms: on a 2-vCPU orb, 9 immediate-restart runs each on main 68833e1 at 20 ms stopped it
+//!   once (height 15), at 100 ms none; 200 ms is twice that (DEV, not a latency result). Known
+//!   gap: only the no-`FRESH_JOURNAL` half of the gate is proven. The no-conflicting-vote half has
+//!   no injected equivocation, so a `VOTER_FAULT` path that never fires would pass it vacuously;
+//!   proving it needs a DEV signing hook in vyrn-validator's voter that signs a second
+//!   `Notarize` for another payload in one view.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -358,6 +373,10 @@ struct Cli {
     /// (R5). For measuring how far the bounds go down.
     #[arg(long, value_name = "US", requires = "dev_hashlag_us")]
     obs_hashlag_us: Option<u64>,
+    /// DEV only, with --restart-voter and --dev-hashlag-us: the restarted validator's catch-up
+    /// bound in µs, in place of the voters' (R17). It replays the repair backlog from frame 1.
+    #[arg(long, value_name = "US", requires_all = ["dev_hashlag_us", "restart_voter"])]
+    restart_hashlag_us: Option<u64>,
     /// Key the vyrn-data node from the roster and drop some of validator 0's data frames, so
     /// its sealed fetches must be served (R7; needs --data and --finality).
     #[arg(long)]
@@ -404,6 +423,15 @@ struct Cli {
     /// R16; needs --finality and at least 4 validators): the rest must finalize through the end.
     #[arg(long)]
     kill_voter: bool,
+    /// With --kill-voter, restart the victim at 3/4 of the packets from its own journal, without
+    /// --fresh (R17): it must rejoin and finalize through the last block, and no node may report
+    /// a conflicting vote from it.
+    #[arg(long)]
+    restart_voter: bool,
+    /// With --restart-voter, restart the victim right after the kill instead, in the view it
+    /// was leading when it died (R17): its journal is replayed mid-view.
+    #[arg(long)]
+    restart_immediate: bool,
 }
 
 fn main() -> ExitCode {
@@ -1479,6 +1507,12 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 .into(),
         );
     }
+    if cli.restart_immediate && !cli.restart_voter {
+        return Err("--restart-immediate needs --restart-voter (R17)".into());
+    }
+    if cli.restart_voter && (!cli.kill_voter || cli.two_path) {
+        return Err("--restart-voter needs --kill-voter and no --two-path (R17)".into());
+    }
     if cli.data_kill && !cli.keyed {
         return Err("--data-kill needs --keyed: the REDIRECTs it checks are sealed (R13)".into());
     }
@@ -1785,6 +1819,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .env("VYRN_E2E_SEQ_SEED", hex(&SEQ_SEED))
         .env("VYRN_E2E_SEQ_XCHG", hex(&SEQ_XCHG));
     let seq = nodes.spawn("vyrn-seq", &mut c, &tx)?;
+    // R17: the victim's restart needs a sender for its lines.
+    let tx_restart = cli.restart_voter.then(|| tx.clone());
     drop(tx);
     let ready = format!("READY vyrn-seq lanes={LANES} rx=");
     nodes.wait(&rx, Instant::now() + wait, "vyrn-seq READY", |ns| {
@@ -1844,6 +1880,13 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let kill_voter_at = cli.kill_voter.then_some(pkts.len() / 2);
     let mut voter_killed: Option<(usize, Option<u64>)> = None;
     let mut barrier_pkt: Option<(u32, u32)> = None;
+    // R17: the restarted victim's node index.
+    let restart_at = cli.restart_voter.then_some(if cli.restart_immediate {
+        pkts.len() / 2
+    } else {
+        pkts.len() * 3 / 4
+    });
+    let mut restarted: Option<usize> = None;
     let mut killed = None;
     let mut moved: BTreeMap<SessionId, Redirect> = BTreeMap::new();
     let mut redirects_heard = 0u64;
@@ -1941,6 +1984,48 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 let at = nodes.0.get(seq).and_then(|n| finals(n).last().copied());
                 voter_killed = Some((i, at));
             }
+        }
+        // R17: the same config, journal and ports, without --fresh. Its ORDER port was
+        // ephemeral; the box sends to the one it printed, so it binds that one again.
+        if let (true, Some((i, _)), Some(tx)) =
+            (restart_at == Some(k), voter_killed, tx_restart.as_ref())
+        {
+            let v = n_val - 1;
+            let order = nodes
+                .0
+                .get(i)
+                .and_then(|n| line(n, "READY vyrn-validator order="))
+                .and_then(|a| a.trim().parse::<SocketAddr>().ok())
+                .ok_or("the victim's ORDER address")?;
+            let cfg = dir.join(format!("validator-{v}.toml"));
+            let text = std::fs::read_to_string(&cfg).map_err(|e| e.to_string())?;
+            let mut text = text.replacen(
+                "order_port = 0\n",
+                &format!("order_port = {}\n", order.port()),
+                1,
+            );
+            // R17: its DEV catch-up bound, harness-only; every other replica keeps its own.
+            if let (Some(us), Some(r)) = (cli.dev_hashlag_us, cli.restart_hashlag_us) {
+                text = text.replacen(
+                    &format!("hashlag_us = {us}\n"),
+                    &format!("hashlag_us = {r}\n"),
+                    1,
+                );
+            }
+            let again = dir.join(format!("validator-{v}-restart.toml"));
+            std::fs::write(&again, text).map_err(|e| e.to_string())?;
+            let mut c = command(
+                &bin_dir.join("vyrn-validator"),
+                cli.validator_cpus.as_deref(),
+            );
+            c.arg("--config")
+                .arg(&again)
+                .arg("--stop-on-stdin-eof")
+                .env("VYRN_E2E_VOTE_SEED", hex(&vote_seed(v)))
+                .env("VYRN_E2E_XCHG", hex(&XCHG_SEED));
+            let j = nodes.spawn(&format!("validator-{v}r"), &mut c, tx)?;
+            vals.push(j);
+            restarted = Some(j);
         }
         resent += apply(
             pkts.get(..k).unwrap_or_default(),
@@ -2630,6 +2715,43 @@ fn run(cli: &Cli) -> Result<bool, String> {
             Err("the victim finalized nothing by the deadline at half the packets; not killed".into()),
         ),
         None => Report::skip("voter-kill", "off (enable with --kill-voter, R16)"),
+    }
+
+    // R17: the restarted victim started from its own journal (no FRESH_JOURNAL: the guard found
+    // it non-empty), and no node, the box included, reported a conflicting vote from its index.
+    // `validators`, `replica-out` and `finality` hold it to every block and FINAL through the end.
+    match restarted {
+        Some(j) => rep.check("voter-restart", {
+            let v = n_val - 1;
+            let me = format!("voter={v}");
+            let faults: Vec<String> = nodes
+                .0
+                .iter()
+                .flat_map(|n| {
+                    n.lines
+                        .iter()
+                        .filter(|l| {
+                            l.starts_with("VOTER_FAULT ")
+                                && l.split_whitespace().any(|w| w == me)
+                        })
+                        .map(move |l| format!("{}: {l}", n.name))
+                })
+                .collect();
+            let r = nodes.0.get(j).ok_or("restarted validator")?;
+            if r.lines.iter().any(|l| l.starts_with("FRESH_JOURNAL ")) {
+                Err(format!("{} started with an empty journal", r.name))
+            } else if !faults.is_empty() {
+                Err(format!("conflicting votes from voter {v}: {}", faults.join("; ")))
+            } else {
+                Ok(format!(
+                    "{} rejoined from its journal: {} blocks, final {:?}, no VOTER_FAULT naming voter {v} on any node",
+                    r.name,
+                    blocks(r).len(),
+                    finals(r).last()
+                ))
+            }
+        }),
+        None => Report::skip("voter-restart", "off (enable with --restart-voter, R17)"),
     }
     // R14: validator 0 lost one path A frame and repair filled it (`finality` above checks it
     // still finalized through the last block).
