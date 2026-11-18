@@ -11,6 +11,8 @@
 //! | Who may vote | [`Committee`] (the voters of `REP_Membership`) | 07 §13.1, 01 §14.4 |
 //! | What a certificate proves, checked offline | [`FinalityCert`], [`verify_finality_cert`] | 07 §6.5 |
 //!
+//! [`evidence`] proves a faulty sequencer or voter offline (07 §10).
+//!
 //! The sequencer's side is [`observer`]: its finality listener and the finality gate (07 §6.8).
 //!
 //! [`voter`] wires these into `commonware-consensus` Simplex (07 §6.3) for one voter, and
@@ -20,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cert;
+pub mod evidence;
 pub mod membership;
 pub mod observer;
 pub mod proposal;
@@ -28,6 +31,7 @@ pub mod source;
 pub mod voter;
 
 pub use cert::{CertErr, FinalityCert, NAMESPACE, verify_finality_cert};
+pub use evidence::{EvidenceErr, FaultKind, SeqEquivocation, VoterFault};
 pub use membership::{Committee, CommitteeErr, VoterOrder};
 pub use observer::{FinalizeVote, Gate, GateAction, Listener, VoteErr};
 pub use proposal::{Proposal, ProposalErr, ProposalKind};

@@ -7,13 +7,14 @@
 //! | `Automaton::verify` | [`App`]: INV-REP-4 (07 §6.4); pending until `REP_VERIFY_WAIT_MS`, then false |
 //! | certify | true exactly when this voter's `verify` (or its own proposal) accepted the payload |
 //! | `Relay` | no-op: headers reach voters through frames (07 §6.3) |
-//! | `Reporter` | [`Finalized`]: every finalization as a [`FinalityCert`], and this voter's own finalize votes as [`FinalizeVote`]s for the sequencer's listener (07 §6.8) |
+//! | `Reporter` | [`Finalized`]: every finalization as a [`FinalityCert`], this voter's own finalize votes as [`FinalizeVote`]s for the sequencer's listener (07 §6.8), and conflicting votes as [`VoterFault`] evidence (07 §10.2) |
 //! | Elector | [`VoterOrder`]: round-robin in `REP_Membership.voters` order ([`Committee::leader`]) |
 //!
 //! A voter does not need the proposal bytes to vote: given the parent it rebuilds every candidate
 //! range from its own headers and matches the payload digest, so the payload never travels.
 
 use crate::cert::{FinalityCert, NAMESPACE};
+use crate::evidence::{FaultKind, VoterFault};
 use crate::membership::{Committee, VoterOrder};
 use crate::observer::FinalizeVote;
 use crate::proposal::{MAX_HDRS_PER_PROPOSAL, Proposal};
@@ -21,14 +22,14 @@ use crate::source::{
     BlockSource, Genesis, Tip, Verdict, chain_after, proposal_for, proposal_range,
 };
 use commonware_actor::Feedback;
-use commonware_codec::DecodeExt;
+use commonware_codec::{DecodeExt, Encode};
 use commonware_consensus::{
     Automaton, CertifiableAutomaton, Relay, Reporter,
     simplex::{
         Plan,
         config::{Config, Floor, ForwardPolicy, SkipBudget, SkipPolicy},
         scheme::ed25519::Scheme,
-        types::{Activity, Context, Finalization, Finalize},
+        types::{Activity, Attributable, Context, Finalization, Finalize},
     },
     types::{Epoch as CwEpoch, Round, ViewDelta},
 };
@@ -329,6 +330,7 @@ pub struct Finalized<E, S> {
     /// This voter's Commonware signer index, and where its own finalize votes go.
     me: Participant,
     votes: mpsc::UnboundedSender<FinalizeVote>,
+    faults: mpsc::UnboundedSender<VoterFault>,
 }
 
 impl<E, S: Clone> Clone for Finalized<E, S> {
@@ -340,6 +342,7 @@ impl<E, S: Clone> Clone for Finalized<E, S> {
             out: self.out.clone(),
             me: self.me,
             votes: self.votes.clone(),
+            faults: self.faults.clone(),
         }
     }
 }
@@ -372,6 +375,13 @@ impl<E: Clock + Spawner, S: BlockSource> Finalized<E, S> {
 }
 
 impl<E: Clock + Spawner, S: BlockSource> Finalized<E, S> {
+    /// Hands out Simplex conflict evidence as a [`VoterFault`]. Optional output, like votes.
+    fn fault(&self, kind: FaultKind, signer: Participant, votes: Vec<u8>) {
+        if let Some(voter) = self.committee.voter_of(signer) {
+            let _ = self.faults.send(VoterFault { kind, voter, votes });
+        }
+    }
+
     /// This voter's own finalize vote, for the sequencer and the standby (07 §6.8).
     fn own_vote(&self, f: &Finalize<Scheme, Digest>) -> Option<FinalizeVote> {
         if f.attestation.signer != self.me {
@@ -403,6 +413,26 @@ impl<E: Clock + Spawner, S: BlockSource> Reporter for Finalized<E, S> {
                 }
                 false
             }
+            Activity::ConflictingNotarize(c) => {
+                self.fault(
+                    FaultKind::ConflictingNotarize,
+                    c.signer(),
+                    c.encode().to_vec(),
+                );
+                false
+            }
+            Activity::ConflictingFinalize(c) => {
+                self.fault(
+                    FaultKind::ConflictingFinalize,
+                    c.signer(),
+                    c.encode().to_vec(),
+                );
+                false
+            }
+            Activity::NullifyFinalize(c) => {
+                self.fault(FaultKind::NullifyFinalize, c.signer(), c.encode().to_vec());
+                false
+            }
             _ => false,
         };
         if closed {
@@ -420,6 +450,8 @@ pub struct Outputs {
     /// This voter's own finalize votes, to send to the sequencer's and the standby's
     /// `REP_UDP_CTRL` (07 §6.8).
     pub votes: mpsc::UnboundedReceiver<FinalizeVote>,
+    /// Conflicting votes this voter's Simplex saw, as evidence against their voter (07 §10.2).
+    pub faults: mpsc::UnboundedReceiver<VoterFault>,
 }
 
 /// The Simplex configuration of one voter, with its [`Outputs`].
@@ -456,6 +488,7 @@ where
         .insert(genesis, (None, Tip::from(cfg.genesis)));
     let (out, certs) = mpsc::unbounded_channel();
     let (votes, votes_rx) = mpsc::unbounded_channel();
+    let (faults, faults_rx) = mpsc::unbounded_channel();
     let own_key = vyrn_crypto::ed25519::public_key(&cfg.vote_seed);
     let me = cfg
         .committee
@@ -481,6 +514,7 @@ where
         out,
         me,
         votes,
+        faults,
     };
     let epoch = CwEpoch::new(u64::from(cfg.epoch.0));
     let t = cfg.timeouts;
@@ -525,6 +559,7 @@ where
         Outputs {
             certs,
             votes: votes_rx,
+            faults: faults_rx,
         },
     ))
 }
