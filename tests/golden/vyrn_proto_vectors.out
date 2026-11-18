@@ -121,6 +121,10 @@ V19 redir A: DataRedirect data[0] down -> data[1], resend_from 5, tag under K_se
   000: 44 52 01 00 01 00 00 00 07 30 10 00 05 00 00 00
   010: 79 96 aa 52 44 74 04 21
   tag=0x2104744452aa9679
+
+V20 admin A: DataTierStatus push, epoch 1000, seq 1, data[0] down (18 B)
+  000: 0e 00 00 00 03 80 e8 03 00 00 01 00 00 00 01 00
+  010: 00 00
 check OK: V1 verifies with K_SEQ
 check OK: V1 fails with K_OUT
 check OK: V1 with one tag bit flipped fails (bound source: close session)
@@ -129,3 +133,4 @@ check OK: V13 tag differs from V2 tag
 check OK: V17 is out of stream (resp_seq 0), reason BUSY 24, echo_pkt 6
 check OK: V18 has V16's logical content (D3) and verifies
 check OK: V19 tag = SipHash(K_SEQ, bytes 0..16), not K_OUT
+check OK: V20 is a 0x8003 admin frame, len 14, and V19's data[to] is not down in it

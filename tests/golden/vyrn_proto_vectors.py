@@ -73,6 +73,11 @@ def data_redirect(s, down, to, frm, key):                              # section
     return body + struct.pack("<Q", siphash24(key, body))
 
 
+def data_tier_status(epoch, seq, down):                                 # section 4.4 admin push
+    body = struct.pack("<IIB3s", epoch, seq, down, bytes(3))
+    return struct.pack("<IH", 2 + len(body), 0x8003) + body
+
+
 def request(s, seq, e16, book, msgs, k_com=None, flags=0):
     body = struct.pack("<IIBBHHH", s, seq, len(msgs), flags, e16, book, 0) + b"".join(msgs)
     tag_com = siphash24(k_com, body) if k_com else 0                    # 0 in BASE mode
@@ -95,6 +100,8 @@ def dump(name, pkt, req):
     print(f"\n{name} ({len(pkt)} B)")
     for off in range(0, len(pkt), 16):
         print(f"  {off:03x}: " + " ".join(f"{x:02x}" for x in pkt[off:off + 16]))
+    if req is None:                                                     # an admin frame: no tag
+        return
     tags = struct.unpack_from("<QQ", pkt, len(pkt) - 16) if req else struct.unpack_from("<Q", pkt, len(pkt) - 8)
     print("  " + "  ".join(f"{n}={t:#018x}" for n, t in zip(("tag_seq", "tag_com") if req else ("tag",), tags)))
 
@@ -136,6 +143,8 @@ V = [
      request(A, 6, E, B, [new(of(0, tif=1), 100_000, 2, 0x88888888)], flags=1), True),
     ("V19 redir A: DataRedirect data[0] down -> data[1], resend_from 5, tag under K_seq",
      data_redirect(A, 0, 1, 5, K_SEQ), False),
+    ("V20 admin A: DataTierStatus push, epoch 1000, seq 1, data[0] down",
+     data_tier_status(E, 1, 0b0000_0001), None),
 ]
 for name, pkt, req in V:
     dump(name, pkt, req)
@@ -156,7 +165,10 @@ for what, ok in [("V1 verifies with K_SEQ", verify_request(v1, K_SEQ)),
                  ("V18 has V16's logical content (D3) and verifies", V[17][1][16:32] == V[15][1][16:32]
                   and V[17][1][:9] == V[15][1][:9] and verify_request(V[17][1], K_SEQ)),
                  ("V19 tag = SipHash(K_SEQ, bytes 0..16), not K_OUT", struct.unpack_from("<Q", V[18][1], 16)[0]
-                  == siphash24(K_SEQ, V[18][1][:16]) != siphash24(K_OUT, V[18][1][:16]))]:
+                  == siphash24(K_SEQ, V[18][1][:16]) != siphash24(K_OUT, V[18][1][:16])),
+                 ("V20 is a 0x8003 admin frame, len 14, and V19's data[to] is not down in it",
+                  struct.unpack_from("<IH", V[19][1]) == (14, 0x8003) and len(V[19][1]) == 18
+                  and not V[19][1][14] >> V[18][1][4] & 1)]:
     if not ok:
         raise SystemExit(f"FAILED: {what}")
     print(f"check OK: {what}")
