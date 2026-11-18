@@ -116,6 +116,11 @@ V18 req A: resend of V16, same pkt_seq and content, bit0 = 1 (48 B)
   010: 01 02 00 00 a0 86 01 00 02 00 00 00 88 88 88 88
   020: 37 e2 a3 17 d7 27 2c 64 00 00 00 00 00 00 00 00
   tag_seq=0x642c27d717a3e237  tag_com=0x0000000000000000
+
+V19 redir A: DataRedirect data[0] down -> data[1], resend_from 5, tag under K_seq (24 B)
+  000: 44 52 01 00 01 00 00 00 07 30 10 00 05 00 00 00
+  010: 79 96 aa 52 44 74 04 21
+  tag=0x2104744452aa9679
 check OK: V1 verifies with K_SEQ
 check OK: V1 fails with K_OUT
 check OK: V1 with one tag bit flipped fails (bound source: close session)
@@ -123,3 +128,4 @@ check OK: V10 tag_com = SipHash(K_COM, bytes 0..32)
 check OK: V13 tag differs from V2 tag
 check OK: V17 is out of stream (resp_seq 0), reason BUSY 24, echo_pkt 6
 check OK: V18 has V16's logical content (D3) and verifies
+check OK: V19 tag = SipHash(K_SEQ, bytes 0..16), not K_OUT

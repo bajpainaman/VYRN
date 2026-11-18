@@ -1,8 +1,9 @@
 //! Data box failover (07 §5.7): the backup home rule (step 2) and the `DataRedirect` record a
 //! live data box sends to each affected session's address (step 3).
 //!
-//! *Reading (recorded in 07 §5.7):* 04 owns `DataRedirect` but gives no bytes. This crate fixes
-//! them, 24 bytes, little-endian:
+//! 04 §7.6 owns `DataRedirect` (adopted from this crate's reading of 07 §5.7), 24 bytes,
+//! little-endian. `down` and `to` are positions in the session's `KeyBundle.data` list (04 §4.4),
+//! so [`backup_home`] takes `live` in that list's order (reading, 04 §7.6):
 //!
 //! ```text
 //! off size field
@@ -89,7 +90,8 @@ impl Redirect {
 }
 
 /// 07 §5.7 step 2: the backup home of a session homed on `down` is the next live box after it
-/// in facility order, wrapping; `live[i]` says whether box `i` is up. `None` if no other box is
+/// in facility order, which is the session's `KeyBundle.data` order (04 §7.6), wrapping;
+/// `live[i]` says whether entry `i` is up. `None` if no other box is
 /// live. Every box and replica computes the same answer, so no message chooses it.
 pub fn backup_home(down: u8, live: &[bool]) -> Option<u8> {
     let n = live.len();

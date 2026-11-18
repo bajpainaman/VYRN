@@ -200,3 +200,34 @@ fn redirects_match_the_published_vectors() {
     }
     assert_eq!((ok, err), (2, 6));
 }
+
+/// V19 of the 04 §11 protocol vectors: the `DataRedirect` of 04 §7.6, sealed under the test
+/// `K_seq` (bytes 00..0f) for session A.
+#[test]
+fn v19_of_the_protocol_vectors_opens_and_reseals() {
+    use vyrn_data::redirect::Redirect;
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/golden/vyrn_proto_vectors.out"
+    );
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut rows = text.lines().skip_while(|l| !l.starts_with("V19 "));
+    assert!(rows.next().unwrap().ends_with("(24 B)"));
+    let bytes: Vec<u8> = rows
+        .take(2)
+        .flat_map(|l| l.trim().split_once(": ").unwrap().1.split(' '))
+        .map(|h| u8::from_str_radix(h, 16).unwrap())
+        .collect();
+    let k_seq: [u8; 16] = core::array::from_fn(|i| i as u8);
+    let r = Redirect::open(&bytes, &k_seq).unwrap();
+    let want = Redirect {
+        down: 0,
+        to: 1,
+        session: SessionId(0x0010_3007),
+        resend_from: 5,
+    };
+    assert_eq!(r, want);
+    assert_eq!(want.seal(&k_seq).as_slice(), bytes.as_slice());
+    let k_out: [u8; 16] = core::array::from_fn(|i| 16 + i as u8);
+    assert!(Redirect::open(&bytes, &k_out).is_err());
+}

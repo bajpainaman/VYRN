@@ -1,5 +1,6 @@
 //! The 04 §11 protocol conformance vectors. `tests/golden/vyrn_proto_vectors.out` is the output of
-//! `python3 -I vyrn_proto_vectors.py`; this test builds the same 18 packets with `vyrn-wire`,
+//! `python3 -I vyrn_proto_vectors.py`; this test builds the same 18 packets with `vyrn-wire`
+//! (V19 is a data-tier `DataRedirect`, 04 §7.6, which `vyrn-data` tests),
 //! compares them byte for byte, parses each back, and repeats the script's checks.
 
 use std::collections::BTreeMap;
@@ -23,7 +24,7 @@ const E: u32 = 1000;
 const E16: u16 = 0x03e8;
 const BOOK: BookId = BookId(1);
 
-/// Vector name ("V1" … "V18") → bytes, from the script's hex dump.
+/// Vector name ("V1" … "V18") → bytes, from the script's hex dump; V19 is left to `vyrn-data`.
 fn golden() -> BTreeMap<String, Vec<u8>> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -55,7 +56,8 @@ fn golden() -> BTreeMap<String, Vec<u8>> {
     for (name, len) in &lens {
         assert_eq!(out[name].len(), *len, "{name} length in the dump");
     }
-    assert_eq!(out.len(), 18);
+    assert_eq!(out.len(), 19);
+    out.remove("V19");
     out
 }
 
