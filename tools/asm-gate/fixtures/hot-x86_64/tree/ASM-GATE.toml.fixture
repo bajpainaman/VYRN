@@ -1,0 +1,20 @@
+# Hot symbols and the callees they must not contain (spec/11-build.md §4.4).
+[[symbol]]
+name = "vyrn_lane_rx_batch"
+forbid_calls = ["vyns_*", "ef_*", "rte_*", "__rust_alloc*", "__rust_dealloc", "__rust_realloc",
+                "*panic_bounds_check*", "*slice_index_fail*", "*panic_fmt*"]
+forbid_indirect_calls = true
+max_bytes = 6144
+
+[[symbol]]
+name = "vyrn_tx_ctpio_send"
+forbid_calls = ["vyns_*", "ef_*", "__rust_alloc*"]
+forbid_indirect_calls = true
+
+[[symbol]]
+name = "vyrn_bbo_step"
+forbid_calls = ["__rust_alloc*", "*panic_bounds_check*", "*panic_fmt*"]
+forbid_indirect_calls = true
+
+# Still to list (§4.4): vyrn_cut_publish, vyrn_siphash_pkt, vyrn_lane_admit, vyrn_lane_classify,
+# vyrn_order_drain, vyrn_pool_take, vyrn_pool_steal, vyrn_dpdk_rx_burst.

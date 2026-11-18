@@ -1,0 +1,11 @@
+Intro.
+
+| ID | What we wanted | Workaround | Files with the marker | Cost | Removed when | Status |
+|---|---|---|---|---|---|---|
+| W-1x | typo | - | `vx/a.vx` | - | - | open |
+| W-03 | spin | host call | `vx/a.vx` | - | - | landed |
+| W-03 | spin again | host call | `vx/a.vx` | - | - | open |
+
+| ID | unrelated second table |
+|---|---|
+| nope | ignored |

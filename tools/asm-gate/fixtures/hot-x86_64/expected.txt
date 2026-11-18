@@ -1,0 +1,5 @@
+ASM-GATE.toml:3: forbidden-call
+ASM-GATE.toml:3: forbidden-call
+ASM-GATE.toml:3: forbidden-call
+ASM-GATE.toml:3: indirect-call
+ASM-GATE.toml:10: symbol-missing

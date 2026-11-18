@@ -1,0 +1,4 @@
+--clock
+@CASE/clock.txt
+@CASE/core0.ring
+@CASE/core1.ring

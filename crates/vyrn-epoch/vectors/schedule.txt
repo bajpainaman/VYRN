@@ -1,0 +1,32 @@
+# vyrn-epoch schedule vectors (spec/08-epochs.md §2.1-2.5, §2.4).
+# genesis = 1000000000000 ns TAI. boundary = from to T home(from) home(to); records apply in order.
+# notice = rx_ts -> next home secs flags | none.
+
+case = rotation
+boundary = 0 1 29800000000000 TYO LDN
+boundary = 1 2 58600000000000 LDN NYC
+boundary = 2 3 87400000000000 NYC TYO
+boundary = 3 4 116200000000000 TYO LDN
+
+case = revisions
+apply = Skip { epoch: Epoch(1) } at 26200000000000 -> ok
+boundary = 0 2 58600000000000 TYO NYC
+apply = HomeOverride { epoch: Epoch(2), home: Tyo } at 29790000000000 -> ok
+boundary = 0 2 58600000000000 TYO TYO
+apply = Skip { epoch: Epoch(2) } at 29790000000000 -> ok
+boundary = 0 3 87400000000000 TYO TYO
+apply = Hold { epoch: Epoch(0), t_new: Nanos(88300000000000) } at 87390000000000 -> ok
+boundary = 0 3 88300000000000 TYO TYO
+
+case = notices
+boundary = 0 1 29800000000000 TYO LDN
+notice = 26100000000000 -> none
+notice = 26200000000000 -> 1 LDN 3600 0
+notice = 26200001000000 -> none
+notice = 29200000000000 -> 1 LDN 600 0
+notice = 29741000000000 -> 1 LDN 59 0
+notice = 29790500000000 -> 1 LDN 10 0
+notice = 29796000000000 -> none
+notice = 29799000000000 -> 1 LDN 1 0
+notice = 29799001000000 -> none
+notice = 29800000000000 -> 1 LDN 0 0

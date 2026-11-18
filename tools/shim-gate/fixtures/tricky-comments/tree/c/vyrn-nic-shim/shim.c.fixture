@@ -1,0 +1,4 @@
+const char *s = "/* not a comment";
+const char *t = "// nor this";
+/* c */ /* d */
+char q = '"';

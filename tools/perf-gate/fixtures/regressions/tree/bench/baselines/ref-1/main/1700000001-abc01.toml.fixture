@@ -1,0 +1,27 @@
+schema = 1
+runner = "ref-1"
+commit = "abc01"
+
+[[metric]]
+id = "B2.service_ns"
+stat = "mean"
+value = 9999
+better = "lower"
+
+[[metric]]
+id = "B2.service_ns"
+stat = "p99"
+value = 2000
+better = "lower"
+
+[[metric]]
+id = "B8.ops_per_s"
+stat = "mean"
+value = 1000000
+better = "higher"
+
+[[metric]]
+id = "B8.ops_per_s"
+stat = "p99"
+value = 900000
+better = "higher"

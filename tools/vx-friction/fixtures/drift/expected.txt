@@ -1,0 +1,5 @@
+vx/FRICTION.md:3: entry-file-without-marker
+vx/build.sh:1: issue-mismatch
+vx/client.vx:2: issue-mismatch
+vx/client.vx:3: marker-without-entry
+vx/other.vx:1: marker-file-unlisted

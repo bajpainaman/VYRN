@@ -123,6 +123,10 @@ dependencies = [
 [[package]]
 name = "asm-gate"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml",
+]
 
 [[package]]
 name = "async-trait"
@@ -2277,6 +2281,10 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "perf-gate"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml",
+]
 
 [[package]]
 name = "pin-project"
@@ -3547,8 +3555,6 @@ dependencies = [
  "k256",
  "thiserror",
  "vyrn-crypto",
- "vyrn-epoch",
- "vyrn-replica",
  "vyrn-types",
 ]
 
@@ -3604,9 +3610,11 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "vyrn-crypto",
  "vyrn-log",
  "vyrn-nic",
  "vyrn-types",
+ "vyrn-wire",
 ]
 
 [[package]]
@@ -3626,6 +3634,7 @@ version = "0.1.0"
 dependencies = [
  "thiserror",
  "vyrn-consensus",
+ "vyrn-crypto",
  "vyrn-types",
 ]
 

@@ -1,0 +1,7 @@
+const char *s = "first \
+/* second";
+int x;
+/* c */
+// note \
+int hidden;
+int y;

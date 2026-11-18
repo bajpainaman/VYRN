@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish = false
-description = "CI gate tool (spec/11-build.md)."
+description = "Vx workaround markers against vx/FRICTION.md (spec/11-build.md §5.6)."
 
 [dependencies]
 
