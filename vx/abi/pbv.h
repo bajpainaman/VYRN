@@ -153,7 +153,7 @@ PBV_STATIC_ASSERT(offsetof(pbo_event, msg) == 40, pbo_event_msg_offset);
 /* ===================================================================================== */
 
 /* Bumped on any change to a layout, a ring, an error code or the supported subset. */
-#define PBV_ABI_VERSION 1u
+#define PBV_ABI_VERSION 2u
 
 typedef struct pbv_ctx pbv_ctx;
 
@@ -188,7 +188,8 @@ typedef struct pbv_ctx pbv_ctx;
 #define PBV_IN_BYTES    512u /* 0 lane u8, 1 count u8, 2 flags u8, 3 n_routes u8 (<= 10),
                                 4 session u32, 8 pkt_seq u32, 12 payload_len u32, 16 rx_ts u64,
                                 24 pkt_hash u64, 32 first_lane_seq u64, 40 fills_applied u64,
-                                48 record index u64 (for errors), 64 routes (16 bytes each:
+                                48 record index u64 (for errors), 56 snap_lag u16 (0 on an
+                                Advance or SHED record), 64 routes (16 bytes each:
                                 lane_seq u64, cross u8), 224 payload. One slot per PacketRecord,
                                 MID and Advance records included, in O-order; a packet's
                                 RouteRecords ride in its slot. */

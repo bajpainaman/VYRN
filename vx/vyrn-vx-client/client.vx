@@ -7,11 +7,12 @@
 //
 // - lane -> BBO: an op log per lane, one entry per LaneSeq, readable up to the lane's `applied`;
 //   a forwarded-op queue per lane;
-// - BBO -> lane: a fill-event log per lane, readable up to its head, and the cut and best
-//   bid/ask of every step (a history of HIST steps), readable once `done_step` covers the step.
+// - BBO -> lane: a fill-event log per lane, readable up to its head; the cut and snapshot
+//   version of every step (a history of HIST steps), readable once `done_step` covers the step;
+//   and the best bid/ask of every snapshot version (SNAP_HIST versions), up to `snap_now`.
 //
 // Merge rule (07 §7.1 REP_MERGE): a lane call whose `fills_applied` is f runs once step f is
-// done; step s runs once every lane has applied the ops its cut covers. A lane that waits on a
+// done and the version its `snap_lag` names is published; step s runs once every lane has applied the ops its cut covers. A lane that waits on a
 // step at or after s while step s waits on it is REP_E_ORDER, as in vyrn-engine.
 //
 // Every C struct and ring slot is read and written by byte offset (as in the oracle), so the ABI
@@ -35,7 +36,7 @@ extern "C" {
 // ---- constants ---------------------------------------------------------------------------
 // VX-WORKAROUND W-12 (issue to file): no hex integer literals, so every constant is decimal.
 
-const ABI_VERSION : u64 = 1;
+const ABI_VERSION : u64 = 2;
 const U32_MAX : u64 = 4294967295;
 const U64_MAX : u64 = 18446744073709551615;
 const NS_PER_S : u64 = 1000000000;
@@ -59,6 +60,7 @@ const OPLOG_CAP : u64 = 16384;
 const FWDQ_CAP : u64 = 1024;
 const EV_CAP : u64 = 16384;
 const HIST : u64 = 4096;          // ENG_STEP_LOG
+const SNAP_HIST : u64 = 4096;     // REPLAY_SNAP_HIST = ENG_SNAP_HIST (07 §7.1)
 const PEND_CAP : i64 = 65536;
 const B3_CAP : i64 = 4096;
 const MAX_TX : i64 = 12;
@@ -255,7 +257,8 @@ struct Lane {
   routes : *mut Route, n_routes : i64, route_hits : i64, classified : u64,
   taker_notional : u128, taker_leg : i64,
   tails : *mut u64, segs_used : *mut u64, segs_base : *mut u64, next_seg : u64,
-  ev_tail : u64, fwd_head : u64, rec_at : u64, pkt_first : u64, snap_ver : u64,
+  ev_tail : u64, fwd_head : u64, rec_at : u64, snap_ver : u64,
+  snap_base : u64, pkt_bid : u64, pkt_ask : u64,
 }
 
 struct Bbo {
@@ -279,8 +282,8 @@ struct Ctx {
   in_base : i64, out_base : i64, step_base : i64, tx_base : i64,
   lanes : *mut Lane, bbo : *mut Bbo,
   oplog : *mut LOp, fwdq : *mut u64, evlog : *mut Ev,
-  hist_id : *mut AtomicU64, hist_cut : *mut u64, hist_bid : *mut u64, hist_ask : *mut u64,
-  hist_ver : *mut u64,
+  hist_id : *mut AtomicU64, hist_cut : *mut u64, hist_ver : *mut u64,
+  sv_id : *mut AtomicU64, sv_bid : *mut u64, sv_ask : *mut u64,
 }
 
 // ---- bytes, memory -------------------------------------------------------------------------
@@ -363,7 +366,7 @@ fn ctl_lines(n : i64) -> i64 { return 1i64 + 4i64 * (n + 1i64); }
 
 // Vx-owned sync words. Lane line 2l: 0 applied, 1 fwd_head, 2 ev_tail, 3 fills_applied,
 // 4 snapshot version. BBO line 2l + 1: 0 ev_head, 1 fwd_tail, 2 cut, 3 the cut it waits for.
-// BBO line 2n: 0 done_step.
+// BBO line 2n: 0 done_step, 1 the newest published snapshot version.
 const Y_APPLIED : i64 = 0;
 const Y_FWD_HEAD : i64 = 1;
 const Y_EV_TAIL : i64 = 2;
@@ -373,6 +376,8 @@ const Y_CUT : i64 = 2;
 const Y_WAIT : i64 = 3;
 // Lane line 2l word 4: the version of the snapshot it last read (word 3 is fills_applied).
 const Y_SNAP_VER : i64 = 4;
+// BBO line 2n word 1: the newest snapshot version (replay's `snap_now`).
+const Y_SNAP_NOW : i64 = 1;
 
 fn stopped(c : *mut Ctx) -> bool { return ld(c, 0i64, 0i64) != 0u64; }
 fn done_step(c : *mut Ctx) -> u64 { unsafe { return sld(c, 2i64 * (*c).n, 0i64); } }
@@ -752,16 +757,36 @@ fn check_tick(c : *mut Ctx, ln : *mut Lane, side : u64, tick : u64, detail : *mu
     return 0u64;
   }
 }
-// The op's snapshot: best bid and ask after step `pkt_first`, the lane's latest boundary;
-// an empty ask reads 0, as vyrn-lane's `risk_snap` gives it.
+// The op's snapshot: the best bid and ask of the version its packet's `snap_lag` names
+// (lane_pkt); an empty ask reads 0, as vyrn-lane's `risk_snap` gives it.
 fn snap_bid(c : *mut Ctx, ln : *mut Lane) -> u64 {
-  unsafe { return *offset_mut((*c).hist_bid, (((*ln).pkt_first % HIST)) as i64); }
+  unsafe { return (*ln).pkt_bid; }
 }
 fn snap_ask(c : *mut Ctx, ln : *mut Lane) -> u64 {
   unsafe {
-    let a = *offset_mut((*c).hist_ask, (((*ln).pkt_first % HIST)) as i64);
-    if a == NO_ASK { return 0u64; }
-    return a;
+    if (*ln).pkt_ask == NO_ASK { return 0u64; }
+    return (*ln).pkt_ask;
+  }
+}
+
+// The snapshot version step f published, or U64_MAX once the step history dropped f.
+fn ver_at(c : *mut Ctx, f : u64) -> u64 {
+  unsafe {
+    let s = (f % HIST) as i64;
+    let idp : *mut AtomicU64 = offset_mut((*c).hist_id, s);
+    if (*idp).load(AtomicOrdering::Acquire) != f { return U64_MAX; }
+    let v = *offset_mut((*c).hist_ver, s);
+    if (*idp).load(AtomicOrdering::Acquire) != f { return U64_MAX; }
+    return v;
+  }
+}
+
+// The version a packet record names, `snap_base + snap_lag` (07 §7.1), for a record that
+// classifies (not Advance, not SHED); U64_MAX otherwise.
+fn snap_want(ln : *mut Lane, r : *mut i8) -> u64 {
+  unsafe {
+    if (rd8(r, 2i64) & (F_ADVANCE | F_SHED)) != 0u64 { return U64_MAX; }
+    return (*ln).snap_base + rd16(r, 56i64);
   }
 }
 
@@ -1034,11 +1059,9 @@ fn maybe_mid(c : *mut Ctx, l : i64, pass : u64, next : u64) -> void {
     if !hit { return; }
     (*ln).next_mid = (*ln).next_mid + 1i64;
     let f = (*m).f;
+    // The packet keeps the snapshot it was accepted with; boundary moves only the base of
+    // later packets' snap_lag.
     boundary(c, l, f, pass, next);
-    (*ln).pkt_first = f;
-    let sv = *offset_mut((*c).hist_ver, ((f % HIST)) as i64);
-    if sv > (*ln).snap_ver { (*ln).snap_ver = sv; }
-    sst(c, 2i64 * l, Y_SNAP_VER, (*ln).snap_ver);
   }
 }
 
@@ -1095,10 +1118,19 @@ fn lane_pkt(c : *mut Ctx, l : i64, r : *mut i8, mids : u64) -> void {
     (*s).expected = ((*s).expected + 1u64) & U32_MAX;
     let prio = max(rx_ts, (*ln).last_prio);
     (*ln).last_prio = prio;
-    // The snapshot at accept: the one its last boundary read (fills_applied), never older.
-    let sv = *offset_mut((*c).hist_ver, (((*ln).pkt_first % HIST)) as i64);
-    if sv > (*ln).snap_ver { (*ln).snap_ver = sv; }
-    sst(c, 2i64 * l, Y_SNAP_VER, (*ln).snap_ver);
+    // The snapshot the live lane classified this packet against: version snap_base +
+    // snap_lag (05 §6.5, 07 §7.1). One the ring no longer holds is NoSnapshot (PBV_E_FAULT).
+    let v = snap_want(ln, r);
+    let vi = (v % SNAP_HIST) as i64;
+    let vp : *mut AtomicU64 = offset_mut((*c).sv_id, vi);
+    if (*vp).load(AtomicOrdering::Acquire) != v { fail_lane(ln, E_FAULT); return; }
+    let vb = *offset_mut((*c).sv_bid, vi);
+    let va = *offset_mut((*c).sv_ask, vi);
+    if (*vp).load(AtomicOrdering::Acquire) != v { fail_lane(ln, E_FAULT); return; }
+    (*ln).pkt_bid = vb;
+    (*ln).pkt_ask = va;
+    (*ln).snap_ver = v;
+    sst(c, 2i64 * l, Y_SNAP_VER, v);
     if rd64(r, 32i64) != (*ln).seq + 1u64 { fail_lane(ln, E_MISMATCH); return; }
     (*ln).n_ops = 0i64;
     (*ln).cur_sess = si;
@@ -1481,6 +1513,10 @@ fn boundary(c : *mut Ctx, l : i64, f : u64, pass : u64, next : u64) -> void {
     if f <= (*ln).fills { fail_lane(ln, E_MISMATCH); return; }
     let cf = cut_at(c, f, l);
     if cf == U64_MAX { fail_lane(ln, E_TOO_OLD); return; }
+    // The base of later packets' snap_lag: the version step f published (05 §6.5).
+    let fv = ver_at(c, f);
+    if fv == U64_MAX { fail_lane(ln, E_TOO_OLD); return; }
+    (*ln).snap_base = fv;
     // B1.
     let mut step = 0u64;
     loop {
@@ -1650,6 +1686,11 @@ fn lane_call(c : *mut Ctx, l : i64, k : u64) -> void {
       let f = rd64(r, 40i64);
       boundary(c, l, f, 0u64, 0u64);
       if (*ln).err != 0u64 { return; }
+      // Outside a packet the lane also takes the boundary's snapshot if newer (vyrn-lane).
+      if (*ln).snap_base > (*ln).snap_ver {
+        (*ln).snap_ver = (*ln).snap_base;
+        sst(c, 2i64 * l, Y_SNAP_VER, (*ln).snap_ver);
+      }
       if flags != F_ADVANCE || rd64(r, 32i64) != (*ln).seq + 1u64 || rd64(r, 16i64) != (*ln).last_prio
          || rd32(r, 4i64) != 0u64 || rd8(r, 1i64) != 0u64 {
         fail_lane(ln, E_MISMATCH);
@@ -1667,9 +1708,6 @@ fn lane_call(c : *mut Ctx, l : i64, k : u64) -> void {
       (*mp).f = rd64(m, 40i64);
       (*ln).n_mid = (*ln).n_mid + 1i64;
     }
-    // Lanes read the snapshot only at boundaries: the packet's ops up to its first MID use the
-    // snapshot after its `fills_applied` step; each MID boundary moves to its own (maybe_mid).
-    (*ln).pkt_first = rd64(r, 40i64);
     (*ln).n_routes = rd8(r, 3i64) as i64;
     (*ln).route_hits = 0i64;
     for i in 0i64..(*ln).n_routes {
@@ -1731,7 +1769,12 @@ pub fn pbv_lane_run(c : *mut Ctx, l : u32) -> void {
           }
           if k > 21u64 { (*ln).rec_at = rd64(r, 48i64); fail_lane(ln, E_BAD_RECORD); continue; }
         }
-        if done_step(c) >= wait {
+        // Due once its fills_applied step ran and the BBO has published the version its
+        // snap_lag names (07 §7.1). done_step first: snap_now is published before it.
+        let ds = done_step(c);
+        let v = snap_want(ln, r);
+        if v != U64_MAX && v > sld(c, 2i64 * (*c).n, Y_SNAP_NOW) { wait = max(wait, ds + 1u64); }
+        if ds >= wait {
           lane_call(c, li, k);
           // Publish the idle state afresh after every call: the BBO reads this lane's counter
           // (applied, snapshot version) only once the lane says which step it waits for.
@@ -2149,9 +2192,15 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
       *offset_mut((*b).vh_ver, vi) = (*b).ver;
       *offset_mut((*b).vh_b, vi) = (*b).bb;
       *offset_mut((*b).vh_a, vi) = (*b).ba;
+      // The lanes' copy (snap_lag lookups), tag last.
+      let si = ((*b).ver % SNAP_HIST) as i64;
+      let sp : *mut AtomicU64 = offset_mut((*c).sv_id, si);
+      (*sp).store(U64_MAX, AtomicOrdering::Release);
+      *offset_mut((*c).sv_bid, si) = (*b).bb;
+      *offset_mut((*c).sv_ask, si) = (*b).ba;
+      (*sp).store((*b).ver, AtomicOrdering::Release);
+      sst(c, 2i64 * n, Y_SNAP_NOW, (*b).ver);
     }
-    *offset_mut((*c).hist_bid, h) = (*b).bb;
-    *offset_mut((*c).hist_ask, h) = (*b).ba;
     *offset_mut((*c).hist_ver, h) = (*b).ver;
     (*idp).store(s, AtomicOrdering::Release);
     (*b).next = s + 1u64;
@@ -2571,9 +2620,11 @@ pub fn pbv_new(cfg : *const i8, accts : *const i8, n_accts : u32, sp : *const i8
     let hid : *mut AtomicU64 = zalloc(8i64 * (HIST as i64));
     (*c).hist_id = hid;
     (*c).hist_cut = zalloc(8i64 * n * (HIST as i64));
-    (*c).hist_bid = zalloc(8i64 * (HIST as i64));
-    (*c).hist_ask = zalloc(8i64 * (HIST as i64));
     (*c).hist_ver = zalloc(8i64 * (HIST as i64));
+    let svid : *mut AtomicU64 = zalloc(8i64 * (SNAP_HIST as i64));
+    (*c).sv_id = svid;
+    (*c).sv_bid = zalloc(8i64 * (SNAP_HIST as i64));
+    (*c).sv_ask = zalloc(8i64 * (SNAP_HIST as i64));
     if is_null_mut((*c).lanes) || is_null_mut((*c).bbo) || is_null_mut((*c).oplog)
        || is_null_mut((*c).evlog) || is_null_mut((*c).hist_cut) {
       return nul;
@@ -2583,7 +2634,6 @@ pub fn pbv_new(cfg : *const i8, accts : *const i8, n_accts : u32, sp : *const i8
       let ip : *mut AtomicU64 = offset_mut((*c).hist_id, h);
       (*ip).store(U64_MAX, AtomicOrdering::Release);
     }
-    *offset_mut((*c).hist_ask, 0i64) = NO_ASK;
     let b = (*c).bbo;
     (*b).next = 1u64;
     (*b).cut = zalloc(8i64 * n);
@@ -2597,12 +2647,19 @@ pub fn pbv_new(cfg : *const i8, accts : *const i8, n_accts : u32, sp : *const i8
     (*b).rver = zalloc(8i64 * n);
     if is_null_mut((*b).vh_ver) || is_null_mut((*b).vh_b) || is_null_mut((*b).vh_a)
        || is_null_mut((*b).lowver) || is_null_mut((*b).rapp) || is_null_mut((*b).rver)
-       || is_null_mut((*c).hist_ver) {
+       || is_null_mut((*c).hist_ver) || is_null_mut((*c).sv_id) || is_null_mut((*c).sv_bid)
+       || is_null_mut((*c).sv_ask) {
       return nul;
     }
     // Version 0: an empty book (Bbo::new).
     for v in 1i64..(HIST as i64) { *offset_mut((*b).vh_ver, v) = U64_MAX; }
     *offset_mut((*b).vh_a, 0i64) = NO_ASK;
+    for v in 1i64..(SNAP_HIST as i64) {
+      let ip : *mut AtomicU64 = offset_mut((*c).sv_id, v);
+      (*ip).store(U64_MAX, AtomicOrdering::Release);
+    }
+    *offset_mut((*c).sv_bid, 0i64) = NO_BID;
+    *offset_mut((*c).sv_ask, 0i64) = NO_ASK;
     (*b).fwd_tail = zalloc(8i64 * n);
     (*b).ev_head = zalloc(8i64 * n);
     (*b).ords = zalloc(sizeof<BOrd>() * n * (slot_cap as i64));
@@ -2670,9 +2727,10 @@ pub fn pbv_free(c : *mut Ctx) -> void {
     let r5 : *mut i8 = (*c).evlog; free(r5);
     let r6 : *mut i8 = (*c).hist_id; free(r6);
     let r7 : *mut i8 = (*c).hist_cut; free(r7);
-    let r8 : *mut i8 = (*c).hist_bid; free(r8);
     let rv : *mut i8 = (*c).hist_ver; free(rv);
-    let r9 : *mut i8 = (*c).hist_ask; free(r9);
+    let s0 : *mut i8 = (*c).sv_id; free(s0);
+    let s1 : *mut i8 = (*c).sv_bid; free(s1);
+    let s2 : *mut i8 = (*c).sv_ask; free(s2);
   }
   let cc : *mut i8 = c;
   free(cc);
