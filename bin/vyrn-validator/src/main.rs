@@ -1180,20 +1180,28 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 .filter_map(|&b| 1u64.checked_shl(u32::try_from(b).unwrap_or(u32::MAX)))
                 .fold(0, |m, b| m | b),
         );
-        if !due.is_empty() {
-            // Every client record of a pending block counts, resolved here or not: a block
-            // that is not final may hold a payload only this replica has (reading t).
-            let mut pending = std::collections::BTreeMap::new();
-            for (b, _) in &self.pending {
+        // Every client record of a pending block counts, resolved here or not: a block that is
+        // not final may hold a payload only this replica has (reading t). Walked only for a
+        // move's rounds, or for repairs, which `repair` paces per session.
+        let lows = |pending: &VecDeque<(BlockInputs<N>, Option<Mark>)>| {
+            let mut m = std::collections::BTreeMap::new();
+            for (b, _) in pending {
                 for r in &b.lanes {
                     let LaneRec::Pkt(p) = r else { continue };
                     if p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) != 0 {
                         continue;
                     }
-                    let e = pending.entry(p.session).or_insert(p.pkt_seq);
+                    let e = m.entry(p.session).or_insert(p.pkt_seq);
                     *e = (*e).min(p.pkt_seq);
                 }
             }
+            m
+        };
+        if fo.wants_repair(now) {
+            fo.queue_repairs(&lows(&self.pending), now);
+        }
+        if !due.is_empty() {
+            let pending = lows(&self.pending);
             let list = fo.resend_from(&pending);
             for (down, to) in due {
                 fo.queue(down, to, &list);
@@ -1286,7 +1294,7 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                             // Every live box lacks it: after a home move its session's REDIRECT
                             // may have been lost, so it goes again, paced (07 §5.7 reading).
                             if let Some(fo) = self.failover.as_mut() {
-                                fo.repair(session, pkt_seq, now);
+                                fo.repair(session, now);
                             }
                             let join = Self::join(&mut self.join, &mut self.replay);
                             // From where the last round stopped, found by height from the front
@@ -1329,7 +1337,7 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                                 if self.sources.stuck(p.session, p.pkt_seq)
                                     && let Some(fo) = self.failover.as_mut()
                                 {
-                                    fo.repair(p.session, p.pkt_seq, now);
+                                    fo.repair(p.session, now);
                                 }
                                 let to = self.sources.due(p.session, p.pkt_seq, now);
                                 sent = sent.saturating_add(usize::from(!to.is_empty()));

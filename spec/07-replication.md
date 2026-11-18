@@ -1390,18 +1390,19 @@ same for a list.
 replica sends each move's REDIRECTs in 3 rounds. Under load those rounds can all be lost: one loaded
 run moved only 749 of 1963 sessions, and their packets kept going to the dead box. So after a home
 move, when a pending key's KEY fetch has a miss from every live box, the replica queues that
-session's REDIRECT again from the key's `pkt_seq`, at most once per 10 ms per session, through the
-same paced outbox, once from each earlier home to the current one: a client that lost a later move's
-rounds is still on an earlier home, and DR2 drops a REDIRECT whose `down` is not its home. It is a
-re-send, not a fetch, so it refines the 3 rounds rather than replacing them. The client acts on its
-first REDIRECT per session (DR2), so a repeat costs one box fetch token and nothing more. A dead box
-answers nothing, so "every live box" counts only the boxes not effectively down. **Known gaps
-(open).** (1) The repair is triggered only by a pending key that every live box lacks. A session
-whose REDIRECTs were all lost, but whose data reaches the replicas from another source (a peer or
-the sequencer), never triggers it: that stalls nothing, but its copy 2 still goes to the dead box.
-One loaded run left 8 such sessions unmoved. (2) A box counted `redirect_unknown = 3` (REDIRECTs for
-sessions it had no source address for) in two loaded runs before the repair, and in none of 16
-after. Its cause is not established.
+session's REDIRECT again, with `resend_from` chosen as for a move (its lowest `pkt_seq` in a pending
+or not-final block, so a repair met at a later key skips no earlier one), at most once per 10 ms per
+session, through the same paced outbox, once from each earlier home to the current one: a client
+that lost a later move's rounds is still on an earlier home, and DR2 drops a REDIRECT whose `down`
+is not its home. It is a re-send, not a fetch, so it refines the 3 rounds rather than replacing
+them. The client acts on its first REDIRECT per session (DR2), so a repeat costs one box fetch token
+and nothing more. A dead box answers nothing, so "every live box" counts only the boxes not
+effectively down. **Known gaps (open).** (1) The repair is triggered only by a pending key that
+every live box lacks. A session whose REDIRECTs were all lost, but whose data reaches the replicas
+from another source (a peer or the sequencer), never triggers it: that stalls nothing, but its copy
+2 still goes to the dead box. One loaded run left 8 such sessions unmoved. (2) A box counted
+`redirect_unknown = 3` (REDIRECTs for sessions it had no source address for) in two loaded runs
+before the repair, and in none of 16 after. Its cause is not established.
 
 **Redirect queue policy (*reading*, DEV policy; 07 names none).** No fetch repairs a lost
 `DataRedirect`, so a box does not drop one a full queue refuses (its TX queue, or on a sharded

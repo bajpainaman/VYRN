@@ -220,6 +220,11 @@ pub struct Failover {
     repaired: BTreeMap<SessionId, u64>,
     /// Every home the sessions have had, oldest first: [`FIRST_HOME`], then each move's target.
     homes: Vec<u8>,
+    /// Sessions marked by [`Failover::repair`], not queued yet.
+    want: BTreeSet<SessionId>,
+    /// When [`Failover::queue_repairs`] may run next: one walk of the pending blocks per
+    /// [`GOSSIP_EVERY_NS`] at most.
+    next_repair: u64,
     /// The highest `pkt_seq` per session in a final block.
     final_max: BTreeMap<SessionId, u32>,
     /// Released blocks not final yet: height and each session's lowest and highest `pkt_seq`.
@@ -246,6 +251,8 @@ impl Failover {
             redirected: BTreeSet::new(),
             repaired: BTreeMap::new(),
             homes: vec![FIRST_HOME],
+            want: BTreeSet::new(),
+            next_repair: 0,
             final_max: BTreeMap::new(),
             unfinal: VecDeque::new(),
             counts: Counts::default(),
@@ -352,11 +359,11 @@ impl Failover {
     }
 
     /// *Reading (07 §5.7):* after a home move, a pending key that every live box lacks may be
-    /// one whose session's REDIRECT was lost (no fetch repairs one), so its session's REDIRECT
-    /// from `pkt_seq` is queued again, from every earlier home to the current one, at most once
-    /// per [`GOSSIP_EVERY_NS`] per session. The
-    /// client takes only its first (DR2), so a repeat costs one box token and nothing else.
-    pub fn repair(&mut self, session: SessionId, pkt_seq: u32, now: u64) {
+    /// one whose session's REDIRECT was lost (no fetch repairs one), so the session is marked
+    /// for a repair REDIRECT, at most once per [`GOSSIP_EVERY_NS`] per session; the client takes
+    /// only its first (DR2), so a repeat costs one box token and nothing else. The REDIRECT
+    /// itself is queued by [`Failover::queue_repairs`].
+    pub fn repair(&mut self, session: SessionId, now: u64) {
         if !self.moved {
             return;
         }
@@ -366,12 +373,30 @@ impl Failover {
             .is_none_or(|t| now.saturating_sub(*t) >= GOSSIP_EVERY_NS);
         if due {
             self.repaired.insert(session, now);
-            // The client may be on any earlier home (it lost a later move's rounds), and DR2
-            // drops a REDIRECT whose `down` is not its home: one from each (Codex r4619507158).
-            for &h in self.homes.iter().filter(|&&h| h != self.home) {
-                self.outbox.push_back((session, pkt_seq, h, self.home));
-            }
+            self.want.insert(session);
             self.counts.repairs = self.counts.repairs.saturating_add(1);
+        }
+    }
+
+    /// Whether sessions marked by [`Failover::repair`] wait for [`Failover::queue_repairs`].
+    pub fn wants_repair(&self, now: u64) -> bool {
+        !self.want.is_empty() && now >= self.next_repair
+    }
+
+    /// Queues the marked sessions' repair REDIRECTs. `unresolved` is each session's lowest
+    /// `pkt_seq` in the pending blocks: `resend_from` is as for a move ([`Failover::resend_from`]),
+    /// so a repair met at a later key of a session does not skip an earlier one the client
+    /// must resend (Vercel r4619586756). One from every earlier home to the current one: a
+    /// client that lost a later move's rounds is on an earlier home, and DR2 drops a REDIRECT
+    /// whose `down` is not its home (Codex r4619507158).
+    pub fn queue_repairs(&mut self, unresolved: &BTreeMap<SessionId, u32>, now: u64) {
+        self.next_repair = now.saturating_add(GOSSIP_EVERY_NS);
+        let want = std::mem::take(&mut self.want);
+        let list = self.resend_from(unresolved);
+        for (s, r) in list.into_iter().filter(|(s, _)| want.contains(s)) {
+            for &h in self.homes.iter().filter(|&&h| h != self.home) {
+                self.outbox.push_back((s, r, h, self.home));
+            }
         }
     }
 
@@ -697,19 +722,29 @@ mod tests {
     /// at most once per gossip period; never before a move.
     #[test]
     fn a_lost_redirect_is_repaired_paced() {
+        let s9 = SessionId(9);
         let mut f = Failover::new(2, 0, 1, 0, 1);
-        f.repair(SessionId(9), 4, 0);
-        assert!(f.batch(0).is_empty(), "no move yet");
+        f.repair(s9, 0);
+        assert!(!f.wants_repair(0), "no move yet");
         f.silent(&[0], 0);
         let _ = f.step(0);
-        f.repair(SessionId(9), 4, 1);
-        f.repair(SessionId(9), 4, 2);
+        f.repair(s9, 1);
+        f.repair(s9, 2);
+        // The session's lowest pending pkt_seq, not the key the repair was met at.
+        assert!(f.wants_repair(2));
+        f.queue_repairs(&BTreeMap::from([(s9, 2), (SessionId(5), 1)]), 2);
+        f.repair(SessionId(5), 3);
+        assert!(!f.wants_repair(3), "one walk per period");
         let sent = flat(&f.batch(GOSSIP_EVERY_NS));
-        let r: Vec<_> = sent.iter().filter(|r| r.0 == SessionId(9)).collect();
+        let r: Vec<_> = sent.iter().filter(|r| r.0 == s9).collect();
         assert_eq!(r.len(), 1, "paced");
-        assert_eq!((r[0].1, r[0].2, r[0].3), (4, 0, 1));
-        f.repair(SessionId(9), 4, 1 + GOSSIP_EVERY_NS);
-        assert_eq!(f.counts.repairs, 2);
+        assert_eq!((r[0].1, r[0].2, r[0].3), (2, 0, 1));
+        assert!(
+            !sent.iter().any(|r| r.0 == SessionId(5)),
+            "only marked sessions"
+        );
+        f.repair(s9, 1 + GOSSIP_EVERY_NS);
+        assert_eq!(f.counts.repairs, 3, "s9 twice, session 5 once");
         // After 0 → 1 → 2 a client may be on 0 or 1: one REDIRECT from each to 2.
         let mut f = Failover::new(3, 0, 1, 0, 1);
         f.silent(&[0], 0);
@@ -720,10 +755,11 @@ mod tests {
         let _ = f.batch(GOSSIP_EVERY_NS);
         let _ = f.batch(2 * GOSSIP_EVERY_NS);
         let _ = f.batch(3 * GOSSIP_EVERY_NS);
-        f.repair(SessionId(9), 4, 4 * GOSSIP_EVERY_NS);
+        f.repair(s9, 4 * GOSSIP_EVERY_NS);
+        f.queue_repairs(&BTreeMap::from([(s9, 4)]), 4 * GOSSIP_EVERY_NS);
         let mut r: Vec<_> = flat(&f.batch(5 * GOSSIP_EVERY_NS))
             .into_iter()
-            .filter(|r| r.0 == SessionId(9))
+            .filter(|r| r.0 == s9)
             .map(|r| (r.2, r.3))
             .collect();
         r.sort_unstable();
