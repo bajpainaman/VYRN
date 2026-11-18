@@ -6,12 +6,24 @@
 //! crate ever sees the Commonware index.
 //!
 //! The sequencer never votes (01 §14.4): a committee refuses any `seq_key` among its voters.
+//!
+//! **Who leads.** [`Committee::leader`] is the elector of 07 §6.3: plain round-robin in
+//! `REP_Membership.voters` order. [`VoterOrder`] hands the same schedule to Simplex, so the leader
+//! Simplex elects and the leader §9.2 names to build a seal are one function.
+//!
+//! Spec gap (07 §6.3 says "plain `RoundRobin` over the voters" without the arithmetic). Reading
+//! taken: Commonware `RoundRobin`'s `(epoch + view) mod n` with no shuffle seed, indexing
+//! `REP_Membership.voters` instead of the sorted keys. Only the order differs from Commonware's.
 
 use commonware_codec::DecodeExt;
-use commonware_cryptography::ed25519;
+use commonware_consensus::{
+    simplex::elector::{Config as ElectorConfig, Elector, Scheduled, Terms},
+    types::Round,
+};
+use commonware_cryptography::{certificate::Scheme, ed25519};
 use commonware_utils::{Participant, ordered::Set};
 use thiserror::Error;
-use vyrn_types::{Mode, PubKey};
+use vyrn_types::{Epoch, Mode, PubKey};
 
 /// Why a voter list is not a valid committee (07 §13.1 validation rules).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -94,6 +106,31 @@ impl Committee {
         u8::try_from(i).ok()
     }
 
+    /// The voter index that leads `view` of `epoch` (07 §6.3): `(epoch + view) mod n`. No index
+    /// is skipped and a failover does not change it (07 §6.3, §9.2).
+    pub fn leader(&self, epoch: Epoch, view: u64) -> u8 {
+        let n = self.voters.len().max(1) as u64;
+        // n ≤ 5, so the index always fits.
+        u8::try_from(u64::from(epoch.0).wrapping_add(view) % n).unwrap_or(u8::MAX)
+    }
+
+    /// The Simplex elector of this committee (07 §6.3).
+    pub fn elector(&self) -> VoterOrder {
+        // For each voter index, its Commonware participant index.
+        let order = self
+            .voters
+            .iter()
+            .filter_map(|v| {
+                let at = self.participants.iter().position(|k| {
+                    let bytes: &[u8] = k.as_ref();
+                    bytes == v.as_slice()
+                })?;
+                Some(Participant::from_usize(at))
+            })
+            .collect();
+        VoterOrder { order }
+    }
+
     /// The Commonware participant set (sorted keys).
     pub(crate) fn participants(&self) -> &Set<ed25519::PublicKey> {
         &self.participants
@@ -112,9 +149,54 @@ impl Committee {
     }
 }
 
+/// The elector of 07 §6.3 for `commonware-consensus` Simplex: round-robin over
+/// `REP_Membership.voters` order. It is both the elector config and the built elector; build it
+/// with [`Committee::elector`].
+#[derive(Clone, Debug)]
+pub struct VoterOrder {
+    /// `order[i]` is the Commonware participant index of voter `i`.
+    order: Vec<Participant>,
+}
+
+impl<S: Scheme> ElectorConfig<S> for VoterOrder {
+    type Elector = Self;
+
+    /// Panics if `participants` is not the committee this elector came from: Simplex would
+    /// otherwise elect leaders other voters do not.
+    fn build(self, participants: &Set<S::PublicKey>) -> Self {
+        assert_eq!(
+            participants.len(),
+            self.order.len(),
+            "elector built for another committee"
+        );
+        self
+    }
+}
+
+impl<S: Scheme> Elector<S> for VoterOrder {
+    type Mode = Scheduled;
+
+    fn terms(&self) -> Terms {
+        Terms::rotating()
+    }
+
+    fn elect(&self, round: Round, _: ()) -> Participant {
+        let n = self.order.len().max(1) as u64;
+        let at = round.epoch().get().wrapping_add(round.view().get()) % n;
+        self.order
+            .get(usize::try_from(at).unwrap_or(0))
+            .copied()
+            .unwrap_or(Participant::new(0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use commonware_consensus::{
+        simplex::scheme::ed25519::Scheme as Ed,
+        types::{Epoch as CwEpoch, View},
+    };
 
     fn key(seed: u8) -> PubKey {
         vyrn_crypto::ed25519::public_key(&[seed; 32])
@@ -150,6 +232,40 @@ mod tests {
             Committee::new(Mode::Base, dup, &[]).err(),
             Some(CommitteeErr::Duplicate(2))
         );
+    }
+
+    #[test]
+    fn simplex_elects_in_membership_order() {
+        // Voters listed in an order their sorted keys do not follow.
+        let voters: Vec<_> = [9, 3, 7, 1, 5].into_iter().map(key).collect();
+        let mut sorted = voters.clone();
+        sorted.sort();
+        assert_ne!(sorted, voters);
+        let c = Committee::new(Mode::Chain, voters.clone(), &[]).unwrap_or_else(|e| panic!("{e}"));
+        let elector: VoterOrder =
+            <VoterOrder as ElectorConfig<Ed>>::build(c.elector(), c.participants());
+        for epoch in [0u32, 3, u32::MAX] {
+            for view in [1u64, 2, 3, 4, 5, 6, 11, 1 << 40] {
+                let round = Round::new(CwEpoch::new(u64::from(epoch)), View::new(view));
+                let p = Elector::<Ed>::elect(&elector, round, ());
+                let elected: &[u8] = c
+                    .participants()
+                    .get(usize::try_from(p.get()).unwrap_or(usize::MAX))
+                    .map_or(&[], |k| k.as_ref());
+                // Independent of the code under test: (epoch + view) mod 5 into `voters`.
+                let want = (u128::from(epoch) + u128::from(view)) % 5;
+                let want = u8::try_from(want).unwrap_or(u8::MAX);
+                assert_eq!(
+                    c.leader(Epoch(epoch), view),
+                    want,
+                    "epoch {epoch} view {view}"
+                );
+                assert_eq!(elected, voters[usize::from(want)].as_slice());
+            }
+        }
+        // Consecutive views never repeat a leader (07 §6.6: one view in n).
+        let leaders: Vec<u8> = (1..=10).map(|v| c.leader(Epoch(0), v)).collect();
+        assert_eq!(leaders, vec![1, 2, 3, 4, 0, 1, 2, 3, 4, 0]);
     }
 
     #[test]

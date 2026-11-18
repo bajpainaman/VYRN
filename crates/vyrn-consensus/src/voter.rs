@@ -8,13 +8,13 @@
 //! | certify | true exactly when this voter's `verify` (or its own proposal) accepted the payload |
 //! | `Relay` | no-op: headers reach voters through frames (07 §6.3) |
 //! | `Reporter` | [`Finalized`]: every finalization as a [`FinalityCert`] |
-//! | Elector | `RoundRobin` (see the follow-up on its order in the PR) |
+//! | Elector | [`VoterOrder`]: round-robin in `REP_Membership.voters` order ([`Committee::leader`]) |
 //!
 //! A voter does not need the proposal bytes to vote: given the parent it rebuilds every candidate
 //! range from its own headers and matches the payload digest, so the payload never travels.
 
 use crate::cert::{FinalityCert, NAMESPACE};
-use crate::membership::Committee;
+use crate::membership::{Committee, VoterOrder};
 use crate::proposal::{MAX_HDRS_PER_PROPOSAL, Proposal};
 use crate::source::{
     BlockSource, Genesis, Tip, Verdict, chain_after, proposal_for, proposal_range,
@@ -26,7 +26,6 @@ use commonware_consensus::{
     simplex::{
         Plan,
         config::{Config, Floor, ForwardPolicy, SkipBudget, SkipPolicy},
-        elector::RoundRobin,
         scheme::ed25519::Scheme,
         types::{Activity, Context, Finalization},
     },
@@ -385,7 +384,7 @@ pub fn config<E, S, B>(
     cfg: VoterConfig<S>,
 ) -> Result<
     (
-        Config<Scheme, RoundRobin, B, Digest, App<E, S>, App<E, S>, Finalized<E, S>, Sequential>,
+        Config<Scheme, VoterOrder, B, Digest, App<E, S>, App<E, S>, Finalized<E, S>, Sequential>,
         mpsc::UnboundedReceiver<FinalityCert>,
     ),
     VoterErr,
@@ -403,6 +402,7 @@ where
         ed25519::PrivateKey::decode(cfg.vote_seed.to_vec()).map_err(|_| VoterErr::NotAVoter)?;
     let scheme = Scheme::signer(NAMESPACE, cfg.committee.participants().clone(), key)
         .ok_or(VoterErr::NotAVoter)?;
+    let elector = cfg.committee.elector();
     let genesis = Digest(cfg.genesis.hash.0);
     let known = Arc::new(Mutex::new(Known::default()));
     lock(&known)
@@ -427,7 +427,7 @@ where
     let one = NonZeroUsize::MIN;
     let config = Config {
         scheme,
-        elector: RoundRobin::default(),
+        elector,
         blocker,
         automaton: app.clone(),
         relay: app,
