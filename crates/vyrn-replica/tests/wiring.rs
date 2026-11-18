@@ -286,6 +286,21 @@ fn count_follows_the_lane_numbering() {
         "a header reject numbers every message"
     );
     assert!(!vyrn_replica::data::count_fits(0, &p));
+    // A third message with the Heartbeat type byte that does not decode as one: the lane rejects
+    // it, so it takes a LaneSeq (two numbered messages, or three under a packet-level reject).
+    let mut q = vec![0u8; 16 + 48 + 16];
+    q[8] = 3;
+    q[16] = 0x01;
+    q[32] = 0x10;
+    q[48] = 0x10;
+    q[63] = 1;
+    assert!(vyrn_wire::Msg::decode(q[48..64].try_into().unwrap()).is_err());
+    assert!(vyrn_replica::data::count_fits(2, &q));
+    assert!(vyrn_replica::data::count_fits(3, &q));
+    assert!(
+        !vyrn_replica::data::count_fits(1, &q),
+        "the malformed one is numbered"
+    );
 }
 
 #[test]

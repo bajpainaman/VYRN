@@ -55,8 +55,8 @@ impl EpochView for View {
 /// The engine's conformance script (`vyrn-engine/tests/engine.rs`), whole: a resting order, a
 /// forwarded improve whose step runs before lane 0's next packet (a `MID` Advance record, 07
 /// §3.6), a forwarded cross, a forwarded op late at the BBO (a `Shed` step), a packet shed at
-/// the lane and its resend (07 §3.5: hashed, joined, its LaneSeqs kept), a cancel and an idle
-/// poll.
+/// the lane and its resend (07 §3.5: hashed, joined, its LaneSeqs kept), a packet whose
+/// Heartbeat takes no LaneSeq, a cancel and an idle poll.
 fn script() -> Vec<Act> {
     use Side::{Buy, Sell};
     use Tif::{Day, Ioc};
@@ -86,6 +86,15 @@ fn script() -> Vec<Act> {
         // 05 §6.8: one New, age 462 at dequeue is late (path 519 + 462 > 980); then its resend.
         p(0, 3, 10_000, 10_462, vec![new(Sell, Day, 300, 1, 9)]),
         p(0, 3, 20_000, 20_461, vec![new(Sell, Day, 300, 1, 9)]),
+        Act::Run,
+        // A Heartbeat takes no LaneSeq (05 §3.1), so the record counts only the New.
+        p(
+            1,
+            2,
+            25_000,
+            25_000,
+            vec![new(Buy, Day, 90, 1, 13), vyrn_wire::Msg::Heartbeat],
+        ),
         Act::Run,
         p(
             0,
@@ -366,6 +375,12 @@ fn the_script_reaches_every_case() {
     assert_ne!(s.pkt_hash, PktHash(0));
     assert_eq!((r.session, r.pkt_seq), (s.session, s.pkt_seq), "its resend");
     assert_eq!(r.first_lane_seq.0, s.first_lane_seq.0 + u64::from(s.count));
+    // The New + Heartbeat packet: one numbered message.
+    let hb = lane_pkts(&j, 1)
+        .into_iter()
+        .find(|p| p.session == harness::sid(1, 2))
+        .expect("the heartbeat packet");
+    assert_eq!(hb.count, 1, "{hb:?}");
 }
 
 #[test]
