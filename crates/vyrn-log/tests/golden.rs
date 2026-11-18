@@ -221,6 +221,62 @@ fn worked_example_07_3_11() {
         Err(RepErr::Count),
         "a RouteRecord names an op of the preceding packet"
     );
+    // A MID Advance record (07 §3.6): MID in h bit 4, PASS2 in bit 7, then `back` as LEB128.
+    for (k, flags, first) in [
+        ("ex311.mid.sections", PacketFlags::MID, 8),
+        (
+            "ex311.mid_pass2.sections",
+            PacketFlags::MID | PacketFlags::PASS2,
+            8,
+        ),
+        ("ex311.mid_end.sections", PacketFlags::MID, 11),
+    ] {
+        let mid = vec![Section::LaneRun {
+            lane: LaneId(7),
+            recs: vec![
+                recs[0],
+                LaneRec::Pkt(PacketRecord {
+                    lane: LaneId(7),
+                    count: 0,
+                    flags: PacketFlags::ADVANCE | flags,
+                    session: SessionId(0),
+                    pkt_seq: 0,
+                    rx_ts: Nanos(1_000_512),
+                    pkt_hash: PktHash(0),
+                    first_lane_seq: LaneSeq(first),
+                    fills_applied: StepId(1),
+                }),
+                // The lane's next LaneSeq stays 11: a route after the MID record still names
+                // an op of the packet.
+                LaneRec::Route(RouteRecord {
+                    lane: LaneId(7),
+                    lane_seq: LaneSeq(8),
+                    cross: true,
+                }),
+            ],
+        }];
+        let mut want = bytes(&g, k);
+        want[1] = 3;
+        want.extend([0x82, 0x82, 0x20]);
+        let enc = bound().encode_sections(&mid, BodyKind::Order).unwrap();
+        assert_eq!(enc, want, "{k}");
+        assert_eq!(
+            bound().decode_sections(&enc, BodyKind::Order).unwrap(),
+            mid,
+            "{k}"
+        );
+    }
+    for k in [
+        "ex311.bad_mid_back.sections",
+        "ex311.bad_mid_pass2.sections",
+        "ex311.bad_mid_lseq.sections",
+    ] {
+        assert_eq!(
+            bound().decode_sections(&bytes(&g, k), BodyKind::Order),
+            Err(RepErr::Count),
+            "{k}"
+        );
+    }
     // CROSS needs a source, and no other flag bit exists.
     for (src, flags) in [(0xFF, StepFlags::CROSS), (7, 1)] {
         let mut bad = cross.clone();
