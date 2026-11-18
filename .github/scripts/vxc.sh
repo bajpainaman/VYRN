@@ -18,7 +18,10 @@ case "${1:-}" in
     step "rustup" rustup_install
     # shellcheck disable=SC1091
     source "$HOME/.cargo/env"
-    rustup show active-toolchain || rustup toolchain install
+    # The pin is the default, as setup's `toolchains` makes it: Vx's own setup.sh runs cargo
+    # outside this repository.
+    rustup toolchain install
+    rustup default "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >/dev/null
     ;;
   vxc)
     # shellcheck disable=SC1091
