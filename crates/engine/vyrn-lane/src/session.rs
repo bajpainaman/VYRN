@@ -40,6 +40,9 @@ pub(crate) struct Session {
     pub expected: u32,
     /// Next in-stream `resp_seq` (04 §5.3), from 1.
     pub next_resp: u32,
+    /// The `PROTO_D_*` close cause once `Closed` (04 §4.3): the detail of V7's
+    /// out-of-stream `SESSION_CLOSED`.
+    pub close_cause: u32,
     /// The newest `CancelAll` of this session; orders whose current version precedes it are
     /// ended in lane order (resolve answers `TOO_LATE`).
     pub cancel_all: LaneSeq,
@@ -101,15 +104,5 @@ impl Sessions {
 
     pub fn get_mut(&mut self, ix: u16) -> Option<&mut Session> {
         self.slots.get_mut(usize::from(ix))
-    }
-
-    pub fn set_state(&mut self, id: SessionId, st: SessState) -> bool {
-        match self.find(id).and_then(|i| self.get_mut(i)) {
-            Some(s) => {
-                s.state = st;
-                true
-            }
-            None => false,
-        }
     }
 }

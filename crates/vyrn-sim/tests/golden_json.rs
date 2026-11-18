@@ -3,13 +3,9 @@
 //! `vyrn-lane` for the session-state details. The `.out` files have their own tests; this one makes
 //! sure the JSON is consumed, not only generated.
 //!
-//! *Reading:* `serde_json` is not on the 11 §2.2 dependency allowlist (the workspace keeps it for
-//! `tools/`), so the test reads JSON with the small parser below. It accepts the subset the
-//! generators print: objects, arrays, ASCII strings (`json.dumps` escapes the rest as `\uXXXX`)
-//! and integers.
+//! The JSON reader is `vyrn-lane`'s test module (`tests/json`), shared so both crates read the
+//! files the same way.
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
-
-use std::path::Path;
 
 use vyrn_types::RejectReason;
 use vyrn_wire::{Record, Request, Response};
@@ -22,140 +18,13 @@ const K_COM: [u8; 16] = [
     32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
 ];
 
-#[derive(Debug)]
-enum J {
-    Int(i128),
-    Str(String),
-    Arr(Vec<J>),
-    Obj(Vec<(String, J)>),
-}
+#[path = "../../engine/vyrn-lane/tests/json/mod.rs"]
+mod json;
 
-impl J {
-    fn get(&self, k: &str) -> Option<&J> {
-        match self {
-            J::Obj(m) => m.iter().find(|(n, _)| n == k).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-    fn at(&self, k: &str) -> &J {
-        self.get(k)
-            .unwrap_or_else(|| panic!("no field {k} in {self:?}"))
-    }
-    fn s(&self, k: &str) -> &str {
-        match self.at(k) {
-            J::Str(s) => s,
-            v => panic!("{k} is not a string: {v:?}"),
-        }
-    }
-    fn n(&self, k: &str) -> i128 {
-        match self.at(k) {
-            J::Int(n) => *n,
-            v => panic!("{k} is not an integer: {v:?}"),
-        }
-    }
-    fn arr(&self, k: &str) -> &[J] {
-        match self.at(k) {
-            J::Arr(a) => a,
-            v => panic!("{k} is not an array: {v:?}"),
-        }
-    }
-    fn as_str(&self) -> &str {
-        match self {
-            J::Str(s) => s,
-            v => panic!("not a string: {v:?}"),
-        }
-    }
-}
-
-fn parse(text: &str) -> J {
-    fn ws(b: &[u8], i: &mut usize) {
-        while b.get(*i).is_some_and(u8::is_ascii_whitespace) {
-            *i += 1;
-        }
-    }
-    fn val(b: &[u8], i: &mut usize) -> J {
-        ws(b, i);
-        match b[*i] {
-            b'{' | b'[' => {
-                let obj = b[*i] == b'{';
-                *i += 1;
-                let (mut m, mut a) = (Vec::new(), Vec::new());
-                loop {
-                    ws(b, i);
-                    if b[*i] == b'}' || b[*i] == b']' {
-                        *i += 1;
-                        break;
-                    }
-                    if obj {
-                        let J::Str(k) = val(b, i) else { panic!("key") };
-                        ws(b, i);
-                        assert_eq!(b[*i], b':');
-                        *i += 1;
-                        m.push((k, val(b, i)));
-                    } else {
-                        a.push(val(b, i));
-                    }
-                    ws(b, i);
-                    if b[*i] == b',' {
-                        *i += 1;
-                    }
-                }
-                if obj { J::Obj(m) } else { J::Arr(a) }
-            }
-            b'"' => {
-                *i += 1;
-                let mut s = String::new();
-                while b[*i] != b'"' {
-                    if b[*i] == b'\\' {
-                        *i += 1;
-                        match b[*i] {
-                            b'"' | b'\\' => s.push(char::from(b[*i])),
-                            // `json.dumps` writes non-ASCII as \uXXXX (BMP only here).
-                            b'u' => {
-                                let h = std::str::from_utf8(&b[*i + 1..*i + 5]).unwrap();
-                                s.push(
-                                    char::from_u32(u32::from_str_radix(h, 16).unwrap()).unwrap(),
-                                );
-                                *i += 4;
-                            }
-                            e => panic!("unsupported escape \\{}", char::from(e)),
-                        }
-                    } else {
-                        s.push(char::from(b[*i]));
-                    }
-                    *i += 1;
-                }
-                *i += 1;
-                J::Str(s)
-            }
-            _ => {
-                let start = *i;
-                while b.get(*i).is_some_and(|c| c.is_ascii_digit() || *c == b'-') {
-                    *i += 1;
-                }
-                J::Int(std::str::from_utf8(&b[start..*i]).unwrap().parse().unwrap())
-            }
-        }
-    }
-    let mut i = 0;
-    let v = val(text.as_bytes(), &mut i);
-    ws(text.as_bytes(), &mut i);
-    assert_eq!(i, text.len(), "trailing bytes");
-    v
-}
+use json::{J, unhex};
 
 fn load(name: &str) -> J {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/golden")
-        .join(name);
-    parse(&std::fs::read_to_string(p).unwrap())
-}
-
-fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect()
+    json::load(env!("CARGO_MANIFEST_DIR"), name)
 }
 
 fn tag(t: &J, k: &str) -> u64 {
