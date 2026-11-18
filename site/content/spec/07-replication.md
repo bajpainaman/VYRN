@@ -16,17 +16,17 @@ Draft 0.2, 2026-11-13. Normative for `vyrn-seq` stream cores 4 and 7, the frame 
 | D4 | Two stream cores each own one substream: stream-A (core 4) lanes 0–24, stream-B (core 7) lanes 25–48. Each writes its ORDER frames by CTPIO to both paths, then publishes its own `released[H]` and the `LaneCut` of its lanes. A TX core sends no fill of step `s` until `released[A] ≥ need_A(s)` and `released[B] ≥ need_B(s)`. A lane sends no response of an op until `LaneCut` covers it. | `INV-FRAME-FIRST` holds by construction for **every** response, and the frame is on the wire no later than the response (§4). |
 | D5 | The BBO core pushes a step's record when its kind, source and cut are fixed, before it writes fills. ORDER frames are ≤ 160 B of body. | The gate then runs in parallel with the step and is a **maximum** of 60 ns past the step budget, not a percentile (§4.7). |
 | D6 | Repair: a replica NACKs the sequencer first (the substream's stream core re-posts a buffered frame), then a peer. | Re-posting a descriptor costs ~15 ns. Peers cover the rest (§4.10). |
-| D7 | One `vyrn-data` box per facility. A session sends its data copy to one data home. The data home dedupes, stores and fans out to every replica. | 50 Gbps in and ≤ 124 Gbps out per data box fits COTS NICs (§5). |
+| D7 | One `vyrn-data` box per facility. A session sends its data copy to one data home. The data home dedupes, stores and fans out to every replica. | 100 Gbps in (copy 2 and the standing backup copy 3, 04 D6) and ≤ 124 Gbps out per data box fits COTS NICs (§5). |
 | D8 | `data_root` is computed over the **full** 32-byte BLAKE3 of every packet. The 8-byte `pkt_hash` is a locator and an early check only. | An 8-byte hash allows a 2^32 birthday attack by a client that controls both copies (§5.6). |
 | D9 | Simplex (`commonware-consensus::simplex`, Ed25519 scheme; hybrid Ed25519 + ML-DSA-44 from `E_pq`, 01 §14.20) runs over **ranges of sequencer-signed headers**. Only the n voting replicas vote and lead. `vyrn-seq` **never votes** (01 §14.4). | Proposal traffic stays off the sequencer, a dead sequencer never costs a leader timeout, and a failover never changes the voting set (§6.3). |
 | D10 | A replica votes only when it holds every referenced payload, every root checks, CHAIN tags verify, and no divergence is flagged. Votes never wait for replay. | Finality must not depend on replay lag (§6.4). |
-| D11 | Finality = block close + seal + 4 metro hops (header, proposal, notarize, finalize), and at the maximum one view's wait for the next proposal: **~2.6 ms typical, ≤ 6.99 ms max with no fault, ≤ 9.79 ms max with a leader fault** (the data-box fault is pending 01 §14.20 PQ-13). | Every accepted order is final ≤ 10 ms (§6.6). |
+| D11 | Finality = block close + seal + 4 metro hops (header, proposal, notarize, finalize), and at the maximum one view's wait for the next proposal: **~2.6 ms typical, ≤ 6.99 ms max with no fault, ≤ 9.79 ms max with a leader fault, ≤ 9.59 ms with a data-box fault**. | Every accepted order is final ≤ 10 ms (§6.6). |
 | D12 | State roots every 1000 blocks in both modes, certified with `commonware-consensus::aggregation`. A missing root certificate stops votes after 5000 blocks. A mismatch stops votes at once. | Client diversity must halt the book, not fork it (§7.4, §11). |
 | D13 | Failover finalizes the longest prefix: signed headers from any reporter, plus the unsigned tail held by any reporter and consistent across all reporters. | When the sequencer is the fault, f = 1 is used up, so every reporter is honest (§9.3). |
 | D14 | The sequencer **self-fences** (01 §14.16): no stream core releases anything when fewer than `REP_FENCE_ACKS` = n − Q + 1 + f = 3 voters have acked within 250 µs; a fence on either stream core silences both. Acks from the co-located R1 alone never keep it alive. | A deposition needs Q = 3 voters, so no quorum can depose a sequencer that is still releasing (§4.8, §9.6). |
 | D15 | Membership changes only at epoch boundaries. A dead replica restarts under the **same** key on its facility's spare box, after the old box is fenced. | It keeps the quorum sets fixed for the whole epoch (§13). |
 | D16 | Failover promotes the **warm standby** `vyrn-seq` in F2, never a voter. With no promotable standby the book stays halted after the seal, and a facility spare warms up as the next standby. | `CLIENT_SPLIT` survives every failover (§9.5). |
-| D17 | **Finality gate** in both modes: the sequencer never runs more than `FIN_GATE_BLOCKS` = 8 closed blocks ahead of finality; beyond that the book halts by a logged `Control` step. | No fill is issued while the 10 ms bound is already known to be broken (§6.8). |
+| D17 | **Finality gate** in both modes: the sequencer never runs more than `FIN_GATE_BLOCKS` = 9 closed blocks ahead of finality; beyond that the book halts by a logged `Control` step. | No fill is issued while the 10 ms bound is already known to be broken (§6.8). |
 | D18 | The **recovery service**, a role on one Rust voter per home (R3), keeps `RESP_RETAIN_PKTS` responses per session. | Resends survive the sequencer's 8 s hot ring and a failover (§8.5). |
 
 ## 1. Scope and hard constraints
@@ -1055,9 +1055,9 @@ sends copy 2 of every request packet to its data home's `REP_UDP_DATA` port.
 
 | Per data box at peak (budget) | BASE (n_data 4; 4 voters + standby) | CHAIN (n_data 5; 5 validators + standby) |
 |---|---|---|
-| ingress from clients | 50 Gbps | 40 Gbps |
+| ingress from clients (copy 2 and backup copy 3, 04 D6) | 100 Gbps | 80 Gbps |
 | egress (5 or 6 destinations) | 194 Gbps | 186 Gbps |
-| RAM ring (`REP_DATA_RING_S` = 10 s) | 48 GB | 39 GB |
+| RAM ring (`REP_DATA_RING_S` = 10 s, both copies) | 96 GB | 78 GB |
 | Hardware | 1 socket, 32 cores, 2 × dual-port 100GbE COTS (ConnectX-6 Dx/7, ~97 Gbps TX per card), 256 GB | same |
 
 **A data home is never in the active sequencer's facility.** If F1 held both the sequencer and a
@@ -1458,10 +1458,26 @@ only when the data it expects is late, so the redirect chain comes **on top of**
 | **Stall beyond the data lag** | **4.20** |
 
 The earlier figure, 1 + 0.5 + 1 + 0.5 = 3 ms in place of the data lag, used typical hops and
-replaced the lag it follows. With every other 07 §6.6 row at its maximum, the stall gives
-11.19 ms (scheme 0) and 11.65 ms (scheme 1) from block start, over `FINALITY_MAX_MS` = 10. How
-to bring it inside is **pending ruling** (01 §14.20 PQ-13). [Likely: scratch model of the view
-pipeline at the 07 §6.6 maxima]
+replaced the lag it follows. With every other 07 §6.6 row at its maximum, that chain gives
+11.19 ms (scheme 0) and 11.65 ms (scheme 1) from block start, over `FINALITY_MAX_MS` = 10.
+
+**Standing backup copy (01 §14.20 PQ-13, decided).** Every client also sends copy 3 of each
+transmission to its backup data box `d'` (04 D6). `d'` dedupes and stores it in its RAM ring like
+any copy but does not fan it out. When Q `DataDown{d}` reach it, it fans out every stored copy of
+the sessions homed on `d`, from the oldest that a replica has not resolved, and keeps fanning out
+new ones. The redirect of steps 3 and 4 still runs, to move copy 2 and copy 3 on, but no client
+hop is on the critical path:
+
+| Step | Max (ms, budget) |
+|---|---|
+| silence: `REP_DATA_SILENCE_MS` | 1.00 |
+| `DataDown{d}` gossip → Q at `d'` | 0.80 |
+| `d'` → replica (stored backup copies) | 0.80 |
+| **Stall beyond the data lag** | **2.60** |
+
+With every other 07 §6.6 row at its maximum, a data-box fault gives 9.59 ms (scheme 0) and
+9.56 ms (scheme 1) from block start in BASE (§6.6), and 9.64 / 9.61 ms in CHAIN (09 §4.8).
+[Likely: scratch model of the view pipeline at the 07 §6.6 maxima]
 
 **Why the silence stays 1 ms.** A data box sends `DATA_HB` every 100 µs when idle (§5.3), but
 the delay bound limits each hop to 0.80 ms, not its jitter: a healthy box's heartbeats can reach
@@ -1688,7 +1704,7 @@ budget of §3.13 with the votes (2.5 KB each, 3 kinds, ~1 kHz, n − 1 peers ≈
 
 ### 6.5a Speculative vote signing (scheme 1)
 
-An ML-DSA-44 signature is ≤ 400 µs at `PQ_HEDGE` = 4 on a voter's four PQ cores (pending user ruling, 01 §14.20 PQ-15; ≤ 750 µs
+An ML-DSA-44 signature is ≤ 400 µs at `PQ_HEDGE` = 4 on a voter's four PQ cores (01 §14.20 PQ-15; ≤ 750 µs
 at 2), half a metro hop. Signed after
 the event that triggers each vote, three votes per view would add ~2.2 ms to finality. So a voter
 signs before it knows it will send:
@@ -1700,7 +1716,10 @@ signs before it knows it will send:
   every view in which no client misbehaves; every honest member computes the same root
   (`INV-CHN-EXCL`, 09 §17.4). It sends the vote when the proposal passes §6.4 and equals what it
   signed. If the proposal differs (a prefix, or exclusions), it signs the actual proposal late and
-  sends that; it never rejects a proposal for differing from a `RangeFix`.
+  sends that; it never rejects a proposal for differing from a `RangeFix`. In CHAIN, a voter
+  whose own `verify` finds an exclusion signs again at once over the `excl_root` it computed, on
+  its PQ cores after its `RangeFix` signature (so never alongside its finalize for v, below), and
+  sends that signature only if the proposal carries the same root (09 §5.7).
 - **The leader** signs its own notarize (its proposal) from the moment it fixes the range, in parallel with its `verify`, in both modes; in CHAIN with the empty-exclusion `excl_root` and the item
   list it froze with the range (09 §4.3). It
   signs late, ≤ `PQ_SIGN_MAX_US` = 0.40 ms after its `verify`, only if that `verify` finds an
@@ -1718,13 +1737,13 @@ signs before it knows it will send:
   the measured `PQ_SIGN_MAX_US`; B-PQ-2 measures it]
 - **Finalize.** A voter starts the finalize signature when it sends its notarize, in parallel with
   hop 3.
-- **One schedule for the PQ cores (pending user ruling, 01 §14.20 PQ-15).** Finalize for v and notarize for v + 1 (the next
+- **One schedule for the PQ cores (01 §14.20 PQ-15, decided).** Finalize for v and notarize for v + 1 (the next
   leader's candidate) are wanted in the same hop. Each runs on all four PQ cores, finalize first,
   ≤ 0.40 ms each, so both are done ≤ 0.80 ms after the finalize starts, inside the 0.85 ms
   notarize hop. With two PQ cores (`PQ_HEDGE` = 2, ≤ 0.75 ms each) the pair takes 1.50 ms:
   scratch model, no fault 9.16 ms, leader fault 11.11 ms, and half of honest views nullify at the
-  maximum. Fallback if four cores are refused: notarize first, finalize paused, 6.96 / 9.71 ms, but
-  10.41 ms with a crashed voter, past `FINALITY_MAX_MS`. Not allowed: counting a finalization on
+  maximum. Not adopted: notarize first, finalize paused, 6.96 / 9.71 ms but 10.41 ms with a crashed voter,
+  past `FINALITY_MAX_MS`. Not allowed: counting a finalization on
   its Ed25519 parts with the ML-DSA parts later. A hybrid signature is valid only if both parts
   verify (01 §14.20 A, SG2), so a quantum attacker could forge such a finality. [Likely]
 - **Finalize, sending.** A voter sends its finalize only if Simplex would (a notarization seen and no nullify sent).
@@ -1779,7 +1798,7 @@ links break it counts as the one fault f.
 | **Total, no fault** | **2.59** (2.69 scheme 1) | **6.99** (6.96 scheme 1) | was 5.65 / 5.70 without the wait row and with the repair reserve inside the sum |
 | One fault: a nullified view | | +2.80 | `t_l` 2 ms + 1 hop; under scheme 1 the next leader's signature is done when the view nullifies (L1′) |
 | **Total, one fault (leader)** | | **9.79** (9.76 scheme 1) | ≤ `FINALITY_MAX_MS` = 10, margin 0.21 (0.24 scheme 1). Under scheme 1 a lost `RangeFix` (+0.40 → 7.36) is a smaller one fault |
-| One fault: a data-box stall | | **pending ruling** | §5.7: 4.20 on top of the data lag gives 11.19 (11.65 scheme 1), over the bound; 01 §14.20 PQ-13 |
+| One fault: a data-box stall | | +2.60 → **9.59** (9.56 scheme 1) | §5.7: on top of the data lag; the backup data box already holds each client's standing copy (01 §14.20 PQ-13). Margin 0.41 (0.44) |
 | Reserve, outside the sums: one frame repair | 0.00 | 0.39 | cross-metro, ≤ 0.60 (§4.10); it runs in parallel with the data lag, and `verify` waits for the later, so the pair costs ≤ 0.71. Nothing above spends it: under scheme 1 the leader-fault case is 9.76 by the sums and 9.71 in the model, + 0.39 of reserve |
 | Sequencer fault | | ≤ 9.0 | the seal finalizes the tail ≤ 7.85 ms after the last frame (§9.7) |
 
@@ -1788,7 +1807,7 @@ view pipeline (01 §14.20 PQ-10): 1 kHz headers, every delay at its 07 §6.6 max
 skewed and random delays, and one silent leader or one stalled data box every 37 views. Its worst
 cases are 6.99 / 9.78 ms (scheme 0) and 6.96 / 9.71 ms (scheme 1), 9.79 / 9.76 ms with one voter crashed for the whole run, and no honest
 view nullifies at the maximum delays. The scheme-1 figures assume four PQ cores per voter
-(§6.5a, pending 01 §14.20 PQ-15). [Likely: a model of the budgets, not a run of the protocol; B-PQ-2
+(§6.5a, 01 §14.20 PQ-15). [Likely: a model of the budgets, not a run of the protocol; B-PQ-2
 measures it]
 
 A fill at the end of its block sees ~3.1 ms typical, which is DESIGN §5's "~3 ms". In a single
@@ -1812,9 +1831,9 @@ finality with the voters in 4 real facilities.
 
 ### 6.8 The finality gate (both modes)
 
-`FIN_GATE_BLOCKS` = 8 (01 §14.9) applies in BASE and in CHAIN. **INV-REP-10:** the sequencer
-never releases a response while more than 8 **closed** blocks are not final at the sequencer:
-block `h + 9` opens only when block `h` is final. 09 §4.6 (`INV-CHN-TXGATE`) uses the same count.
+`FIN_GATE_BLOCKS` = 9 (01 §14.9, §14.20 PQ-14) applies in BASE and in CHAIN. **INV-REP-10:** the
+sequencer never releases a response while more than 9 **closed** blocks are not final at the
+sequencer: block `h + 10` opens only when block `h` is final. 09 §4.6 (`INV-CHN-TXGATE`) uses the same count.
 
 - **Voters → sequencer.** Every voter sends its finalize vote to the sequencer's and the
   standby's `REP_UDP_CTRL` as well as to the other voters (09 §4.6), and later the
@@ -1836,12 +1855,13 @@ block `h + 9` opens only when block `h` is final. 09 §4.6 (`INV-CHN-TXGATE`) us
   Until the 08 reopening auction is wired, a resume after a halt of more than 1000 ms also
   goes straight to continuous trading, and the sequencer logs it (reading, **semantics**;
   DEV only).
-- **Within f = 1: pending ruling (01 §14.20 PQ-14).** Block `h` is final at every voter and at the
-  sequencer ≤ 8.79 ms after it closes with a leader fault (8.76 scheme 1; §6.6, signature checks
-  included), and ≤ 8.84 / 8.81 ms in CHAIN (09 §4.8). `h + 9` opens 8 ms after `h` closes, so at
-  the maximum delays one fault trips the gate. These bounds include the next-proposal row of §6.6,
-  which the earlier 7.65 / 7.70 / 7.11 ms left out. Until the ruling `FIN_GATE_BLOCKS` stays 8.
-- **What it bounds.** Outside the fault model (no Q, a slow metro), at most ~9 ms of fills are
+- **It never trips within f = 1.** Block `h` is final at every voter and at the sequencer
+  ≤ 8.79 ms after it closes with a leader fault (8.76 scheme 1; §6.6, signature checks included),
+  ≤ 8.59 / 8.56 ms with a data-box fault, and ≤ 8.84 / 8.81 ms in CHAIN (09 §4.8). `h + 10` opens
+  9 ms after `h` closes, so ≤ 9 closed blocks are open (0.16 ms spare at the worst). These bounds
+  include the next-proposal row of §6.6, which the earlier 7.65 / 7.70 / 7.11 ms left out; with
+  it, 8 blocks would have tripped at one fault, so `FIN_GATE_BLOCKS` is 9 (01 §14.20 PQ-14).
+- **What it bounds.** Outside the fault model (no Q, a slow metro), at most ~10 ms of fills are
   released unfinal before the halt, none reverted; they finalize when Q returns. Draft 0.1's
   100 ms halt (a 10 ms escape) is removed.
 
@@ -1991,7 +2011,7 @@ either client. `vyrn-sim` checks this on every CI run with the Rust engine, `vyr
 | 6 | peer repair server, block server for the facility's archive node (§8.4, §12); on R3 also the recovery service's resend server (§8.5) |
 | 7 | storage writer (`io_uring`, `O_DIRECT`), snapshot serializer |
 | 8–49 | replay lanes 0–41, one to one with the live map; in CHAIN also the `tag_com` pass (§6.4 item 4) |
-| 50, 52–55, 63 | data RX from the 2 data ports, data index, full BLAKE3, mismatch checks. Under scheme 1 a voter moves core 63 to PQ core 2 and runs data RX on 5 cores (open question 13). PQ cores 3 and 4 (pending user ruling, 01 §14.20 PQ-15) are cores of a larger voter box beyond this map, not data RX cores. After a promotion the standby no longer receives data frames, so 52–55 become the sequencer's PQ signing cores (01 §10) and 63 its listener's ML-DSA core |
+| 50, 52–55, 63 | data RX from the 2 data ports, data index, full BLAKE3, mismatch checks. Under scheme 1 a voter moves core 63 to PQ core 2 and runs data RX on 5 cores (open question 13). PQ cores 3 and 4 (01 §14.20 PQ-15) are cores of a larger voter box beyond this map, not data RX cores. After a promotion the standby no longer receives data frames, so 52–55 become the sequencer's PQ signing cores (01 §10) and 63 its listener's ML-DSA core |
 | 51 | OS, IRQs, housekeeping (06 `HK`, the one non-isolated core on every REF box) |
 | 56–62 | replay lanes 42–48, the pool, one to one with the live map; they apply `AcctTake` records in log order (§3.6) |
 
@@ -2762,8 +2782,8 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | One voter crash | p2p liveness; missing votes | none | none (Q still live) | none; no fault margin left | spare box: votes ≤ 2 min |
 | Two voters down (BASE), or a metro partition with no Q | no Q | halted within 8 blocks (gate) | stops | none | restore or heal; backlog clears 16 blocks per view |
 | Leader of one view down | `t_l` timeout | none | +2.8 ms, ≤ 9.79 ms max (9.76 scheme 1) | none | round-robin moves on |
-| Finality lags > 8 closed blocks (any cause) | core 4 gate check | `BOOK_HALTED` (logged `Control` step) | catches up | none | `Control(Resume)` at lag ≤ 4 |
-| Data box down | 1 ms silence | none | +4.2 ms on top of the data lag for affected blocks, 11.65 ms max: pending ruling (01 §14.20 PQ-13) | none | redirect to the backup data home (§5.7) |
+| Finality lags > 9 closed blocks (any cause) | core 4 gate check | `BOOK_HALTED` (logged `Control` step) | catches up | none | `Control(Resume)` at lag ≤ 4 |
+| Data box down | 1 ms silence | none | +2.6 ms on top of the data lag for affected blocks, ≤ 9.59 ms max (the backup box holds each client's standing copy, §5.7) | none | redirect to the backup data home (§5.7) |
 | Client sends two different copies | hash or root mismatch | none | +1 fetch RTT for that block | its session closed; others unaffected | none |
 | Byzantine voter (any of §10.2) | evidence or counters | none | ≤ +2.8 ms per view it leads badly | none | removed at the next epoch |
 | Recovery replica (R3) down | p2p liveness | none | none | resends older than the hot ring get `RESEND_GONE` | R4 takes the role; R3 restored |
@@ -2778,14 +2798,14 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 
 | ID | Measures | Pass (budget) |
 |---|---|---|
-| B-REP-1 | Finality of every fill and ack across 4 real facilities at peak load | max ≤ 6.99 ms with no fault, ≤ 9.79 ms with one injected leader fault (the data-box fault's bound is pending 01 §14.20 PQ-13); `FINALITY_MAX_MS` = 10 never exceeded |
+| B-REP-1 | Finality of every fill and ack across 4 real facilities at peak load | max ≤ 6.99 ms with no fault, ≤ 9.79 ms with one injected leader fault, ≤ 9.59 ms with one data box killed; `FINALITY_MAX_MS` = 10 never exceeded |
 | B-REP-2 | INV-FRAME-FIRST for **every** response, acks included (§4.4) | zero violations over the whole run |
 | B-REP-2W | Wire lead from NIC TX timestamps (input to §9.6 c, not a correctness test) | measured fraction with `lead < 0` ≤ 1e-4 |
 | B-REP-3 | Path skew between A and B | ≤ 2 µs |
 | B-REP-4 | Each stream core's load at the peak mix | ≤ 0.50 |
 | B-REP-5 | Sliced Ed25519 sign on core 4: CPU per signature, longest slice | ≤ 12 µs, ≤ 50 ns |
-| B-PQ-1 | Scheme 1 on `REF`: ML-DSA-44 sign with `PQ_HEDGE` = 4 on cores 52–55 and = 4 on a voter's four PQ cores (pending user ruling, 01 §14.20 PQ-15), 10⁹ signatures; verify per signature | max ≤ `PQ_SIGN_MAX_US` (400 µs); verify ≤ `PQ_VERIFY_US`; ML-KEM-768 decapsulation ≤ 40 µs (01 §14.20 G) |
-| B-PQ-2 | Scheme 1 finality: B-REP-1 with hybrid keys and speculative signing (§6.5a); the frame gate (B-REP-13) and stream-core load (B-REP-4) re-run | BASE max ≤ 6.96 ms no fault, ≤ 9.76 ms with one nullified view and ≤ 7.36 ms with one `RangeFix` dropped; CHAIN ≤ 7.01 / 9.81 ms from block start; a forged `RangeFix` never makes a voter reject an honest proposal; the next-proposal wait (L1, L1′, L1t, §6.3) stays within §6.6's 1.65 ms row at the worst end-to-end case, and no honest leader in BASE or CHAIN misses `t_l` = 2 ms (PQ-10, PQ-11); each voter signs finalize(v) then notarize(v + 1) on its four PQ cores, ≤ 9.76 ms with one voter crashed (PQ-15); CHAIN blocks carry items and still meet the bounds (09 §4.3 item freeze); B-REP-13 and B-REP-4 pass values unchanged |
+| B-PQ-1 | Scheme 1 on `REF`: ML-DSA-44 sign with `PQ_HEDGE` = 4 on cores 52–55 and = 4 on a voter's four PQ cores (01 §14.20 PQ-15), 10⁹ signatures; verify per signature | max ≤ `PQ_SIGN_MAX_US` (400 µs); verify ≤ `PQ_VERIFY_US`; ML-KEM-768 decapsulation ≤ 40 µs (01 §14.20 G) |
+| B-PQ-2 | Scheme 1 finality: B-REP-1 with hybrid keys and speculative signing (§6.5a); the frame gate (B-REP-13) and stream-core load (B-REP-4) re-run | BASE max ≤ 6.96 ms no fault, ≤ 9.76 ms with one nullified view and ≤ 7.36 ms with one `RangeFix` dropped; CHAIN ≤ 7.01 / 9.81 ms from block start; a forged `RangeFix` never makes a voter reject an honest proposal; the next-proposal wait (L1, L1′, L1t, §6.3) stays within §6.6's 1.65 ms row at the worst end-to-end case, and no honest leader in BASE or CHAIN misses `t_l` = 2 ms (PQ-10, PQ-11); each voter signs finalize(v) then notarize(v + 1) on its four PQ cores, ≤ 9.76 ms with one voter crashed (PQ-15); CHAIN blocks carry items and still meet the bounds (09 §4.3 item freeze); a killed data box stays ≤ 9.56 ms (§5.7, PQ-13); B-REP-13 and B-REP-4 pass values unchanged |
 | B-PQ-3 | The switch at `E_pq` in `vyrn-sim`: scheme-0 votes and headers for epoch ≥ `E_pq` injected; forged scheme-0 `DoubleVote` evidence for epoch `E_pq − 1`, and a forged scheme-0 `CrossHomeVote` carrying a genuine hybrid-signed `NodeCert`, submitted after the switch with and without a pre-switch `EvidenceCommit`; a `SessionOpen`, `CommitteeKey` and p2p handshake for an epoch ≥ `E_pq` without their ML-KEM part; history before it replayed | every injected signature and every classical-only key agreement rejected (KG1); uncommitted classical evidence moves no bond and no jail, committed evidence slashes; replay from genesis bit for bit (01 §14.20 SG1–SG7) |
 | B-REP-6 | Sequencer core 50 BLAKE3 load | ≤ 0.60 |
 | B-REP-7 | Replay speed at peak and at average load | ≥ 1.5×, ≥ 10× |
@@ -2893,8 +2913,8 @@ Resolved by 01 and removed: `PacketRecord.flags` (§6.6: `SHED`, `ADVANCE`), INV
 3. **§7:** `INV-ACK-AFTER-CUT` should read "after a *released* cut includes the op (`LaneCut`,
    written by the lane's stream core after its frame's `sfence`)". Add INV-REP-11 next to it, and
    list INV-REP-6 by name with §14.16's "R1 alone never keeps it alive".
-4. **§14.9:** state that `FIN_GATE_BLOCKS` counts **closed** blocks: block h + 9 opens only when
-   block h is final. 07 §6.8 needs it (7.65 ms after close in BASE), and 09 §4.6 now uses it
+4. **§14.9:** state that `FIN_GATE_BLOCKS` counts **closed** blocks: block h + 10 opens only when
+   block h is final (`FIN_GATE_BLOCKS` = 9). 07 §6.8 needs it (8.79 ms after close in BASE), and 09 §4.6 now uses it
    (7.11 ms after close in CHAIN, with the data home outside F1).
 5. **§6.4:** response codes for the client watermarks of §6.9: `Durable { step, height }` and
    `Final { height, view }`, as two separate records.
@@ -2928,6 +2948,6 @@ Resolved by 01 and removed: `PacketRecord.flags` (§6.6: `SHED`, `ADVANCE`), INV
 | 10 | The archive's feed is ≤ 25 Gbps at sustained peak against ~180 Gbps of ingest, so a peak longer than the ≥ 6 h on-box window leaves an archive gap. Is a direct archive subscription to frames and data needed? | 06 / 07 | B-REP-9 at sustained peak for 8 h |
 | 11 | Replay order of a pooled account across pool lanes: does `AcctTake.ver` alone order every cross-lane dependency, including fills settled on the account while another pool core holds its token? | 05 | T-REP-1 with pooled accounts; B4 |
 | 12 | Do both ports of an X2542, each with its own CTPIO writer, keep the wire lead of B-REP-2W, and does a spanning step stay ≤ 142 ns? | 06 | B-REP-2W, B-REP-13 |
-| 13 | Under scheme 1 (01 §14.20), does data RX on 5 cores (50, 52–55) keep up with 155 Gbps of data frames at peak, now that core 63 signs votes? If not, voters need a larger box or `PQ_HEDGE` = 1 with the 1.35 ms tail budgeted. The two further PQ cores of 01 §14.20 PQ-15 are not taken from data RX: they come from a larger voter box, so this question is about core 63 only. | 06 | B-REP-9 data mix plus B-PQ-1 on one voter |
+| 13 | Under scheme 1 (01 §14.20), does data RX on 5 cores (50, 52–55) keep up with 155 Gbps of data frames at peak, now that core 63 signs votes? If not, voters need a larger box or `PQ_HEDGE` = 1 with the 1.35 ms tail budgeted. The two further PQ cores of 01 §14.20 PQ-15 (decided) are not taken from data RX: they come from a larger voter box, so this question is about core 63 only. | 06 | B-REP-9 data mix plus B-PQ-1 on one voter |
 
 Resolved and removed: 14 (a seal `REP_FinalityCert` carries its `REP_SealExt` after the entries; §6.5, §9.4).

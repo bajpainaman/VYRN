@@ -62,7 +62,7 @@ The only source for a payload no data box has is the sequencer's control core.
 One dedicated-lane firm at `WL-REF` sends 2.85M packets/s (02 §5.2), so 2,850 per block. If it
 withholds copy 2 for one block, the sequencer needs 57 ms to serve them. That is past the vote
 deadline (the view nullifies) and past retention (the last 350 become unfetchable while the
-sequencer lives). Votes on those blocks fail, `lag` grows, and after 8 closed blocks the gate
+sequencer lives). Votes on those blocks fail, `lag` grows, and after 9 closed blocks the gate
 halts the book (07 §6.8). **One misbehaving firm can halt the book in about 8 ms.** Draft 0.2 has
 no rule that stops it, and the halt does not identify the firm.
 

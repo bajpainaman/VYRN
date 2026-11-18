@@ -1973,7 +1973,7 @@ virtualised, tuned per 06.
 - **Procedure.** BASE (4 voting replicas, `vyrn-seq` and its standby beside them) and CHAIN
   (5 validators) in four or five lab racks with fiber spools that give 0.5 ms one-way between
   racks (the metro of DESIGN §5), at B3's load, for 1 hour. Then again with one replica powered
-  off. Both modes run with the finality gate of 01 §14.9 (`FIN_GATE_BLOCKS` = 8).
+  off. Both modes run with the finality gate of 01 §14.9 (`FIN_GATE_BLOCKS` = 9).
 - **Metric.** Time from a message's RX timestamp to the formation of a certificate over its
   block, as 02 defines the measurement point, for every block; the maximum.
 - **Pass.** max ≤ `FINALITY_MAX_MS` (10 ms) for every accepted order, healthy and with one

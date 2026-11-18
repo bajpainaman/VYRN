@@ -817,7 +817,7 @@ the final log, because every response is frame-gated (01 §14.5), unless all thr
   frame-loss counters) bound the loss rate; B25 checks the logic.
 
 **REQ-FIN-5. The unfinalized part of the order stream is bounded.**
-- `BASE` and `CHAIN`: ≤ `FIN_GATE_BLOCKS` (8 in both modes) blocks, by `INV-CHN-TXGATE` (09 §4.6, 01
+- `BASE` and `CHAIN`: ≤ `FIN_GATE_BLOCKS` (9 in both modes) blocks, by `INV-CHN-TXGATE` (09 §4.6, 01
   §14.9). When the gap reaches it, the book halts: every packet gets `BOOK_HALTED` within
   `LAT_MAX_NS`, and nothing waits in the NIC rings. Reason: it keeps REQ-FIN-1 a maximum, and it
   turns a dead quorum into a halt, not unbounded risk.
@@ -1031,8 +1031,9 @@ net diff (09 §1, decision 8), within `REQ_CHN_COMMIT_LAG_S` (2 s) after the sec
 
 **REQ-CHN-9. A forced packet is final within 10 ms, like any order, and the sequencer cannot
 censor it.** Under an honest sequencer, a forced-path packet is positioned at the first block
-boundary after the block that includes it is notarized (01 §14.9). Bound: max ≤ `FINALITY_MAX_MS`
-from send, by `M-INC`. `FIN_GATE_BLOCKS` (8) is only the deadline after which validators treat
+boundary after the block that includes it is notarized (01 §14.9). Bound: max ≤ `CHN_FORCED_FINAL_MS`
+(11.5 ms) from send, by `M-INC`: the forced path's own bound (09 §7.4), not a relaxation of
+`FINALITY_MAX_MS`, which bounds every normal-path order. `FIN_GATE_BLOCKS` (9) is only the deadline after which validators treat
 its absence as censorship: evidence plus failover, and then it is final within
 `FAILOVER_TARGET_MS` + `FINALITY_MAX_MS` (01 §14.0, fact 3). The sequencing operator is never the
 Simplex leader (09 §1, decision 4). Test: B29.

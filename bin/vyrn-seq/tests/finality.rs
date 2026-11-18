@@ -188,7 +188,7 @@ genesis_hash = "{}"
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 07 §6.8 enforced: with no votes, more than `FIN_GATE_BLOCKS` = 8 closed blocks ahead of
+/// 07 §6.8 enforced: with no votes, more than `FIN_GATE_BLOCKS` = 9 closed blocks ahead of
 /// finality puts `HaltReq` on the control ring, and the engine logs a `Control` step; votes that
 /// finalize the closed run resume the book with a second one. Heartbeats make the blocks and no
 /// steps, so the box's two steps are exactly the gate's.
@@ -324,7 +324,7 @@ genesis_hash = "{}"
             break l;
         }
     };
-    // `GATE halt closed=<h> final=0`, at the first lag over 8.
+    // `GATE halt closed=<h> final=0`, at the first lag over 9.
     let closed: u64 = halt
         .strip_prefix("GATE halt closed=")
         .and_then(|r| r.split(' ').next())
@@ -334,8 +334,8 @@ genesis_hash = "{}"
     assert_eq!(halt, format!("GATE halt closed={closed} final=0"));
     // The listener checks every ~1 ms, so a loaded box may close a block or two more first.
     assert!(
-        closed >= 9,
-        "halts only past lag FIN_GATE_BLOCKS = 8: {halt}"
+        closed >= 10,
+        "halts only past lag FIN_GATE_BLOCKS = 9: {halt}"
     );
 
     let halt_step = next("CONTROL ");
