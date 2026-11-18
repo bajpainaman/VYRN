@@ -300,9 +300,12 @@ impl<S: BookSource> Ctx<'_, S> {
     }
 
     /// 05 §5.1 `live`: visible, not killed, open > 0, and auction-only only in an uncross.
-    pub fn live(&self, l: usize, slot: u32, v: &OrderSlot) -> Option<u32> {
+    /// `head` is the `ins_seq` of `v`'s queue position: a `Reduce` keeps the TIF, so the
+    /// order was visible at `C*` when its position was, even if a reduce admitted after the
+    /// freeze created `v` (05 §8.8 item 6; the lane outs it from the version at `C*`).
+    pub fn live(&self, l: usize, slot: u32, v: &OrderSlot, head: LaneSeq) -> Option<u32> {
         if v.flags.tif() == Tif::AuctionOnly
-            && (!self.auction || self.st.adead.get(l).is_some_and(|d| v.ins_seq <= *d))
+            && (!self.auction || self.st.adead.get(l).is_some_and(|d| head <= *d))
         {
             return None;
         }
@@ -411,7 +414,7 @@ impl<S: BookSource> Ctx<'_, S> {
                 if v.ins_seq.0 > self.cut(l) && !self.st.explicit(l, vs, v.ins_seq) {
                     break 'segs; // the tail beyond the cut: every later position is later too
                 }
-                if let Some(open) = self.live(l, vs, &v) {
+                if let Some(open) = self.live(l, vs, &v, pos.ins_seq) {
                     return Some(Maker {
                         lane: l,
                         vslot: vs,
@@ -439,7 +442,7 @@ impl<S: BookSource> Ctx<'_, S> {
         if v.ins_seq != p.seq {
             return None;
         }
-        let open = self.live(p.lane, p.slot, &v)?;
+        let open = self.live(p.lane, p.slot, &v, v.ins_seq)?;
         Some(Maker {
             lane: p.lane,
             vslot: p.slot,

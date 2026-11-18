@@ -1437,3 +1437,136 @@ fn ops_before_the_freeze_settle_before_the_auction_out() {
     let out = recs.iter().position(|r| matches!(r, Record::Out { .. }));
     assert!(fill.is_some() && fill < out, "{recs:?}");
 }
+
+#[test]
+fn a_reduce_admitted_after_the_freeze_does_not_keep_the_auction_reservation() {
+    // 05 §8.8 item 6 (#193 review 2): a Reduce admitted after the freeze cut C*, before the
+    // lane applies the uncross, moves the order to a new version with `ins_seq > C*`. The
+    // order was visible at C* through its older version, so it is still Out AUCTION for the
+    // open quantity at C* (10), its reservation is released, and the later reduce is
+    // `TOO_LATE` with detail OUT.
+    use vyrn_bbo::{ControlCmd, OrderFlags, Phase, Stp, Tif};
+    let ao = |side| OrderFlags::new(side, Tif::AuctionOnly, false, Stp::None);
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Auction,
+        lo: Tick(0),
+        hi: Tick(0),
+    });
+    x.settle(&mut bbo);
+    // p* = 105 for 1 on lane 1; the auction-only sell at 110 on lane 0 does not fill.
+    x.send(
+        1,
+        1,
+        1_000,
+        &[
+            new(day(Side::Sell), 104, 1, 1),
+            new(day(Side::Buy), 106, 1, 2),
+        ],
+    );
+    x.send(0, 1, 2_000, &[new(ao(Side::Sell), 110, 10, 4)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 1);
+    assert_eq!(base_resv(&mut x, 0, 1), 10, "the sell reserves its 10");
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Frozen,
+        lo: Tick(1),
+        hi: Tick(u32::MAX - 1),
+    });
+    while x.bbo_step(&mut bbo).is_some() {}
+    // The lane has not applied the freeze: it admits the reduce, after C*.
+    let at = x.lane_cut(0);
+    let none = [Mid {
+        pass: 1,
+        next: LaneSeq(99),
+        at,
+    }];
+    let m = [Msg::Reduce {
+        handle: h,
+        by: Qty(4),
+        client_tag: 6,
+    }];
+    assert_eq!(x.send_at(0, 1, 3_000, 3_000, &m, &none), Rx::Accepted);
+    x.command(&ControlCmd::Uncross {
+        price: Tick(105),
+        qty: 1,
+    });
+    x.settle(&mut bbo);
+    let recs: Vec<_> = x
+        .records(0, 1)
+        .into_iter()
+        .filter(|r| !matches!(r, Record::Ack { .. }))
+        .collect();
+    assert_eq!(
+        recs,
+        vec![
+            Record::Out {
+                index: vyrn_bbo::INDEX_MAKER,
+                cause: vyrn_bbo::OUT_AUCTION,
+                handle: h,
+                qty: Qty(10),
+                client_tag: 4
+            },
+            Record::Reject {
+                index: 0,
+                reason: RejectReason::TooLate,
+                detail: 3,
+                client_tag: 6
+            },
+        ],
+        "{recs:?}"
+    );
+    assert_eq!(base_resv(&mut x, 0, 1), 0, "nothing stays reserved");
+    // The reduced version (ins_seq > C*) is dead to the BBO too: the next auction fills the
+    // lane-1 sell behind it at 110, not the ended order.
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Auction,
+        lo: Tick(0),
+        hi: Tick(0),
+    });
+    x.settle(&mut bbo);
+    x.send(
+        1,
+        1,
+        4_000,
+        &[
+            new(day(Side::Sell), 110, 6, 8),
+            new(day(Side::Buy), 110, 6, 9),
+        ],
+    );
+    x.settle(&mut bbo);
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Frozen,
+        lo: Tick(1),
+        hi: Tick(u32::MAX - 1),
+    });
+    x.command(&ControlCmd::Uncross {
+        price: Tick(110),
+        qty: 6,
+    });
+    x.settle(&mut bbo);
+    assert!(
+        x.records(0, 1)
+            .iter()
+            .all(|r| !matches!(r, Record::Fill { .. })),
+        "the ended order does not trade"
+    );
+    let at_110: Vec<_> = x
+        .records(1, 1)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Fill {
+                tick: Tick(110),
+                qty,
+                ..
+            } => Some(qty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        at_110,
+        vec![Qty(6), Qty(6)],
+        "the lane-1 sell fills instead"
+    );
+}

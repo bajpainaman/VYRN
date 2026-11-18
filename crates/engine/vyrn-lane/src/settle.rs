@@ -463,13 +463,16 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
                 let Some(rp) = self.root(r).copied() else {
                     break;
                 };
-                let cur = self.slot(rp.cur).copied().unwrap_or_default();
+                // The version in effect at `C*`: a reduce or replace admitted after the freeze
+                // has already moved `cur` past it, but the order was visible at `C*`.
                 if rp.live
                     && !rp.ended
-                    && cur.flags.tif() == Tif::AuctionOnly
-                    && cur.ins_seq <= cstar
+                    && let Some(at) = self.version_at(rp.cur, cstar)
+                    && self
+                        .slot(at)
+                        .is_some_and(|s| s.flags.tif() == Tif::AuctionOnly)
                 {
-                    self.auction_out_of(r, &rp);
+                    self.auction_out_of(r, &rp, at);
                 }
                 r = rp.next;
             }
@@ -479,20 +482,33 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
     /// The `Out { cause: AUCTION }` of an auction-only remainder (04 `AUCTION_UNFILLED`), for
     /// its open quantity. The record follows every event record already queued (05 §8.10
     /// rule 4.2), so no event is flushed here.
-    fn auction_out_of(&mut self, r: u32, rp: &crate::lane::RootP) {
-        let open = self.open_of(r, rp.cur);
+    /// `at` is the version in effect at `C*`; the open quantity is its own, and every leg from
+    /// it to `cur` is released (a later reduce or replace then settles `TOO_LATE`).
+    fn auction_out_of(&mut self, r: u32, rp: &crate::lane::RootP, at: u32) {
+        let open = self.open_of(r, at);
         if open == 0 {
             return;
         }
-        let leg = self.slot(rp.cur).map_or(0, |s| s.leg);
-        self.release(leg);
-        if let Some(x) = self.slot_mut(leg) {
-            x.dead = true;
+        let mut v = rp.cur;
+        for _ in 0..self.slots.len() {
+            let Some(s) = self.slot(v).copied() else {
+                break;
+            };
+            self.release(s.leg);
+            if let Some(x) = self.slot_mut(s.leg) {
+                x.dead = true;
+            }
+            if v == at || s.prev_ver == 0 {
+                break;
+            }
+            v = s.prev_ver;
         }
         self.end_root(r, PROTO_D_OUT);
         let handle = self.handle(r);
+        // Held under `at`, the version it ends: a later settle of that version (a reduce or
+        // replace after `C*`) emits it first (05 §8.10 rule 4.1).
         self.emit(
-            rp.cur,
+            at,
             rp.sess,
             0,
             Record::Out {
@@ -744,6 +760,22 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
 
     // -----------------------------------------------------------------------------------------
     // B2 (05 §7.6)
+
+    /// The newest version from `v` back through `prev_ver` whose op is at or before `cut`;
+    /// `None` when the order did not exist yet at `cut`.
+    fn version_at(&self, mut v: u32, cut: LaneSeq) -> Option<u32> {
+        for _ in 0..self.slots.len() {
+            let s = self.slot(v)?;
+            if s.ins_seq <= cut {
+                return Some(v);
+            }
+            if s.prev_ver == 0 {
+                return None;
+            }
+            v = s.prev_ver;
+        }
+        None
+    }
 
     fn open_of(&self, root: u32, v: u32) -> u32 {
         let Some(r) = self.root(root) else { return 0 };
