@@ -1502,7 +1502,7 @@ Measured: the ML-DSA-44 sign at four attempts is 45 µs p50, 111 µs p99 and ≤
 | Δ (timeouts) | `REP_DELTA_MS` = 1 ms. Leader timeout `t_l = 2Δ` = 2 ms. Advance timeout `t_a = 3Δ` = 3 ms. The skip policy for an inactive leader is enabled. |
 | `Automaton::propose` | §6.4 (leader side) |
 | `Automaton::verify` | §6.4 (voter side). This gates the notarize vote. |
-| certify hook | Returns the result of `verify` for the same payload. It adds no check of its own. |
+| certify hook | Returns the result of `verify` for the same payload. It adds no check of its own. *Reading* (`vyrn-consensus`, ruled): certify never answers false for a payload this voter has not judged, because Commonware treats a false certification as final for the view and journals it. It answers true once this voter's own `verify` or proposal accepted the payload, or once it signed a notarize or finalize for it (replayed from its journal on restart). It answers false only when its own `verify` rejected it. Otherwise it waits, and a view left by nullification or finalization drops the wait unanswered. |
 | `Relay` | No-op. Payloads are already at every participant through frames and data frames. |
 | Reporter (activity) | Feeds finalizations to `vyrn-log` (§8), and conflict evidence (`ConflictingNotarize`, `ConflictingFinalize`, `NullifyFinalize`) to §10. |
 | Not used | `marshal` (block sync). Frames and repair do that job. |
