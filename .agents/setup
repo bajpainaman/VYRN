@@ -149,9 +149,10 @@ cargo_tools() {
       https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
   fi
   # deny/vet/fuzz/show-asm are named by 11 (L54, L58, L102, L613); nextest is a faster runner for
-  # the unit tier; cyclonedx writes the release SBOM (11 L316).
+  # the unit tier; cyclonedx writes the release SBOM (11 L316); vx/build.sh checks the vxc pin
+  # with b3sum.
   local tools=() tool
-  for tool in cargo-deny cargo-vet cargo-fuzz cargo-show-asm:cargo-asm cargo-nextest cargo-cyclonedx; do
+  for tool in cargo-deny cargo-vet cargo-fuzz cargo-show-asm:cargo-asm cargo-nextest cargo-cyclonedx b3sum; do
     command -v "${tool#*:}" >/dev/null || tools+=("${tool%%:*}")
   done
   if ((${#tools[@]})); then
