@@ -1,6 +1,7 @@
 // Lists every ASCII block per document with the same rule the renderer uses (fenced code with no
 // language, or "text"). `hash` is lib/diagrams.ts's asciiHash, the key a figure is filed under;
-// asciiIndex and line only help find the block.
+// asciiIndex and heading only help find the block. No line numbers: an edit above a block would
+// change them, and CI fails on any inventory change.
 import { createHash } from "node:crypto";
 import { readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -28,7 +29,6 @@ for (const [slug, file] of files) {
         asciiIndex: index,
         hash: createHash("sha256").update(node.value.trimEnd()).digest("hex").slice(0, 12),
         heading,
-        line: node.position.start.line,
         ascii: node.value,
       });
     index++;
