@@ -65,11 +65,11 @@ pub const RSK_POOL_CORES: u64 = 7;
 
 // ---- Reject details (10 Local definitions, §3.1, §1.4; const) ----
 
-/// `RATE_LIMIT` details for the buckets of 10 §3.8.
-pub const RSK_BUCKET_NEW: u32 = 1;
-pub const RSK_BUCKET_CROSS: u32 = 2;
-pub const RSK_BUCKET_LANE_CROSS: u32 = 3;
-pub const RSK_BUCKET_LANE_IMPROVE: u32 = 4;
+/// `RATE_LIMIT` details for the buckets of 10 §3.8: 8–11, after 04 §9.1's bucket ids 1–7.
+pub const RSK_BUCKET_NEW: u32 = 8;
+pub const RSK_BUCKET_CROSS: u32 = 9;
+pub const RSK_BUCKET_LANE_CROSS: u32 = 10;
+pub const RSK_BUCKET_LANE_IMPROVE: u32 = 11;
 /// `BAD_QTY` details (10 §3.1).
 pub const RSK_D_QTY_ZERO: u32 = 1;
 pub const RSK_D_QTY_MAX: u32 = 2;

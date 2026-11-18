@@ -206,7 +206,7 @@ impl Risk<'_> {
     /// | M4 | account `Active` | `ACCOUNT_KILLED` 0 | `MSG` |
     /// | M5 | snapshot not `halted` | `BOOK_HALTED` 0 | `MSG` |
     /// | M5 | phase allows the TIF and post-only (04 §6.9) | `AUCTION_PHASE` phase | `MSG` |
-    /// | 10 #5 | account `new_bucket`, cost 1 | `RATE_LIMIT` `RSK_BUCKET_NEW` (1) | `MSG` |
+    /// | 10 #5 | account `new_bucket`, cost 1 | `RATE_LIMIT` `RSK_BUCKET_NEW` (8) | `MSG` |
     /// | M6 | `qty ≥ 1` | `BAD_QTY` `RSK_D_QTY_ZERO` | `MSG`, `new` |
     /// | M6 | `qty ≤ max_order_qty` | `BAD_QTY` `RSK_D_QTY_MAX` | `MSG`, `new` |
     /// | M6 | tick range and band ([`BookSpec::check_tick`]) | `BAD_TICK` edge | `MSG`, `new` |
@@ -215,7 +215,7 @@ impl Risk<'_> {
     /// | M7 | a free order slot in the lane's pool | `RISK_ORDER_COUNT` `RSK_D_LANE_FULL` | `MSG`, `new` |
     /// | M7 | balance covers reservation + message fee | `RISK_CREDIT` 1 quote / 2 base | `MSG`, `new` |
     /// | M8 | not post-only with `route == Cross` | `POST_ONLY_WOULD_CROSS` opposite best | `MSG`, `new` |
-    /// | M8 | `BBO` session (3), account (6); cross: `cross_bucket` (2), `lane_cross` (3); improve: `lane_improve` (4) | `RATE_LIMIT` id | `MSG`, `new` |
+    /// | M8 | `BBO` session (3), account (6); cross: `cross_bucket` (9), `lane_cross` (10); improve: `lane_improve` (11) | `RATE_LIMIT` id | `MSG`, `new` |
     ///
     /// M7 has no exposure check (`RISK_POSITION`) in v1 spot; it is the v2 perps limit (10 §6).
     /// The M8 buckets are taken all or none (10 §3.1 decision 3). `IOC` and `FOK` are charged as

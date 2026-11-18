@@ -692,7 +692,7 @@ protocol goes below it.
 | `New`, IOC | queued `Ack` | joins; the rest is `Out` cause auction | normal |
 | `New`, FOK | `Reject AUCTION_PHASE` | — | normal |
 | `New`, auction-only | queued `Ack` | joins; the rest is `Out` cause auction | `Reject AUCTION_PHASE` |
-| `New`, post-only | queued `Ack` | joins as Day; an auction has no taker | normal |
+| `New`, post-only | `Reject AUCTION_PHASE` (04 §6.9; a `Replace` to post-only too) | — | normal |
 | `Cancel`, `Reduce` | queued `Ack` | applied to a carried order, or to a window order named by `wref`; else `UNKNOWN_HANDLE` | normal |
 | `Replace` | queued `Ack` with `wref` | applied as for `Cancel` (04 P9); the new part joins the auction | normal |
 | `CancelAll` | queued `Ack` | applied to carried and earlier window orders of the session | normal |

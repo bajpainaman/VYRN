@@ -115,7 +115,7 @@ struct Ledger {
     base_free: u64, base_resv: u64,   // base atomic units
     quote_free: u64, quote_resv: u64, // quote atomic units
     open_orders: u32,                 // orders with open > 0 or a pending settle
-    fee: FeeTier,                     // { maker_bps: u16, taker_bps: u16 }, 10-accounts-risk-md.md
+    fee: FeeTier,                     // { maker_ppm, taker_ppm, auction_ppm: i32 }, 10 §5
 }
 enum Phase { Continuous, Auction, Frozen, Halted }   // Frozen: auction close, §8.8
 ```
@@ -145,6 +145,7 @@ fn op_new(bk: &mut Book, o: Order, led: &mut Ledger) -> Result<(), Reject> {
     match bk.phase { Halted => return Err(BOOK_HALTED), Frozen => return Err(AUCTION_PHASE), _ => {} }
     if o.tif == AuctionOnly && bk.phase != Auction { return Err(AUCTION_PHASE) }
     if matches!(o.tif, Ioc | Fok) && bk.phase != Continuous { return Err(AUCTION_PHASE) }
+    if o.post_only && bk.phase != Continuous { return Err(AUCTION_PHASE) }   // 04 §6.9
     if o.tick < bk.band.lo || o.tick > bk.band.hi { return Err(BAD_TICK) }
     if o.qty < ENG_MIN_QTY || o.qty > ENG_MAX_ORDER_QTY { return Err(BAD_QTY) }
     if led.open_orders >= ENG_MAX_OPEN_PER_ACCT { return Err(RISK_ORDER_COUNT) }
@@ -178,8 +179,10 @@ position. If `qty' ≤ filled`, the order is finished and the answer is `CancelA
 open }` (01 §14.10 has no `Out` cause for it). The new order then runs `match_on_entry` with
 `open = qty' − filled`. The reservation is adjusted by §2.6.
 
-**`CancelAll`**: cancel every resting order of the session, in key order, each with its own
-`CancelAck`. If the session has none, answer one `CancelAck { handle: 0, canceled: 0 }`.
+**`CancelAll`**: cancel every resting order of the session in the packet's book (04 §6.6), in
+ascending handle order, each with its own `CancelAck { handle, canceled: open }`. Then answer the
+summary `CancelAck { handle: PROTO_HANDLE_ALL, canceled: n }`, where `n` is the number of orders
+canceled. The summary is sent also when `n = 0`. Vector V15 (04 §11) shows the bytes.
 
 **Step `s` of kind `Cross` or `Improve`**: apply the source op's dependencies (§3.7) in index
 order, then `New` or `Replace` for the source op. The step kind is `Cross` if the op produced a
@@ -268,19 +271,32 @@ later amount is bounded by the reservation.
 // quote atomic units per lot at a tick; book parameter (§13.1)
 fn px(t: Tick) -> u64 { t as u64 * QUOTE_PER_TICK_LOT }            // checked
 // reservation per lot for a buy at limit t: price plus the maximum fee, rounded up per lot
-fn rpl(t: Tick) -> u64 { px(t) + ceil_div(px(t) * ENG_MAX_FEE_BPS as u64, 10_000) }
-fn fee(t: Tick, q: Qty, bps: u16) -> u64 { ceil_div(q as u64 * px(t) * bps as u64, 10_000) }
+fn rpl(t: Tick) -> u64 { px(t) + ceil_div(px(t) * ENG_MAX_FEE_PPM as u64, RSK_FEE_DENOM) }
+// fee on notional n at rate ppm (10 §5): a charge (ppm ≥ 0) rounds up, a rebate (ppm < 0) down
+fn fee(n: u64, ppm: i32) -> i64 {
+    if ppm >= 0 { ceil_div(n * ppm as u64, RSK_FEE_DENOM) as i64 }
+    else { -((n * ppm.unsigned_abs() as u64 / RSK_FEE_DENOM) as i64) }
+}
 ```
+
+`RSK_FEE_DENOM` = 10^6 (10 §5): rates are parts per million of notional, so 1 bps = 100 ppm.
 
 | Event | Buy order (limit `t`) | Sell order |
 |---|---|---|
 | Entry | `quote_free −= qty × rpl(t)`; `quote_resv += same`. Reject `RISK_CREDIT` if short. | `base_free −= qty`; `base_resv += qty`. |
-| Fill of `q` at tick `f` | `quote_resv −= q × rpl(t)`; pay `q × px(f) + fee(f, q, bps)`; `quote_free += q × rpl(t) − paid`; `base_free += q`. | `base_resv −= q`; `quote_free += q × px(f) − fee(f, q, bps)`. |
+| Fill of `q` at tick `f`, `n = q × px(f)` | `quote_resv −= q × rpl(t)`; `quote_free += q × rpl(t) − n`; `base_free += q`; then the fee. | `base_resv −= q`; `quote_free += n`; then the fee. |
+| Fee of a maker or auction fill | `quote_free −= fee(n, ppm)` (a rebate adds); `fee_acc[lane] += fee(n, ppm)`. | same |
+| Fee of a taker, once per (taker order, step), at the step's `TakerEnd` | `quote_free −= fee(N, taker_ppm)`, where `N` is the sum of `n` over the order's fills in the step; `fee_acc[lane] += same`. | same |
 | Order ends with `open = o` | `quote_resv −= o × rpl(t)`; `quote_free += same`. | `base_resv −= o`; `base_free += o`. |
 
-- `bps` is the taker or maker rate of the account's tier. It is at most `ENG_MAX_FEE_BPS`.
-- `paid ≤ q × rpl(t)` always holds: `f ≤ t`, `bps ≤ ENG_MAX_FEE_BPS`, and `ceil(q·x) ≤ q·ceil(x)`.
-  So a fill never needs more than the lots it consumes from the reservation.
+- `ppm` is the maker or auction rate of the account's tier, `taker_ppm` its taker rate. Every
+  `|ppm|` is at most `ENG_MAX_FEE_PPM`.
+- The taker fee is rounded once per step on the step's total, as 10 §3.3 and §4.4 fix
+  (`Settle::taker_end`, `crates/engine/vyrn-risk/src/settle.rs`). Rounding each fill instead
+  would charge up to (fills − 1) units more.
+- `n + fee ≤ q × rpl(t)` for every fill, summed over the step for the taker: `f ≤ t`,
+  `ppm ≤ ENG_MAX_FEE_PPM`, and `ceil(Σx) ≤ Σ ceil(x)`. So a fill never needs more than the lots
+  it consumes from the reservation (the release lemma, 10 §3.2).
 - Fees are credited to the lane's fee accumulator `fee_acc[lane]` (10 sums them).
 - **Replace** of a buy: the lane reserves `max(0, need − resv(o))` at once, where `need = (qty' −
   F) × rpl(tick')` and `F` is the filled qty the lane knows. It never releases at the replace.
@@ -1583,22 +1599,28 @@ latency path.
 fn settle_fill(l: &mut Lane, r: RootIx, ev: &FillEvent) {
     let o = &mut l.order[r]; let a = &mut l.acct[o.acct_ix];
     let v = slot(ev.vslot);                             // the version that traded
-    let bps = if ev.liq == MAKER { a.fee.maker_bps } else { a.fee.taker_bps };
-    let fee = fee(ev.tick, ev.qty, bps);
+    let n = ev.qty as u64 * px(ev.tick);
+    // Maker and auction fills pay now; a taker fill adds n to the step's taker notional,
+    // which TakerEnd charges once (10 §4.4).
+    let fee = match ev.liq {
+        MAKER   => fee(n, a.fee.maker_ppm),
+        AUCTION => fee(n, a.fee.auction_ppm),           // liq = 2, uncross fills (§8.8)
+        _       => { l.taker_notional += n; 0 }
+    };
     match v.side() {
         Buy => {
             let used = ev.qty as u64 * rpl(v.tick);     // limit of the version that traded
-            let paid = ev.qty as u64 * px(ev.tick) + fee;
+            let paid = n + fee;
             a.quote_resv -= used; a.quote_free += used - paid; a.base_free += ev.qty as u64;
             o.resv -= used;
         }
         Sell => {
             a.base_resv -= ev.qty as u64;
-            a.quote_free += ev.qty as u64 * px(ev.tick) - fee;
+            a.quote_free += n - fee;
             o.resv -= ev.qty as u64;
         }
     }
-    l.fee_acc += fee as u128;
+    l.fee_acc += fee as i128;
     o.filled += ev.qty;
     if o.filled == o.total_cur && o.pend == 0 { l.finish(r) }   // releases o.resv, frees slots
 }
@@ -1630,7 +1652,7 @@ fn settle_through(l: &mut Lane, c: LaneSeq) {          // c = min(C_f[l], applie
             ReduceAck   => l.settle_reduce(p),         // CancelAck { canceled: min(r, open) }
             ReplaceAck  => l.settle_replace(p),        // TOO_LATE if the old version's open = 0,
                                                        // else Ack { handle, tick' }; true-up resv
-            CancelAllAck => l.settle_cancel_all(p),    // one CancelAck per order, key order
+            CancelAllAck => l.settle_cancel_all(p),    // CancelAck per order, handle order, then summary
             Forwarded   => {}                          // its status came as events in B1
         }
         if l.phase_frozen_at(p.seq) { l.restage(p, Reject(AUCTION_PHASE)) }   // §2.5 P4
@@ -2847,7 +2869,7 @@ cores with SMIs and interrupts off. This is the fault model of the theorem, not 
 | `06` | NIC RX timestamps, TSC↔PHC mapping for the age check, PHC skew bound `ENG_PHC_SKEW_NS`, VI polling for handover, huge pages, isolation with SMIs and interrupts off (§14.5) |
 | `07` | `PacketRecord`/`StepRecord` encoding (lanes pre-encode into `OsRing` in pass 1), the order-stream core, frame gating, failover on silence |
 | `08` | auction start/stop, the freeze and `ENG_FREEZE_MAX_US`, `uncross_price`, `Seal`, epoch-start parameters, `rank_e` epoch number |
-| `10` | account → lane assignment and each account's class (dedicated or pooled, 01 §14.15.4), fee tiers, `ENG_MAX_FEE_BPS`, auction fee rule, `ACCOUNT_KILLED`, `BookSpec` with the admission table `path_ns` |
+| `10` | account → lane assignment and each account's class (dedicated or pooled, 01 §14.15.4), fee tiers in ppm, `ENG_MAX_FEE_PPM`, auction fee rule, `ACCOUNT_KILLED`, `BookSpec` with the admission table `path_ns` |
 | `11` | B2 (lane budget), B3 (BBO and TX load, latency maxima, `BUSY` rate), B4 (replay), the `vyrn-sim` scheduler, the canonical state encoding |
 
 **Provides:**
@@ -2890,7 +2912,7 @@ runs live and replay, selected by configuration (`C-ONEBIN`).
 | `ENG_MAX_OPEN_PER_ACCT` | 65_536 | open orders per account (`RISK_ORDER_COUNT`) |
 | `ENG_MIN_QTY` | 1 | lots |
 | `ENG_MAX_ORDER_QTY` | ≤ 2^31 − 1 (per book) | lots per order |
-| `ENG_MAX_FEE_BPS` | set by `10` | maximum fee rate; sizes reservations |
+| `ENG_MAX_FEE_PPM` | set by `10` (`max_fee_ppm`, §5) | maximum fee rate in ppm; sizes reservations |
 | `ENG_LADDER_PAGES` | 4096 | 4096-tick pages in the ladder (`TICK_MAX < 2^24`) |
 | `ENG_OVF_PAGES` | 64 | overflow pages per lane per side (physical) |
 | `ENG_FAR_PAGES_MAX` | 56 | distinct far pages with orders per lane per side (logical cap; `BAD_TICK` beyond). |

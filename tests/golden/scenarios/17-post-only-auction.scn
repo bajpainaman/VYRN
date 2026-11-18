@@ -1,0 +1,22 @@
+# Post-only in the auction phase is Reject AUCTION_PHASE, detail 2 = PROTO_PHASE_AUCTION
+# (04 §6.9; 08 §7.2). A Replace follows the rules of its new order's TIF and flags (04 §6.9), so
+# a Replace to post-only is rejected the same way and leaves the old order. A Day order without
+# post-only still rests (04 §6.9: Ack now). qptl = 1, no fees: a buy reserves qty × tick.
+
+book band=90..110 qptl=1 max_qty=100 phase=auction
+lane 1 first=0x01000001
+account 1 lane=1 base=10 quote=1000
+session 0x11 account=1
+
+msg 1 0x11 0 rx=1 seq=1 : new buy day post 95 1 0xa1
+=> 0x11 reject 0 AUCTION_PHASE 2 0xa1
+msg 1 0x11 0 rx=2 seq=2 : new sell day post 105 1 0xa2
+=> 0x11 reject 0 AUCTION_PHASE 2 0xa2
+msg 1 0x11 0 rx=3 seq=3 : new buy day 95 1 0xa3
+=> 0x11 ack 0 0x01000001 95 0xa3
+msg 1 0x11 0 rx=4 seq=4 : replace buy day post 0x01000001 96 1
+=> 0x11 reject 0 AUCTION_PHASE 2 0xa3
+
+check phase auction
+check resting 0x01000001
+check account 1 open=1 base_free=10 base_resv=0 quote_free=905 quote_resv=95

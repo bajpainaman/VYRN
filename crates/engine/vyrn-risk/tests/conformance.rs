@@ -272,7 +272,7 @@ fn m5_phase_table_of_04_6_9() {
 // ---------------------------------------------------------------- 10 #5: new_bucket
 
 #[test]
-fn new_bucket_is_detail_1_and_later_rejects_still_consume_it() {
+fn new_bucket_is_detail_8_and_later_rejects_still_consume_it() {
     let mut f = Fx::new();
     f.acct.buckets.new = Gcra::new(1_000, 2);
     // Decision 2 of 10 §3.1: a BAD_QTY after the new_bucket still costs its token.
@@ -283,7 +283,7 @@ fn new_bucket_is_detail_1_and_later_rejects_still_consume_it() {
     assert!(f.new_order(buy(99_000, 1), Route::Join).is_ok());
     assert_eq!(
         reason(f.new_order(buy(99_000, 1), Route::Join)),
-        Some((R::RateLimit, RSK_BUCKET_NEW))
+        Some((R::RateLimit, 8)) // RSK_BUCKET_NEW, 04 §9.1
     );
     // Decision 1: checks 1–4 consume no new_bucket token.
     let mut g = Fx::new();
@@ -502,7 +502,7 @@ fn m8_lane_cross_shortage_costs_the_account_no_token() {
     let bal = f.bal;
     assert_eq!(
         reason(f.new_order(buy(100_000, 1), Route::Cross)),
-        Some((R::RateLimit, RSK_BUCKET_LANE_CROSS))
+        Some((R::RateLimit, 10)) // RSK_BUCKET_LANE_CROSS, 04 §9.1
     );
     assert_eq!(f.acct.buckets.cross, acct_cross);
     assert_eq!(f.sess.bbo, bbo);
@@ -518,14 +518,14 @@ fn m8_account_cross_and_lane_improve_buckets() {
     assert!(f.new_order(buy(100_000, 1), Route::Cross).is_ok());
     assert_eq!(
         reason(f.new_order(buy(100_000, 1), Route::Cross)),
-        Some((R::RateLimit, RSK_BUCKET_CROSS))
+        Some((R::RateLimit, 9)) // RSK_BUCKET_CROSS, 04 §9.1
     );
     let mut g = Fx::new();
     g.lane.improve = Gcra::new(1_000, 1);
     assert!(g.new_order(buy(99_500, 1), Route::Improve).is_ok());
     assert_eq!(
         reason(g.new_order(buy(99_500, 1), Route::Improve)),
-        Some((R::RateLimit, RSK_BUCKET_LANE_IMPROVE))
+        Some((R::RateLimit, 11)) // RSK_BUCKET_LANE_IMPROVE, 04 §9.1
     );
 }
 

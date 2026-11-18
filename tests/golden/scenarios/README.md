@@ -35,11 +35,16 @@ client sees only its own stream.
 
 ## Spec choices these files fix
 
+These were open when the scenarios were written; the owner settled them, and the spec now says
+the same.
+
 - **CancelAll** follows 04 §6.6 and vector V15: one `CancelAck` per live order of the session in
-  ascending handle order, then the summary `CancelAck(0xFFFFFFFF, count)`, also for a count of 0.
-  05 §2.3 says key order and one `CancelAck(0, 0)` when there are none; 04 is the client contract
-  and V15 is a byte vector, so 05 §2.3 should be changed to match.
+  ascending handle order, then the summary `CancelAck(0xFFFFFFFF, count)`, also for a count of 0
+  (05 §2.3).
 - **Fee units** are ppm of notional (10 §5, `RSK_FEE_DENOM = 10^6`): ceil for a charge, floor for
-  a rebate. 05 §2.6 writes bps over 10^4; 10 owns fees, and ppm expresses every bps rate exactly.
-  The fee is per fill, as 05 §2.6 writes it; 10 §3.3 charges the taker once per step on the
-  step's total notional, which differs by rounding. That difference is open.
+  a rebate (05 §2.6).
+- **The taker fee** is charged once per (taker order, step) on the step's total notional, rounded
+  once (10 §3.3, §4.4, `vyrn-risk` `Settle::taker_end`). Maker and auction fees are per fill.
+  `16-taker-fee-per-step.scn` fails an implementation that rounds each taker fill.
+- **Post-only in the auction phase** is `Reject AUCTION_PHASE` with detail 2 (04 §6.9, 08 §7.2).
+  `17-post-only-auction.scn` checks `New` and `Replace`.
