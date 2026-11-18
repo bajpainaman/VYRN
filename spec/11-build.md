@@ -1038,9 +1038,12 @@ the client.
    `3a89e3c7`). Refuse otherwise. **[Reading, W-10]** v0.0.4 has no release binary, so the value
    is per host kind (`vxc_blake3.<arch>-<os>`): the hash of `.agents/setup`'s build, made with
    the `rust-toolchain.toml` pin by that name and with the registry, toolchain and rust-src paths
-   remapped. vxc still embeds its source and target dirs, so the host kind includes setup's
-   layout under `HOME`. A pin is recorded only once two clean builds on that host kind match,
-   and never for a host kind nobody has built on.
+   remapped, and with mlir-sys's and tblgen's build scripts sorted (they list a directory in
+   `read_dir` order, which differs between filesystems and so changed vxc's static link order
+   between machines). vxc still embeds its source and target dirs, so the host kind includes
+   setup's layout under `HOME`. The host kind is not per CPU: two x86_64 orbs with identical CPU
+   flags differed only by link order. A pin is recorded only once clean builds on two machines of
+   that host kind match, and never for a host kind nobody has built on.
 2. Build `vyrn-vx-oracle` and `vyrn-vx-client` as shared libraries for the host target, with
    optimisation on. On aarch64, pass `-fweak-relaxed-atomics` for the client (DESIGN §8: without
    it, `Relaxed` loads compile as `Acquire`; correct either way, slower without it).
