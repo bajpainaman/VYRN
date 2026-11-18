@@ -3818,6 +3818,8 @@ dependencies = [
  "vyrn-cut",
  "vyrn-engine",
  "vyrn-lane",
+ "vyrn-log",
+ "vyrn-replica",
  "vyrn-risk",
  "vyrn-types",
  "vyrn-wire",
