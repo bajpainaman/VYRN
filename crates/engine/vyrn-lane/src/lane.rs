@@ -155,6 +155,9 @@ pub(crate) struct SlotP {
     /// pending replaces keeps every link (contract rule R).
     pub pred: u32,
     pub pred_pending: bool,
+    /// `KeepPrio` and `NewPrio` versions: the version this one succeeded (0 for the first).
+    /// Read only to find the version in effect at an uncross's `C*` (05 §8.8 item 6).
+    pub prev_ver: u32,
     /// `NewPrio` versions: the reservation was trued up for the predecessor's fills.
     pub trued: bool,
     /// A `Rescan` batch taker whose latest status event is `RESTED_IN_FLIGHT` (rule B).
@@ -1331,6 +1334,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                         pkt: cur_pkt,
                         pred: v,
                         pred_pending: route.is_some(),
+                        prev_ver: v,
                         ..SlotP::default()
                     };
                 }
@@ -1510,6 +1514,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                 ix: base.ix,
                 sess: cur_sess,
                 pkt: cur_pkt,
+                prev_ver: v,
                 ..SlotP::default()
             };
         }
