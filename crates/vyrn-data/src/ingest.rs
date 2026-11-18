@@ -30,6 +30,10 @@ pub struct HomeConfig {
     pub ring_slots: usize,
 }
 
+/// Variants with the same logical content kept per `pkt_seq` (04 D3 allows `flags` bit 0 and
+/// `epoch16` to differ). More are duplicates. *Gap:* 04 sets no bound.
+pub const MAX_VARIANTS: usize = 4;
+
 /// Why a packet was dropped (crate docs, § Ingest).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Reject {
@@ -159,8 +163,13 @@ impl DataHome {
         match self.dedupe.mark(session, pkt_seq) {
             Seen::New => {}
             Seen::Late => return Err(Reject::Late),
-            Seen::Repeat => match self.ring.get(session, pkt_seq) {
-                Some(first) if first.hash != full => {
+            Seen::Repeat => {
+                let mut vars = self.ring.variants(session, pkt_seq);
+                let Some(first) = vars.next() else {
+                    // The first copy has left the ring and cannot be compared.
+                    return Err(Reject::Duplicate);
+                };
+                if !same_logical(first.bytes(), pkt) {
                     *event = Some(Event::CopyConflict {
                         session,
                         pkt_seq,
@@ -170,10 +179,21 @@ impl DataHome {
                         second: Packet::new(pkt),
                     });
                     forward = false;
+                } else {
+                    // A resend (04 D3). A byte-identical copy, or one past MAX_VARIANTS, is a
+                    // duplicate; a new variant is stored and forwarded, because the sequencer
+                    // may have accepted these exact bytes.
+                    let mut n = 1usize;
+                    let mut dup = first.hash == full;
+                    for v in vars {
+                        n = n.saturating_add(1);
+                        dup |= v.hash == full;
+                    }
+                    if dup || n >= MAX_VARIANTS {
+                        return Err(Reject::Duplicate);
+                    }
                 }
-                // Equal, or the first copy has left the ring and cannot be compared.
-                _ => return Err(Reject::Duplicate),
-            },
+            }
         }
         self.ring.put(session, pkt_seq, full, rx_ts, pkt, forward);
         Ok(Ingested {
@@ -186,6 +206,20 @@ impl DataHome {
             forward,
         })
     }
+}
+
+/// 04 D3: two transmissions of one `pkt_seq` carry the same logical content, `(session,
+/// pkt_seq, count, book, message bytes)`. Only `flags` bit 0, `epoch16` and the tags may differ,
+/// so those bytes (9..12 and the tags) are not compared. Both packets parsed, so `count` fixes
+/// their lengths.
+pub fn same_logical(a: &[u8], b: &[u8]) -> bool {
+    fn signed(p: &[u8]) -> &[u8] {
+        let n = usize::from(p.get(8).copied().unwrap_or(0));
+        p.get(..n.saturating_mul(16).saturating_add(16))
+            .unwrap_or(&[])
+    }
+    let (a, b) = (signed(a), signed(b));
+    a.len() == b.len() && a.get(..9) == b.get(..9) && a.get(12..) == b.get(12..)
 }
 
 /// `PktHash`: the first 8 bytes of the full hash, little-endian (01 §3).

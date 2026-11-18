@@ -440,3 +440,55 @@ fn kernel_udp_loopback_serves_a_replica() {
     assert_eq!(d.hdr.kind, Kind::FetchResp);
     assert_eq!(d.packets().collect::<Vec<_>>(), vec![&p[..]]);
 }
+
+/// 04 D3: a resend may change `flags` bit 0 and `epoch16` (and so the tags and the full hash)
+/// without changing the logical content. It is not equivocation, and because the sequencer may
+/// accept its exact bytes, it is stored and forwarded as a second variant; an identical copy of
+/// it is a duplicate, and a KEY fetch returns both variants.
+#[test]
+fn a_resend_with_new_flags_and_epoch_is_a_forwarded_variant() {
+    let mut r = rig(MemStore::default());
+    let mut c = client_rx(&mut r);
+    let a = req(5, 1, &[Msg::Heartbeat], &K);
+    let mut out = [0u8; MAX_REQ_PAYLOAD];
+    let h = ReqHeader::new(SessionId(5), 1, 10, BOOK, true);
+    let n = encode_request(&mut out, h, &[Msg::Heartbeat], &K, None).unwrap();
+    let resend = out[..n].to_vec();
+    assert_ne!(
+        vyrn_crypto::hash::hash(&a[..32]),
+        vyrn_crypto::hash::hash(&resend[..32])
+    );
+    r.send(&a, 0);
+    r.send(&resend, 0);
+    r.send(&resend, 0);
+    r.node.poll(Nanos(0));
+    r.node.flush(Nanos(0));
+    let k = *r.node.counters();
+    assert_eq!((k.stored, k.duplicate, k.conflicts), (2, 1, 0));
+    assert_eq!(r.node.drain_events().count(), 0);
+    // epoch16 differs, so each variant goes out in its own DATA frame, in arrival order.
+    let frames: Vec<Vec<u8>> = r.drain(0);
+    let pkts: Vec<Vec<u8>> = frames
+        .iter()
+        .flat_map(|f| {
+            frame::decode(f)
+                .unwrap()
+                .packets()
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(pkts, vec![a.clone(), resend.clone()]);
+    r.fetch(Fetch::Key {
+        session: SessionId(5),
+        pkt_seq: 1,
+    });
+    r.node.poll(Nanos(1));
+    let got = drain_rx(&mut c);
+    let d = frame::decode(&got[0]).unwrap();
+    let mut v: Vec<&[u8]> = d.packets().collect();
+    v.sort();
+    let mut want = vec![&a[..], &resend[..]];
+    want.sort();
+    assert_eq!(v, want);
+}

@@ -35,8 +35,12 @@
 //!    `K_com` ([`Mode`]). No key for the session → `UnknownSession`. A failed tag → `BadMac` and
 //!    an [`Event::BadMac`]. The data tier never closes a session.
 //! 3. Dedupe by `(session, pkt_seq)` with `hi` and a 256-bit window below it ([`dedupe`]):
-//!    a new `pkt_seq` is stored; a repeat whose full hash equals the stored copy's → `Duplicate`;
-//!    a repeat with a different full hash is client equivocation: both are stored, the first is
+//!    a new `pkt_seq` is stored; a repeat with the stored copy's logical content (04 D3:
+//!    `session`, `pkt_seq`, `count`, `book`, the messages; `flags` bit 0, `epoch16` and the tags
+//!    may differ) is a resend: byte-identical → `Duplicate`, otherwise a new variant that is
+//!    stored and forwarded too, because the sequencer may accept those exact bytes (04 D2), up
+//!    to `MAX_VARIANTS` per `pkt_seq` (*gap*); a repeat with different logical content is client
+//!    equivocation (04 §2.4): both are stored, the first is
 //!    the one forwarded and served, and [`Event::CopyConflict`] carries both packets;
 //!    `pkt_seq ≤ hi − 256` → `Late` (*gap:* dropped and counted, never forwarded).
 //! 4. Hash: full BLAKE3-256 over bytes `0..16+16n`; `pkt_hash` is its first 8 bytes (01 §3).
@@ -79,8 +83,9 @@
 //!          3 BLOCK  height u64                      the payloads of a logged block
 //! ```
 //!
-//! - KEY: one `FETCH_RESP` with `data_seq = session << 32 | pkt_seq` and the packet (ring first,
-//!   then the newest `log_scan` blocks of the log source), or `n_pkts` 0 if neither has it.
+//! - KEY: one `FETCH_RESP` with `data_seq = session << 32 | pkt_seq` and every variant of the
+//!   packet in the ring (by `pkt_hash`), else the copy in the newest `log_scan` blocks of the log
+//!   source, or `n_pkts` 0 if neither has it.
 //! - RANGE: the stored `DATA` frames `from..=to` resent byte for byte, those still in the
 //!   destination's history; `to − from < max_range` and `from ≥ 1`, `dst` known.
 //! - BLOCK: the block's payloads (07 §8.2 data region, split by `count`) in O-order, as

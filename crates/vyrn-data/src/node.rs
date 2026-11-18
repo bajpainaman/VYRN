@@ -447,9 +447,15 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
         match q {
             Fetch::Key { session, pkt_seq } => {
                 let seq = key_seq(session, pkt_seq);
-                if let Some(s) = self.home.ring().get(session, pkt_seq) {
-                    let (_, _, book, e16) = pkt_key(s.bytes());
+                let mut hit = None;
+                for s in self.home.ring().variants(session, pkt_seq) {
+                    if hit.is_none() {
+                        let (_, _, book, e16) = pkt_key(s.bytes());
+                        hit = Some((book, e16));
+                    }
                     self.resp.push(s.bytes());
+                }
+                if let Some((book, e16)) = hit {
                     bump(&mut self.counters.fetch_ring_hit);
                     return self.send_resp(to, book, e16, seq);
                 }

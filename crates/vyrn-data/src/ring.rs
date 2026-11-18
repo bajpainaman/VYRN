@@ -1,8 +1,10 @@
 //! The RAM ring (07 §5.2 step 5): fixed slots of `MAX_REQ_PAYLOAD` bytes, overwritten oldest
-//! first, and an index from `(session, pkt_seq)` to the slot of the first copy stored.
+//! first, and an index from `(session, pkt_seq, pkt_hash)` to a slot.
 //!
-//! A conflicting second copy (07 §5.2 step 3) takes a slot but is not indexed: lookups return the
-//! first copy, which is the one forwarded.
+//! One `pkt_seq` may have several indexed variants: transmissions with the same logical content
+//! whose `flags` bit 0 or `epoch16` differ (04 D3), so their hashes differ too. The sequencer may
+//! accept any of them, so each is kept. A conflicting copy (07 §5.2 step 3) takes a slot but is
+//! not indexed.
 
 use std::collections::BTreeMap;
 
@@ -28,7 +30,7 @@ impl Slot {
 pub struct Ring {
     slots: Vec<Option<Slot>>,
     next: usize,
-    index: BTreeMap<(SessionId, u32), usize>,
+    index: BTreeMap<(SessionId, u32, u64), usize>,
 }
 
 impl Ring {
@@ -63,7 +65,7 @@ impl Ring {
             return;
         };
         if let Some(old) = slot.take() {
-            let k = (old.session, old.pkt_seq);
+            let k = (old.session, old.pkt_seq, ph(&old.hash));
             if self.index.get(&k) == Some(&at) {
                 self.index.remove(&k);
             }
@@ -82,15 +84,25 @@ impl Ring {
             bytes,
         });
         if indexed {
-            self.index.insert((session, pkt_seq), at);
+            self.index.insert((session, pkt_seq, ph(&hash)), at);
         }
     }
 
-    /// The first stored copy of `(session, pkt_seq)`, if it is still in the ring.
-    pub fn get(&self, session: SessionId, pkt_seq: u32) -> Option<&Slot> {
-        let at = *self.index.get(&(session, pkt_seq))?;
-        self.slots.get(at)?.as_ref()
+    /// Every indexed variant of `(session, pkt_seq)` still in the ring, by `pkt_hash`.
+    pub fn variants(&self, session: SessionId, pkt_seq: u32) -> impl Iterator<Item = &Slot> {
+        self.index
+            .range((session, pkt_seq, 0)..=(session, pkt_seq, u64::MAX))
+            .filter_map(|(_, &at)| self.slots.get(at)?.as_ref())
     }
+
+    /// One indexed variant of `(session, pkt_seq)`, if any is still in the ring.
+    pub fn get(&self, session: SessionId, pkt_seq: u32) -> Option<&Slot> {
+        self.variants(session, pkt_seq).next()
+    }
+}
+
+fn ph(h: &Hash) -> u64 {
+    crate::ingest::pkt_hash_of(h).0
 }
 
 #[cfg(test)]
