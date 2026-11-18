@@ -67,12 +67,13 @@
 //! `vyrn_consensus` voter config. [`ReplicaLocal`] is this replica's `vyrn_epoch::LocalView`,
 //! and [`EpochJournal`] makes `SignOnce` admissions and `armed(e+1)` durable before they are
 //! acted on ([`epoch`]). [`DataJoin`] joins payloads, checks `data_root` (07 §6.4 item 3) and
-//! is the engine's `Payloads` ([`data`]). `ReplayEngine` has no Rust implementation yet: see
-//! [`ports`].
+//! is the engine's `Payloads` ([`data`]). [`RustReplay`] implements `ReplayEngine` over
+//! `vyrn_engine::Engine::replay_wire` ([`rust`], which also fixes the block output hash).
 //!
 //! **Conformance.** `tests/golden/vyrn_replica_vectors.txt` at the repository root lists frame
 //! sequences and the verdict a conforming replica reaches on each one. `tests/conformance.rs`
-//! runs them.
+//! runs them. `tests/replay.rs` runs a live engine through `vyrn_log::SeqWriter`, this order core
+//! and [`RustReplay`], and checks that replay reproduces the live run byte for byte.
 #![deny(unsafe_code)]
 #![deny(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -84,6 +85,7 @@ pub mod hashlag;
 pub mod lane;
 pub mod order;
 pub mod ports;
+pub mod rust;
 
 // Listed in UNSAFE.toml; the only module of this crate allowed to contain `unsafe`.
 #[allow(unsafe_code)]
@@ -99,3 +101,4 @@ pub use ports::{
     BlockInputs, BlockOutputs, CanonicalStateWriter, EpochView, ReplayEngine, ReplayError,
     StateSnapshot,
 };
+pub use rust::{OUTPUT_DOMAIN, RustReplay, output_hash};

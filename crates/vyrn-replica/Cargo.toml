@@ -7,12 +7,16 @@ license-file.workspace = true
 publish = false
 description = "The replica: two-path order frames, data fetch, replay engine (Rust or Vx), state roots, votes."
 
-# Layer 6 (spec/11-build.md §1.4): vyrn-engine (4) for replay payloads, vyrn-epoch (5) for the
+# Layer 6 (spec/11-build.md §1.4): vyrn-engine (4) for replay, with the engine types its Sink and
+# Visibility bounds name (vyrn-bbo, vyrn-lane, vyrn-cut, below it); vyrn-epoch (5) for the
 # handoff, vyrn-consensus (4) and vyrn-log (2).
 [dependencies]
 vyrn-types = { workspace = true }
 vyrn-crypto = { workspace = true }
 vyrn-engine = { workspace = true }
+vyrn-bbo = { workspace = true }
+vyrn-lane = { workspace = true }
+vyrn-cut = { workspace = true }
 vyrn-epoch = { workspace = true }
 vyrn-wire = { workspace = true }
 vyrn-consensus = { workspace = true }
@@ -24,6 +28,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 prometheus-client = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# The engine's test harness (`tests/replay.rs` includes it by path) builds its box from these.
+vyrn-risk = { workspace = true }
 
 [lints]
 workspace = true
