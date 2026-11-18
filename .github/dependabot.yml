@@ -1,0 +1,13 @@
+# Weekly update PRs for the pinned GitHub Actions (CDPI S10). Workflows pin every action to a
+# full commit SHA with its tag in a comment; Dependabot keeps that form, moving SHA and comment.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
