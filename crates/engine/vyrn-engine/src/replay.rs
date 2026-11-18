@@ -19,7 +19,9 @@
 //!   A `Route` record is part of its packet's lane call and is compared like the packet's.
 
 use vyrn_bbo::admit::NeverLate;
-use vyrn_bbo::{Cut, CutDelta, Diverge, MAX_LANES, Record, ReplayStep, StepEntry, TxEntry};
+use vyrn_bbo::{
+    ControlCmd, Cut, CutDelta, Diverge, MAX_LANES, Phase, Record, ReplayStep, StepEntry, TxEntry,
+};
 use vyrn_cut::LaneCutEntry;
 use vyrn_cut::Visibility;
 use vyrn_lane::{Mid, RespPkt, RxIn};
@@ -337,6 +339,42 @@ fn is_mid(p: &PacketRecord) -> bool {
     p.flags & PacketFlags::MID != 0
 }
 
+/// Bytes of a `Control` step's payload (07 §3.8 "code, argument"): `code` u8 (1 Phase, 2
+/// Band, as `ControlCmd`'s line), `phase` u8 (0 for Band), `lo` u32 LE, `hi` u32 LE
+/// [Reading: 07 §3.8 names the fields, not their layout; PR body].
+pub const CONTROL_PAYLOAD_LEN: usize = 10;
+
+/// `c` as a `Control` step's payload; `None` for `Uncross` and `Seal`, which have their own step
+/// kinds.
+pub fn control_payload(c: &ControlCmd) -> Option<[u8; CONTROL_PAYLOAD_LEN]> {
+    let (code, phase, lo, hi) = match *c {
+        ControlCmd::Phase { phase, lo, hi } => (1, phase.code(), lo, hi),
+        ControlCmd::Band { lo, hi } => (2, 0, lo, hi),
+        ControlCmd::Uncross { .. } | ControlCmd::Seal => return None,
+    };
+    let ([l0, l1, l2, l3], [h0, h1, h2, h3]) = (lo.0.to_le_bytes(), hi.0.to_le_bytes());
+    Some([code, phase, l0, l1, l2, l3, h0, h1, h2, h3])
+}
+
+/// The command a `Control` step's payload names ([`control_payload`]'s inverse).
+pub fn control_of_payload(b: &[u8]) -> Option<ControlCmd> {
+    let b: &[u8; CONTROL_PAYLOAD_LEN] = b.try_into().ok()?;
+    let [code, phase, l0, l1, l2, l3, h0, h1, h2, h3] = *b;
+    let (lo, hi) = (
+        Tick(u32::from_le_bytes([l0, l1, l2, l3])),
+        Tick(u32::from_le_bytes([h0, h1, h2, h3])),
+    );
+    match (code, phase) {
+        (1, p) => Some(ControlCmd::Phase {
+            phase: Phase::from_code(p)?,
+            lo,
+            hi,
+        }),
+        (2, 0) => Some(ControlCmd::Band { lo, hi }),
+        _ => None,
+    }
+}
+
 /// One whole step as 07 delivers it (§3.8, merged by StepId): kind, source, cut, kind payload.
 /// Every other `StepEntry` field is an output of replay (07 §7.1 "Fields replay derives").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -351,7 +389,7 @@ pub struct WireStep<'p> {
     /// `cut[l]` for every lane of the box.
     pub cut: &'p [LaneSeq],
     /// The kind payload; for `Rescan`, `band_lo` u32 LE then `band_hi` u32 LE, or empty for all
-    /// ticks (07 §3.8, §7.1).
+    /// ticks (07 §3.8, §7.1); for `Control`, [`control_payload`]'s bytes.
     pub payload: &'p [u8],
 }
 
@@ -601,6 +639,14 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             }
             if !covered {
                 return Err(at(Why::Order));
+            }
+            // The live control role queued the command before this step (05 §8.8); replay
+            // queues the one the step's payload names.
+            if w.kind == StepKind::Control {
+                let c = control_of_payload(w.payload).ok_or(at(Why::BadStep))?;
+                if !self.command(&c) {
+                    return Err(at(Why::BadStep));
+                }
             }
             let mut cut: Cut = [LaneSeq(0); MAX_LANES];
             for (d, c) in cut.iter_mut().zip(w.cut) {

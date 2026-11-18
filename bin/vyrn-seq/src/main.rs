@@ -55,7 +55,8 @@
 //!
 //! **Events on stdout**, one line each, for tests and operators: `LAYOUT engine=<core|unpinned>
 //! stream=<core|unpinned> control=main`, `REPAIR addr=<ip:port>` (with `[repair]`), `READY ...`,
-//! `BLOCK height=<h> first_step=<s> last_step=<s>`, `NOTICE lane=<l> next=<e> secs=<s>`, and at
+//! `BLOCK height=<h> first_step=<s> last_step=<s>`, `NOTICE lane=<l> next=<e> secs=<s>`,
+//! `CONTROL step=<id> phase=<halt|resume>` as it frames a finality-gate `Control` step, and at
 //! exit `STATS records=<n> steps=<n> blocks=<n> responses=<n> tx=<n> tx_unsent=<n>
 //! seal_violations=<n> handoff_full=<n>`, then with `[repair]` `REPAIR_STATS retain_dropped=<n>
 //! served=<n> missed=<n> limited=<n> bad=<n>`.
@@ -142,6 +143,8 @@ enum Out {
     Route(RouteRecord),
     GroupEnd,
     Step(StepEntry, u8, [CutDelta; MAX_LANES]),
+    /// The payload of the next `Control` step: the engine queued its command (07 §3.8, §6.8).
+    Control([u8; vyrn_engine::CONTROL_PAYLOAD_LEN]),
     Resp(LaneId, Endpoint, RespPkt),
     /// A fill TX packet (05 §8.10 rules 1 and 2), its records cut to one response's worth.
     Tx(Endpoint, TxEntry, u8, [Record; MAX_RECS]),
@@ -268,7 +271,7 @@ where
         .map(|s| Ok((dev_sid(s)?, config::hex::<16>(&s.k_out)?)))
         .collect::<Result<_, String>>()?;
     let block = Duration::from_millis(cfg.replication.block_ms);
-    let plan = EnginePlan::from(cfg)?;
+    let mut plan = EnginePlan::from(cfg)?;
     let fin = match &cfg.consensus {
         Some(c) => {
             let st = Arc::clone(&stats);
@@ -282,6 +285,7 @@ where
                 Arc::clone(&stop),
             )?;
             println!("CONSENSUS ctrl={}", f.ctrl);
+            plan.gate = Some(Arc::clone(&f.counts));
             Some(f)
         }
         None => None,
@@ -328,6 +332,7 @@ where
                         stats,
                         pending: Vec::new(),
                         pending_tx: Vec::new(),
+                        control: std::collections::VecDeque::new(),
                     };
                     // Ends the engine's wait on a full ring, and the engine loop, however this
                     // thread exits: a return, an error, or a panic that unwinds.
@@ -517,6 +522,8 @@ struct EnginePlan {
     sessions: Vec<(usize, SessionSpec, u64, u64)>,
     notifier: Option<Notifier>,
     seal: String,
+    /// The finality gate's `HaltReq` (07 §6.8), with `[consensus]`.
+    gate: Option<Arc<finality::Counts>>,
 }
 
 impl EnginePlan {
@@ -597,6 +604,7 @@ impl EnginePlan {
             sessions,
             notifier,
             seal: cfg.cores.seal.clone(),
+            gate: None,
         })
     }
 }
@@ -806,6 +814,8 @@ fn engine_loop<R: RxRing>(
     // A fault stays a `Copy` value until the allocator is unsealed: formatting it here would
     // allocate, and under `seal = "abort"` turn the fail-stop into an abort.
     let mut fault: Option<Fault> = None;
+    let gate = plan.gate.clone();
+    let mut halted = false;
     while !stop.load(Ordering::Acquire) && !sink.tx.dead {
         let mut got = 0usize;
         for (l, rx) in rxs.iter_mut().enumerate() {
@@ -826,6 +836,20 @@ fn engine_loop<R: RxRing>(
         sink.flush();
         if fault.is_some() {
             break;
+        }
+        // 07 §6.8: the gate's HaltReq becomes the BBO core's next step. The stream thread gets
+        // the command's payload first, so it frames that Control step with it.
+        if let Some(g) = &gate {
+            let want = g.halt_req.load(Ordering::Acquire);
+            if want != halted {
+                let c = finality::gate_cmd(want);
+                if let Some(p) = vyrn_engine::control_payload(&c)
+                    && engine.command(&c)
+                {
+                    halted = want;
+                    sink.send(Out::Control(p));
+                }
+            }
         }
         if got == 0 {
             std::thread::yield_now();
@@ -956,6 +980,8 @@ struct StreamCore<T: TxRing> {
     stats: Arc<Stats>,
     pending: Vec<(LaneId, Endpoint, RespPkt)>,
     pending_tx: Vec<(Endpoint, TxEntry, u8, [Record; MAX_RECS])>,
+    /// Payloads of queued commands, for their `Control` steps in order.
+    control: std::collections::VecDeque<[u8; vyrn_engine::CONTROL_PAYLOAD_LEN]>,
 }
 
 impl<T: TxRing> StreamCore<T> {
@@ -1028,6 +1054,10 @@ impl<T: TxRing> StreamCore<T> {
             Out::Pkt(p, full) => self.writer.packet(p, full),
             Out::Route(t) => self.writer.route(t),
             Out::GroupEnd => return Ok(()),
+            Out::Control(p) => {
+                self.control.push_back(p);
+                return Ok(());
+            }
             Out::Step(e, n, ds) => {
                 for d in ds.iter().take(usize::from(n)) {
                     if let Some(c) = self.cut.get_mut(usize::from(d.lane.0)) {
@@ -1036,8 +1066,30 @@ impl<T: TxRing> StreamCore<T> {
                 }
                 let kind = StepKind::from_code(e.kind).ok_or("unknown step kind")?;
                 let src = has_src(kind).then_some((e.src_lane, e.src_lane_seq));
-                // Spec gap: the engine's StepEntry carries no payload for Rescan, Control, Seal
-                // and Uncross (07 §3.8), so those steps are framed with an empty one.
+                // Spec gap: the engine's StepEntry carries no payload for Rescan, Seal and
+                // Uncross (07 §3.8), so those steps are framed with an empty one. A Control
+                // step takes the payload of the command the engine queued for it.
+                let payload = if kind == StepKind::Control {
+                    let p = self
+                        .control
+                        .pop_front()
+                        .ok_or("Control step without a queued command")?;
+                    let what = match vyrn_engine::control_of_payload(&p) {
+                        Some(vyrn_bbo::ControlCmd::Phase {
+                            phase: Phase::Halted,
+                            ..
+                        }) => "halt",
+                        Some(vyrn_bbo::ControlCmd::Phase {
+                            phase: Phase::Continuous,
+                            ..
+                        }) => "resume",
+                        _ => "other",
+                    };
+                    println!("CONTROL step={} phase={what}", e.step.0);
+                    p.to_vec()
+                } else {
+                    Vec::new()
+                };
                 // The route bit (05 §4.15, 07 §3.8 src byte bit 7) travels with the source op.
                 let flags = if src.is_some() && e.flags & vyrn_bbo::STEP_CROSS != 0 {
                     StepFlags::CROSS
@@ -1045,7 +1097,7 @@ impl<T: TxRing> StreamCore<T> {
                     0
                 };
                 self.writer
-                    .step(e.step, kind, src, flags, Vec::new(), &self.cut)
+                    .step(e.step, kind, src, flags, payload, &self.cut)
             }
             Out::Resp(l, ep, p) => {
                 self.pending.push((l, ep, p));

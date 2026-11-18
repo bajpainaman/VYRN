@@ -7,10 +7,13 @@
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, UdpSocket};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use vyrn_consensus::cert::finalize_message;
 use vyrn_consensus::{FinalizeVote, Proposal, ProposalKind, ctrl};
-use vyrn_types::{Epoch, Hash, Height, Mode};
+use vyrn_types::{BookId, Epoch, Hash, Height, LaneId, Mode};
+use vyrn_wire::{Msg, ReqHeader, encode_request};
 
 const SEED: [u8; 32] = [0x42; 32];
 
@@ -181,6 +184,199 @@ genesis_hash = "{}"
     drop(child.stdin.take());
     let f = lines.find(|l| l.starts_with("FINALITY")).unwrap();
     assert_eq!(f, "FINALITY votes=4 refused=1 final=3");
+    assert!(child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 07 §6.8 enforced: with no votes, more than `FIN_GATE_BLOCKS` = 8 closed blocks ahead of
+/// finality puts `HaltReq` on the control ring, and the engine logs a `Control` step; votes that
+/// finalize the closed run resume the book with a second one. Heartbeats make the blocks and no
+/// steps, so the box's two steps are exactly the gate's.
+#[test]
+fn gate_halts_and_resumes_the_book_with_control_steps() {
+    const K_SEQ: [u8; 16] = [0x11; 16];
+    let dir = std::env::temp_dir().join(format!("vyrn-seq-gate-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let keys: Vec<[u8; 32]> = (0..4)
+        .map(|i| vyrn_crypto::ed25519::public_key(&vote_seed(i)))
+        .collect();
+    let seq_key = vyrn_crypto::ed25519::public_key(&SEED);
+    let (roster_hex, roster_hash) = roster(&keys, &[1, 2, 3, 4], [seq_key, [0x77; 32]]);
+    let roster_file = dir.join("roster.hex");
+    std::fs::write(&roster_file, roster_hex).unwrap();
+    let cfg = dir.join("seq.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"schema = 1
+protocol = 1
+role = "seq"
+mode = "BASE"
+home = "LDN"
+book = 7
+
+[engine]
+dedicated = 2
+tick_min = 1
+tick_max = 512
+win_center = 100
+
+[nic]
+backend = "kernel_udp"
+ip = "127.0.0.1"
+port_base = 0
+
+[replication]
+order = ["{}"]
+block_ms = 2
+
+[keys]
+seq = "env:VYRN_GATE_SEQ_SEED"
+
+[[dev_session]]
+lane = 0
+slot = 1
+account = 1
+k_seq = "{}"
+k_out = "{}"
+quote = 1000000000000
+base = 1000000000
+
+[consensus]
+ctrl = "127.0.0.1:0"
+roster = "{}"
+roster_hash = "{roster_hash}"
+genesis_hash = "{}"
+"#,
+            replica.local_addr().unwrap(),
+            hex(&K_SEQ),
+            hex(&[0x22; 16]),
+            roster_file.display(),
+            hex(&[0; 32])
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vyrn-seq"))
+        .arg("--config")
+        .arg(&cfg)
+        .arg("--stop-on-stdin-eof")
+        .env("VYRN_GATE_SEQ_SEED", hex(&SEED))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    let out = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for l in BufReader::new(out).lines() {
+            if tx.send(l.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    // Lines read but not yet asked for: the listener's `GATE` and the stream thread's
+    // `CONTROL` lines may come in either order.
+    let seen = std::cell::RefCell::new(Vec::<String>::new());
+    let take = |want: &str, wait: Duration| -> Option<String> {
+        let mut seen = seen.borrow_mut();
+        if let Some(i) = seen.iter().position(|l| l.starts_with(want)) {
+            return Some(seen.remove(i));
+        }
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            if let Ok(l) = rx.recv_timeout(Duration::from_millis(1)) {
+                if l.starts_with(want) {
+                    return Some(l);
+                }
+                seen.push(l);
+            }
+        }
+        None
+    };
+    let next = |want: &str| {
+        take(want, Duration::from_secs(20)).unwrap_or_else(|| panic!("no {want} line"))
+    };
+    let ctrl_addr: SocketAddr = next("CONSENSUS ctrl=")["CONSENSUS ctrl=".len()..]
+        .parse()
+        .unwrap();
+    let lane0: SocketAddr = next("READY vyrn-seq lanes=2 rx=")
+        ["READY vyrn-seq lanes=2 rx=".len()..]
+        .split(',')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Heartbeats until the gate halts the book.
+    let session = vyrn_wire::session_id(1, LaneId(0), 1).unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut buf = [0u8; vyrn_types::MAX_REQ_PAYLOAD];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut pkt_seq = 0u32;
+    let halt = loop {
+        assert!(Instant::now() < deadline, "no GATE halt");
+        pkt_seq += 1;
+        let hdr = ReqHeader::new(session, pkt_seq, Epoch(0).low16(), BookId(7), false);
+        let n = encode_request(&mut buf, hdr, &[Msg::Heartbeat], &K_SEQ, None).unwrap();
+        client.send_to(&buf[..n], lane0).unwrap();
+        if let Some(l) = take("GATE halt", Duration::from_millis(3)) {
+            break l;
+        }
+    };
+    // `GATE halt closed=<h> final=0`, at the first lag over 8.
+    let closed: u64 = halt
+        .strip_prefix("GATE halt closed=")
+        .and_then(|r| r.split(' ').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(halt, format!("GATE halt closed={closed} final=0"));
+    // The listener checks every ~1 ms, so a loaded box may close a block or two more first.
+    assert!(
+        closed >= 9,
+        "halts only past lag FIN_GATE_BLOCKS = 8: {halt}"
+    );
+
+    let halt_step = next("CONTROL ");
+    assert!(halt_step.ends_with(" phase=halt"), "{halt_step}");
+
+    // Finalize 1..=closed: lag 0 <= REP_GATE_RESUME_BLOCKS resumes.
+    let proposal = Proposal {
+        kind: ProposalKind::Headers,
+        epoch: Epoch(0),
+        first_height: Height(1),
+        last_height: Height(closed),
+        last_hash: Hash([7; 32]),
+        excl_root: Hash([0; 32]),
+    };
+    let msg = finalize_message(Epoch(0), 1, 0, &proposal, None);
+    for i in 0..3 {
+        let v = FinalizeVote {
+            epoch: Epoch(0),
+            view: 1,
+            parent_view: 0,
+            proposal,
+            index: i,
+            sig: vyrn_crypto::ed25519::sign(&vote_seed(i), &msg),
+            seal: None,
+        };
+        client.send_to(&ctrl::encode_vote(&v), ctrl_addr).unwrap();
+    }
+    let resume = next("GATE resume");
+    // The halt's Control step itself may close one more block (lag 1, still <= 4).
+    assert!(
+        resume.contains(&format!(" final={closed} halted_ms=")) && !resume.contains("reopen="),
+        "{resume}"
+    );
+    let resume_step = next("CONTROL ");
+    assert!(resume_step.ends_with(" phase=resume"), "{resume_step}");
+    drop(child.stdin.take());
+    let stats = next("STATS");
+    assert!(
+        stats.contains(" steps=2 "),
+        "one Control step each way: {stats}"
+    );
     assert!(child.wait().unwrap().success());
     let _ = std::fs::remove_dir_all(&dir);
 }

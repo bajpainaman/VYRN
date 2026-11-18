@@ -13,9 +13,16 @@
 //! `FINAL height=<h> view=<v> from=<votes|cert>` each time `final_height` moves.
 //!
 //! **Gate.** At every block close the stream thread's block count gives `closed_height`; the
-//! listener runs `Gate::check(closed_height, final_height)` and prints `GATE halt ...` or
-//! `GATE resume ...`. Putting `HaltReq` on the BBO control ring is not wired yet (follow-up): the
-//! gate is observed, not enforced.
+//! listener runs `Gate::check(closed_height, final_height)`, prints `GATE halt ...` or
+//! `GATE resume ... halted_ms=<n>`, and sets [`Counts::halt_req`]. The engine loop reads it once a
+//! turn and puts [`gate_cmd`] on the BBO control ring (`HaltReq`, 07 §6.8): the next step is
+//! `Control(Halt)` (`Phase::Halted`; every lane answers new ops `BOOK_HALTED`) or
+//! `Control(Resume)` (`Phase::Continuous`). The stream thread frames that step with the
+//! command's payload (`vyrn_engine::control_payload`), so replay queues the same command.
+//!
+//! **Resume after > `REP_GATE_AUCTION_MS`** (reading, **semantics**): 07 §6.8 reopens through a
+//! reopening auction (08) after a halt longer than 1000 ms. The auction is not wired, so this
+//! build resumes continuous trading at once and prints `reopen=continuous` on such a resume.
 //!
 //! **Committee** from the roster file `[consensus] roster` through
 //! `vyrn_epoch::Membership::from_roster`, with the DEV `EpoConfig` of `vyrn-validator` (home and
@@ -27,12 +34,13 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use vyrn_bbo::{ControlCmd, Phase};
 use vyrn_consensus::ctrl::{self, Ctrl};
 use vyrn_consensus::{Gate, GateAction, Listener};
 use vyrn_epoch::{Domain, EpoConfig, Membership};
-use vyrn_types::{Epoch, Hash, Height, HomeCode, Mode, Nanos, PubKey};
+use vyrn_types::{Epoch, Hash, Height, HomeCode, Mode, Nanos, PubKey, Tick};
 
 use crate::config::{Consensus, hex};
 
@@ -42,6 +50,25 @@ pub struct Counts {
     pub votes: AtomicU64,
     pub refused: AtomicU64,
     pub final_height: AtomicU64,
+    /// The gate wants the book halted (07 §6.8 `HaltReq`); the engine loop applies changes.
+    pub halt_req: AtomicBool,
+}
+
+/// `REP_GATE_AUCTION_MS` (07 §6.8): a longer halt reopens through an auction.
+const REP_GATE_AUCTION_MS: u128 = 1000;
+
+/// The control command for the gate's state: halt, or resume continuous trading (07 §6.8).
+/// `lo`/`hi` are unused by a phase change to `Halted` or `Continuous` (05 §8.8).
+pub fn gate_cmd(halt: bool) -> ControlCmd {
+    ControlCmd::Phase {
+        phase: if halt {
+            Phase::Halted
+        } else {
+            Phase::Continuous
+        },
+        lo: Tick(0),
+        hi: Tick(0),
+    }
 }
 
 /// A running listener: its CTRL address, counts and thread.
@@ -136,6 +163,7 @@ fn listen(
 ) {
     let mut buf = [0u8; 9216];
     let mut gate = Gate::default();
+    let mut since: Option<Instant> = None;
     while !stop.load(Ordering::Acquire) {
         if let Ok((n, _)) = sock.recv_from(&mut buf) {
             let before = l.final_height();
@@ -168,16 +196,29 @@ fn listen(
         if c > 0 {
             let closed_h = Height(c.saturating_sub(1));
             match gate.check(closed_h, l.final_height()) {
-                GateAction::Halt => println!(
-                    "GATE halt closed={} final={}",
-                    closed_h.0,
-                    l.final_height().0
-                ),
-                GateAction::Resume => println!(
-                    "GATE resume closed={} final={}",
-                    closed_h.0,
-                    l.final_height().0
-                ),
+                GateAction::Halt => {
+                    counts.halt_req.store(true, Ordering::Release);
+                    since = Some(Instant::now());
+                    println!(
+                        "GATE halt closed={} final={}",
+                        closed_h.0,
+                        l.final_height().0
+                    );
+                }
+                GateAction::Resume => {
+                    counts.halt_req.store(false, Ordering::Release);
+                    let ms = since.take().map_or(0, |t| t.elapsed().as_millis());
+                    let reopen = if ms > REP_GATE_AUCTION_MS {
+                        " reopen=continuous"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "GATE resume closed={} final={} halted_ms={ms}{reopen}",
+                        closed_h.0,
+                        l.final_height().0
+                    );
+                }
                 GateAction::Hold => {}
             }
         }
