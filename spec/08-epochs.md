@@ -97,6 +97,7 @@ struct EpoConfig {            // control record in the log of epoch e (07 contro
     version: u32,             // engine semantics version in force for the epoch (§9.4)
     endpoint_hash: Hash,      // the endpoint table of home(epoch) (§11.1)
     flags: u16,               // bit0 skip (the epoch is empty), bit1 date roll, bit2 leap second
+    sig_scheme: SigScheme,    // scheme of every live key and signature of `epoch` (01 §3, §14.20)
 }
 ```
 
@@ -108,6 +109,12 @@ Rules:
 - 10 publishes the full `lane_map(e+1)` with the same lead (10 §1.4, `ACC_MAP_PUBLISH_LEAD_S`).
 - The `HandoffRecord` covers `EpoConfig` through `log_hash`, so the certificate certifies the next
   epoch's configuration as well as the final state.
+- **`sig_scheme`** follows 01 §14.20 SG1–SG6, the signature form of 04 §12's VR4: it changes only
+  here, at a boundary, never decreases, and `roster_hash` of an epoch with `sig_scheme` ≥ 1 names
+  hybrid keys only. A carried-forward configuration (first rule) keeps the previous
+  `sig_scheme`, so a missing record cannot downgrade it. `HandoffCert(e)` is signed under
+  `EpoConfig(e).sig_scheme` and certifies `EpoConfig(e+1)`, so the last scheme-0 certificate
+  certifies the first hybrid roster.
 
 ### 2.4 How T is announced: `EpochNotice`
 
@@ -443,6 +450,9 @@ off size field          value
 120      end
 ```
 
+Under `EpoConfig(e+1).sig_scheme` = 1 (01 §14.20), `next_seq_key` is the 1,344-byte hybrid key
+and the record is 1,432 bytes; the layout is otherwise unchanged.
+
 - `state_root` = BLAKE3 `derive_key("vyrn v1 state root", lthash)`, where `lthash` is the
   2,048-byte lattice hash over every state element at S: accounts and balances per lane, sessions
   (keys excluded, `pkt_seq` and `resp_seq` high-water marks included), resting orders with their
@@ -460,14 +470,22 @@ struct HandoffCert {
     sigs: [(u8, Ed25519Sig); Q],   // (voting-member index in R_e, signature); distinct, ascending
 }
 // BASE: 120 + 3 × 65 = 315 bytes.  CHAIN: 120 + 4 × 65 = 380 bytes.
+// Scheme 1, hybrid signatures of 2,484 B and a 1,344 B next_seq_key:
+// BASE: 1,432 + 3 × 2,485 = 8,887 bytes.  CHAIN: 1,432 + 4 × 2,485 = 11,372 bytes.
 ```
 
 ### 5.2 Signature
 
 ```
 msg = derive_key("vyrn      v1 handoff", genesis_hash ‖ mode ‖ encode(HandoffRecord))
-sig = Ed25519_sign(VK(i, home(e)), msg)
+sig = Ed25519_sign(VK(i, home(e)), msg)       // scheme 0
+sig = Hybrid_sign(VK(i, home(e)), scheme ‖ msg) // scheme ≥ 1: both parts, 01 §14.20
 ```
+
+The scheme is `EpoConfig(e).sig_scheme`, the scheme of the epoch that ends. A `HandoffSig` is
+signed once per book per 8 h, off any hot loop: the voter runs the ML-DSA part with `PQ_HEDGE` = 8
+on its idle replay lanes after replay reached S, ≤ `PQ_SIGN_MAX_US` = 250 µs, inside the 1 ms
+`t_sign` of §6.1.
 
 `genesis_hash` and `mode` stop a record from one deployment or mode from verifying in another. The
 key is the member's vote key (09 §2.2), because a handoff signature is a consensus statement and
@@ -510,7 +528,10 @@ A node of `R_{e+1}` (and the third home) accepts cert(e, S) when every step pass
 | 4 | `log_hash` = BLAKE3 of the header at `last_height` in my log, and I hold that block's finality cert | the tail is missing | fetch tail |
 | 5 | My `state_root` at S = `record.state_root` | my replay is wrong | stop voting, alarm, re-sync from a snapshot (07) |
 
-Checks 1–2 cost Q Ed25519 verifications: ≤ 0.2 ms (budget, at ≤ 50 µs each). Checks 3–5 compare
+Checks 1–2 cost Q Ed25519 verifications: ≤ 0.2 ms (budget, at ≤ 50 µs each). Under scheme 1
+they add Q ML-DSA-44 verifications at `PQ_VERIFY_US` = 35 µs each, run in parallel on Q idle
+lane cores, so the pair costs ≤ 0.24 ms (budget). `t_ver` max (§6.1) becomes 0.25 ms, and every
+W max of §6.2 rises by ≤ 0.05 ms, inside `EPO_WINDOW_SLACK_MS`. [Likely] Checks 3–5 compare
 hashes the node already holds. A failure of check 5 at a node does not change the certificate:
 Q members of `R_e` signed it, so the node, not the certificate, is wrong.
 
@@ -1112,7 +1133,8 @@ fairness and the window length, not safety. vyrn-sim tests skew up to ±10 s (§
 ### 9.1 Sequencer keys
 
 - **Block signing.** `next_seq_key` is `SK(seq_index, home(e+1))` of the F1 sequencer box (09
-  §2.2). It is fixed in `EpoGo` and then in the `HandoffRecord`. The replicas of e+1 accept
+  §2.2), of the scheme of `EpoConfig(e+1)`. From `E_pq` on, the replicas accept no scheme-0
+  `seq_sig` for e ≥ `E_pq` (01 §14.20 SG2). It is fixed in `EpoGo` and then in the `HandoffRecord`. The replicas of e+1 accept
   `seq_sig` only under this key until a failover in e+1 moves the role to the F2 standby, whose
   `SK` the roster also holds (§10.4).
 - **Session keys.** `K_seq(e+1, i)` and `K_out(e+1, i)` come from X25519 between the session's key
@@ -1479,6 +1501,8 @@ epochs (§14.8). These remain:
 5. §6.4 `Ack`: `index = 0xFE` marks a re-ack of a carried order with a new handle after a lane
    move.
 6. §3: add `PubKey` = `[u8; 32]` (Ed25519), `Ed25519Sig` = `[u8; 64]` and `HomeCode` = u8.
+   *`PubKey` and `Ed25519Sig` resolved by 01 §3 and §14.20 (with `Sig` and `SigScheme`).*
+   Remaining: `HomeCode`.
 7. Promote `EpoConfig` (with `seq_order: [u8; 2]`) to §6.6 (10's Requests to 01, item 5, asks for
    the same record), and `EPO_WAN_OW_MS`, `EPO_HIST_HALF` and `EPO_WINDOW_SLACK_MS` to §5, since
    02, 03 and 11 use them.
