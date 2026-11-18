@@ -793,8 +793,8 @@ packet ≤ δ, because the client sends it to all 4 members).
 | `SessionRebind`, `SessionClose`, `Deallocate` debit | lane, first boundary after C is notarized | ~4.5 usable, ~8 final | 8.7 usable, 14.0 final |
 | `Deallocate` credit to free, close's bond release | end of C′, which includes that book block | ~9 | 15.2 |
 | `Move` | lane of `to` | ~9 usable, ~13 final | 15.7 usable, 21.1 final |
-| `ForcedPacket`, honest sequencer | the hint (§7.1), or the boundary after C is notarized | ~4 executed, ~7.5 final | final ≤ 10 (§7.4) |
-| `ForcedPacket`, censoring sequencer | the new sequencer's first block | — | final ≤ deadline + `FAILOVER_TARGET_MS` + `FINALITY_MAX_MS` ≈ 41 |
+| `ForcedPacket`, honest sequencer | the hint (§7.1), or the boundary after C is notarized | ~4 executed, ~7.5 final | final ≤ `CHN_FORCED_FINAL_MS` = 11.5 (§7.4) |
+| `ForcedPacket`, censoring sequencer | the new sequencer's first block | — | final ≤ deadline + `FAILOVER_TARGET_MS` + `FINALITY_MAX_MS` ≈ 42 (§7.4) |
 
 Every item has the same hard deadline, `act(C, b)`, ≤ 8 ms after C's proposal. A sequencer that
 misses it is replaced.
@@ -1055,7 +1055,7 @@ fn exclusion_list(st: &ChainState, blk: &BookBlock, pay: &Payloads) -> Exclusion
   `CHN_SESSION_BOND_MIN`) must cover that cost. **An exclusion is a second fault** (coordinator ruling,
   2026-11-18): it is not in the 07 §6.6 one-fault sum. An exclusion next to a member fault reaches
   **10.11 ms** from block start at uniform maximum delays and **up to 10.91 ms** with that skew,
-  over `FINALITY_MAX_MS`, and is outside the one-fault model. [Likely: scratch model]
+  over `FINALITY_MAX_MS`. It is a **two-fault case**, outside the one-fault model and outside REQ-FIN-1, whose conditions cover one fault at a time (02). [Likely: scratch model]
 
 ### 5.8 TagFault and suspension
 
@@ -2040,7 +2040,7 @@ No path changes the rules without 72 h of notice.
 | Byzantine sequencer | forges a client packet | needs `K_com` (§5.6) | none within f = 1 |
 | Byzantine sequencer | sends bad-`tag_com` packets of a client | busted; the client's bond pays | one bond per victim session; visible in FQ-4 |
 | Byzantine sequencer | front-runs | rotation, bond, FQ-1–FQ-3 | up to 20% of flow, until governance acts |
-| Byzantine sequencer | censors a client | forced path (§7), deadline, `Censorship` slash, failover | ≤ 2.4 ms out of the log; final ≤ ~40 ms (`FAILOVER_TARGET_MS` + `FINALITY_MAX_MS` after the deadline) |
+| Byzantine sequencer | censors a client | forced path (§7), deadline, `Censorship` slash, failover | ≤ 2.4 ms out of the log; final ≤ ~42 ms (`FAILOVER_TARGET_MS` + `FINALITY_MAX_MS` after the deadline) |
 | Byzantine sequencer | halts without cause | `CHN_HALT_GRACE_MS`, then silence and failover (§4.6) | ≤ 1 ms of `BOOK_HALTED` plus the failover |
 | Byzantine sequencer | keeps trading after T | fence, `FenceViolation`, `HandoffWithheld` | the next home starts ~10 ms later |
 | Byzantine sequencer | ignores `TagFault`s | `SESSION_DEAD` busts everything after | more busted fills, visible in FQ-4 |

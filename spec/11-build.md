@@ -1978,8 +1978,8 @@ virtualised, tuned per 06.
   block, as 02 defines the measurement point, for every block; the maximum.
 - **Pass.** max ≤ `FINALITY_MAX_MS` (10 ms) for every accepted order, healthy and with one
   replica down (01 §14.0). In either mode, a lag past the gate halts the book and no fill is
-  issued that could not be final within 10 ms. Forced packets are final ≤ 10 ms after they are
-  sent (01 §14.9). The p50 is reported against DESIGN's ~3 ms.
+  issued that could not be final within 10 ms. Forced packets are final ≤ `CHN_FORCED_FINAL_MS` = 11.5 ms after
+  they are sent (01 §14.9), their own bound, not a relaxation of `FINALITY_MAX_MS`. The p50 is reported against DESIGN's ~3 ms.
 
 ### 7.15 B12: replay throughput (Rust and Vx)
 
