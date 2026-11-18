@@ -116,10 +116,11 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
         let c = at.cut.min(self.applied);
         loop {
             let front = self.pend.front().copied();
-            if let Some(cs) = self.auction_out
+            if let Some(&(cs, st)) = self.auction_out.front()
                 && front.is_none_or(|p| p.seq > cs)
             {
-                self.auction_out = None;
+                self.auction_out.pop_front();
+                self.ev_step = st;
                 self.end_auction_only(cs);
                 continue;
             }
@@ -172,6 +173,7 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
     // B1 (05 §7.4)
 
     fn apply_event(&mut self, ev: &FillEvent, taker: &mut Option<u32>) {
+        self.ev_step = ev.step;
         let Some(kind) = ev.fill_kind() else {
             self.fault = true;
             return;
@@ -191,7 +193,11 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
                 // The auction ends (05 §8.8); histograms are a follow-up.
                 self.phase = Phase::Continuous;
                 let cstar = LaneSeq(u64::from(ev.handle.0) | (u64::from(ev.vslot) << 32));
-                self.auction_out = Some(cstar);
+                if self.auction_out.len() >= crate::lane::ENG_AUCTION_DRAIN {
+                    self.fault = true;
+                } else {
+                    self.auction_out.push_back((cstar, ev.step));
+                }
                 return;
             }
             _ => {}
@@ -1010,8 +1016,20 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
 
     /// A record of an event that the lane, not the fill TX core, sends; held until the settle
     /// of the op that created or ended version `v`, or the end of B2.
+    /// Inserted after every held record of an earlier or the same step (05 §8.10 rule 4.2), so
+    /// an auction's `Out`s, ended in B2, precede a later auction's fills from B1.
     fn emit(&mut self, v: u32, sess: u16, pkt: u32, r: Record) {
-        self.emitq.push((v, sess, pkt, r));
+        let st = self.ev_step;
+        let mut i = self.emitq.len();
+        while i > 0
+            && self
+                .emitq
+                .get(i.saturating_sub(1))
+                .is_some_and(|e| e.4 > st)
+        {
+            i = i.saturating_sub(1);
+        }
+        self.emitq.insert(i, (v, sess, pkt, r, st));
     }
 
     /// Moves held event records of version `v` (all of them for `None`) to B3, in event order.
@@ -1023,7 +1041,7 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
                 .get(i)
                 .is_some_and(|e| v.is_none_or(|v| e.0 == v));
             if take {
-                let (_, s, pkt, r) = self.emitq.remove(i);
+                let (_, s, pkt, r, _) = self.emitq.remove(i);
                 self.b3.push((s, pkt, r));
             } else {
                 i = i.saturating_add(1);

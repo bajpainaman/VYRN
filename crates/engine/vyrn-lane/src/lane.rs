@@ -43,6 +43,8 @@ pub const FWD_DEADLINE_NS: u32 = 615;
 const MAX_OPS: usize = 10;
 /// Generation of every root slot while slots are not reused (05 §4.2; reuse is a follow-up).
 pub const ROOT_GEN: u8 = 1;
+/// Uncrosses one boundary can drain (05 §8.10 known bounds); more faults the lane.
+pub const ENG_AUCTION_DRAIN: usize = 4;
 /// `TOO_LATE` details (04 §6.3).
 pub const PROTO_D_FILLED: u32 = 1;
 pub const PROTO_D_CANCELED: u32 = 2;
@@ -287,7 +289,11 @@ pub struct Lane<'a, V: Visibility, const NA: usize> {
     pub(crate) pend: std::collections::VecDeque<PendE>,
     /// `C*` of an uncross whose auction-only remainders B2 has not ended yet (05 §8.8 item 6):
     /// they end once every pending op at or before it has settled.
-    pub(crate) auction_out: Option<LaneSeq>,
+    /// One entry per uncross B1 applied at this boundary, oldest first, with the uncross's
+    /// step: a held lane can drain more than one auction at one boundary (05 §8.10 rule 4.2).
+    pub(crate) auction_out: std::collections::VecDeque<(LaneSeq, StepId)>,
+    /// Step of the event B1 is applying, or of the uncross B2 is ending; tags held records.
+    pub(crate) ev_step: StepId,
     pub(crate) evbuf: std::collections::VecDeque<vyrn_bbo::FillEvent>,
     pub(crate) fwd: std::collections::VecDeque<FwdOut>,
     pub(crate) out: Outbox,
@@ -317,8 +323,9 @@ pub struct Lane<'a, V: Visibility, const NA: usize> {
     pub(crate) b3: Vec<(u16, u32, Record)>,
     /// Pending explicit cancels forwarded as dependencies: root, op seq, op ts (rule R).
     pub(crate) dep_cancels: Vec<(u32, LaneSeq, Nanos)>,
-    /// Lane-emitted batch-taker records awaiting B3: vslot, session, `pkt_seq`, record.
-    pub(crate) emitq: Vec<(u32, u16, u32, Record)>,
+    /// Lane-emitted records awaiting B3: vslot, session, `pkt_seq`, record, and the step of
+    /// the event (or uncross) that produced it; kept in step order.
+    pub(crate) emitq: Vec<(u32, u16, u32, Record, StepId)>,
 }
 
 fn rej(reason: RejectReason, detail: u32) -> RiskReject {
@@ -424,7 +431,8 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             },
             lag_max: u64::from(SNAP_LAG_MAX),
             pend: std::collections::VecDeque::with_capacity(n),
-            auction_out: None,
+            auction_out: std::collections::VecDeque::with_capacity(ENG_AUCTION_DRAIN),
+            ev_step: StepId(0),
             evbuf: std::collections::VecDeque::with_capacity(ENG_FILL_RING),
             fwd: std::collections::VecDeque::with_capacity(ENG_FWD_RING),
             out: Outbox::new(cfg.out_cap),
