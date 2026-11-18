@@ -132,7 +132,12 @@ pub struct OrderSide {
     pub was_frozen: bool,
     /// Its TailReport went to the consensus thread in this failover.
     pub reported: bool,
-    pub sealed: bool,
+    /// The decided prefix and `next_seq`, once taken (07 §9.3).
+    pub decision: Option<(Prefix, u8)>,
+    /// The candidate seal's `unavail` length; `None` before one is built, or after `NO_SEAL`.
+    /// While it is above zero, a payload that arrives later rebuilds the candidate (Codex
+    /// r4618710713), so voters that held different payloads at the decision converge.
+    pub unavail: Option<usize>,
     /// ORDER datagrams drained unread since deposition (INV-REP-5).
     pub dropped: u64,
 }

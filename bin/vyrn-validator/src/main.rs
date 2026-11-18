@@ -689,7 +689,8 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
             me: u8::try_from(p.me).unwrap_or(u8::MAX),
             was_frozen: false,
             reported: false,
-            sealed: false,
+            decision: None,
+            unavail: None,
             dropped: 0,
         }),
         _ => None,
@@ -1599,10 +1600,16 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                             f.dropped = f.dropped.saturating_add(n as u64);
                         }
                     }
-                    if !f.sealed
-                        && let Some((p, next)) = f.shared.take_decision()
-                    {
-                        f.sealed = true;
+                    let fresh = f.decision.is_none();
+                    if fresh {
+                        f.decision = f.shared.take_decision();
+                    }
+                    let retry = !fresh
+                        && data.is_some()
+                        && f.unavail.is_some_and(|n| n > 0)
+                        && f.decision
+                            .is_some_and(|(p, _)| source.final_height() < p.height.0);
+                    if let Some((p, next)) = f.decision.filter(|_| fresh || retry) {
                         let star = vyrn_consensus::BlockSource::header(source, p.height);
                         let join = data
                             .as_mut()
@@ -1615,9 +1622,16 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                             .and_then(|()| core.tail().ok_or_else(|| "no ready block".to_string()))
                             .and_then(|t| depose::seal(&t, &p, next, 0, star, join));
                         match s {
+                            // A rebuild replaces the candidate only when it holds more payloads.
+                            Ok(s)
+                                if retry && f.unavail.is_some_and(|n| s.ext.unavail.len() >= n) => {
+                            }
+                            Err(_) if retry => {}
                             Ok(s) => {
+                                f.unavail = Some(s.ext.unavail.len());
                                 println!(
-                                    "SEAL height={} end_a={} end_b={} last_step={} next_seq={} unavail={}",
+                                    "{} height={} end_a={} end_b={} last_step={} next_seq={} unavail={}",
+                                    if retry { "RESEAL" } else { "SEAL" },
                                     s.header.height.0,
                                     s.ext.end_frame_seq[0],
                                     s.ext.end_frame_seq[1],
