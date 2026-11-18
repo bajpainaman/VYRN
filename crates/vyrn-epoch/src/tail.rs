@@ -31,14 +31,18 @@ pub const EPO_TAIL_REQ_MAX: usize = 1_024;
 const HEADER_BYTES: usize = 2 + 4 + 4 + 1 + 2;
 
 /// What a follower holds of epoch e above its last snapshot or certified start.
+///
+/// A finality certificate for a block also finalizes every ancestor (07 §2.1), so the follower
+/// keeps one certified frontier, not one flag per height: state is final through the contiguous
+/// held prefix up to that frontier.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TailFollow {
     /// Every height at or below this is held and final.
     final_height: Height,
     /// Held above `final_height`, finalized or not.
     held: BTreeSet<u64>,
-    /// Held above `final_height` with a finality certificate.
-    finalized: BTreeSet<u64>,
+    /// The highest height with a finality certificate seen, held or not.
+    certified: Height,
 }
 
 impl TailFollow {
@@ -47,11 +51,11 @@ impl TailFollow {
         Self {
             final_height: base,
             held: BTreeSet::new(),
-            finalized: BTreeSet::new(),
+            certified: base,
         }
     }
 
-    /// A block's frames arrived (speculative until [`TailFollow::on_final`]).
+    /// A block's frames arrived (speculative until a certificate at or above it).
     pub fn on_block(&mut self, h: Height) {
         if h > self.final_height {
             self.held.insert(h.0);
@@ -59,25 +63,16 @@ impl TailFollow {
         self.advance();
     }
 
-    /// A finality certificate for `h` arrived. Finality of a height the follower does not hold
-    /// yet is remembered; the height counts once its frames arrive.
+    /// A finality certificate for `h` arrived: `h` and every ancestor are final. Heights the
+    /// follower does not hold yet become final once their frames arrive.
     pub fn on_final(&mut self, h: Height) {
-        if h > self.final_height {
-            self.finalized.insert(h.0);
-        }
+        self.certified = self.certified.max(h);
         self.advance();
     }
 
     fn advance(&mut self) {
-        loop {
-            let next = self.final_height.0 + 1;
-            if self.held.contains(&next) && self.finalized.contains(&next) {
-                self.held.remove(&next);
-                self.finalized.remove(&next);
-                self.final_height = Height(next);
-            } else {
-                break;
-            }
+        while self.final_height < self.certified && self.held.remove(&(self.final_height.0 + 1)) {
+            self.final_height = Height(self.final_height.0 + 1);
         }
     }
 
@@ -95,12 +90,14 @@ impl TailFollow {
         Height(h)
     }
 
-    /// Heights through `last_height` (the certificate's) that this follower does not hold, or
-    /// holds without a finality certificate: what check 4 of §5.4 waits for. Ascending, at most
-    /// `max` of them.
+    /// What check 4 of §5.4 waits for before `last_height` (the certificate's) is final here:
+    /// every height through it that this follower does not hold, and `last_height` itself when
+    /// no certificate at or above it has arrived (its certificate finalizes the rest). Ascending,
+    /// at most `max`.
     pub fn missing(&self, last_height: Height, max: usize) -> Vec<Height> {
+        let uncertified = self.certified < last_height;
         (self.final_height.0 + 1..=last_height.0)
-            .filter(|h| !(self.held.contains(h) && self.finalized.contains(h)))
+            .filter(|h| !self.held.contains(h) || (uncertified && *h == last_height.0))
             .take(max)
             .map(Height)
             .collect()
@@ -277,27 +274,32 @@ mod tests {
             (f.final_height(), f.spec_height()),
             (Height(10), Height(13))
         );
-        // Finality out of order: 12 before 11, and 14 before its frames.
+        assert_eq!(f.missing(Height(15), 10), [Height(14), Height(15)]);
+        // One certificate at 12 finalizes 11 and 12 (07 §2.1).
         f.on_final(Height(12));
-        f.on_final(Height(14));
-        assert_eq!(f.final_height(), Height(10));
-        f.on_final(Height(11));
         assert_eq!(f.final_height(), Height(12));
+        // A certificate at 15 above a gap at 14 finalizes only through 13.
+        f.on_final(Height(15));
         assert_eq!(
-            f.missing(Height(15), 10),
-            [Height(13), Height(14), Height(15)]
+            (f.final_height(), f.spec_height()),
+            (Height(13), Height(13))
         );
-        assert_eq!(f.missing(Height(15), 1), [Height(13)]);
-        f.on_final(Height(13));
+        assert_eq!(f.missing(Height(15), 10), [Height(14)]);
+        assert_eq!(f.missing(Height(16), 1), [Height(14)]);
+        // A certificate that arrived before the frames counts once they arrive.
         f.on_block(Height(14));
         assert_eq!(
             (f.final_height(), f.spec_height()),
-            (Height(14), Height(15))
+            (Height(15), Height(15))
         );
-        assert_eq!(f.missing(Height(15), 10), [Height(15)]);
+        assert_eq!(f.missing(Height(15), 10), Vec::<Height>::new());
+        // Held but uncertified: the last height's certificate is what is missing.
+        f.on_block(Height(16));
+        assert_eq!(f.missing(Height(16), 10), [Height(16)]);
         // Anything at or below the final height is ignored.
         f.on_block(Height(3));
-        assert_eq!(f.missing(Height(14), 10), Vec::<Height>::new());
+        f.on_final(Height(4));
+        assert_eq!(f.final_height(), Height(15));
     }
 
     #[test]
