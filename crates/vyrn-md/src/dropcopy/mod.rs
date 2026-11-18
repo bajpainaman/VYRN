@@ -43,7 +43,7 @@ pub mod wire;
 
 use std::collections::{BTreeMap, VecDeque};
 
-use vyrn_replica::sink::{OUT_STP, ROLE_MAKER, ROLE_TAKER, Record as Resp};
+use vyrn_replica::sink::{OUT_STP, ROLE_DEPS, ROLE_MAKER, ROLE_TAKER, Record as Resp, TxEntry};
 use vyrn_types::{
     AccountId, BookId, Handle, Height, LaneId, LaneSeq, Qty, SessionId, StepFlags, StepId,
     StepKind, Tick,
@@ -886,7 +886,7 @@ impl<O: DcOut> DropCopy<O> {
         let mut taker_n = 0u128;
         for (h, r) in st.tx {
             match (h.role, *r) {
-                (ROLE_MAKER, Resp::Fill { tick, qty, .. }) => {
+                (_, Resp::Fill { tick, qty, .. }) if is_maker(h, r) => {
                     *levels.entry(tick.0).or_default() += i64::from(qty.0);
                     n_match += 1;
                     taker_n += u128::from(self.notional(qty, tick)?);
@@ -911,7 +911,7 @@ impl<O: DcOut> DropCopy<O> {
         };
         let mut k = 0u16;
         for (h, r) in st.tx {
-            if h.role != ROLE_MAKER {
+            if !is_maker(h, r) {
                 continue;
             }
             match *r {
@@ -1070,6 +1070,13 @@ impl<O: DcOut> DropCopy<O> {
         self.set_taker(Some((key, filled)));
         Ok(())
     }
+}
+
+/// A maker record: a maker TX packet's, or a Join dependency's own `Fill` / `Out(STP)` in the
+/// dependency TX packet (05 §8.9 role 1), whose `Ack`s and `CancelAck`s come as lane ops.
+fn is_maker(h: &TxEntry, r: &Resp) -> bool {
+    h.role == ROLE_MAKER
+        || (h.role == ROLE_DEPS && matches!(r, Resp::Fill { .. } | Resp::Out { .. }))
 }
 
 impl<O: DcOut> Tap for DropCopy<O> {

@@ -41,9 +41,15 @@
 //! carries it (10 §7.9 item 9).
 //!
 //! **Not covered yet** ([`SinkError::Unsupported`]): `Replace` (local or forwarded) and any step
-//! source other than `New`, `CancelAll`, dependency TX
-//! packets (`ROLE_DEPS`), unsolicited lane records (expiry, kills), steps without a source that
-//! fill (Rescan, Uncross) and STP causes other than STP. A `SHED` packet keeps its LaneSeqs
+//! source other than `New`, `CancelAll`, a Join dependency that trades on entry, unsolicited
+//! lane records (expiry, kills), steps without a source that fill (Rescan, Uncross) and STP
+//! causes other than STP.
+//!
+//! **Dependencies.** A dependency TX packet (`ROLE_DEPS`) resolves the source packet's earlier
+//! ops it names; they are explicit, at the step (05 §5.1 F2): their effects are step-channel
+//! events right after `MD_STEP`, in index order, before the execs, and the [`Tap`] gets them as
+//! lane ops after the step's interval. A Join dependency's maker records in it are the step's
+//! maker records in TX order (10 §7.9 item 10). A `SHED` packet keeps its LaneSeqs
 //! (07 §3.5) and its ops resolve by their `BUSY` rejects; `MID` and other Advance records change
 //! nothing.
 
@@ -129,6 +135,8 @@ struct PendStep {
     ticks: u32,
     taker: Vec<Resp>,
     maker: Vec<(LaneId, Resp)>,
+    /// The dependencies resolved by its dependency TX packet, in index order: `(lane, seq, op)`.
+    deps: Vec<(u8, u64, Op)>,
     /// Every TX record with its packet's header, in TX order (for the [`Tap`]).
     tx: Vec<(TxEntry, Resp)>,
 }
@@ -144,7 +152,8 @@ struct Resting {
 /// lane op of an interval as it is pushed, then the step that closes the interval. The order
 /// is a function of the log, whatever order the sink calls came in. Drop copy (10 §8) is one.
 pub trait Tap {
-    /// A lane op with its response record, in the interval's `(prio_ts, lane, LaneSeq)` order.
+    /// A lane op with its response record, in the interval's `(prio_ts, lane, LaneSeq)` order;
+    /// then a step's dependencies (explicit at the step, 10 §7.9 item 10), in index order.
     fn lane_op(&mut self, _op: &TapOp) {}
     /// A released step, after its interval's lane ops.
     fn step(&mut self, _st: &TapStep<'_>) {}
@@ -512,12 +521,40 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
             ticks: 0,
             taker: Vec::new(),
             maker: Vec::new(),
+            deps: Vec::new(),
             tx: Vec::new(),
         });
         Ok(())
     }
 
     fn on_tx(&mut self, h: &TxEntry, recs: &[Resp]) -> Result<(), SinkError> {
+        // A dependency TX packet (05 §8.9 role 1) answers earlier ops of the source's packet,
+        // which are explicit: positioned at this step, not in an interval (05 §5.1 F2). It also
+        // carries a Join dependency's own maker `Fill` or `Out(STP)` once that dependency rests.
+        let mut deps = Vec::new();
+        let mut dep_makers = Vec::new();
+        if h.role == ROLE_DEPS {
+            for r in recs {
+                match *r {
+                    Resp::Ack { index, .. }
+                    | Resp::CancelAck { index, .. }
+                    | Resp::Reject { index, .. } => deps.push(self.dep(h, index, *r)?),
+                    Resp::Fill { handle, .. } | Resp::Out { handle, .. } => {
+                        let rested = |d: &(u8, u64, Op)| matches!(d.2.res, Some(Resp::Ack { handle: a, .. }) if a == handle);
+                        let st = self.steps.iter().find(|s| s.step == h.step);
+                        if !deps
+                            .iter()
+                            .chain(st.iter().flat_map(|s| &s.deps))
+                            .any(rested)
+                        {
+                            // The dependency's own taker records: it crossed (05 §3.7, F4).
+                            return Err(SinkError::Unsupported("dependency that trades"));
+                        }
+                        dep_makers.push((h.lane, *r));
+                    }
+                }
+            }
+        }
         let st = self
             .steps
             .iter_mut()
@@ -528,10 +565,35 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
         match h.role {
             ROLE_TAKER => st.taker.extend_from_slice(recs),
             ROLE_MAKER => st.maker.extend(recs.iter().map(|r| (h.lane, *r))),
-            ROLE_DEPS => return Err(SinkError::Unsupported("dependency TX packet")),
+            ROLE_DEPS => {
+                st.deps.append(&mut deps);
+                st.maker.append(&mut dep_makers);
+            }
             _ => return Err(SinkError::Book),
         }
         Ok(())
+    }
+
+    /// Resolves dependency `index` of the source's packet `(h.session, h.pkt_seq)` by `r` and
+    /// marks it explicit, so no interval emits it.
+    fn dep(&mut self, h: &TxEntry, index: u8, r: Resp) -> Result<(u8, u64, Op), SinkError> {
+        let pk = self
+            .pkts
+            .get(&(h.session, h.pkt_seq))
+            .filter(|k| k.lane == h.lane.0)
+            .ok_or(SinkError::Book)?;
+        let Some(off) = pk.offset.get(usize::from(index)).copied().flatten() else {
+            return Err(SinkError::Unsupported("response to an unnumbered message"));
+        };
+        let (l, seq) = (pk.lane, pk.first + u64::from(off));
+        let op = self.op_mut(usize::from(l), seq).ok_or(SinkError::Book)?;
+        if op.fwd || op.res.is_some() {
+            return Err(SinkError::Unsupported("several records for one op"));
+        }
+        op.fwd = true;
+        op.res = Some(r);
+        op.resp_seq = h.resp_seq;
+        Ok((l, seq, *op))
     }
 
     /// Pushes every step that is complete and whose covered ops are resolved, in step order.
@@ -543,6 +605,19 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
             let st = self.steps.pop_front().ok_or(SinkError::Book)?;
             self.emit_interval(&st.covers)?;
             self.emit_step(&st)?;
+            for &(lc, seq, op) in &st.deps {
+                if let Some(rec) = op.res {
+                    self.tap.lane_op(&TapOp {
+                        lane: LaneId(lc),
+                        seq: LaneSeq(seq),
+                        session: op.pkt.0,
+                        pkt_seq: op.pkt.1,
+                        resp_seq: op.resp_seq,
+                        msg: op.msg,
+                        rec,
+                    });
+                }
+            }
             self.tap.step(&TapStep {
                 step: st.step,
                 kind: st.kind,
@@ -736,6 +811,17 @@ impl<K: PacketSink, T: Tap> SinkStream<K, T> {
                 taker: taker.unwrap_or(0),
             },
         )?;
+        // The dependencies first, in index order (05 §8.1), each as its lane op would be but on
+        // the step channel and `via BBO`: the BBO core applied it.
+        for &(lane, _, op) in &st.deps {
+            let r = op.res.ok_or(SinkError::Book)?;
+            if let Some(mut b) = self.lane_op(lane, &op, &r)? {
+                if let BookOp::Add { via_bbo, .. } = &mut b {
+                    *via_bbo = true;
+                }
+                self.push(ts, EventKind::StepOp(b))?;
+            }
+        }
         let mut ordinal = 0u16;
         for &(lane, r) in &st.maker {
             match r {
