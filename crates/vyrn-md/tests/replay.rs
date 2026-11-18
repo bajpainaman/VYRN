@@ -223,6 +223,7 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
     let mut w = SeqWriter::new(layout, ident, tenure(), SEED, 9000).unwrap();
     let mut out = Vec::new();
     let mut cut = vec![LaneSeq(0); N];
+    let mut pending = false;
     for (i, r) in j.recs.iter().enumerate() {
         match r {
             OwnedRec::Packet(p) => {
@@ -233,7 +234,7 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
                 });
                 out.extend(w.packet(*p, full).unwrap());
             }
-            OwnedRec::Route(_) => panic!("SeqWriter frames no RouteRecord yet"),
+            OwnedRec::Route(t) => out.extend(w.route(*t).unwrap()),
             OwnedRec::Step(e, d) => {
                 for x in &d[..usize::from(e.n_delta)] {
                     cut[usize::from(x.lane.0)] = x.seq;
@@ -253,7 +254,12 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
                 out.extend(w.step(e.step, kind, src, flags, payload, &cut).unwrap());
             }
         }
-        if cuts.contains(&i) || i + 1 == j.recs.len() {
+        // A packet's routes stay in its block (07 §3.6), as vyrn-seq frames them: a cut right
+        // after a packet moves past its routes.
+        let route_next = matches!(j.recs.get(i + 1), Some(OwnedRec::Route(_)));
+        pending |= cuts.contains(&i);
+        if (pending && !route_next) || i + 1 == j.recs.len() {
+            pending = false;
             out.extend(w.close_block().unwrap().0);
         }
     }
@@ -311,25 +317,14 @@ fn replay_md_equals_live_md_byte_for_byte() {
     assert_eq!(rep_md, live_md);
 }
 
-/// Splits where `RustReplay` itself diverges today (`Step(Source)` at step 10): a block
-/// boundary between the two forwarded improves of lane 1's two-message packet (after step 9,
-/// or after the Advance record that follows it). A replay gap, reported to the engine thread;
-/// the md comparison skips only these, and the test fails if any other split diverges.
-const REPLAY_GAP_SPLITS: [usize; 2] = [20, 21];
-
 #[test]
 fn every_block_split_gives_the_same_md() {
     let (j, store, live_md) = live(&script());
     let live_md = live_md.unwrap();
     for at in 0..j.recs.len() - 1 {
-        match replay_md(&j, &store, &blocks(&j, &store, &[at])) {
-            Ok(rep_md) => assert_eq!(rep_md, live_md, "split after record {at}"),
-            Err(e) => assert!(
-                REPLAY_GAP_SPLITS.contains(&at),
-                "split after record {at}: {e} ({})",
-                rec_line(&j.recs[at])
-            ),
-        }
+        let rep_md = replay_md(&j, &store, &blocks(&j, &store, &[at]))
+            .unwrap_or_else(|e| panic!("split after record {at}: {e}"));
+        assert_eq!(rep_md, live_md, "split after record {at}");
     }
 }
 
