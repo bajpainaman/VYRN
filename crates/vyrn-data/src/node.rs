@@ -43,6 +43,8 @@ pub struct NodeConfig {
     /// fetches from anyone, under one shared rate limit (DEV and tests). Otherwise only these
     /// sources are served, and only with the 40-byte authenticated form.
     pub fetch_keys: BTreeMap<Ipv4Addr, [u8; 16]>,
+    /// The epoch `fetch_keys` are for. [`DataNode::set_fetch_keys`] adds the next one.
+    pub fetch_epoch: u32,
     /// Fetches per second each source may send, refilled continuously.
     pub fetch_rate: u64,
     /// The most fetches a source may send at once after being idle.
@@ -64,6 +66,7 @@ impl NodeConfig {
             log_scan: 64,
             max_events: 1024,
             fetch_keys: BTreeMap::new(),
+            fetch_epoch: 0,
             fetch_rate: 20_000,
             fetch_burst: 256,
         }
@@ -182,6 +185,15 @@ fn pkt_key(p: &[u8]) -> (u32, u32, BookId, u16) {
     (u(0, 4), u(4, 4), BookId(u(12, 2) as u16), u(10, 2) as u16)
 }
 
+/// Why [`DataNode::set_fetch_keys`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FetchKeysErr {
+    #[error("an open-mode box takes no fetch keys")]
+    OpenMode,
+    #[error("an empty key set would serve nobody")]
+    Empty,
+}
+
 /// A token bucket in token-nanoseconds: one fetch costs `1e9`, and `rate` tokens/s refill
 /// `rate` per elapsed ns. Integer only.
 #[derive(Clone, Copy, Debug)]
@@ -230,6 +242,9 @@ pub struct DataNode<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> {
     /// One bucket per keyed source, made at construction, so a flood of new addresses grows
     /// nothing; open mode shares `open_bucket`.
     buckets: BTreeMap<Ipv4Addr, Bucket>,
+    /// `K_fetch` per requester address, for at most two epochs (08 §4.6): a fetch is served
+    /// under either. Empty forever on an open-mode box.
+    keys: Vec<(u32, BTreeMap<Ipv4Addr, [u8; 16]>)>,
     open_bucket: Bucket,
 }
 
@@ -263,7 +278,13 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
             .map(|&ip| (ip, Bucket::full(cfg.fetch_burst)))
             .collect();
         let open_bucket = Bucket::full(cfg.fetch_burst);
+        let keys = if cfg.fetch_keys.is_empty() {
+            Vec::new()
+        } else {
+            vec![(cfg.fetch_epoch, cfg.fetch_keys.clone())]
+        };
         Self {
+            keys,
             home: DataHome::new(cfg.home.clone()),
             events: Vec::with_capacity(cfg.max_events),
             cfg,
@@ -296,6 +317,50 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
     /// [`DataHome::retire_epoch`] on this box's home.
     pub fn retire_epoch(&mut self, epoch: u32) {
         self.home.retire_epoch(epoch);
+    }
+
+    /// Installs `K_fetch` of `epoch` (08 §9.6), replacing that epoch's keys if held. A box holds
+    /// two epochs' keys and serves a fetch under either (08 §4.6), so a third evicts the lowest.
+    /// Refused on an open-mode box (it stays open: a box's mode is fixed at start) and for an
+    /// empty map (which would mean nobody is served).
+    pub fn set_fetch_keys(
+        &mut self,
+        epoch: u32,
+        keys: BTreeMap<Ipv4Addr, [u8; 16]>,
+    ) -> Result<(), FetchKeysErr> {
+        if self.keys.is_empty() {
+            return Err(FetchKeysErr::OpenMode);
+        }
+        if keys.is_empty() {
+            return Err(FetchKeysErr::Empty);
+        }
+        let burst = self.cfg.fetch_burst;
+        for &ip in keys.keys() {
+            self.buckets
+                .entry(ip)
+                .or_insert_with(|| Bucket::full(burst));
+        }
+        match self.keys.iter_mut().find(|(e, _)| *e == epoch) {
+            Some((_, k)) => *k = keys,
+            None => self.keys.push((epoch, keys)),
+        }
+        self.keys.sort_unstable_by_key(|(e, _)| *e);
+        if self.keys.len() > 2 {
+            self.keys.remove(0);
+        }
+        Ok(())
+    }
+
+    /// Drops `K_fetch` of `epoch`. The last held epoch is kept: a keyed box never goes open.
+    pub fn retire_fetch_keys(&mut self, epoch: u32) {
+        if self.keys.len() > 1 {
+            self.keys.retain(|(e, _)| *e != epoch);
+        }
+    }
+
+    /// The epochs whose `K_fetch` this box holds, lowest first.
+    pub fn fetch_epochs(&self) -> impl Iterator<Item = u32> + '_ {
+        self.keys.iter().map(|(e, _)| *e)
     }
 
     pub fn store(&self) -> &S {
@@ -399,12 +464,20 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
             let src = f.hdr.src;
             // Authenticate and decode, then charge the source: a forged, unkeyed or malformed
             // fetch costs one SipHash at most and never a token of an honest source's bucket.
-            let q = if self.cfg.fetch_keys.is_empty() {
+            let q = if self.keys.is_empty() {
                 Fetch::decode(f.payload)
-            } else if let Some(key) = self.cfg.fetch_keys.get(&src.ip) {
-                Fetch::open(f.payload, key)
             } else {
-                Err(FrameErr::Tag)
+                // Each held epoch's key in turn: at most two SipHashes for a forged fetch.
+                let mut q = Err(FrameErr::Tag);
+                for (_, m) in &self.keys {
+                    if let Some(key) = m.get(&src.ip) {
+                        q = Fetch::open(f.payload, key);
+                        if !matches!(q, Err(FrameErr::Tag)) {
+                            break;
+                        }
+                    }
+                }
+                q
             };
             let q = match q {
                 Ok(q) => q,

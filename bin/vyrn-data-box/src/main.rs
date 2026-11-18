@@ -49,6 +49,13 @@
 //! `home`, `src`. The loop publishes deltas every 100 ms; a std thread serves `GET` on the
 //! listener. *Reading:* 11 §8.4 says a tokio task; one blocking thread does the same job here.
 //!
+//! **Control** (stdin, one line each; *reading*: 07 and 08 name no transport for it yet).
+//! `EPOCH <e>` derives `K_fetch` of epochs `e` and `e + 1` from `[roster]` and serves fetches
+//! under either (08 §4.6), dropping older epochs' keys, then prints `FETCH_EPOCHS <e>,<e+1>`. At
+//! start the box holds `[roster] epoch` and the next one, so requesters that move to the next
+//! epoch are served without a restart. A refused or unknown line prints `CONTROL_ERR <why>` on
+//! stderr and changes nothing.
+//!
 //! **Stop.** With `--stop-on-stdin-eof`, closing stdin flushes open frames and prints `STATS`.
 #![forbid(unsafe_code)]
 
@@ -73,6 +80,7 @@ use vyrn_nic::{
     BackendKind, KernelUdp, NicBackend, NicConfig, PortConfig, PortId, RxBind, TxClass,
 };
 use vyrn_types::{LaneId, Nanos};
+use vyrn_wire::{RxRing, TxRing};
 
 #[derive(Parser)]
 #[command(version, about = "The VYRN data box")]
@@ -236,66 +244,129 @@ fn ep(a: SocketAddrV4) -> Endpoint {
     }
 }
 
-/// `K_fetch(e, i, d)` of every requester of `home(e)`, by its `repl_addr` IPv4 (08 §9.6), from
-/// `[roster]`. Empty without it (open mode, DEV). This is config wiring: the roster codec and the
-/// derivation are `vyrn-epoch`'s, which the layer-4 library may not link (11 §1.3, §1.4).
-fn fetch_keys(cfg: &Config) -> Result<BTreeMap<Ipv4Addr, [u8; 16]>, String> {
-    let Some(r) = &cfg.roster else {
-        return Ok(BTreeMap::new());
-    };
-    let mode = if cfg.mode == "CHAIN" {
-        vyrn_types::Mode::Chain
-    } else {
-        vyrn_types::Mode::Base
-    };
-    let home = match cfg.home.as_str() {
-        "TYO" => vyrn_types::HomeCode::Tyo,
-        "LDN" => vyrn_types::HomeCode::Ldn,
-        "NYC" => vyrn_types::HomeCode::Nyc,
-        _ => return Err("config home must be TYO, LDN or NYC with [roster]".into()),
-    };
-    let bytes = roster_bytes(&r.file)?;
-    let domain = vyrn_epoch::Domain {
-        genesis_hash: vyrn_types::Hash(hex::<32>(&r.genesis_hash)?),
-        mode,
-    };
-    if vyrn_epoch::Roster::hash_bytes(&domain, &bytes).0 != hex::<32>(&r.roster_hash)? {
-        return Err("roster: the file does not hash to roster_hash".into());
-    }
-    let roster = vyrn_epoch::Roster::decode(mode, &bytes).map_err(|e| format!("roster: {e}"))?;
-    // R3 (08 §9.6): a roster configures only epochs from its `epoch_from`.
-    if roster.epoch_from > vyrn_types::Epoch(r.epoch) {
-        return Err(format!(
-            "roster: epoch_from {} is after the configured epoch {}",
-            roster.epoch_from.0, r.epoch
-        ));
-    }
-    let secret = cfg.resolve::<32>(&r.xchg_secret)?;
-    let keys = roster
-        .box_fetch_keys(
-            vyrn_epoch::FETCH_CONTEXT,
-            &domain,
-            vyrn_types::Epoch(r.epoch),
-            home,
-            r.data_box,
-            &secret,
-        )
-        .ok_or("roster: box is not a data box of home, or xchg_secret is not its key")?;
-    let mut out = BTreeMap::new();
-    for (i, addr, k) in keys {
-        let ip = addr
-            .ipv4()
-            .ok_or(format!("roster: requester {i} has no IPv4 repl_addr"))?;
-        // One key per source address: two requesters behind one address cannot be told apart.
-        if out.insert(ip, k).is_some() {
-            return Err(format!("roster: two requesters share {ip}"));
+/// `[roster]`, decoded once: derives `K_fetch(e, i, d)` of every requester of `home(e)`, by its
+/// `repl_addr` IPv4 (08 §9.6), for any epoch the roster is in force at. This is config wiring:
+/// the roster codec and the derivation are `vyrn-epoch`'s, which the layer-4 library may not link
+/// (11 §1.3, §1.4).
+struct KeySource {
+    roster: vyrn_epoch::Roster,
+    domain: vyrn_epoch::Domain,
+    home: vyrn_types::HomeCode,
+    data_box: u8,
+    secret: [u8; 32],
+}
+
+impl KeySource {
+    /// `None` without `[roster]` (open mode, DEV).
+    fn load(cfg: &Config) -> Result<Option<Self>, String> {
+        let Some(r) = &cfg.roster else {
+            return Ok(None);
+        };
+        let mode = if cfg.mode == "CHAIN" {
+            vyrn_types::Mode::Chain
+        } else {
+            vyrn_types::Mode::Base
+        };
+        let home = match cfg.home.as_str() {
+            "TYO" => vyrn_types::HomeCode::Tyo,
+            "LDN" => vyrn_types::HomeCode::Ldn,
+            "NYC" => vyrn_types::HomeCode::Nyc,
+            _ => return Err("config home must be TYO, LDN or NYC with [roster]".into()),
+        };
+        let bytes = roster_bytes(&r.file)?;
+        let domain = vyrn_epoch::Domain {
+            genesis_hash: vyrn_types::Hash(hex::<32>(&r.genesis_hash)?),
+            mode,
+        };
+        if vyrn_epoch::Roster::hash_bytes(&domain, &bytes).0 != hex::<32>(&r.roster_hash)? {
+            return Err("roster: the file does not hash to roster_hash".into());
         }
+        let roster =
+            vyrn_epoch::Roster::decode(mode, &bytes).map_err(|e| format!("roster: {e}"))?;
+        Ok(Some(Self {
+            roster,
+            domain,
+            home,
+            data_box: r.data_box,
+            secret: cfg.resolve::<32>(&r.xchg_secret)?,
+        }))
     }
-    // An empty map is open mode (DEV only): a roster that yields no key must not turn it on.
-    if out.is_empty() {
-        return Err("roster: no requester has a usable K_fetch".into());
+
+    fn derive(&self, epoch: u32) -> Result<BTreeMap<Ipv4Addr, [u8; 16]>, String> {
+        // R3 (08 §9.6): a roster configures only epochs from its `epoch_from`.
+        if self.roster.epoch_from > vyrn_types::Epoch(epoch) {
+            return Err(format!(
+                "roster: epoch_from {} is after the configured epoch {epoch}",
+                self.roster.epoch_from.0
+            ));
+        }
+        let keys = self
+            .roster
+            .box_fetch_keys(
+                vyrn_epoch::FETCH_CONTEXT,
+                &self.domain,
+                vyrn_types::Epoch(epoch),
+                self.home,
+                self.data_box,
+                &self.secret,
+            )
+            .ok_or("roster: box is not a data box of home, or xchg_secret is not its key")?;
+        let mut out = BTreeMap::new();
+        for (i, addr, k) in keys {
+            let ip = addr
+                .ipv4()
+                .ok_or(format!("roster: requester {i} has no IPv4 repl_addr"))?;
+            // One key per source address: two requesters behind one address cannot be told apart.
+            if out.insert(ip, k).is_some() {
+                return Err(format!("roster: two requesters share {ip}"));
+            }
+        }
+        // An empty map is open mode (DEV only): a roster that yields no key must not turn it on.
+        if out.is_empty() {
+            return Err("roster: no requester has a usable K_fetch".into());
+        }
+        Ok(out)
     }
-    Ok(out)
+
+    /// Installs `K_fetch` of `e` and `e + 1` (08 §4.6: both epochs of a boundary are served),
+    /// which evicts any older epoch's keys.
+    fn install<R: RxRing, F: RxRing, T: TxRing, S: BlockStore>(
+        &self,
+        node: &mut DataNode<R, F, T, S>,
+        e: u32,
+    ) -> Result<(), String> {
+        for x in [e, e.saturating_add(1)] {
+            node.set_fetch_keys(x, self.derive(x)?)
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+/// One control line (cold path). `EPOCH <e>` installs `K_fetch` of e and e + 1 and prints
+/// `FETCH_EPOCHS <a>,<b>`; a refused or unknown line prints `CONTROL_ERR <why>` on stderr.
+fn control<R: RxRing, F: RxRing, T: TxRing, S: BlockStore>(
+    line: &str,
+    keys: Option<&KeySource>,
+    node: &mut DataNode<R, F, T, S>,
+    acks: &std::sync::mpsc::SyncSender<Result<String, String>>,
+) {
+    let mut w = line.split_whitespace();
+    let r = match (w.next(), w.next().map(str::parse::<u32>), w.next()) {
+        (None, ..) => return,
+        (Some("EPOCH"), Some(Ok(e)), None) => match keys {
+            Some(k) => k.install(node, e),
+            None => Err("an open-mode box has no fetch keys".into()),
+        },
+        _ => Err(format!("unknown control line {:?}", line.trim())),
+    };
+    // Printed by their own thread: a stalled stdout or stderr never blocks the poll loop, and
+    // a full queue drops the line (the keys are installed either way).
+    let ack = r.map(|()| {
+        let ep: Vec<String> = node.fetch_epochs().map(|e| e.to_string()).collect();
+        format!("FETCH_EPOCHS {}", ep.join(","))
+    });
+    let _ = acks.try_send(ack.map_err(|e| format!("CONTROL_ERR {e}")));
 }
 
 /// The roster file: raw bytes, or the same bytes as hex text (whitespace ignored).
@@ -323,7 +394,12 @@ fn roster_bytes(path: &Path) -> Result<Vec<u8>, String> {
 
 fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), String> {
     let home = cfg.home()?;
-    let fetch_keys = fetch_keys(cfg)?;
+    let keys = KeySource::load(cfg)?;
+    let fetch_epoch = cfg.roster.as_ref().map_or(0, |r| r.epoch);
+    let fetch_keys = match &keys {
+        Some(k) => k.derive(fetch_epoch)?,
+        None => BTreeMap::new(),
+    };
     let ip = cfg.nic.ip;
     let ncfg = NicConfig::new(BackendKind::Kernel, vec![PortConfig { id: PortId(0), ip }]);
     let mut nic = KernelUdp::open(&ncfg).map_err(|e| e.to_string())?;
@@ -351,8 +427,12 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
         cfg.dests.iter().copied().map(ep).collect(),
     );
     ncfg.fetch_keys = fetch_keys;
+    ncfg.fetch_epoch = fetch_epoch;
     (ncfg.fetch_rate, ncfg.fetch_burst) = (cfg.fetch.rate, cfg.fetch.burst);
     let mut node = DataNode::new(ncfg, ingest, fetch, tx, store);
+    if let Some(k) = &keys {
+        k.install(&mut node, fetch_epoch)?;
+    }
 
     let labels = [
         ("role", "data".to_owned()),
@@ -379,20 +459,41 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
         .map_err(|e| e.to_string())?;
 
     let stop = Arc::new(AtomicBool::new(false));
-    if stdin_stop {
+    // Control input on stdin, one line each (crate docs, Control): `EPOCH <e>` moves the fetch
+    // keys to epochs e and e + 1. EOF stops the box with `--stop-on-stdin-eof`.
+    let (ctl_tx, ctl) = std::sync::mpsc::channel::<String>();
+    let (acks, acks_rx) = std::sync::mpsc::sync_channel::<Result<String, String>>(16);
+    std::thread::Builder::new()
+        .name("vyrn-data/control".into())
+        .spawn(move || {
+            for a in acks_rx {
+                match a {
+                    Ok(l) => {
+                        let mut out = std::io::stdout().lock();
+                        let _ = writeln!(out, "{l}");
+                        let _ = out.flush();
+                    }
+                    Err(l) => eprintln!("{l}"),
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    {
         let stop = Arc::clone(&stop);
         std::thread::Builder::new()
             .name("vyrn-data/stdin".into())
             .spawn(move || {
-                let mut sink = String::new();
+                let mut line = String::new();
                 while std::io::stdin()
                     .lock()
-                    .read_line(&mut sink)
+                    .read_line(&mut line)
                     .is_ok_and(|n| n > 0)
                 {
-                    sink.clear();
+                    let _ = ctl_tx.send(std::mem::take(&mut line));
                 }
-                stop.store(true, Ordering::Release);
+                if stdin_stop {
+                    stop.store(true, Ordering::Release);
+                }
             })
             .map_err(|e| e.to_string())?;
     }
@@ -426,6 +527,9 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
     let now = |t0: Instant| Nanos(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));
     while !stop.load(Ordering::Acquire) {
         let work = node.poll(now(t0));
+        while let Ok(l) = ctl.try_recv() {
+            control(&l, keys.as_ref(), &mut node, &acks);
+        }
         // Never block the poll loop on stdout: a full queue drops and counts the line.
         hand_over(node.drain_events(), &mut unprinted);
         if published.elapsed() >= Duration::from_millis(100) {
