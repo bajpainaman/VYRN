@@ -122,6 +122,8 @@ struct Sub {
     first_lane: u8,
     lanes: Vec<LaneState>,
     cut: Vec<LaneSeq>,
+    /// The half-cut its `TenureStart` set, which the step merger starts from.
+    base_cut: Vec<LaneSeq>,
     mark_bounds: Vec<LaneSeq>,
     started: bool,
     tenure: u8,
@@ -170,6 +172,7 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
                 first_lane: half.start,
                 lanes: vec![LaneState::default(); n],
                 cut: vec![LaneSeq(0); n],
+                base_cut: vec![LaneSeq(0); n],
                 mark_bounds: vec![LaneSeq(0); n],
                 started: false,
                 tenure: 0,
@@ -218,7 +221,9 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
         {
             return Verdict::Invalid;
         }
-        if last.0 < self.next_height && self.tip.is_some() {
+        // Heights before this tenure's first block were never decoded here.
+        let decoded = self.anchor.is_some_and(|a| first >= a.first_height);
+        if last.0 < self.next_height && self.tip.is_some() && decoded {
             Verdict::Valid
         } else {
             Verdict::Pending
@@ -250,9 +255,8 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
 
     /// Takes one frame of either substream, received at `now`.
     pub fn on_frame(&mut self, bytes: &[u8], now: u64) -> Result<(), FrameErr> {
-        if let Some(f) = self.fault {
-            return Err(FrameErr::Fault(f));
-        }
+        // Deadlines first: a HashRun that arrives late must not clear the record it is late for.
+        self.tick(now)?;
         let id = match FrameHeader::parse(bytes) {
             Ok((h, _)) => FrameId {
                 tenure: h.tenure,
@@ -344,14 +348,17 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
         }
         sub.lanes = ts.lanes.iter().map(LaneState::from_base).collect();
         sub.cut.clone_from(&ts.prev_cut);
+        sub.base_cut.clone_from(&ts.prev_cut);
         sub.mark_bounds = sub.lanes.iter().map(LaneState::prefix).collect();
         sub.started = true;
         sub.tenure = id.tenure;
         sub.open = ts.first_height.0;
         if self.subs.iter().all(|s| s.started) {
+            // From the TenureStart cuts, not `sub.cut`: a substream that started first may
+            // already have moved its half-cut with steps queued in `pre_merge`.
             let mut cut = [LaneSeq(0); N];
             for sub in &self.subs {
-                for (l, c) in (sub.first_lane..).zip(&sub.cut) {
+                for (l, c) in (sub.first_lane..).zip(&sub.base_cut) {
                     if let Some(x) = cut.get_mut(usize::from(l)) {
                         *x = *c;
                     }

@@ -355,6 +355,30 @@ fn vectors() -> Vec<Vector> {
 
     let (a, b) = good_steps();
     let (mut t, mut ev) = block0(0, a, b);
+    ev.push(Ev::Frame(200, t.a(&order(false, vec![mark(2, [3, 0])]))));
+    ev.push(Ev::Frame(1_000_001, t.a(&hash_run(0, 0x1111))));
+    out.push(Vector {
+        name: "hashlag_late_hash",
+        about: "INV-REP-8: lane 0's HashRun arrives 1 ms + 1 ns after its record, with no tick between",
+        events: ev,
+        expect: vec![fault("REP_E_HASHLAG", 0, 1)],
+    });
+
+    let (mut t, mut ev) = block0(
+        0,
+        vec![step(2, StepKind::Cross, Some((0, 1)), false, [3, 0])],
+        vec![step(1, StepKind::Improve, Some((2, 2)), false, [2, 0])],
+    );
+    finish(&mut t, &mut ev, &SEED, |_| {});
+    out.push(Vector {
+        name: "merge_from_tenure_cut",
+        about: "A delivers step 2 before B delivers step 1: step 1 keeps A's TenureStart half-cut",
+        events: ev,
+        expect: vec!["cuts 0.0.2.0 3.0.2.0".into()],
+    });
+
+    let (a, b) = good_steps();
+    let (mut t, mut ev) = block0(0, a, b);
     finish(&mut t, &mut ev, &OTHER_SEED, |_| {});
     out.push(Vector {
         name: "header_bad_sig",
@@ -399,7 +423,8 @@ fn render(vs: &[Vector]) -> String {
          #                             the first fault: its REP_E_* code (HEADER for header\n\
          #                             rules), the frame that showed it, the first height that\n\
          #                             loses its vote\n\
-         #   verdict <first> <last> <Valid|Invalid|Pending>   07 §6.4 items 2 and 5\n",
+         #   verdict <first> <last> <Valid|Invalid|Pending>   07 §6.4 items 2 and 5\n\
+         #   cuts <c0.c1.c2.c3> ...    the full cut of each step of the first ready block\n",
     );
     let _ = writeln!(s, "seq_key {}", hex(&key));
     for v in vs {
@@ -490,6 +515,17 @@ fn vectors_hold() {
                         );
                         assert_eq!(got, w[2..].join(" "), "{name}: {f}");
                     }
+                    "cuts" => {
+                        let b = c
+                            .take_ready()
+                            .unwrap_or_else(|| panic!("{name}: not ready"));
+                        let got: Vec<String> = b
+                            .steps
+                            .iter()
+                            .map(|s| s.rec.cut.map(|x| x.0.to_string()).join("."))
+                            .collect();
+                        assert_eq!(got.join(" "), w[2..].join(" "), "{name}");
+                    }
                     "verdict" => {
                         let v =
                             c.verdict(Height(w[2].parse().unwrap()), Height(w[3].parse().unwrap()));
@@ -508,4 +544,28 @@ fn vectors_hold() {
         }
     }
     assert_eq!(ran, vectors().len());
+}
+
+/// A tenure that starts at height 5 has checked nothing below it (07 §6.4).
+#[test]
+fn verdict_starts_at_the_tenure() {
+    let ts = TenureStart {
+        first_height: Height(5),
+        ..tenure_start()
+    };
+    let key = vyrn_crypto::ed25519::public_key(&SEED);
+    let mut core: OrderCore<N, View> = OrderCore::new(layout(), View(key)).unwrap();
+    for (s, lane) in [(0, 0), (1, 2)] {
+        let mut e = StreamEncoder::new(layout(), s, ident()).unwrap();
+        let f = e
+            .encode(&Body::Order {
+                tenure_start: Some(ts.clone()),
+                sections: vec![bind(lane, 7)],
+            })
+            .unwrap();
+        core.on_frame(&f, 0).unwrap();
+    }
+    assert_eq!(core.next_height(), Height(5));
+    assert_eq!(core.verdict(Height(0), Height(3)), Verdict::Pending);
+    assert_eq!(core.verdict(Height(4), Height(5)), Verdict::Pending);
 }
