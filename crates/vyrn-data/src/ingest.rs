@@ -28,6 +28,9 @@ pub struct HomeConfig {
     pub keys: BTreeMap<SessionId, [u8; 16]>,
     /// RAM ring slots.
     pub ring_slots: usize,
+    /// The secret of the ring index's bucket hash (`ring` module docs). Draw it at random per
+    /// box; it never leaves the box.
+    pub index_key: [u8; 16],
 }
 
 /// Variants with the same logical content kept per `pkt_seq` (04 D3 allows `flags` bit 0 and
@@ -121,9 +124,10 @@ impl DataHome {
         Self {
             mode: cfg.mode,
             books: cfg.books,
+            // Every keyed session gets its window now, so ingest never inserts one.
+            dedupe: Dedupe::with_sessions(cfg.keys.keys().copied()),
             keys: cfg.keys,
-            dedupe: Dedupe::default(),
-            ring: Ring::new(cfg.ring_slots),
+            ring: Ring::new(cfg.ring_slots, cfg.index_key),
         }
     }
 
@@ -183,12 +187,11 @@ impl DataHome {
                     // A resend (04 D3). A byte-identical copy, or one past MAX_VARIANTS, is a
                     // duplicate; a new variant is stored and forwarded, because the sequencer
                     // may have accepted these exact bytes.
-                    let mut n = 1usize;
-                    let mut dup = first.hash == full;
-                    for v in vars {
-                        n = n.saturating_add(1);
-                        dup |= v.hash == full;
-                    }
+                    let n = 1usize.saturating_add(vars.count());
+                    let dup = self
+                        .ring
+                        .find(session, pkt_seq, pkt_hash_of(&full).0)
+                        .is_some_and(|v| v.hash == full);
                     if dup || n >= MAX_VARIANTS {
                         return Err(Reject::Duplicate);
                     }

@@ -44,8 +44,10 @@
 //!    the one forwarded and served, and [`Event::CopyConflict`] carries both packets;
 //!    `pkt_seq ≤ hi − 256` → `Late` (*gap:* dropped and counted, never forwarded).
 //! 4. Hash: full BLAKE3-256 over bytes `0..16+16n`; `pkt_hash` is its first 8 bytes (01 §3).
-//! 5. Store in the RAM ring, indexed by `(session, pkt_seq)`. *Gap:* the ring evicts by slot
-//!    count, not by `REP_DATA_RING_S`; size it as rate × retention.
+//! 5. Store in the RAM ring, indexed by a fixed open-addressed table ([`ring`]) whose entries are
+//!    `(session, pkt_seq, pkt_hash, slot)`. *Gap:* the bucket is a keyed hash of `(session,
+//!    pkt_seq)`, not `pkt_hash`, because the box looks packets up by key. *Gap:* the ring evicts
+//!    by slot count, not by `REP_DATA_RING_S`; size it as rate × retention.
 //! 6. Fan out: append to every destination's open `DATA` frame.
 //!
 //! ## Data frame (07 §5.3)
@@ -84,7 +86,7 @@
 //! ```
 //!
 //! - KEY: one `FETCH_RESP` with `data_seq = session << 32 | pkt_seq` and every variant of the
-//!   packet in the ring (by `pkt_hash`), else the copy in the newest `log_scan` blocks of the log
+//!   packet in the ring (in the order stored), else the copy in the newest `log_scan` blocks of the log
 //!   source, or `n_pkts` 0 if neither has it.
 //! - RANGE: the stored `DATA` frames `from..=to` resent byte for byte, those still in the
 //!   destination's history; `to − from < max_range` and `from ≥ 1`, `dst` known.
@@ -96,10 +98,10 @@
 //!
 //! # Hot path
 //!
-//! The ring slots, frame buffers and send history are sized at construction. The indexes are
-//! `BTreeMap`s (the workspace bans `HashMap`, 01 §11.2), which allocate nodes as sessions and
-//! packets arrive; 07 §5.2 step 5's fixed open-addressed table is a follow-up. Fetches are the
-//! cold path.
+//! The ring slots, its index, the dedupe windows (one per keyed session, made at construction),
+//! frame buffers and send history are sized at construction, so [`DataHome::ingest`] allocates
+//! nothing (`vyrn-bench`'s `data_ingest` bench counts it with the sealing allocator). Fetches
+//! are the cold path.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

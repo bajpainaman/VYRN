@@ -448,6 +448,7 @@ fn payloads_from_a_data_box_replay_the_live_run() {
         books: vec![BOOK],
         keys,
         ring_slots: 64,
+        index_key: [0x42; 16],
     };
     let mut node = DataNode::new(
         NodeConfig::new(home, 0, ingest_ep, vec![other_ep, replica_ep]),

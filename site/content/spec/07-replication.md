@@ -989,6 +989,12 @@ leaves the destination set, and the next standby joins it once it starts warming
 5. **Store.** The bytes go into a RAM ring, indexed by a fixed open-addressed table keyed by
    `pkt_hash` that holds `(session, pkt_seq, ring offset)`. 8-byte collisions do occur at 100M/s
    (~3e-4 per 10 s window), so a lookup always matches `(session, pkt_seq)` too.
+   **Data box layout (reading, `vyrn-data`):** the data box looks packets up by `(session,
+   pkt_seq)` (dedupe, `DataFetch{session, pkt_seq}`), so its table's bucket is SipHash-2-4 of
+   `(session u32, pkt_seq u32)` LE under a per-box secret that never leaves the box, and each
+   entry stores `(session, pkt_seq, pkt_hash, ring offset)`. A lookup by hash matches all three
+   of `session`, `pkt_seq` and `pkt_hash`. The table is fixed at load ≤ 0.5 and never
+   allocates. A replica's join table (§5.4) may still key by `pkt_hash`.
 6. **Fan-out.** The packet is appended to one data frame per destination replica (§5.3). A frame
    is sent when it reaches 9000 B or is `REP_DATA_BATCH_US` = 5 µs old.
 

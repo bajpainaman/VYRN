@@ -27,5 +27,12 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
 
+[dev-dependencies]
+vyrn-data = { workspace = true }
+
+[[bench]]
+name = "data_ingest"
+harness = false
+
 [lints]
 workspace = true
