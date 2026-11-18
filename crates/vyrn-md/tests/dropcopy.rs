@@ -319,6 +319,7 @@ fn live(script: &[Act]) -> (Journal, Store, Run) {
                 e.poll_lanes(&mut s).unwrap();
             }
             Act::Run => assert!(e.run(&NeverLate, &mut s, 64).unwrap(), "no quiescence"),
+            Act::Cmd(c) => assert!(e.command(c), "control ring full"),
         }
     }
     let fee_acc = (0..N).map(|l| e.lane(l).unwrap().book_acc().fee_acc).sum();

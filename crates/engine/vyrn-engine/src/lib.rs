@@ -112,5 +112,6 @@ pub mod role;
 
 pub use engine::{Engine, Fault, Rec, Shared, Sink};
 pub use replay::{
-    Diverged, NoResponses, OwnedRec, Payloads, Responses, Why, WireAt, WireDiverged, WireStep,
+    CONTROL_PAYLOAD_LEN, Diverged, NoResponses, OwnedRec, Payloads, Responses, Why, WireAt,
+    WireDiverged, WireStep, control_of_payload, control_payload,
 };

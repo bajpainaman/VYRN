@@ -157,6 +157,8 @@ pub enum Act {
     Poll,
     /// Steps and polls until quiet.
     Run,
+    /// The control role queues a command (`Engine::command`); logged in `Journal::cmds`.
+    Cmd(vyrn_bbo::ControlCmd),
 }
 
 /// Everything the engine emitted.
@@ -165,6 +167,8 @@ pub struct Journal {
     pub recs: Vec<OwnedRec>,
     pub resp: Vec<(LaneId, RespPkt)>,
     pub tx: Vec<(TxEntry, Vec<Record>)>,
+    /// Commands queued, in order.
+    pub cmds: Vec<vyrn_bbo::ControlCmd>,
 }
 
 impl Sink for Journal {
@@ -273,6 +277,10 @@ pub fn live(script: &[Act]) -> (Journal, Store, Vec<Rx>, String) {
             Act::Run => {
                 assert!(e.run(&NeverLate, &mut j, 64).unwrap(), "no quiescence");
                 writeln!(inputs, "I run").unwrap();
+            }
+            Act::Cmd(c) => {
+                assert!(e.command(c), "control ring full");
+                j.cmds.push(*c);
             }
         }
     }

@@ -408,6 +408,13 @@ with any other flag bit (`REP_E_KIND`). It costs no byte. The clamped step-cut r
 | Seal | 0xFF | — | the book's last step of an epoch (08) |
 | Uncross | 0xFF | uncross data | the auction uncross (05 §8.8, 08) |
 
+**Control payload** (reading, **wire**; 05 and 07 name the fields only): `plen` 10, `code` u8
+(1 phase, 2 band), `phase` u8 (05 `Phase` code: 0 continuous, 1 auction, 2 halted, 3 frozen;
+0 for band), `lo` u32 LE, `hi` u32 LE. The finality gate's halt is phase 2 and its resume
+phase 0, both with `lo` = `hi` = 0. Replay queues the command a Control step's payload names
+before replaying the step; any other payload is a replay divergence. Uncross and Seal have their
+own kinds.
+
 **Size (budget):** each cut core publishes every ≤ `CUT_REFRESH_NS` = 100 ns, so each half changes
 ≤ 10M times/s and the two halves ≤ 20M times/s together. A changed half moves ~2 ops per lane, so
 its DENSE form is ~25 B + 1 B. A home record is ~4 B with its gap byte, and ≤ 10M cut-only records/s
@@ -1481,6 +1488,9 @@ block `h + 9` opens only when block `h` is final. 09 §4.6 (`INV-CHN-TXGATE`) us
   up.
 - **Resume.** `Control(Resume)` at `lag ≤ REP_GATE_RESUME_BLOCKS` = 4; after > 1000 ms, via a
   reopening auction (08).
+  Until the 08 reopening auction is wired, a resume after a halt of more than 1000 ms also
+  goes straight to continuous trading, and the sequencer logs it (reading, **semantics**;
+  DEV only).
 - **It never trips within f = 1.** Block `h` is final at every voter and at the sequencer ≤ 7.65 ms
   after it closes (§6.6, signature checks included). `h + 8` closes 8 ms after `h` closes, so ≤ 8
   closed blocks are open (0.35 ms spare). Under scheme 1 the bound is 7.70 ms after close (0.30 ms

@@ -246,6 +246,7 @@ fn live(script: &[Act]) -> (Journal, Store, Result<Vec<Vec<u8>>, SinkError>) {
                 e.poll_lanes(&mut s).unwrap();
             }
             Act::Run => assert!(e.run(&NeverLate, &mut s, 64).unwrap(), "no quiescence"),
+            Act::Cmd(c) => assert!(e.command(c), "control ring full"),
         }
     }
     (j, store, m.finish())

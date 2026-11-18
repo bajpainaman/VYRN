@@ -261,6 +261,7 @@ fn replay_checks_responses_against_a_response_log() {
         recs: j.recs.clone(),
         resp: j.resp.clone(),
         tx: j.tx.clone(),
+        cmds: Vec::new(),
     };
     bad.resp[0].1.resp_seq += 1;
     assert!(matches!(
@@ -275,6 +276,7 @@ fn replay_checks_responses_against_a_response_log() {
         recs: j.recs.clone(),
         resp: j.resp.clone(),
         tx: j.tx.clone(),
+        cmds: Vec::new(),
     };
     bad.tx[0].0.resp_seq += 1;
     assert!(matches!(
@@ -289,6 +291,7 @@ fn replay_checks_responses_against_a_response_log() {
         recs: j.recs.clone(),
         resp: j.resp.clone(),
         tx: j.tx.clone(),
+        cmds: Vec::new(),
     };
     extra.resp.push(extra.resp[0]);
     assert_eq!(
@@ -340,6 +343,86 @@ fn replay_from_07_fields_only_in_canonical_order() {
             .iter()
             .filter(|r| matches!(r, OwnedRec::Step(..)))
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn replay_from_07_queues_control_steps_from_their_payload() {
+    // 07 §6.8: the finality gate halts and resumes the book with Control(Phase) steps. 07
+    // carries the command in the step's payload, and replay queues it from there.
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    use vyrn_bbo::{ControlCmd, Phase};
+    let phase = |phase| ControlCmd::Phase {
+        phase,
+        lo: vyrn_types::Tick(0),
+        hi: vyrn_types::Tick(0),
+    };
+    let pkt = |l, a, t, m| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs: vec![m],
+    };
+    let s = vec![
+        pkt(0, 1, 1_000, new(Sell, Day, 105, 1, 1)),
+        Act::Run,
+        Act::Cmd(phase(Phase::Halted)),
+        Act::Run,
+        pkt(1, 1, 2_000, new(Buy, Day, 105, 1, 2)),
+        Act::Run,
+        Act::Cmd(phase(Phase::Continuous)),
+        Act::Run,
+        pkt(1, 1, 3_000, new(Buy, Day, 105, 1, 3)),
+        Act::Run,
+    ];
+    let (j, store, _, _) = live(&s);
+    let halted = j
+        .resp
+        .iter()
+        .flat_map(|(_, p)| p.records())
+        .filter(|r| {
+            matches!(
+                r,
+                Record::Reject {
+                    reason: RejectReason::BookHalted,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        halted, 1,
+        "the order inside the halt is BOOK_HALTED: {:?}",
+        j.resp
+    );
+    assert!(!j.tx.is_empty(), "the order after the resume fills");
+    let (lanes, routes, mut ws) = to_wire(&j.recs);
+    let mut cmds = j.cmds.iter();
+    for w in ws.iter_mut().filter(|w| w.1 == StepKind::Control) {
+        w.5 = vyrn_engine::control_payload(cmds.next().unwrap())
+            .unwrap()
+            .to_vec();
+    }
+    assert!(cmds.next().is_none(), "one Control step per command");
+    let (r, rep) = replay_wire(&lanes, &routes, &ws, &store, Some(&j));
+    assert_eq!(r, Ok(()));
+    assert_eq!(rep.resp, j.resp);
+    assert_eq!(rep.tx, j.tx);
+
+    // A Control step without its command cannot be replayed.
+    let at = ws.iter().find(|w| w.1 == StepKind::Control).unwrap().0;
+    for w in ws.iter_mut().filter(|w| w.0 == at) {
+        w.5.clear();
+    }
+    let (r, _) = replay_wire(&lanes, &routes, &ws, &store, None);
+    assert_eq!(
+        r,
+        Err(WireDiverged {
+            at: WireAt::Step(at),
+            why: Why::BadStep
+        })
     );
 }
 

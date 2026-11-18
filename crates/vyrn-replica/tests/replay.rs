@@ -159,6 +159,7 @@ fn live07(script: &[Act]) -> (Journal, Store) {
                 e.poll_lanes(&mut j).unwrap();
             }
             Act::Run => assert!(e.run(&NeverLate, &mut j, 64).unwrap(), "no quiescence"),
+            Act::Cmd(c) => assert!(e.command(c), "control ring full"),
         }
     }
     (j, store)
