@@ -45,6 +45,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+      - name: vyrn-nic against the C shim, which checks its ABI version (06 §7.5)
+        run: cargo test --locked -p vyrn-nic --features shim
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         if: matrix.os == 'ubuntu-24.04'
         with:
