@@ -7,7 +7,7 @@
 //! | `Automaton::verify` | [`App`]: INV-REP-4 (07 §6.4); pending until `REP_VERIFY_WAIT_MS`, then false |
 //! | certify | true exactly when this voter's `verify` (or its own proposal) accepted the payload |
 //! | `Relay` | no-op: headers reach voters through frames (07 §6.3) |
-//! | `Reporter` | [`Finalized`]: every finalization as a [`FinalityCert`] |
+//! | `Reporter` | [`Finalized`]: every finalization as a [`FinalityCert`], and this voter's own finalize votes as [`FinalizeVote`]s for the sequencer's listener (07 §6.8) |
 //! | Elector | [`VoterOrder`]: round-robin in `REP_Membership.voters` order ([`Committee::leader`]) |
 //!
 //! A voter does not need the proposal bytes to vote: given the parent it rebuilds every candidate
@@ -15,6 +15,7 @@
 
 use crate::cert::{FinalityCert, NAMESPACE};
 use crate::membership::{Committee, VoterOrder};
+use crate::observer::FinalizeVote;
 use crate::proposal::{MAX_HDRS_PER_PROPOSAL, Proposal};
 use crate::source::{
     BlockSource, Genesis, Tip, Verdict, chain_after, proposal_for, proposal_range,
@@ -27,7 +28,7 @@ use commonware_consensus::{
         Plan,
         config::{Config, Floor, ForwardPolicy, SkipBudget, SkipPolicy},
         scheme::ed25519::Scheme,
-        types::{Activity, Context, Finalization},
+        types::{Activity, Context, Finalization, Finalize},
     },
     types::{Epoch as CwEpoch, Round, ViewDelta},
 };
@@ -35,7 +36,10 @@ use commonware_cryptography::{blake3::Digest, ed25519};
 use commonware_p2p::Blocker;
 use commonware_parallel::Sequential;
 use commonware_runtime::{Clock, Spawner, buffer::paged::CacheRef};
-use commonware_utils::channel::{fallible::OneshotExt, oneshot};
+use commonware_utils::{
+    Participant,
+    channel::{fallible::OneshotExt, oneshot},
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -322,6 +326,9 @@ pub struct Finalized<E, S> {
     committee: Committee,
     epoch: Epoch,
     out: mpsc::UnboundedSender<FinalityCert>,
+    /// This voter's Commonware signer index, and where its own finalize votes go.
+    me: Participant,
+    votes: mpsc::UnboundedSender<FinalizeVote>,
 }
 
 impl<E, S: Clone> Clone for Finalized<E, S> {
@@ -331,6 +338,8 @@ impl<E, S: Clone> Clone for Finalized<E, S> {
             committee: self.committee.clone(),
             epoch: self.epoch,
             out: self.out.clone(),
+            me: self.me,
+            votes: self.votes.clone(),
         }
     }
 }
@@ -362,21 +371,53 @@ impl<E: Clock + Spawner, S: BlockSource> Finalized<E, S> {
     }
 }
 
+impl<E: Clock + Spawner, S: BlockSource> Finalized<E, S> {
+    /// This voter's own finalize vote, for the sequencer and the standby (07 §6.8).
+    fn own_vote(&self, f: &Finalize<Scheme, Digest>) -> Option<FinalizeVote> {
+        if f.attestation.signer != self.me {
+            return None;
+        }
+        let proposal = self.app.resolve(&f.proposal.payload)?.0?;
+        let sig: &[u8] = f.attestation.signature.get()?.as_ref();
+        Some(FinalizeVote {
+            epoch: self.epoch,
+            view: f.proposal.round.view().get(),
+            parent_view: f.proposal.parent.get(),
+            proposal,
+            index: self.committee.voter_of(self.me)?,
+            sig: sig.try_into().ok()?,
+        })
+    }
+}
+
 impl<E: Clock + Spawner, S: BlockSource> Reporter for Finalized<E, S> {
     type Activity = Activity<Scheme, Digest>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
-        if let Activity::Finalization(f) = activity
-            && let Some(cert) = self.cert(&f)
-            && self.out.send(cert).is_err()
-        {
+        let closed = match activity {
+            Activity::Finalization(f) => self.cert(&f).is_some_and(|c| self.out.send(c).is_err()),
+            Activity::Finalize(f) => self
+                .own_vote(&f)
+                .is_some_and(|v| self.votes.send(v).is_err()),
+            _ => false,
+        };
+        if closed {
             return Feedback::Closed;
         }
         Feedback::Ok
     }
 }
 
-/// The Simplex configuration of one voter, with the receiver of its finality certificates.
+/// What one voter's instance hands out besides Simplex itself.
+pub struct Outputs {
+    /// Every finalization this voter learns, as a `REP_FinalityCert` (07 §6.5).
+    pub certs: mpsc::UnboundedReceiver<FinalityCert>,
+    /// This voter's own finalize votes, to send to the sequencer's and the standby's
+    /// `REP_UDP_CTRL` (07 §6.8).
+    pub votes: mpsc::UnboundedReceiver<FinalizeVote>,
+}
+
+/// The Simplex configuration of one voter, with its [`Outputs`].
 #[allow(clippy::type_complexity)]
 pub fn config<E, S, B>(
     context: E,
@@ -385,7 +426,7 @@ pub fn config<E, S, B>(
 ) -> Result<
     (
         Config<Scheme, VoterOrder, B, Digest, App<E, S>, App<E, S>, Finalized<E, S>, Sequential>,
-        mpsc::UnboundedReceiver<FinalityCert>,
+        Outputs,
     ),
     VoterErr,
 >
@@ -408,7 +449,19 @@ where
     lock(&known)
         .tips
         .insert(genesis, (None, Tip::from(cfg.genesis)));
-    let (out, rx) = mpsc::unbounded_channel();
+    let (out, certs) = mpsc::unbounded_channel();
+    let (votes, votes_rx) = mpsc::unbounded_channel();
+    let own_key = vyrn_crypto::ed25519::public_key(&cfg.vote_seed);
+    let me = cfg
+        .committee
+        .participants()
+        .iter()
+        .position(|k| {
+            let bytes: &[u8] = k.as_ref();
+            bytes == own_key.as_slice()
+        })
+        .map(Participant::from_usize)
+        .ok_or(VoterErr::NotAVoter)?;
     let app = App {
         context: Arc::new(context),
         source: cfg.source,
@@ -421,6 +474,8 @@ where
         committee: cfg.committee,
         epoch: cfg.epoch,
         out,
+        me,
+        votes,
     };
     let epoch = CwEpoch::new(u64::from(cfg.epoch.0));
     let t = cfg.timeouts;
@@ -460,7 +515,13 @@ where
         fetch_retry_delay: POLL,
         forward: ForwardPolicy::Disabled,
     };
-    Ok((config, rx))
+    Ok((
+        config,
+        Outputs {
+            certs,
+            votes: votes_rx,
+        },
+    ))
 }
 
 #[cfg(test)]
