@@ -302,7 +302,8 @@ defines any.
   last numbered op: the lane polls `LaneCut` before every message, and a trailing `Heartbeat` or
   `ResendReq` takes no `LaneSeq` (05 §3.1), so the boundary before it names the next LaneSeq.
   A `MID` record does not move `next_lane_seq`, so later route records still name the packet's
-  ops. `LSEQ_EXC` on any Advance record is `REP_E_COUNT`. Size ~6 B; near zero at peak.
+  ops. Like a route record it travels with its packet: the sequencer frames a packet's `MID` and
+  route records in the packet's block, because §7.1 replays them in one lane call. `LSEQ_EXC` on any Advance record is `REP_E_COUNT`. Size ~6 B; near zero at peak.
 - **`AcctTake { account, ver, lane }`** (01 §14.17 item 4, 05 R15). A pooled lane logs one each
   time it takes an account's token, in its `LaneRun` just before the first record that uses the
   account: `h` = 0, `slot` = `REP_SLOT_TAKE`, then `account` LEB128 and `ver` LEB128 (the token's

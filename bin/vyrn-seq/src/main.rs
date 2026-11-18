@@ -91,8 +91,8 @@ use vyrn_nic::{
 };
 use vyrn_risk::{AcctRisk, AcctSlot, BookSpec, SessionBuckets};
 use vyrn_types::{
-    AccountId, BookId, Epoch, Hash, HomeCode, LaneId, LaneSeq, MAX_MSGS_PER_PKT, Nanos,
-    PacketRecord, PktHash, RouteRecord, SessionId, StepFlags, StepId, StepKind, TAG_BYTES,
+    AccountId, BookId, Epoch, Hash, HomeCode, LaneId, LaneSeq, Nanos, PacketFlags, PacketRecord,
+    PktHash, RouteRecord, SessionId, StepFlags, StepId, StepKind, TAG_BYTES,
 };
 use vyrn_wire::{PROTO_RESP_MAX_BYTES, RX_BURST, RespHeader, RxPkt, RxRing, TxRing};
 
@@ -128,9 +128,12 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy)]
 enum Out {
-    /// A lane record and the `RouteRecord`s the lane logged right after it (07 §3.6), in one
-    /// element so the stream core never closes a block between them.
-    Pkt(PacketRecord, Option<Hash>, Routes),
+    /// A lane record. A non-Advance one opens its packet's group: its `MID` Advance records
+    /// and `RouteRecord`s follow, then [`Out::GroupEnd`]. The stream core closes no block inside
+    /// a group, so they share the packet's block (07 §3.6, §7.1 `REP_MERGE` item 1).
+    Pkt(PacketRecord, Option<Hash>),
+    Route(RouteRecord),
+    GroupEnd,
     Step(StepEntry, u8, [CutDelta; MAX_LANES]),
     Resp(LaneId, Endpoint, RespPkt),
     /// A fill TX packet (05 §8.10 rules 1 and 2), its records cut to one response's worth.
@@ -138,28 +141,6 @@ enum Out {
     /// A TX packet this release cannot send (see `EngineSink::tx`).
     Unsent,
     Notice(LaneId, EpochNotice),
-}
-
-/// The routes of one packet's ops, at most one per op.
-#[derive(Clone, Copy)]
-struct Routes {
-    n: u8,
-    r: [RouteRecord; MAX_MSGS_PER_PKT as usize],
-}
-
-impl Routes {
-    const NONE: Self = Self {
-        n: 0,
-        r: [RouteRecord {
-            lane: LaneId(0),
-            lane_seq: LaneSeq(0),
-            cross: false,
-        }; MAX_MSGS_PER_PKT as usize],
-    };
-
-    fn iter(&self) -> impl Iterator<Item = &RouteRecord> {
-        self.r.iter().take(usize::from(self.n))
-    }
 }
 
 #[derive(Default)]
@@ -565,17 +546,18 @@ struct EngineSink<'a> {
     from: Option<(SessionId, u32, Endpoint)>,
     notifiers: Vec<Notifier>,
     stats: Arc<Stats>,
-    /// The newest packet, held until the records after it are known to be other than its
-    /// routes (see [`EngineSink::flush`]).
-    held: Option<(PacketRecord, Option<Hash>, Routes)>,
+    /// A packet's group is open (see [`Out::Pkt`]).
+    group: bool,
 }
 
 impl EngineSink<'_> {
-    /// Sends the held packet with its routes. Called before any other element and after each
-    /// engine call: the engine sends a packet's routes right after it in the same lane drain.
+    /// Ends the open packet group. Called before any element that is not the packet's `MID`
+    /// or route record, and after each engine call: the engine sends those right after the
+    /// packet, in the same lane drain.
     fn flush(&mut self) {
-        if let Some((p, full, r)) = self.held.take() {
-            self.send(Out::Pkt(p, full, r));
+        if self.group {
+            self.group = false;
+            self.send(Out::GroupEnd);
         }
     }
 
@@ -607,7 +589,9 @@ impl Sink for EngineSink<'_> {
     fn record(&mut self, r: &Rec<'_>) {
         match r {
             Rec::Packet(p) => {
-                self.flush();
+                if p.flags & PacketFlags::MID == 0 {
+                    self.flush();
+                }
                 let full = self
                     .recent
                     .iter()
@@ -623,7 +607,8 @@ impl Sink for EngineSink<'_> {
                     self.send(Out::Notice(p.lane, n));
                 }
                 self.stats.records.fetch_add(1, Ordering::Relaxed);
-                self.held = Some((*p, full, Routes::NONE));
+                self.send(Out::Pkt(*p, full));
+                self.group |= p.flags & PacketFlags::ADVANCE == 0;
             }
             Rec::Step(e, d) => {
                 self.flush();
@@ -634,18 +619,7 @@ impl Sink for EngineSink<'_> {
                 self.stats.steps.fetch_add(1, Ordering::Relaxed);
                 self.send(Out::Step(*e, e.n_delta, ds));
             }
-            Rec::Route(t) => {
-                let slot = self.held.as_mut().and_then(|(_, _, r)| {
-                    let s = r.r.get_mut(usize::from(r.n))?;
-                    r.n = r.n.wrapping_add(1);
-                    Some(s)
-                });
-                match slot {
-                    Some(s) => *s = *t,
-                    // The engine sends a route only after its packet, one per op.
-                    None => self.tx.dead = true,
-                }
-            }
+            Rec::Route(t) => self.send(Out::Route(*t)),
         }
     }
     /// The answer to the packet being ingested goes to its source, accepted or not; every other
@@ -726,7 +700,7 @@ fn engine_loop<R: RxRing>(
         from: None,
         notifiers: plan.notifier.map_or_else(Vec::new, |x| vec![x; n]),
         stats: Arc::clone(stats),
-        held: None,
+        group: false,
     };
     // Deadline admission needs a class A or C clock (06 §6.8); DEV backends run without it.
     if !matches!(class, LatencyClass::E | LatencyClass::S) {
@@ -897,6 +871,8 @@ impl<T: TxRing> StreamCore<T> {
         // The block holds a packet record or a step since `opened`: it closes `block` later.
         let mut open = false;
         let mut opened = Instant::now();
+        // Inside a packet's group (see `Out::Pkt`): the block does not close on its timer.
+        let mut group = false;
         loop {
             // Read before popping: if the engine was done then, an empty ring is the end.
             let done = engine_done.load(Ordering::Acquire);
@@ -909,11 +885,16 @@ impl<T: TxRing> StreamCore<T> {
                     open = true;
                     opened = Instant::now();
                 }
+                match &o {
+                    Out::Pkt(p, _) if p.flags & PacketFlags::ADVANCE == 0 => group = true,
+                    Out::GroupEnd => group = false,
+                    _ => {}
+                }
                 self.take(o)?;
             }
             self.drain()?;
             let end = done && got == 0;
-            if open && (end || opened.elapsed() >= block) {
+            if open && (end || (!group && opened.elapsed() >= block)) {
                 self.close_block()?;
                 open = false;
             }
@@ -939,13 +920,9 @@ impl<T: TxRing> StreamCore<T> {
 
     fn take(&mut self, o: Out) -> Result<(), String> {
         let frames = match o {
-            Out::Pkt(p, full, routes) => {
-                let mut frames = self.writer.packet(p, full).map_err(|e| e.to_string())?;
-                for t in routes.iter() {
-                    frames.extend(self.writer.route(*t).map_err(|e| e.to_string())?);
-                }
-                Ok(frames)
-            }
+            Out::Pkt(p, full) => self.writer.packet(p, full),
+            Out::Route(t) => self.writer.route(t),
+            Out::GroupEnd => return Ok(()),
             Out::Step(e, n, ds) => {
                 for d in ds.iter().take(usize::from(n)) {
                     if let Some(c) = self.cut.get_mut(usize::from(d.lane.0)) {
@@ -1143,7 +1120,7 @@ mod tests {
             from: None,
             notifiers: Vec::new(),
             stats: std::sync::Arc::default(),
-            held: None,
+            group: false,
         };
         let ep = |port| Endpoint {
             mac: [0; 6],
