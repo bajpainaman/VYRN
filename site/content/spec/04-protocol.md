@@ -899,7 +899,7 @@ its order state from the drop copy (`10-accounts-risk-md.md`).
 | Response lost, later ones arrive | client | `resp_seq` gap | `ResendReq` to the lane, or recovery |
 | Last response lost | client | heartbeat answer reveals the gap | `ResendReq` |
 | Request and its responses all lost | client (timer) | — | resend with bit0 = 1; lane resends from its ring |
-| Lane overloaded | lane or BBO core (test D) | `Reject BUSY` ≤ 1 µs | lane shed: resend from detail; BBO shed: resend the message (§3.5) |
+| Lane overloaded | lane or BBO core (test D) | `Reject BUSY` ≤ 1 µs | lane shed: resend from `echo_pkt` (go-back-N); BBO shed: resend the message (§3.5) |
 | Data copy lost | replicas | missing payload | `07-replication.md` repair; the client does nothing |
 
 ### 5.6 Sequencer failover
