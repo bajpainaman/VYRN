@@ -57,7 +57,7 @@ pub use record::{
 };
 
 use crate::record::Side;
-use crate::replay::{Tap, TapOp, TapStep};
+use crate::replay::{Tap, TapOp, TapStep, TapTaker};
 
 /// Epochs a stream can be replayed from: the current and the previous (10 §8.3, config).
 pub const MD_DC_REPLAY_EPOCHS: usize = 2;
@@ -244,6 +244,8 @@ pub struct DropCopy<O: DcOut> {
     undo: VecDeque<(u64, Undo)>,
     /// The source of the last step and its taker fills so far (a `CONT` run).
     taker_acc: Option<((LaneId, LaneSeq), u32)>,
+    /// The maker `Fill`s the `Rescan` takers of the step being released matched.
+    rescan_fills: usize,
     /// `DC_EOD` is out: only `DC_SETTLED` may follow.
     ended: bool,
     /// Each account's own stream's `DC_EOD` records, its statement section (10 §10).
@@ -327,6 +329,7 @@ impl<O: DcOut> DropCopy<O> {
             allocs: VecDeque::new(),
             undo: VecDeque::new(),
             taker_acc: None,
+            rescan_fills: 0,
             ended: false,
             eods: BTreeMap::new(),
             out,
@@ -853,15 +856,178 @@ impl<O: DcOut> DropCopy<O> {
         Ok(())
     }
 
+    /// A `Rescan` batch taker (10 §8.5 item 4, §7.9 item 11): the maker's and the taker's
+    /// `DC_FILL` per match, as for a sourced step, the taker's step fee on its last one, then
+    /// its `DC_ACK` for what rests. A join pays no message fee (10 §5.3).
+    fn on_rescan_taker(&mut self, t: &TapTaker<'_>) -> Result<(), DcError> {
+        self.rel = t.step.0;
+        let Some(Msg::New {
+            flags,
+            qty,
+            client_tag,
+            ..
+        }) = t.msg
+        else {
+            return Err(DcError::Unsupported("Rescan taker other than New"));
+        };
+        let tside = side_of(flags.side);
+        let taker_acct = self.sessions.get(&t.session).copied();
+        let mut levels: BTreeMap<u32, (i64, u32)> = BTreeMap::new();
+        let mut taker_handle = None;
+        for (rs, r) in t.fills {
+            let Resp::Fill {
+                handle, tick, qty, ..
+            } = *r
+            else {
+                return Err(DcError::Fills);
+            };
+            taker_handle.get_or_insert(handle);
+            let e = levels.entry(tick.0).or_insert((0, *rs));
+            e.0 -= i64::from(qty.0);
+        }
+        let mut taker_n = 0u128;
+        for (_, r, _) in t.makers {
+            if let Resp::Fill { tick, qty, .. } = *r {
+                levels.entry(tick.0).or_insert((0, 0)).0 += i64::from(qty.0);
+                taker_n += u128::from(self.notional(qty, tick)?);
+            }
+        }
+        if levels.values().any(|v| v.0 != 0) {
+            return Err(DcError::Fills);
+        }
+        let th = taker_handle.ok_or(DcError::Fills)?;
+        let taker_fee = match taker_acct.and_then(|a| self.accts.get(&a)) {
+            Some(x) => fee_of(taker_n, x.taker_ppm).ok_or(DcError::Overflow)?,
+            None => 0,
+        };
+        let mut filled = t.prior;
+        for (i, (h, r, k)) in t.makers.iter().enumerate() {
+            let Resp::Fill {
+                handle, tick, qty, ..
+            } = *r
+            else {
+                return Err(DcError::Fills);
+            };
+            let mkey = (h.lane.0, handle.0);
+            let mut m = *self.orders.get(&mkey).ok_or(DcError::Order)?;
+            m.open = m.open.checked_sub(qty.0).ok_or(DcError::Order)?;
+            self.set_order(mkey, (m.open != 0).then_some(m));
+            if opposite(m.side) != tside {
+                return Err(DcError::Order);
+            }
+            filled = filled.checked_add(qty.0).ok_or(DcError::Overflow)?;
+            if let Some(a) = taker_acct {
+                let resp_seq = levels.get(&tick.0).map_or(0, |v| v.1);
+                self.emit(&DcOrder {
+                    kind: DcType::Fill,
+                    side: tside,
+                    taker: true,
+                    ordinal: *k,
+                    account: a,
+                    step: t.step.0,
+                    session: t.session,
+                    resp_seq,
+                    handle: th,
+                    tick,
+                    qty,
+                    client_tag,
+                    fee: if i + 1 == t.makers.len() {
+                        taker_fee
+                    } else {
+                        0
+                    },
+                })?;
+            }
+            if let Some(a) = m.account {
+                let n = u128::from(self.notional(qty, tick)?);
+                let ppm = self.accts.get(&a).map_or(0, |x| x.maker_ppm);
+                self.emit(&DcOrder {
+                    kind: DcType::Fill,
+                    side: m.side,
+                    taker: false,
+                    ordinal: *k,
+                    account: a,
+                    step: t.step.0,
+                    session: m.session,
+                    resp_seq: h.resp_seq,
+                    handle,
+                    tick,
+                    qty,
+                    client_tag: m.client_tag,
+                    fee: fee_of(n, ppm).ok_or(DcError::Overflow)?,
+                })?;
+            }
+        }
+        self.rescan_fills = self.rescan_fills.saturating_add(t.makers.len());
+        match t.rest {
+            Some((
+                rs,
+                Resp::Ack {
+                    index,
+                    handle,
+                    tick,
+                    client_tag,
+                },
+            )) => {
+                let left = qty.0.checked_sub(filled).ok_or(DcError::Order)?;
+                self.set_order(
+                    (t.lane.0, handle.0),
+                    Some(Resting {
+                        account: taker_acct,
+                        session: t.session,
+                        side: tside,
+                        tick,
+                        open: left,
+                        client_tag,
+                    }),
+                );
+                if let Some(a) = taker_acct {
+                    self.emit(&DcOrder {
+                        kind: DcType::Ack,
+                        side: tside,
+                        taker: false,
+                        ordinal: u16::from(index),
+                        account: a,
+                        step: t.seq.0,
+                        session: t.session,
+                        resp_seq: rs,
+                        handle,
+                        tick,
+                        qty: Qty(left),
+                        client_tag,
+                        fee: 0,
+                    })?;
+                }
+            }
+            None | Some((_, Resp::Reject { .. })) => {}
+            Some(_) => return Err(DcError::Unsupported("Rescan taker record")),
+        }
+        Ok(())
+    }
+
     fn on_step(&mut self, st: &TapStep<'_>) -> Result<(), DcError> {
         self.released = st.step;
         self.rel = st.step.0;
+        let rescan = std::mem::take(&mut self.rescan_fills);
         let Some(src) = st.src else {
-            if st.tx.iter().any(|(_, r)| !matches!(r, Resp::Reject { .. })) {
-                return Err(DcError::Unsupported("records of a step without a source"));
+            // A `Rescan`'s maker fills went out with its takers (`Tap::rescan_taker`).
+            let mut fills = 0usize;
+            for (h, r) in st.tx {
+                match (h.role, r) {
+                    (_, Resp::Reject { .. }) => {}
+                    (ROLE_MAKER, Resp::Fill { .. }) if st.kind == StepKind::Rescan => fills += 1,
+                    _ => return Err(DcError::Unsupported("records of a step without a source")),
+                }
             }
-            return Ok(());
+            return if fills == rescan {
+                Ok(())
+            } else {
+                Err(DcError::Fills)
+            };
         };
+        if rescan != 0 {
+            return Err(DcError::Fills);
+        }
         let Some(Msg::New {
             flags,
             tick: limit,
@@ -1108,6 +1274,18 @@ impl<O: DcOut> Tap for DropCopy<O> {
             return self.fail(DcError::Final);
         }
         if let Err(e) = self.on_lane_op(op) {
+            self.fail(e);
+        }
+    }
+
+    fn rescan_taker(&mut self, t: &TapTaker<'_>) {
+        if self.err.is_some() {
+            return;
+        }
+        if self.ended {
+            return self.fail(DcError::Final);
+        }
+        if let Err(e) = self.on_rescan_taker(t) {
             self.fail(e);
         }
     }

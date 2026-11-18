@@ -1593,11 +1593,31 @@ interleave in (07 §7.1 fixes only each lane's order). The rules below are readi
     right after its `MD_STEP`, in index order, before its execs, and a dependency's `MD_ADD` has
     `via BBO` (the BBO core applied it, 05 §3.7). A Join dependency's own maker `Fill` or
     `Out(STP)` in that packet is a maker record of the step in TX order (item 4). \[Likely\]
+11. **`Rescan` takers.** A `Rescan` step sweeps its batch in key order (05 §3.4, §8.6), so a
+    batch join can be a taker: the lane answers its `New` with `Fill { liq = 1 }` records, one
+    per level, and then, if anything rests, its `Ack` (05 §8.10 rule 4). The step's maker
+    `Fill`s are role-2 TX records with no taker TX packet. From the interval's first such taker
+    on, in key order (`(rx_ts, lane, LaneSeq)`, item 6), the batch belongs to the step: each op
+    is a step-channel event after the `MD_STEP`, a non-taker as its lane effect (item 2), a
+    taker as its `MD_EXEC`s and then, for what rests, an `MD_ADD` with `via BBO`, so a later
+    taker of the batch can match it. Ops before the first taker stay on the lane channels.
+    `MD_STEP.taker` is the first taker's oid. **Aggressor grouping** (§4.1 rule 2, open question
+    8): a taker's execs at a level are the step's maker `Fill`s at that tick, against a resting
+    order on the other side, not yet given to an earlier taker, taken in TX order until they sum
+    to its level `Fill`; `ordinal` stays the maker `Fill`'s TX position (item 4). A taker whose
+    next level `Fill` no maker of this step covers was capped (05 §8.5): its sweep and the rest
+    of the batch go on in the following `CONT` `Rescan` steps, and it rests after its last one.
+    A maker `Out(STP)` in a `Rescan`, or a lane `Fill` of any other op, is `Unsupported`.
+    \[Guessing\]
+
+Every response pair without a rule above is `SinkError::Unsupported` with its reason, never
+`Book`, which means only a response that contradicts the rebuilt book.
 
 Not rebuilt yet (`SinkError::Unsupported`): `Replace` (local or forwarded) and any step source
 other than `New`, `CancelAll`, a Join dependency that trades on entry (05 §3.7, its own taker
 records in the dependency packet; open question 13),
-unsolicited lane records (expiry, kills), steps without a source that fill (Rescan, Uncross),
+unsolicited lane records (expiry, kills), steps without a source that fill other than `Rescan`
+batch takers (item 11: Uncross),
 and pooled lanes. A lane-shed packet keeps its LaneSeqs (07 §3.5): its ops resolve by their
 `BUSY` rejects and change nothing, and it leaves the lane's priority clock alone, as it is not
 accepted. `MID` and other Advance records change nothing.
@@ -1768,6 +1788,13 @@ carries its label.
     a frame is passed by both paths only once it has been handed on, so the copy handed on is
     always compared with the first copy kept. The sequencer reports a refused path B send
     (`PATH_B_DOWN`) and keeps trading on path A (07 §4.9). \[Likely\]
+14. **`Rescan` takers.** `SinkStream` hands each batch taker of a `Rescan` step (§7.9 item 11)
+    to the tap before the step, with its level `Fill`s, the maker `Fill`s it matched and their
+    ordinals, and, in its sweep's last step, the `Ack` of what rests. Per match, the taker's and
+    the maker's `DC_FILL` at `(step, ordinal)` as item 4 (the taker's `resp_seq` is that of its
+    lane packet carrying the level's `Fill`), the taker's step fee on its last `DC_FILL` of the
+    step, no message fee (a join, §5.3), then `DC_ACK` with `qty` = what rests after every
+    step of its sweep. \[Guessing\]
 
 Not rebuilt yet: every case `SinkStream` leaves `Unsupported` (§7.9).
 
@@ -1878,7 +1905,11 @@ makes, byte for byte. That equality is tested against `RustReplay` at every spli
    - 6 `revert_after`;
    - 7 route;
    - 8 epoch begin;
-   - 9 epoch end, with each account's closing balances.
+   - 9 epoch end, with each account's closing balances;
+   - 10 `Rescan` taker (§8.4 item 14): StepId, lane, LaneSeq, session, pkt_seq, message, the
+     qty filled in earlier steps (u32), `n: u16` level fills (resp_seq u32, record), the rest
+     (presence byte, resp_seq u32, record), `n: u16` maker fills (TX entry, record, ordinal
+     u16).
 
    A message and a source op are a presence byte followed by zeroes when absent. \[Guessing\]
 3. **Publication.** The writer buffers lane ops. A step, a shell input, or a buffer over
@@ -2145,7 +2176,7 @@ token takes (`AcctTake`, §14.17 item 4). Still open:
 | 5 | A sweep that gives one lane more than `RSK_DRAIN_MAX` events in one step (§4.2): is a split of B1 inside a step needed | 05 | B3 `BUSY` count with `WL-XSWEEP` |
 | 6 | How a `CHAIN`-mode revert reaches lanes that already settled the reverted fills | 09 | `vyrn-sim` revert scenario; `INV-ACC-2` holds after |
 | 7 | Time priority of resting orders whose account changes lane or class at a boundary | 05, 08 | handoff replay test: level FIFO identical before and after |
-| 8 | Aggressor grouping of fill events in `Rescan` steps (§4.1 rule 2) | 05 | B4 replay with forced rescans |
+| 8 | Aggressor grouping of fill events in `Rescan` steps (§4.1 rule 2). For `MBO` and the drop copy, settled by §7.9 item 11's reading (no output carries the BBO's grouping); open for the engine's own event rule | 05 | B4 replay with forced rescans |
 | 9 | Whether p99 of 1-second `lane_ns` is the right `lane_map` load metric and class rank, whether `ACC_PROMOTE_RATIO_PPM` stops class churn, and how many sessions both close per boundary | 10 | `vyrn-sim` on recorded flow over 30 epochs: max lane load, promotions, demotions and moves per boundary |
 | 10 | Cross-asset routes (USDT book to USDC book) with a priced conversion and its inventory risk | 10, 09 | v2 product design |
 | 11 | Does the account-token CAS stay ~20 ns when one pooled account sends on several sessions at once, and how much does the `PoolRisk` token add to pooled crosses | 05 | 11's pool token-contention test, then B3's pooled `BUSY` curve |

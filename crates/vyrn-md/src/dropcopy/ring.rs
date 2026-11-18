@@ -46,7 +46,7 @@ use vyrn_wire::Msg;
 
 use super::server::{DcStore, Wake};
 use super::{Alloc, AllocAsset, Balances, DcError, DcOut, DcRecord, DcRoute, DropCopy, StreamId};
-use crate::replay::{Tap, TapOp, TapSrc, TapStep};
+use crate::replay::{Tap, TapOp, TapSrc, TapStep, TapTaker};
 
 pub const RING_MAGIC: [u8; 8] = *b"VYRNDCR1";
 /// Bytes before the data region.
@@ -68,6 +68,7 @@ const K_REVERT: u8 = 6;
 const K_ROUTE: u8 = 7;
 const K_BEGIN: u8 = 8;
 const K_END: u8 = 9;
+const K_RESCAN: u8 = 10;
 
 /// Why the ring stopped.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +117,19 @@ pub enum RingFrame {
         src: Option<TapSrc>,
         tx: Vec<(TxEntry, Resp)>,
     },
+    /// [`Tap::rescan_taker`].
+    Rescan {
+        step: StepId,
+        lane: LaneId,
+        seq: LaneSeq,
+        session: SessionId,
+        pkt_seq: u32,
+        msg: Option<Msg>,
+        prior: u32,
+        fills: Vec<(u32, Resp)>,
+        rest: Option<(u32, Resp)>,
+        makers: Vec<(TxEntry, Resp, u16)>,
+    },
     /// [`DropCopy::final_block`].
     Final(Height, StepId),
     /// [`DropCopy::alloc`].
@@ -150,6 +164,29 @@ impl RingFrame {
                 flags: *flags,
                 src: *src,
                 tx,
+            }),
+            Self::Rescan {
+                step,
+                lane,
+                seq,
+                session,
+                pkt_seq,
+                msg,
+                prior,
+                fills,
+                rest,
+                makers,
+            } => dc.rescan_taker(&TapTaker {
+                step: *step,
+                lane: *lane,
+                seq: *seq,
+                session: *session,
+                pkt_seq: *pkt_seq,
+                msg: *msg,
+                prior: *prior,
+                fills,
+                rest: *rest,
+                makers,
             }),
             Self::Final(h, s) => dc.final_block(*h, *s),
             Self::Alloc(a) => dc.alloc(*a),
@@ -207,12 +244,50 @@ impl RingFrame {
                 let n = u16::try_from(tx.len()).unwrap_or(u16::MAX);
                 out.extend_from_slice(&n.to_le_bytes());
                 for (h, r) in tx.iter().take(usize::from(n)) {
-                    out.extend_from_slice(&h.step.0.to_le_bytes());
-                    out.extend_from_slice(&h.session.0.to_le_bytes());
-                    out.extend_from_slice(&h.resp_seq.to_le_bytes());
-                    out.extend_from_slice(&h.pkt_seq.to_le_bytes());
-                    out.extend_from_slice(&[h.lane.0, h.n_rec, h.role]);
+                    put_tx(out, h);
                     out.extend_from_slice(&r.encode());
+                }
+            }
+            Self::Rescan {
+                step,
+                lane,
+                seq,
+                session,
+                pkt_seq,
+                msg,
+                prior,
+                fills,
+                rest,
+                makers,
+            } => {
+                out.push(K_RESCAN);
+                out.extend_from_slice(&step.0.to_le_bytes());
+                out.push(lane.0);
+                out.extend_from_slice(&seq.0.to_le_bytes());
+                out.extend_from_slice(&session.0.to_le_bytes());
+                out.extend_from_slice(&pkt_seq.to_le_bytes());
+                put_msg(out, *msg);
+                out.extend_from_slice(&prior.to_le_bytes());
+                let n = u16::try_from(fills.len()).unwrap_or(u16::MAX);
+                out.extend_from_slice(&n.to_le_bytes());
+                for (rs, r) in fills.iter().take(usize::from(n)) {
+                    out.extend_from_slice(&rs.to_le_bytes());
+                    out.extend_from_slice(&r.encode());
+                }
+                match rest {
+                    None => out.extend_from_slice(&[0; 21]),
+                    Some((rs, r)) => {
+                        out.push(1);
+                        out.extend_from_slice(&rs.to_le_bytes());
+                        out.extend_from_slice(&r.encode());
+                    }
+                }
+                let n = u16::try_from(makers.len()).unwrap_or(u16::MAX);
+                out.extend_from_slice(&n.to_le_bytes());
+                for (h, r, k) in makers.iter().take(usize::from(n)) {
+                    put_tx(out, h);
+                    out.extend_from_slice(&r.encode());
+                    out.extend_from_slice(&k.to_le_bytes());
                 }
             }
             Self::Final(h, s) => {
@@ -306,15 +381,7 @@ impl RingFrame {
                 let n = c.u16()?;
                 let mut tx = Vec::with_capacity(usize::from(n));
                 for _ in 0..n {
-                    let h = TxEntry {
-                        step: StepId(c.u64()?),
-                        session: SessionId(c.u32()?),
-                        resp_seq: c.u32()?,
-                        pkt_seq: c.u32()?,
-                        lane: LaneId(c.u8()?),
-                        n_rec: c.u8()?,
-                        role: c.u8()?,
-                    };
+                    let h = c.tx()?;
                     tx.push((h, c.rec()?));
                 }
                 Self::Step {
@@ -323,6 +390,51 @@ impl RingFrame {
                     flags,
                     src,
                     tx,
+                }
+            }
+            K_RESCAN => {
+                let step = StepId(c.u64()?);
+                let lane = LaneId(c.u8()?);
+                let seq = LaneSeq(c.u64()?);
+                let session = SessionId(c.u32()?);
+                let pkt_seq = c.u32()?;
+                let msg = c.msg()?;
+                let prior = c.u32()?;
+                let n = c.u16()?;
+                let mut fills = Vec::with_capacity(usize::from(n));
+                for _ in 0..n {
+                    let rs = c.u32()?;
+                    fills.push((rs, c.rec()?));
+                }
+                let rest = match c.u8()? {
+                    0 => {
+                        c.take(20)?;
+                        None
+                    }
+                    1 => {
+                        let rs = c.u32()?;
+                        Some((rs, c.rec()?))
+                    }
+                    _ => return None,
+                };
+                let n = c.u16()?;
+                let mut makers = Vec::with_capacity(usize::from(n));
+                for _ in 0..n {
+                    let h = c.tx()?;
+                    let r = c.rec()?;
+                    makers.push((h, r, c.u16()?));
+                }
+                Self::Rescan {
+                    step,
+                    lane,
+                    seq,
+                    session,
+                    pkt_seq,
+                    msg,
+                    prior,
+                    fills,
+                    rest,
+                    makers,
                 }
             }
             K_FINAL => Self::Final(Height(c.u64()?), StepId(c.u64()?)),
@@ -379,6 +491,15 @@ impl RingFrame {
     }
 }
 
+/// A TX entry's header fields, as a step frame carries them.
+fn put_tx(out: &mut Vec<u8>, h: &TxEntry) {
+    out.extend_from_slice(&h.step.0.to_le_bytes());
+    out.extend_from_slice(&h.session.0.to_le_bytes());
+    out.extend_from_slice(&h.resp_seq.to_le_bytes());
+    out.extend_from_slice(&h.pkt_seq.to_le_bytes());
+    out.extend_from_slice(&[h.lane.0, h.n_rec, h.role]);
+}
+
 /// `has: u8` then the 16 message bytes (zero when absent).
 fn put_msg(out: &mut Vec<u8>, m: Option<Msg>) {
     match m {
@@ -424,6 +545,17 @@ impl Cur<'_> {
     }
     fn rec(&mut self) -> Option<Resp> {
         Resp::decode(&self.arr()?)
+    }
+    fn tx(&mut self) -> Option<TxEntry> {
+        Some(TxEntry {
+            step: StepId(self.u64()?),
+            session: SessionId(self.u32()?),
+            resp_seq: self.u32()?,
+            pkt_seq: self.u32()?,
+            lane: LaneId(self.u8()?),
+            n_rec: self.u8()?,
+            role: self.u8()?,
+        })
     }
 }
 
@@ -550,6 +682,25 @@ impl RingTap {
 impl Tap for RingTap {
     fn lane_op(&mut self, op: &TapOp) {
         RingFrame::Op(*op).encode(&mut self.buf);
+        if self.buf.len() as u64 > self.cap / 4 {
+            self.flush();
+        }
+    }
+
+    fn rescan_taker(&mut self, t: &TapTaker<'_>) {
+        RingFrame::Rescan {
+            step: t.step,
+            lane: t.lane,
+            seq: t.seq,
+            session: t.session,
+            pkt_seq: t.pkt_seq,
+            msg: t.msg,
+            prior: t.prior,
+            fills: t.fills.to_vec(),
+            rest: t.rest,
+            makers: t.makers.to_vec(),
+        }
+        .encode(&mut self.buf);
         if self.buf.len() as u64 > self.cap / 4 {
             self.flush();
         }
