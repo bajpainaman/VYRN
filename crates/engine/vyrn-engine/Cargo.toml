@@ -13,9 +13,9 @@ vyrn-lane = { workspace = true }
 vyrn-bbo = { workspace = true }
 vyrn-cut = { workspace = true }
 vyrn-wire = { workspace = true }
+# `vyrn_risk::Route` in `Lane::replay_packet`'s signature (layer 1; 11 §1.4 diagram gap).
+vyrn-risk = { workspace = true }
 
 [lints]
 workspace = true
 
-[dev-dependencies]
-vyrn-risk = { workspace = true }

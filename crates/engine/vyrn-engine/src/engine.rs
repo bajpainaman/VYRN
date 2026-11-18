@@ -4,8 +4,8 @@
 
 use vyrn_bbo::admit::{Clock, NeverLate};
 use vyrn_bbo::{
-    Bbo, ControlCons, ControlRing, CutDelta, ENG_CONTROL_RING, FillProd, FwdCons, MAX_LANES, Poll,
-    Record, StepEntry, StepLogProd, TxEntry, TxProd, decode_records,
+    Bbo, ControlCons, ControlRing, Cut, CutDelta, Diverge, ENG_CONTROL_RING, FillProd, FwdCons,
+    MAX_LANES, Poll, Record, StepEntry, StepLogProd, TxEntry, TxProd, decode_records,
 };
 use vyrn_cut::{
     BboFloor, Consumer, Counter, CounterLine, CutEntry, CutWriter, ENG_STEP_LOG, ENG_TX_RING,
@@ -13,13 +13,14 @@ use vyrn_cut::{
     Producer, STEP_LOG_READERS, Snapshot, SnapshotLine, StepLog, TxRing, Visibility,
 };
 use vyrn_lane::{
-    Arena, ArenaConfig, ArenaView, ArenaWriter, Config as LaneConfig, Lane, LaneBook, LogRec,
+    Arena, ArenaConfig, ArenaView, ArenaWriter, Config as LaneConfig, Lane, LaneBook, LogRec, Mid,
     Ports, RespPkt, Rx, RxIn,
 };
+use vyrn_risk::Route;
 use vyrn_types::{LaneId, LaneSeq, PacketRecord, StepId};
 
-/// Packets per lane whose op range and `prio_ts` replay keeps (`ENG_FWD_RING`).
-pub(crate) const PKT_HIST: usize = vyrn_cut::ENG_FWD_RING;
+/// Steps whose cut replay keeps for `MID` boundaries (`ENG_STEP_LOG`).
+pub(crate) const STEP_HIST: usize = ENG_STEP_LOG;
 /// Records one fill TX packet can carry (`TxEntry.n_rec` is a `u8`).
 const TX_RECS: usize = 256;
 /// Polls per step before the engine reports no step (`Bbo::poll` may return `Idle` while it
@@ -114,7 +115,6 @@ type StepLogCons<'a, V> = Consumer<'a, Line64, ENG_STEP_LOG, STEP_LOG_READERS, V
 /// One box: `NA` lane-local accounts per lane (`vyrn_lane::Lane`'s parameter).
 pub struct Engine<'a, V: Visibility, const NA: usize> {
     pub(crate) vis: &'a V,
-    pub(crate) cfgs: Vec<LaneConfig>,
     pub(crate) lanes: Vec<Lane<'a, V, NA>>,
     views: Vec<ArenaView<'a>>,
     fwd_c: Vec<FwdCons<'a, V>>,
@@ -135,15 +135,13 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     cw: [CutWriter; 2],
     pub(crate) bbo: Bbo,
     /// `C_f[l]` of the newest step.
-    cut: Vec<LaneSeq>,
+    pub(crate) cut: Cut,
     deltas: [CutDelta; MAX_LANES],
+    /// `C_f` of the last [`STEP_HIST`] steps, `n` entries per step, keyed by `f mod STEP_HIST`;
+    /// `hist_id` holds the step each slot is for (step 0, the epoch start, is all zeros).
+    hist: Vec<LaneSeq>,
+    hist_id: Vec<StepId>,
     recs: Vec<Record>,
-    /// Replay: each lane's recent packets with ops, `(first LaneSeq, last LaneSeq, prio_ts)`,
-    /// ring of [`PKT_HIST`] per lane (0 = empty).
-    pub(crate) pkts: Vec<(u64, u64, u64)>,
-    /// Replay: each lane's `prio_ts` (05 §6.3: `rx_ts` clamped to be non-decreasing).
-    pub(crate) prio: Vec<u64>,
-    pub(crate) pkt_next: Vec<usize>,
     pub(crate) scratch: Vec<PacketRecord>,
 }
 
@@ -217,7 +215,6 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
         let (log_p, log_c) = log.split()?;
         Some(Self {
             vis,
-            cfgs: cfgs.to_vec(),
             lanes,
             views,
             fwd_c,
@@ -237,12 +234,11 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             floor,
             cw: [CutWriter::new(), CutWriter::new()],
             bbo,
-            cut: vec![LaneSeq(0); n],
+            cut: [LaneSeq(0); MAX_LANES],
             deltas: [CutDelta::default(); MAX_LANES],
+            hist: vec![LaneSeq(0); n.saturating_mul(STEP_HIST)],
+            hist_id: vec![StepId(0); STEP_HIST],
             recs: Vec::with_capacity(TX_RECS),
-            pkts: vec![(0, 0, 0); n.saturating_mul(PKT_HIST)],
-            prio: vec![0; n],
-            pkt_next: vec![0; n],
             scratch: Vec::with_capacity(32),
         })
     }
@@ -271,7 +267,7 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
     }
     /// `C_f[l]` of the newest step.
     pub fn cut(&self) -> &[LaneSeq] {
-        &self.cut
+        self.cut.get(..self.lanes.len()).unwrap_or(&[])
     }
 
     /// Live: lane `l` processes one received packet. `clock` is the lane's deadline clock.
@@ -288,6 +284,23 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
         Ok(r)
     }
 
+    /// Replay: lane `l` replays one logged packet with its boundaries and forwarded ops given
+    /// (`vyrn_lane::Lane::replay_packet`).
+    pub(crate) fn replay_ingest<C: Clock, S: Sink>(
+        &mut self,
+        l: usize,
+        p: RxIn<'_>,
+        clock: &C,
+        mids: &[Mid],
+        routes: &[(LaneSeq, Route)],
+        sink: &mut S,
+    ) -> Result<Rx, Fault> {
+        let lane = self.lanes.get_mut(l).ok_or(Fault::NoLane)?;
+        let r = lane.replay_packet(self.vis, p, clock, mids, routes);
+        self.drain(l, sink)?;
+        Ok(r)
+    }
+
     /// Both cut cores publish, then the BBO core decides at most one step; the stream core then
     /// writes every `LaneCut` and the fan-out copies the new snapshot to every lane.
     /// `clock` is the BBO core's deadline clock.
@@ -296,7 +309,28 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
         clock: &C,
         sink: &mut S,
     ) -> Result<Option<StepId>, Fault> {
-        self.publish_cut()?;
+        self.drive(sink, |bbo, vis, ports, book| {
+            Ok(bbo.poll(vis, ports, book, clock))
+        })
+        .map_err(|e| match e {
+            StepErr::Fault(f) => f,
+            StepErr::Diverge(_) => Fault::Bbo,
+        })
+    }
+
+    /// Both cut cores publish, then `decide` runs the BBO core until it publishes a step (or
+    /// [`POLLS_PER_STEP`] passes go by); then the stream and fan-out roles read the step.
+    pub(crate) fn drive<S: Sink>(
+        &mut self,
+        sink: &mut S,
+        mut decide: impl FnMut(
+            &mut Bbo,
+            &V,
+            &mut vyrn_bbo::Ports<'_, 'a, V>,
+            &LaneBook<'_, 'a>,
+        ) -> Result<Poll, Diverge>,
+    ) -> Result<Option<StepId>, StepErr> {
+        self.publish_cut().map_err(StepErr::Fault)?;
         for _ in 0..POLLS_PER_STEP {
             let r = {
                 let mut ports = vyrn_bbo::Ports {
@@ -311,14 +345,14 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
                     floor: self.floor,
                 };
                 let book = LaneBook::new(&self.views);
-                self.bbo.poll(self.vis, &mut ports, &book, clock)
+                decide(&mut self.bbo, self.vis, &mut ports, &book).map_err(StepErr::Diverge)?
             };
             match r {
                 Poll::Step(s) => {
-                    self.read_step(sink)?;
+                    self.read_step(sink).map_err(StepErr::Fault)?;
                     return Ok(Some(s));
                 }
-                Poll::Fault => return Err(Fault::Bbo),
+                Poll::Fault => return Err(StepErr::Fault(Fault::Bbo)),
                 Poll::Idle | Poll::Stalled => {}
             }
         }
@@ -438,6 +472,7 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
                 }
             }
         }
+        self.remember_cut(entry.step);
         let deltas = self.deltas.get(..n_delta).ok_or(Fault::Ring)?;
         sink.record(&Rec::Step(entry, deltas));
         for c in &mut self.tx_c {
@@ -472,6 +507,48 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
         }
         Ok(())
     }
+}
+
+impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
+    fn slot(f: StepId) -> usize {
+        usize::try_from(f.0)
+            .ok()
+            .and_then(|x| x.checked_rem(STEP_HIST))
+            .unwrap_or(0)
+    }
+
+    fn remember_cut(&mut self, f: StepId) {
+        let n = self.lanes.len();
+        let s = Self::slot(f);
+        let base = s.saturating_mul(n);
+        if let (Some(dst), Some(src)) = (
+            self.hist.get_mut(base..base.saturating_add(n)),
+            self.cut.get(..n),
+        ) {
+            dst.copy_from_slice(src);
+        }
+        if let Some(id) = self.hist_id.get_mut(s) {
+            *id = f;
+        }
+    }
+
+    /// `C_f[l]`, if step `f` is still in the history.
+    pub(crate) fn cut_at(&self, f: StepId, l: usize) -> Option<LaneSeq> {
+        let s = Self::slot(f);
+        if *self.hist_id.get(s)? != f {
+            return None;
+        }
+        self.hist
+            .get(s.saturating_mul(self.lanes.len()).saturating_add(l))
+            .copied()
+    }
+}
+
+/// Why [`Engine::drive`] stopped.
+pub(crate) enum StepErr {
+    Fault(Fault),
+    /// The BBO core refused a replayed step.
+    Diverge(Diverge),
 }
 
 pub(crate) fn lane_id(l: usize) -> LaneId {
