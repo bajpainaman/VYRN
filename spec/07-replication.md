@@ -358,9 +358,12 @@ DEV only: `vyrn-validator`'s `[replay] hashlag_us` (with `dev = true`) sets a la
 unpinned DEV and CI hosts, which do not meet the pinned-core budget of §7.2. A validator without
 `dev = true` refuses any value other than the 1 ms above, so production behaviour is unchanged.
 In `tools/e2e-smoke`, the observer gets its own DEV bound of 200 ms while voters keep the run's
-(50 ms in CI): it also replays, feeds the drop copy and finalizes on its order thread, and the
-bound is measured when a frame is processed (kernel_udp has no RX timestamps yet), so DEV
-scheduler stalls reach it first. A stuck HashRun still fails the observer. \[DEV only\]
+(50 ms in CI): it also replays, feeds the drop copy and finalizes on its order thread. The
+bound runs from each frame's `rx_ts`, the kernel's receive time (`SO_TIMESTAMPNS` on Linux
+kernel_udp, 06 §6.6), not from when the order thread gets to the frame, so time a frame waits
+in the socket queue behind a stalled thread does not count. The observer's 200 ms stays until
+loaded DEV runs show it within the voters' bound. A stuck HashRun still fails the observer.
+\[DEV only\]
 
 The H-part is not part of `order_root` (§6.1). It is implied by `data_root`, which covers the full
 hashes. The 8-byte `pkt_hash` is used for three things: the lookup key into the data store, an

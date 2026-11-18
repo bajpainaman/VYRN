@@ -439,3 +439,32 @@ fn pin_current_thread_sets_the_affinity_mask() {
     .join()
     .expect("pin thread");
 }
+
+/// `SO_TIMESTAMPNS`: `rx_ts` is when the datagram reached the socket, not when `poll` read it.
+/// A datagram left 50 ms in the socket keeps the stamp from before the wait.
+#[cfg(target_os = "linux")]
+#[test]
+fn kernel_udp_rx_ts_is_the_kernel_receive_time() {
+    let realtime = || {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        Nanos(u64::try_from(d.as_nanos()).unwrap())
+    };
+    let mut nic = KernelUdp::open(&cfg(BackendKind::Kernel)).unwrap();
+    let mut rx = nic.rx_ring(&bind(0)).unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let before = realtime();
+    peer.send_to(b"stamp", rx.local_addr()).unwrap();
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(50) {
+        std::thread::yield_now();
+    }
+    let polled = realtime();
+    let p = poll_one(&mut rx);
+    assert!(
+        p.rx_ts() >= before && p.rx_ts().0 + 25_000_000 < polled.0,
+        "rx_ts {:?} not between send {before:?} and poll {polled:?} - 25 ms",
+        p.rx_ts()
+    );
+}

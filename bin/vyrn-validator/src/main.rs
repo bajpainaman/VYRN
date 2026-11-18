@@ -1276,8 +1276,9 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             }
             // A gated observer replays at most one block per order-thread turn: the gate
             // releases blocks in bursts, and replaying a burst inline would leave ORDER and
-            // HASH frames unpolled long enough to trip `REP_E_HASHLAG`, which is measured when
-            // a frame is processed (kernel_udp has no RX timestamps yet).
+            // HASH frames unpolled long enough to trip `REP_E_HASHLAG` for the frames still in
+            // the socket (a frame's wait runs from its `rx_ts`, but a burst is only read once
+            // the thread polls).
             if durable.is_some() && !self.replay_dead {
                 return;
             }
@@ -1442,10 +1443,16 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             let Some(rx) = rx else { continue };
             let n = rx.poll(&mut burst);
             k += n;
+            // `REP_E_HASHLAG` runs from each frame's receive time (07 §3.7): its `rx_ts`
+            // (CLOCK_REALTIME, the kernel's stamp under kernel_udp) moved onto this thread's
+            // monotonic clock by the offset read at this poll, so a frame that waited in the
+            // socket while the thread was descheduled is not counted late.
+            let (mono, real) = (now(), realtime_ns());
             for p in burst.iter().take(n) {
                 let Ok(f) = frame::parse(rx.bytes(p)) else {
                     continue;
                 };
+                let at = mono.saturating_sub(real.saturating_sub(p.rx_ts().0));
                 // The sequencer's answer to a Nack for frames its ring no longer holds.
                 if let (Some(t), Some(ps)) = (NackTooOld::decode(f.payload), paths.as_mut()) {
                     rep_stats[2] = rep_stats[2].saturating_add(1);
@@ -1455,7 +1462,7 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                 stats.frames.fetch_add(1, Ordering::Relaxed);
                 let mut on = |payload: &[u8]| {
                     delivered += 1;
-                    let r = core.on_frame(payload, now());
+                    let r = core.on_frame(payload, at);
                     if track
                         && !matches!(r, Err(FrameErr::OutOfOrder))
                         && let Some((key, q)) = vyrn_replica::paths::frame_key(payload)
@@ -1665,6 +1672,14 @@ fn block_line<const N: usize>(b: &BlockInputs<N>, verdict: Verdict) -> String {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// `CLOCK_REALTIME` in ns, the clock of kernel_udp's `rx_ts`.
+fn realtime_ns() -> u64 {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

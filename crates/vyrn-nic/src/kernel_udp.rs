@@ -6,14 +6,16 @@
 //! parses `kernel_udp` frames exactly as it parses NIC frames. `send` takes a fast-path frame and
 //! sends its payload to the frame's destination address and port.
 //!
-//! `rx_ts` is `CLOCK_REALTIME` read right after the datagram is received (`TsSource::Kernel`);
-//! on Linux, one read right after the `recvmmsg` stamps its whole burst. That clock can step
-//! backwards, so the clamp of 06 §6.1 rule 1 matters here.
+//! `rx_ts` is `CLOCK_REALTIME` (`TsSource::Kernel`). On Linux every queue sets
+//! `SO_TIMESTAMPNS`, so each datagram carries the kernel's software receive stamp, taken when
+//! it reached the socket, not when `poll` ran (06 §6.6); a datagram without one takes the
+//! clock read right after its `recvmmsg`. Elsewhere it is the clock read right after the
+//! receive call. That clock can step backwards, so the clamp of 06 §6.1 rule 1 matters here.
 //!
 //! On Linux, `poll` takes its burst with one `recvmmsg`, and `send_burst` sends up to `RX_BURST`
 //! frames with one `sendmmsg` (06 §6.6, wrappers in `sys`). `TxRing::send` is a burst of one.
 //! Other targets use std's one-datagram calls, which meet the same contract. `SO_BUSY_POLL`,
-//! `SO_TIMESTAMPING` and `kqueue` are not used yet.
+//! hardware `SO_TIMESTAMPING` and `kqueue` are not used yet.
 //!
 //! On Linux a queue bound to `0.0.0.0` sets `IP_PKTINFO`, and each frame's destination IP is
 //! `in_pktinfo.ipi_addr`: the destination address of the datagram's IP header, which is what the
@@ -101,6 +103,9 @@ impl NicBackend for KernelUdp {
             });
         }
         let sock = socket(bind.port, SocketAddrV4::new(bind.ip, bind.udp_port))?;
+        #[cfg(target_os = "linux")]
+        sys::set_timestampns(sock.as_raw_fd())
+            .map_err(|e| NicError::io(KIND, bind.port, "setsockopt(SO_TIMESTAMPNS)", &e))?;
         #[cfg(target_os = "linux")]
         if wildcard {
             sys::set_pktinfo(sock.as_raw_fd())
@@ -246,6 +251,7 @@ impl RxRing for KernelRx {
             if i > k {
                 self.slots.pull(i - k, HDR_BYTES + d.len);
             }
+            let ts = d.ts.map_or(ts, Nanos);
             if let Some(p) = self.deliver(src, dst_ip, d.len, ts) {
                 out[k] = p;
                 k += 1;
