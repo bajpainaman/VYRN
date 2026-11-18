@@ -59,6 +59,11 @@
 //! `FINALITY_FAULT height=<h> ...` and replay stops. A ring or adapter error prints
 //! `REPLAY_FAULT height=<h> output ring: <why>` and replay stops. Not wired here: the epoch's
 //! end (`DC_EOD`; this build serves one epoch), settlement, and `MBO` publication.
+//! **Control** (stdin, one line each; *reading*: 07 and 08 name no transport for it yet).
+//! `EPOCH <e>` re-derives every `K_fetch` of a keyed `[data]` for epoch `e` (07 §5.5 Epoch
+//! boundary); once the order thread has installed the keys it prints `FETCH_EPOCH <e>`. A
+//! refused or unknown line prints `CONTROL_ERR <why>` on stderr and changes nothing. With
+//! `--stop-on-stdin-eof`, EOF stops the validator.
 //!
 //! **Not wired yet** (PR follow-ups): seals in the voter's source (tail reports, Silence), the chain guardian
 //! (`vyrn_chain::bridge::Guardian` needs a `vyrn_chain::Replica` over finalized `StateCommit`s,
@@ -67,7 +72,6 @@
 
 use std::collections::VecDeque;
 
-use std::io::Read as _;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -145,7 +149,7 @@ fn d_ring_cap() -> u64 {
     64 << 20
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Data {
     boxes: Vec<std::net::SocketAddrV4>,
@@ -172,7 +176,7 @@ struct Data {
 
 /// A peer replica: its roster voter index (for its key, `VOTER_TARGET + voter`) and its
 /// `[nic] data_port` address.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Peer {
     voter: u8,
@@ -408,6 +412,9 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
     };
     let rx = nic.rx_ring(&bind).map_err(|e| e.to_string())?;
     let addr = rx.local_addr();
+    // Keyed `[data]`: the `EPOCH <e>` control line's key derivation, and where its keys go.
+    let mut control = None;
+    let mut rekey = None;
     let data = match &cfg.data {
         Some(d) => {
             let drx = nic
@@ -419,92 +426,50 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                 })
                 .map_err(|e| e.to_string())?;
             let n = u8::try_from(d.boxes.len()).map_err(|_| "config data.boxes: too many")?;
-            let secret = match (&d.xchg, &plan) {
-                (Some(h), Some(_)) => Some(consensus::resolve(h)?),
-                _ => None,
-            };
-            let keys = match (&d.xchg, &plan) {
-                (None, _) => Vec::new(),
+            let ring = match (&d.xchg, &plan) {
+                (None, _) => None,
                 (Some(_), None) => {
                     return Err(
                         "config data.xchg needs [consensus]: K_fetch is derived from the roster"
                             .into(),
                     );
                 }
-                (Some(_), Some(p)) => {
-                    let secret = secret.unwrap_or_default();
-                    (0..n)
-                        .map(|b| {
-                            p.fetch_key(vyrn_epoch::FETCH_CONTEXT, b, &secret)
-                                .ok_or_else(|| {
-                                    format!("config data.xchg: no K_fetch for box {b} (08 §9.6)")
-                                })
-                        })
-                        .collect::<Result<_, String>>()?
-                }
+                (Some(h), Some(p)) => Some((p.keyring(), consensus::resolve(h)?)),
             };
-            // 07 §5.5 sources 2 and 3, sealed like the box fetches when keyed (08 §9.6).
-            // A peer or box whose roster key is unusable holds no keys either: it serves the
-            // 32-byte form only, so that is what it gets (reading, PR body).
-            let key = |context: &str, t: u8| -> Result<Option<[u8; 16]>, String> {
-                Ok(match (&secret, &plan) {
-                    (Some(s), Some(p)) => {
-                        let k = p.fetch_key(context, t, s);
-                        if k.is_none() {
-                            eprintln!(
-                                "vyrn-validator: fetch target {t:#04x} has no K_fetch; unsealed"
-                            );
-                        }
-                        k
-                    }
-                    _ => None,
-                })
+            let ks = match &ring {
+                Some((kr, s)) => Some(derive_keys(kr, d, s, Epoch(cfg.epoch), cfg.dev)?),
+                None => None,
             };
+            let target = |addr, key| fetch::Target { addr, key };
             let boxes = d
                 .boxes
                 .iter()
                 .enumerate()
-                .map(|(b, addr)| fetch::Target {
-                    addr: *addr,
-                    key: keys.get(b).copied(),
-                })
+                .map(|(b, a)| target(*a, ks.as_ref().and_then(|k| k.boxes.get(b).copied())))
                 .collect();
             let peers = d
                 .peer
                 .iter()
-                .map(|p| {
-                    let t = vyrn_epoch::VOTER_TARGET.saturating_add(p.voter);
-                    Ok(fetch::Target {
-                        addr: p.addr,
-                        key: key(consensus::PEER_FETCH_CONTEXT, t)?,
-                    })
+                .enumerate()
+                .map(|(i, p)| {
+                    target(
+                        p.addr,
+                        ks.as_ref().and_then(|k| k.peers.get(i).copied().flatten()),
+                    )
                 })
-                .collect::<Result<Vec<_>, String>>()?;
-            let seq = match d.seq_repair {
-                Some(addr) => Some(fetch::Target {
-                    addr,
-                    key: key(
-                        vyrn_epoch::FETCH_CONTEXT,
-                        vyrn_epoch::SEQ_TARGET.saturating_add(d.seq_box),
-                    )?,
-                }),
-                None => None,
-            };
+                .collect();
+            let seq = d
+                .seq_repair
+                .map(|a| target(a, ks.as_ref().and_then(|k| k.seq)));
             let sources = fetch::Sources::new(boxes, peers, seq);
             let peer_addrs: Vec<SocketAddrV4> = d.peer.iter().map(|p| p.addr).collect();
-            let peer_keys = match (&secret, &plan) {
-                (Some(s), Some(p)) => {
-                    let k = p.peer_keys(s)?;
-                    if k.is_empty() {
-                        eprintln!(
-                            "vyrn-validator: keyed, but no peer has a usable K_fetch; serving no peer fetches"
-                        );
-                    }
-                    Some(k)
-                }
-                _ => None,
-            };
-            let peer = fetch::PeerServer::new(&peer_addrs, peer_keys);
+            let keys = ks.as_ref().map_or_else(Vec::new, |k| k.boxes.clone());
+            let peer = fetch::PeerServer::new(&peer_addrs, ks.map(|k| k.serve));
+            if let Some((kr, _)) = ring {
+                let (tx, rx) = std::sync::mpsc::channel();
+                rekey = Some(rx);
+                control = Some((kr, d.clone(), tx));
+            }
             // A box keys a requester by its repl_addr's IPv4 (08 §9.6), so fetches leave from
             // [nic] ip: the reading is that it is this voter's repl_addr IP.
             let repair = UdpSocket::bind(SocketAddrV4::new(ip, 0)).map_err(|e| e.to_string())?;
@@ -528,6 +493,7 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                 certs: cert_rx.take(),
                 tips: VecDeque::new(),
                 replayed: None,
+                rekey: rekey.take(),
             })
         }
         None => None,
@@ -612,9 +578,27 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
         .map_or_else(|| "unpinned".into(), |c| c.to_string());
     println!("LAYOUT order={core_of} control=main");
     println!("READY vyrn-validator order={addr}");
+    let (eof_tx, eof_rx) = std::sync::mpsc::channel::<()>();
+    {
+        // Control lines on stdin (crate docs, Control); EOF stops with `--stop-on-stdin-eof`.
+        let dev = cfg.dev;
+        std::thread::Builder::new()
+            .name("vyrn-validator/stdin".into())
+            .spawn(move || {
+                for line in std::io::stdin().lines() {
+                    let Ok(line) = line else { break };
+                    match control_line(&line, control.as_ref(), dev) {
+                        Ok(Some(ack)) => println!("{ack}"),
+                        Ok(None) => {}
+                        Err(e) => eprintln!("CONTROL_ERR {e}"),
+                    }
+                }
+                let _ = eof_tx.send(());
+            })
+            .map_err(|e| e.to_string())?;
+    }
     if stdin_stop {
-        let mut sink = Vec::new();
-        let _ = std::io::stdin().read_to_end(&mut sink);
+        let _ = eof_rx.recv();
     }
     // Shutdown (stdin EOF): the finality thread stops and is joined first, so the order
     // thread's last drain sees every certificate it accepted. Without `--stop-on-stdin-eof`
@@ -690,6 +674,119 @@ struct DataRx<const N: usize, R> {
     tips: VecDeque<(Height, Hash)>,
     /// Observer: the newest replayed height.
     replayed: Option<Height>,
+    /// Keyed: the key sets `EPOCH <e>` derived, applied at the next poll.
+    rekey: Option<std::sync::mpsc::Receiver<(u32, KeySet)>>,
+}
+
+/// Every `K_fetch` a keyed validator seals or serves fetches under in one epoch (07 §5.5,
+/// 08 §9.6), by `[data]` index.
+struct KeySet {
+    boxes: Vec<[u8; 16]>,
+    peers: Vec<Option<[u8; 16]>>,
+    seq: Option<[u8; 16]>,
+    /// Peer fetches served under epochs `e - 1`, `e` and `e + 1`: peers move one at a time.
+    serve: Vec<(Ipv4Addr, [u8; 16])>,
+}
+
+/// Derives epoch `e`'s [`KeySet`] (cold path). A box without a key, or a peer or seq box
+/// whose roster key is unusable, is an error unless `dev`: then the latter is sent the
+/// 32-byte form (07 §5.5).
+fn derive_keys(
+    kr: &consensus::Keyring,
+    d: &Data,
+    secret: &[u8; 32],
+    e: Epoch,
+    dev: bool,
+) -> Result<KeySet, String> {
+    let boxes = (0..d.boxes.len())
+        .map(|b| {
+            u8::try_from(b)
+                .ok()
+                .and_then(|b| kr.fetch_key(e, vyrn_epoch::FETCH_CONTEXT, b, secret))
+                .ok_or_else(|| format!("config data.xchg: no K_fetch for box {b} (08 §9.6)"))
+        })
+        .collect::<Result<_, String>>()?;
+    let key = |context: &str, t: u8| match kr.fetch_key(e, context, t, secret) {
+        Some(k) => Ok(Some(k)),
+        None if dev => {
+            eprintln!("vyrn-validator: fetch target {t:#04x} has no K_fetch; unsealed (DEV)");
+            Ok(None)
+        }
+        None => Err(format!(
+            "fetch target {t:#04x} has no usable roster xchg_key: unsealed fetches are DEV only \
+             (07 §5.5; set dev = true on a DEV validator)"
+        )),
+    };
+    let peers = d
+        .peer
+        .iter()
+        .map(|p| {
+            key(
+                consensus::PEER_FETCH_CONTEXT,
+                vyrn_epoch::VOTER_TARGET.saturating_add(p.voter),
+            )
+        })
+        .collect::<Result<_, String>>()?;
+    let seq = match d.seq_repair {
+        Some(_) => key(
+            vyrn_epoch::FETCH_CONTEXT,
+            vyrn_epoch::SEQ_TARGET.saturating_add(d.seq_box),
+        )?,
+        None => None,
+    };
+    // Served under e - 1 too: peers move one at a time, and one still on e - 1 must be served
+    // until it moves; e + 1 for one that moved first.
+    let mut serve = Vec::new();
+    for ep in [e.0.checked_sub(1), Some(e.0), e.0.checked_add(1)]
+        .into_iter()
+        .flatten()
+    {
+        serve.extend(kr.peer_keys(Epoch(ep), secret)?);
+    }
+    if serve.is_empty() {
+        eprintln!(
+            "vyrn-validator: keyed, but no peer has a usable K_fetch; serving no peer fetches"
+        );
+    }
+    Ok(KeySet {
+        boxes,
+        peers,
+        seq,
+        serve,
+    })
+}
+
+/// What `EPOCH <e>` derives keys from, and where it sends them with their epoch.
+type Control = (
+    consensus::Keyring,
+    Data,
+    std::sync::mpsc::Sender<(u32, KeySet)>,
+);
+
+/// One stdin control line (cold path). `EPOCH <e>` re-derives every `K_fetch` for epoch `e`,
+/// and hands it to the order thread, which acks `FETCH_EPOCH <e>` once the keys are installed;
+/// empty lines are ignored.
+fn control_line(
+    line: &str,
+    control: Option<&Control>,
+    dev: bool,
+) -> Result<Option<String>, String> {
+    let mut w = line.split_whitespace();
+    match (w.next(), w.next().map(str::parse::<u32>), w.next()) {
+        (None, ..) => Ok(None),
+        (Some("EPOCH"), Some(Ok(e)), None) => {
+            let Some((kr, d, tx)) = control else {
+                return Err("EPOCH needs a keyed [data] (data.xchg)".into());
+            };
+            let secret = consensus::resolve(d.xchg.as_deref().unwrap_or_default())?;
+            let ks = derive_keys(kr, d, &secret, Epoch(e), dev)?;
+            tx.send((e, ks))
+                .map_err(|_| "the order thread has stopped")?;
+            // The order thread acks `FETCH_EPOCH <e>` once it has installed the keys.
+            Ok(None)
+        }
+        _ => Err(format!("unknown control line {:?}", line.trim())),
+    }
 }
 
 /// Observer: the most replayed blocks that may wait for finality, and the most certified tips
@@ -715,6 +812,23 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
     /// Polls the queue and the repair socket once; sends queued fetches. Returns the datagrams
     /// taken.
     fn poll(&mut self, now: u64) -> usize {
+        let rekeyed: Vec<(u32, KeySet)> = self
+            .rekey
+            .as_ref()
+            .map_or_else(Vec::new, |r| r.try_iter().collect());
+        if !rekeyed.is_empty() {
+            let mut acks = Vec::new();
+            for (e, ks) in rekeyed {
+                self.sources.set_keys(&ks.boxes, &ks.peers, ks.seq);
+                self.peer.set_keys(ks.serve);
+                self.keys = ks.boxes;
+                acks.push(e);
+            }
+            // Acked only once installed: a box may drop the old epoch's keys after it.
+            for e in acks {
+                println!("FETCH_EPOCH {e}");
+            }
+        }
         let mut burst = [RxPkt::empty(); RX_BURST];
         let k = self.rx.poll(&mut burst);
         let mut gaps = Vec::new();

@@ -104,6 +104,24 @@ impl Sources {
         }
     }
 
+    /// A new epoch's keys (`EPOCH <e>`), by the same index as the targets they seal for.
+    pub fn set_keys(
+        &mut self,
+        boxes: &[[u8; 16]],
+        peers: &[Option<[u8; 16]>],
+        seq: Option<[u8; 16]>,
+    ) {
+        for (t, k) in self.boxes.iter_mut().zip(boxes) {
+            t.key = Some(*k);
+        }
+        for (t, k) in self.peers.iter_mut().zip(peers) {
+            t.key = *k;
+        }
+        if let Some(t) = self.seq.as_mut() {
+            t.key = seq;
+        }
+    }
+
     fn configured(&self, s: Stage) -> bool {
         match s {
             Stage::Boxes => !self.boxes.is_empty(),
@@ -201,6 +219,14 @@ impl PeerServer {
             order: VecDeque::new(),
             buf: FrameBuf::default(),
             resume: BTreeMap::new(),
+        }
+    }
+
+    /// A keyed server's new epoch's keys (`EPOCH <e>`): it then serves only fetches sealed
+    /// under them. An unkeyed server stays unkeyed.
+    pub fn set_keys(&mut self, keys: Vec<(Ipv4Addr, [u8; 16])>) {
+        if self.keys.is_some() {
+            self.keys = Some(keys);
         }
     }
 
