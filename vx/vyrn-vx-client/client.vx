@@ -382,6 +382,9 @@ const Y_WAIT : i64 = 3;
 const Y_SNAP_VER : i64 = 4;
 // BBO line 2n word 1: the newest snapshot version (replay's `snap_now`).
 const Y_SNAP_NOW : i64 = 1;
+// Lane line 2l word 5: the take this lane waits for, (pred ver << 32) | (pred lane << 24) |
+// (pooled account + 1); 0 when it waits for none.
+const Y_TAKE_WAIT : i64 = 5;
 
 fn stopped(c : *mut Ctx) -> bool { return ld(c, 0i64, 0i64) != 0u64; }
 fn done_step(c : *mut Ctx) -> u64 { unsafe { return sld(c, 2i64 * (*c).n, 0i64); } }
@@ -1025,6 +1028,26 @@ fn find_pa(c : *mut Ctx, id : u64) -> i64 {
   return NONE;
 }
 fn pa_done(c : *mut Ctx, i : i64) -> *mut AtomicU64 { unsafe { return offset_mut((*c).pa_done, i); } }
+
+// Whether the take waits from lane l lead back to l, each still blocked: then none can move
+// (each waits on a take behind the next one's head), a cyclic take order (Codex r4612327830).
+// A word read stale cannot pass: a lane leaves a wait only once its count reaches its ver,
+// and counts only grow, so a hop whose count is still below its ver is in that wait now.
+fn take_cycle(c : *mut Ctx, l : i64) -> bool {
+  unsafe {
+    let mut cur = l;
+    for _h in 0i64..(*c).n {
+      let w = sld(c, 2i64 * cur, Y_TAKE_WAIT);
+      if w == 0u64 { return false; }
+      let pa = ((w & 16777215u64) as i64) - 1i64;
+      let pv = w >> 32u64;
+      if (*pa_done(c, pa)).load(AtomicOrdering::Acquire) >= pv { return false; }
+      cur = ((w >> 24u64) & 255u64) as i64;
+      if cur == l { return true; }
+    }
+    return false;
+  }
+}
 
 // 05 §6.9: a record of a pooled session takes the account's token, so its slot must hold the
 // take of the next ver; any other record must hold none. A divergence is PBV_E_FAULT.
@@ -1818,6 +1841,8 @@ pub fn pbv_lane_run(c : *mut Ctx, l : u32) -> void {
           if pa != NONE && (*pa_done(c, pa)).load(AtomicOrdering::Acquire) < pv {
             let pl = rd8(r, IN_TAKE + 1i64) as i64;
             if pl == li || pl >= (*c).n { (*ln).rec_at = rd64(r, 48i64); fail_lane(ln, E_FAULT); continue; }
+            sst(c, 2i64 * li, Y_TAKE_WAIT, (pv << 32u64) | ((pl as u64) << 24u64) | ((pa as u64) + 1u64));
+            if take_cycle(c, li) { (*ln).rec_at = rd64(r, 48i64); fail_lane(ln, E_FAULT); continue; }
             let head_m = ld(c, l_in_head(pl), 0i64);
             let fed_m = ld(c, l_in_head(pl), 1i64);
             let seen_m = ld(c, l_in_tail(pl), 1i64);
@@ -1832,6 +1857,7 @@ pub fn pbv_lane_run(c : *mut Ctx, l : u32) -> void {
             wait = max(wait, need_m);
           }
         }
+        if sld(c, 2i64 * li, Y_TAKE_WAIT) != 0u64 { sst(c, 2i64 * li, Y_TAKE_WAIT, 0u64); }
         if ds >= wait {
           lane_call(c, li, k);
           // Publish the idle state afresh after every call: the BBO reads this lane's counter

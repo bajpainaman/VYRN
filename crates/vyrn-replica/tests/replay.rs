@@ -1432,6 +1432,35 @@ fn the_vx_client_reproduces_each_take_in_pool_order() {
         "a dropped take",
     );
     fault(&blocks, false, "a box without the pool");
+    // A cyclic take order (Codex r4612327830): lane 1 holds vers [3, 1] and lane 2 [2], so
+    // lane 1's head waits for lane 2's ver 2, which waits for ver 1 behind lane 1's head. The
+    // client must halt with PBV_E_FAULT, not spin; RustReplay cannot replay it either.
+    let cyclic = {
+        let mut x = b.clone();
+        let mut k = 0;
+        for r in &mut x.lanes {
+            if let vyrn_log::LaneRec::Take(t) = r {
+                t.ver = 3 - k;
+                k += 1;
+            }
+        }
+        vec![x]
+    };
+    let rust = rust_unchecked(&live_j, &store, &cyclic, true);
+    assert!(
+        rust.is_err() || rust.as_ref().ok() != Some(&rust_hashes),
+        "rust: {rust:?}"
+    );
+    let (txc, rxc) = std::sync::mpsc::channel();
+    let (st, lb) = (Store(store.0.clone()), lib.clone());
+    std::thread::spawn(move || {
+        let _ = txc.send(vx_replay_on(&st, &cyclic, &lb, true).map(|_| ()));
+    });
+    let e = rxc
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the Vx client spun on a cyclic take order")
+        .unwrap_err();
+    assert!(e.0.contains("diverged (fault)"), "cyclic take order: {e}");
     rejected(
         &edit(&|l| {
             let t = l[take_at(0)];

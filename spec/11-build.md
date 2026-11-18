@@ -1006,7 +1006,9 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   fed so far, and its lane. A pooled record is due once the account's reproduced count reaches
   that predecessor, so the account's takes replay in `ver` order across lane threads; a lane
   waiting on another lane's take reports that lane's wait step, and only while that lane is idle,
-  so the BBO's merge never reads it as settled early. A take carries with its packet because the
+  so the BBO's merge never reads it as settled early. A lane in a take wait publishes the take it
+  waits for; one whose chain of waiting lanes leads back to itself, every hop still blocked, has
+  a cyclic take order no lane can break and stops with `PBV_E_FAULT`. A take carries with its packet because the
   record stays in its ring. **[Reading]** Each pooled record's lane call takes the account's
   next `ver` (gapless from 1, the token's order); a record of a pooled session without a take,
   a take of another account or `ver`, or a take on a record of an unpooled session is
