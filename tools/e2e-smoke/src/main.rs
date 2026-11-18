@@ -4,7 +4,7 @@
 //!
 //! **Invocation.** `e2e-smoke [--bin-dir DIR] [--validators K] [--packets P] [--rate R]
 //! [--seed S] [--wait-s T] [--seq-cpus L] [--validator-cpus L] [--strict-hashlag] [--finality]
-//! [--data]`. `DIR` holds `vyrn-seq` and `vyrn-validator`
+//! [--data]`. `DIR` holds `vyrn-seq`, `vyrn-validator` and (with `--data`) `vyrn-data`
 //! (default: this binary's directory). Exit 0 when every enabled check passes, 1 when one fails,
 //! 2 when the run could not start. Every wait has a deadline of `T` seconds (default 30): the
 //! harness never blocks on a child, a socket or a pipe without one, and kills every child it
@@ -31,7 +31,7 @@
 //! | `replay` | the tap's `OrderCore` readies the same blocks, holding every packet sent exactly once, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box |
 //! | `replica-out` | each validator that prints `out=<hex>` on its `BLOCK` lines matches the tap's output hash per block; SKIP while no validator replays |
 //! | `finality` | with `--finality`: each validator prints `FINAL height=<h>` up to `H`; SKIP without it |
-//! | `data` | with `--data`: payloads reach validators through `vyrn-data`; refused until that path is wired |
+//! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed reports no gap or rejected frame, and that join is the one `replay` reads; SKIP without `--data` |
 //!
 //! **Readings** (the spec does not settle these; PR body):
 //! - R1. The box publishes no output hash. The reference for "replay matches the sequencer" is
@@ -42,8 +42,10 @@
 //!   itself cannot be recomputed from the box's side.
 //! - R2. The tap's engine is built the way `vyrn-seq` builds its DEV engine (`EnginePlan`,
 //!   `engine_loop`), copied here. A drift between the two shows as a replay failure.
-//! - R3. Until `vyrn-data` runs and `vyrn-validator` feeds `vyrn_replica::DataFeed` from it, the tap's `DataJoin` gets copy 2
-//!   of each packet from the client in process, standing in for 07 §5.1.
+//! - R3. With `--data`, the tap's `DataJoin` is filled only from `vyrn-data`'s frames through
+//!   `vyrn_replica::DataFeed` (the tap is destination 0). Without it, the join gets copy 2 from
+//!   the client in process. Validators do not read a data queue yet, so only the tap checks
+//!   `data_root`.
 //! - R4. `FINAL height=<h>` is this harness's guess at a validator's finality line.
 //! - R5. `REP_E_HASHLAG` (07 §3.7 INV-REP-8) is a 1 ms real-time bound that the validator
 //!   measures with user-space receive times and that 07 §7.2 budgets for pinned cores. On an
@@ -87,7 +89,9 @@ use vyrn_cut::Hw;
 use vyrn_engine::{Engine, NoResponses, Rec, Shared, Sink};
 use vyrn_lane::{ArenaConfig, Lane, PathTable, RespPkt, SessionSpec};
 use vyrn_log::Layout;
-use vyrn_replica::{BlockInputs, DataJoin, EpochView, OrderCore, ReplayEngine, RustReplay};
+use vyrn_replica::{
+    BlockInputs, DataFeed, DataJoin, EpochView, OrderCore, ReplayEngine, RustReplay,
+};
 use vyrn_risk::{AcctRisk, AcctSlot, BookSpec, SessionBuckets};
 use vyrn_types::{
     AccountId, BookId, Epoch, Hash, Height, LaneId, PacketFlags, PubKey, SessionId, Tick,
@@ -438,7 +442,7 @@ fn client(sock: UdpSocket, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<Vec
 /// The box's DEV engine (R2), with the sessions open and funded.
 fn replay_all(
     sessions: &[Sess],
-    pkts: &[Pkt],
+    data: DataJoin,
     blocks: &[BlockInputs<LANES>],
 ) -> Result<(Vec<Hash>, Vec<Resp>), String> {
     let n = u8::try_from(LANES).map_err(|e| e.to_string())?;
@@ -505,11 +509,6 @@ fn replay_all(
         if !ok {
             return Err(format!("session {:?} did not open", s.id));
         }
-    }
-    // R3: copy 2 of every packet, from the client.
-    let mut data = DataJoin::default();
-    for p in pkts {
-        data.put(p.session, p.pkt_seq, p.bytes.clone());
     }
     let mut rep = RustReplay::new(engine, data, NoResponses, Collect::default());
     let mut hashes = Vec::new();
@@ -643,15 +642,48 @@ vote = "dev:validator-{i}"
     Ok(p)
 }
 
+/// The vyrn-data DEV config: one destination (the tap's data socket), every session's `K_seq`.
+fn data_config(dir: &Path, dest: &str, sessions: &[Sess]) -> Result<PathBuf, String> {
+    let mut s = format!(
+        r#"schema = 1
+protocol = 1
+role = "data"
+mode = "BASE"
+home = "LDN"
+dev = true
+src = 0
+books = [{BOOK}]
+dests = ["{dest}"]
+
+[nic]
+backend = "kernel_udp"
+ip = "127.0.0.1"
+ingest_port = 0
+fetch_port = 0
+
+[ring]
+slots = 65536
+
+[metrics]
+listen = "127.0.0.1:0"
+"#
+    );
+    for x in sessions {
+        s.push_str(&format!(
+            "\n[[session]]\nid = {}\nkey = \"hex:{}\"\n",
+            x.id.0,
+            hex(&x.k_seq)
+        ));
+    }
+    let p = dir.join("data.toml");
+    std::fs::write(&p, s).map_err(|e| e.to_string())?;
+    Ok(p)
+}
+
 fn run(cli: &Cli) -> Result<bool, String> {
     // R5's HASHLAG exception needs validators that actually report; zero would pass vacuously.
     if cli.validators == 0 {
         return Err("--validators must be at least 1".into());
-    }
-    if cli.data {
-        return Err(
-            "--data: vyrn-data is an empty binary and vyrn-validator polls no data RX queue on this build".into(),
-        );
     }
     let wait = Duration::from_secs(cli.wait_s);
     let bin_dir = match &cli.bin_dir {
@@ -721,6 +753,33 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
     let cl_recv = cl_sock.try_clone().map_err(|e| e.to_string())?;
 
+    // --data: a vyrn-data node takes copy 2 from the client and fans DATA frames out to the
+    // tap's data socket (07 §5.1, §5.2).
+    let data_node = if cli.data {
+        let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        sock.set_read_timeout(timeout).map_err(|e| e.to_string())?;
+        let dest = sock.local_addr().map_err(|e| e.to_string())?.to_string();
+        let cfg = data_config(&dir, &dest, &sessions)?;
+        let mut c = command(&bin_dir.join("vyrn-data"), cli.seq_cpus.as_deref());
+        c.arg("--config").arg(cfg).arg("--stop-on-stdin-eof");
+        let i = nodes.spawn("vyrn-data", &mut c, &tx)?;
+        nodes.wait(&rx, Instant::now() + wait, "vyrn-data READY", |ns| {
+            ns.get(i)
+                .is_some_and(|n| line(n, "READY vyrn-data ").is_some())
+        })?;
+        let ingest: SocketAddrV4 = nodes
+            .0
+            .get(i)
+            .and_then(|n| line(n, "READY vyrn-data "))
+            .and_then(|l| field(l, "ingest"))
+            .ok_or("vyrn-data READY has no ingest=")?
+            .parse()
+            .map_err(|e| format!("vyrn-data ingest address: {e}"))?;
+        Some((i, ingest, sock))
+    } else {
+        None
+    };
+
     let cfg = seq_config(&dir, &order, &sessions)?;
     let mut c = command(&bin_dir.join("vyrn-seq"), cli.seq_cpus.as_deref());
     c.arg("--config")
@@ -746,6 +805,14 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let tap_h = tap(tap_sock, Arc::clone(&stop_tap));
     let stop_cl = Arc::new(AtomicBool::new(false));
     let cl_h = client(cl_recv, Arc::clone(&stop_cl));
+    let (data_idx, data_ingest, data_h) = match data_node {
+        Some((i, ingest, sock)) => (
+            Some(i),
+            Some(ingest),
+            Some(tap(sock, Arc::clone(&stop_tap))),
+        ),
+        None => (None, None, None),
+    };
 
     // Send, paced by send_ns.
     let t0 = Instant::now();
@@ -756,6 +823,10 @@ fn run(cli: &Cli) -> Result<bool, String> {
         }
         let dst = lane_addrs.get(usize::from(p.lane)).ok_or("lane address")?;
         cl_sock.send_to(&p.bytes, dst).map_err(|e| e.to_string())?;
+        // Copy 2 (07 §5.1): the client sends the same bytes to the data node.
+        if let Some(d) = data_ingest {
+            cl_sock.send_to(&p.bytes, d).map_err(|e| e.to_string())?;
+        }
     }
     // Let the box take the last packets before it stops; its stop closes the last block.
     let settle = Instant::now() + Duration::from_millis(300);
@@ -763,6 +834,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
         std::thread::park_timeout(d);
     }
     let seq_ok = nodes.stop(seq, &rx, Instant::now() + wait)?;
+    // The data node flushes its open frames on stop.
+    let data_ok = data_idx.map(|i| nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
     let seq_node = nodes.0.get(seq).ok_or("seq")?;
     let seq_blocks: Vec<(u64, u64, u64)> = blocks(seq_node).into_iter().map(|b| b.0).collect();
     let stats = line(seq_node, "STATS ").unwrap_or("").to_owned();
@@ -791,6 +864,38 @@ fn run(cli: &Cli) -> Result<bool, String> {
     stop_tap.store(true, Ordering::Release);
     stop_cl.store(true, Ordering::Release);
     let frames = tap_h.join().map_err(|_| "tap thread")?;
+    let data_frames = match data_h {
+        Some(h) => Some(h.join().map_err(|_| "data tap thread")?),
+        None => None,
+    };
+    // The tap's join: DATA frames through DataFeed with --data, else copy 2 in process (R3).
+    let mut join = DataJoin::default();
+    let mut feed_errs = Vec::new();
+    let mut fed_stored = 0u64;
+    match &data_frames {
+        Some(fs) => {
+            let mut feed = DataFeed::new(BookId(BOOK), 1, 0);
+            for f in fs {
+                match feed.on_frame(&mut join, f, 0) {
+                    Ok(fed) => {
+                        fed_stored += u64::from(fed.stored);
+                        if fed.dropped > 0 {
+                            feed_errs.push(format!("{} packets dropped", fed.dropped));
+                        }
+                        if let Some(g) = fed.gap {
+                            feed_errs.push(format!("gap {}..={}", g.from, g.to));
+                        }
+                    }
+                    Err(e) => feed_errs.push(e.to_string()),
+                }
+            }
+        }
+        None => {
+            for p in &pkts {
+                join.put(p.session, p.pkt_seq, p.bytes.clone());
+            }
+        }
+    }
     let got = cl_h.join().map_err(|_| "client thread")?;
 
     let mut rep = Report(true);
@@ -943,7 +1048,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     sent.len()
                 ));
             }
-            let (hashes, mut replayed) = replay_all(&sessions, &pkts, &ready)?;
+            let (hashes, mut replayed) = replay_all(&sessions, std::mem::take(&mut join), &ready)?;
             out_hashes = hashes;
             let mut live: Vec<Resp> = Vec::new();
             for g in &got {
@@ -1069,10 +1174,47 @@ fn run(cli: &Cli) -> Result<bool, String> {
             "off (consensus is not wired into the binaries on this build; enable with --finality)",
         );
     }
-    Report::skip(
-        "data",
-        "off (vyrn-data is an empty binary and vyrn-validator polls no data RX queue yet; the tap joins copy 2 in process, R3)",
-    );
+    match (data_idx, data_ok) {
+        (Some(i), Some(ok)) => rep.check("data", {
+            let n = nodes.0.get(i).ok_or("data node")?;
+            let st = line(n, "STATS ").unwrap_or("").to_owned();
+            let stored = field(&st, "stored").and_then(|v| v.parse::<u64>().ok());
+            let events: Vec<&String> = n.lines.iter().filter(|l| l.starts_with("EVENT")).collect();
+            let mut errs = Vec::new();
+            if !ok {
+                errs.push(format!("vyrn-data did not stop cleanly: {st}"));
+            }
+            if stored != Some(pkts.len() as u64) {
+                errs.push(format!("stored {stored:?} != {} packets sent", pkts.len()));
+            }
+            // #120: EVENT lines + events_unprinted + events_dropped = bad_mac + copy conflicts.
+            // The client sends one byte-identical copy under the right key, so all are 0.
+            for k in ["bad_mac", "events_dropped", "events_unprinted"] {
+                if field(&st, k) != Some("0") {
+                    errs.push(format!("{k} is {:?}, not 0", field(&st, k)));
+                }
+            }
+            if let Some(e) = events.first() {
+                errs.push(format!("{} EVENT lines, first {e}", events.len()));
+            }
+            if !feed_errs.is_empty() {
+                errs.push(format!("feed: {}", feed_errs.join(", ")));
+            }
+            if errs.is_empty() {
+                Ok(format!(
+                    "vyrn-data stored {} packets, {} data frames (DATA and DATA_HB) fed {fed_stored} packets into the replay join; {st}",
+                    pkts.len(),
+                    data_frames.as_ref().map_or(0, Vec::len)
+                ))
+            } else {
+                Err(errs.join("; "))
+            }
+        }),
+        _ => Report::skip(
+            "data",
+            "off (enable with --data; vyrn-validator polls no data RX queue yet, so the tap joins copy 2 in process, R3)",
+        ),
+    }
 
     let _ = std::io::stdout().flush();
     let _ = std::fs::remove_dir_all(&dir);
