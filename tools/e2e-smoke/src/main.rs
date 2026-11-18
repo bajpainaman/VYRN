@@ -1432,8 +1432,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
         if let (Some(every), Some(d)) = (cli.tap_loss, dests.first_mut()) {
             let port = sock.local_addr().map_err(|e| e.to_string())?.port();
             let (addr, h) = relay(
-                port,
-                |n, every| n.is_multiple_of(every),
+                Arc::new(std::sync::atomic::AtomicU16::new(port)),
+                |n, every, _| n.is_multiple_of(every),
                 every,
                 Arc::clone(&stop_tap),
             )?;
