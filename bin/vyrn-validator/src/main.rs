@@ -1172,9 +1172,9 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
     /// Item 3 for the pending blocks, in height order: a block whose payloads are all joined
     /// passes or contradicts; a missing payload waits. The front block's first missing payload is
     /// fetched by key; once it is `Sources::stuck` (lost at its box), every payload the pending
-    /// blocks miss (up to `fetch::FETCH_KEYS_MAX`, from the front, a round at most every
-    /// `fetch::ROUND_NS`) is too. Each is fetched once it
-    /// has been missing `REP_DATA_WAIT_US`, from each of 07 §5.5's sources in turn, each key on
+    /// blocks miss is too: a round at most every `fetch::ROUND_NS` examines at most
+    /// `fetch::FETCH_SCAN_MAX` records and asks at most `fetch::FETCH_KEYS_MAX` keys, going on
+    /// where the last round stopped. Each is fetched once it has been missing `REP_DATA_WAIT_US`, from each of 07 §5.5's sources in turn, each key on
     /// its own timer (`fetch.rs`, reading (j)), so a lost RANGE request or reply, or a data box
     /// that lacks a burst, does not stall the queue.
     ///
@@ -1226,38 +1226,36 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                         // burst reaches source 3 while the sequencer still retains it.
                         if self.sources.stuck(session, pkt_seq, now) {
                             let join = Self::join(&mut self.join, &mut self.replay);
-                            let missing = self
-                                .pending
-                                .iter()
-                                .flat_map(|(b, _)| &b.lanes)
-                                .filter_map(|r| match r {
-                                    LaneRec::Pkt(p)
-                                        if p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED)
-                                            == 0
-                                            && (p.session, p.pkt_seq) != (session, pkt_seq)
-                                            && matches!(
-                                                join.resolve(p),
-                                                Err(DataErr::Missing { .. })
-                                            ) =>
-                                    {
-                                        Some((p.session, p.pkt_seq))
-                                    }
-                                    _ => None,
-                                })
-                                .take(fetch::FETCH_SCAN_MAX);
+                            let total: usize =
+                                self.pending.iter().map(|(b, _)| b.lanes.len()).sum();
+                            let start = self.sources.scan_start(total);
+                            let recs = self.pending.iter().flat_map(|(b, _)| &b.lanes);
+                            let mut examined = 0usize;
                             let mut sent = 0usize;
-                            for (s, q) in missing {
-                                if sent >= fetch::FETCH_KEYS_MAX {
-                                    // Its timer keeps running; a later round asks it.
-                                    self.sources.touch(s, q, now);
+                            // From where the last round stopped, wrapping once: at most
+                            // FETCH_SCAN_MAX records and FETCH_KEYS_MAX fetches.
+                            for r in recs.clone().skip(start).chain(recs.take(start)) {
+                                if examined >= fetch::FETCH_SCAN_MAX
+                                    || sent >= fetch::FETCH_KEYS_MAX
+                                {
+                                    break;
+                                }
+                                examined = examined.saturating_add(1);
+                                let LaneRec::Pkt(p) = r else { continue };
+                                if p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) != 0
+                                    || (p.session, p.pkt_seq) == (session, pkt_seq)
+                                    || !matches!(join.resolve(p), Err(DataErr::Missing { .. }))
+                                {
                                     continue;
                                 }
-                                let to = self.sources.due(s, q, now);
+                                let to = self.sources.due(p.session, p.pkt_seq, now);
                                 sent = sent.saturating_add(usize::from(!to.is_empty()));
-                                fetch::send_key(&self.repair, s, q, &to);
+                                fetch::send_key(&self.repair, p.session, p.pkt_seq, &to);
                             }
+                            self.sources.scanned(examined, total);
+                        } else {
+                            self.sources.scanned(0, 0);
                         }
-                        self.sources.end_round();
                         return;
                     }
                     Ok(()) => source.valid(h),

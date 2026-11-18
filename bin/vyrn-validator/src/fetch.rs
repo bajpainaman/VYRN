@@ -12,9 +12,11 @@
 //! one after another: the sequencer retains a packet only `REP_SEQ_PKT_RETAIN_MS` = 50 ms
 //! (07 §5.5, reading (j)). A replica catching up, whose data is still arriving by RANGE, keeps
 //! asking for one key.
-//! A round ([`Sources::begin_round`], [`Sources::end_round`]) asks at most [`FETCH_KEYS_MAX`]
-//! keys, from the front block on, keeps the timers of up to [`FETCH_SCAN_MAX`], forgets the
-//! keys it no longer names, and runs at most every [`ROUND_NS`].
+//! A round ([`Sources::begin_round`]) runs at most every [`ROUND_NS`], examines at most
+//! [`FETCH_SCAN_MAX`] pending records and asks at most [`FETCH_KEYS_MAX`] keys, starting where
+//! the last round stopped ([`Sources::scan_start`], [`Sources::scanned`]), so every missing key
+//! gets its turn however long the backlog; a key is forgotten after a full cycle of the scan
+//! that does not name it.
 //!
 //! **`PeerDataFetch`** (reading (a), accepted). The request is the same KEY fetch as `DataFetch`
 //! and `SeqDataReq`. A replica answers on its data port, so `[[data.peer]]` lists the peers'
@@ -63,9 +65,8 @@ const BURST_NS: u64 = 10_000_000;
 /// Missing keys one round of [`Sources`] asks for at most (reading (j)): a burst this size
 /// reaches source 3 in one escalation, a longer one in turns of this many.
 pub const FETCH_KEYS_MAX: usize = 128;
-/// Missing keys one round tracks at most: each keeps its timer while it waits for a turn
-/// ([`Sources::touch`]), so a key past [`FETCH_KEYS_MAX`] is not forgotten (CodeRabbit
-/// r4618053807).
+/// Pending records one round examines at most; the next round goes on from there (Codex
+/// r4618145217).
 pub const FETCH_SCAN_MAX: usize = 4096;
 /// The least time between two rounds, so a replica far behind (catching up from a restart) does
 /// not rescan its pending blocks on every poll.
@@ -108,7 +109,7 @@ struct Esc {
     at: u64,
     /// When it was first seen missing.
     since: u64,
-    /// The round that last named it.
+    /// The scan cycle that last named it.
     round: u64,
     /// Its own peer cursor, so each key turns through every peer whatever the other keys do
     /// (Vercel r4617946666).
@@ -123,7 +124,10 @@ pub struct Sources {
     next_peer: usize,
     /// Per missing key, its escalation.
     missing: BTreeMap<(SessionId, u32), Esc>,
+    /// Scan cycles: one ends each time the scan wraps past the last pending record.
     round: u64,
+    /// Where the next scan starts, in the pending blocks' records.
+    scan_at: usize,
     /// When the last round began (`None`: none yet).
     round_at: Option<u64>,
     pub counts: Counts,
@@ -138,6 +142,7 @@ impl Sources {
             next_peer: 0,
             missing: BTreeMap::new(),
             round: 0,
+            scan_at: 0,
             round_at: None,
             counts: Counts::default(),
         }
@@ -184,7 +189,6 @@ impl Sources {
             return false;
         }
         self.round_at = Some(now);
-        self.round = self.round.wrapping_add(1);
         true
     }
 
@@ -198,33 +202,27 @@ impl Sources {
             .is_some_and(|x| now.saturating_sub(x.since) >= REP_DATA_WAIT_NS.saturating_mul(2))
     }
 
-    /// Names `(session, pkt_seq)` in this round without asking for it: its timer starts (or
-    /// keeps running) and it is not forgotten, so it is asked as soon as a round has room.
-    pub fn touch(&mut self, session: SessionId, pkt_seq: u32, now: u64) {
-        let round = self.round;
-        match self.missing.get_mut(&(session, pkt_seq)) {
-            Some(x) => x.round = round,
-            None => {
-                let peer = self.next_peer;
-                self.next_peer = self.next_peer.wrapping_add(1);
-                self.missing.insert(
-                    (session, pkt_seq),
-                    Esc {
-                        last: None,
-                        at: now,
-                        since: now,
-                        round,
-                        peer,
-                    },
-                );
-            }
-        }
+    /// Where this round's scan starts among `total` pending records: where the last one
+    /// stopped, so every record gets its turn (Codex r4618145217, CodeRabbit r4618053807).
+    pub fn scan_start(&self, total: usize) -> usize {
+        self.scan_at.checked_rem(total).unwrap_or(0)
     }
 
-    /// Ends a round: keys it did not name (joined, or released) are forgotten.
-    pub fn end_round(&mut self) {
+    /// The round examined `examined` records from [`Sources::scan_start`]. When the scan wraps
+    /// past the last record a cycle ends, and keys the cycle did not name (joined, or released)
+    /// are forgotten; so is everything not named this cycle once more than
+    /// 2 × [`FETCH_SCAN_MAX`] keys are held.
+    pub fn scanned(&mut self, examined: usize, total: usize) {
+        let at = self.scan_start(total).saturating_add(examined);
+        let ended = total > 0 && at >= total;
+        self.scan_at = if ended { at.saturating_sub(total) } else { at };
         let r = self.round;
-        self.missing.retain(|_, x| x.round == r);
+        if ended {
+            self.round = r.wrapping_add(1);
+            self.missing.retain(|_, x| x.round == r);
+        } else if self.missing.len() > FETCH_SCAN_MAX.saturating_mul(2) {
+            self.missing.retain(|_, x| x.round == r);
+        }
     }
 
     /// A pending block misses `(session, pkt_seq)` at `now`: the targets to KEY-fetch it from
@@ -545,10 +543,11 @@ mod tests {
     fn missing_keys_escalate_together_and_rounds_forget_joined_ones() {
         let mut s = Sources::new(vec![t(1)], vec![t(11)], Some(t(21)));
         let (k, w) = (SessionId(5), REP_DATA_WAIT_NS);
+        // One round that scans every key of `keys`, a full cycle.
         let round = |s: &mut Sources, keys: &[u32], now: u64| {
             assert!(s.begin_round(now));
             let out: Vec<Vec<Target>> = keys.iter().map(|&q| s.due(k, q, now)).collect();
-            s.end_round();
+            s.scanned(keys.len(), keys.len());
             out
         };
         assert_eq!(round(&mut s, &[1, 2, 3], 0), vec![vec![]; 3]);
@@ -567,29 +566,52 @@ mod tests {
             for (q, g) in (1u32..).zip(got.iter_mut()) {
                 g.extend(s.due(k, q, c * w));
             }
-            s.end_round();
+            s.scanned(2, 2);
         }
         for g in &got {
             assert!(g.contains(&t(11)) && g.contains(&t(12)), "{g:?}");
         }
-        let mut s = Sources::new(vec![t(1)], vec![t(11)], Some(t(21)));
-        assert!(s.begin_round(4 * w));
-        s.end_round();
         // A key is stuck once its boxes and a peer had their wait.
+        let mut s = Sources::new(vec![t(1)], vec![t(11)], Some(t(21)));
         assert!(s.begin_round(5 * w));
         assert!(s.due(k, 9, 5 * w).is_empty());
         assert!(!s.stuck(k, 9, 7 * w - 1));
         assert!(s.stuck(k, 9, 7 * w));
-        s.end_round();
         // Rounds are at least ROUND_NS apart.
         assert!(!s.begin_round(5 * w + ROUND_NS - 1));
         assert!(s.begin_round(5 * w + ROUND_NS));
-        // A touched key keeps its timer through the round without being asked (CodeRabbit
-        // r4618053807): it is due once named again.
-        s.touch(k, 9, 5 * w + ROUND_NS);
-        s.end_round();
-        assert!(s.begin_round(8 * w));
-        assert_eq!(s.due(k, 9, 8 * w), vec![t(1)]);
+    }
+
+    /// The scan goes on where the last round stopped and wraps, so a key past one round's budget
+    /// gets its turn, and a key named in the last cycle keeps its timer (Codex r4618145217,
+    /// CodeRabbit r4618053807).
+    #[test]
+    fn the_scan_resumes_where_it_stopped_and_keeps_timers_across_rounds() {
+        let mut s = Sources::new(vec![t(1)], Vec::new(), None);
+        assert_eq!(s.scan_start(10), 0);
+        s.scanned(4, 10);
+        assert_eq!(s.scan_start(10), 4);
+        s.scanned(4, 10);
+        assert_eq!(s.scan_start(10), 8);
+        // Key 7 named in cycle 0, then the scan wraps twice past it without naming it in the
+        // second cycle: forgotten only then.
+        let k = SessionId(5);
+        assert!(s.due(k, 7, 0).is_empty());
+        s.scanned(4, 10); // wraps: cycle 0 ends, key 7 named in it stays
+        assert_eq!(s.scan_start(10), 2);
+        assert_eq!(s.missing.len(), 1);
+        assert_eq!(
+            s.due(k, 7, REP_DATA_WAIT_NS),
+            vec![t(1)],
+            "its timer kept running"
+        );
+        s.scanned(10, 10); // cycle 1 named it: stays
+        assert_eq!(s.missing.len(), 1);
+        s.scanned(10, 10); // cycle 2 did not: forgotten
+        assert!(s.missing.is_empty());
+        // A shrinking backlog cannot leave the cursor past its end.
+        s.scanned(3, 10);
+        assert_eq!(s.scan_start(2), 1);
     }
 
     /// A keyed target gets the 40-byte form that opens under its key; an unkeyed one the 32.
