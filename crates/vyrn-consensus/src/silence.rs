@@ -9,8 +9,8 @@
 //!
 //! The other two suspicion reasons (equivocation evidence, an unrepairable `order_root`) come from
 //! other components; they construct a [`Suspicion`] themselves. The signed `Silence` message and
-//! its TailReport (07 §9.3) are not in this crate yet; [`Deposition`] counts the voters whose
-//! `Silence` the caller has already verified.
+//! its TailReport (07 §9.3) are [`crate::tail`]; [`Deposition`] counts the voters whose `Silence`
+//! [`crate::tail::Silence::verify`] returned as [`crate::tail::Reporter::Voter`].
 
 use commonware_runtime::Clock;
 use std::sync::{Arc, Mutex, PoisonError};
