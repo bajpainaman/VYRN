@@ -145,3 +145,27 @@ fn dedupe_matches_the_published_vectors() {
     }
     assert_eq!(n, 5);
 }
+
+#[test]
+fn authenticated_fetches_match_the_published_vectors() {
+    let key = |h: &str| -> [u8; 16] { unhex(h).try_into().unwrap() };
+    let (mut ok, mut err) = (0, 0);
+    for f in lines() {
+        match f[0].as_str() {
+            "fetch_auth" => {
+                let (k, plain, sealed) = (key(&f[2]), unhex(&f[3]), unhex(&f[4]));
+                let q = Fetch::decode(&plain).unwrap();
+                assert_eq!(&q.seal(&k)[..], &sealed[..], "seal {}", f[1]);
+                assert_eq!(Fetch::open(&sealed, &k).unwrap(), q, "open {}", f[1]);
+                ok += 1;
+            }
+            "fetch_auth_err" => {
+                let e = Fetch::open(&unhex(&f[3]), &key(&f[2])).unwrap_err();
+                assert_eq!(format!("{e:?}"), f[4], "{}", f[1]);
+                err += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((ok, err), (3, 4));
+}

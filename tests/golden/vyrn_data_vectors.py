@@ -12,6 +12,8 @@ Line formats (space-separated; '-' for an empty list):
   fetch_ok  <name> range <dst> <from> <to> <hex>
   fetch_ok  <name> block <height> <hex>
   fetch_err <name> <hex> <reason>
+  fetch_auth <name> <key hex> <32-byte fetch hex> <40-byte sealed hex>
+  fetch_auth_err <name> <key hex> <hex> <reason>
   dedupe    <name> <pkt_seq,...> <verdict,...>   (verdicts: New Repeat Late; one session)
 """
 import struct
@@ -52,6 +54,47 @@ def rng(dst, frm, to):
 
 def block(h):
     return fetch(3, struct.pack("<Q", h) + bytes(16))
+
+
+M64 = (1 << 64) - 1
+
+
+def rotl(x, b):
+    return ((x << b) | (x >> (64 - b))) & M64
+
+
+def siphash24(key, msg):
+    """SipHash-2-4 (Aumasson and Bernstein, 2012), written from the paper."""
+    k0, k1 = struct.unpack("<QQ", key)
+    v = [k0 ^ 0x736F6D6570736575, k1 ^ 0x646F72616E646F6D, k0 ^ 0x6C7967656E657261,
+         k1 ^ 0x7465646279746573]
+
+    def rnd():
+        v[0] = (v[0] + v[1]) & M64; v[1] = rotl(v[1], 13); v[1] ^= v[0]; v[0] = rotl(v[0], 32)
+        v[2] = (v[2] + v[3]) & M64; v[3] = rotl(v[3], 16); v[3] ^= v[2]
+        v[0] = (v[0] + v[3]) & M64; v[3] = rotl(v[3], 21); v[3] ^= v[0]
+        v[2] = (v[2] + v[1]) & M64; v[1] = rotl(v[1], 17); v[1] ^= v[2]; v[2] = rotl(v[2], 32)
+
+    full = len(msg) - len(msg) % 8
+    blocks = [struct.unpack("<Q", msg[i:i + 8])[0] for i in range(0, full, 8)]
+    tail = msg[full:] + bytes(7 - len(msg) % 8) + bytes([len(msg) & 0xFF])
+    blocks.append(struct.unpack("<Q", tail)[0])
+    for m in blocks:
+        v[3] ^= m
+        rnd(); rnd()
+        v[0] ^= m
+    v[2] ^= 0xFF
+    for _ in range(4):
+        rnd()
+    return v[0] ^ v[1] ^ v[2] ^ v[3]
+
+
+def seal(b, k):
+    return b + struct.pack("<Q", siphash24(k, b))
+
+
+# The paper's appendix vector: key 00..0f, message 00..0e, tag a129ca6149be45e5.
+assert siphash24(bytes(range(16)), bytes(range(15))) == 0xA129CA6149BE45E5
 
 
 def window(seqs):
@@ -125,6 +168,18 @@ def main():
     ]
     for name, b, why in bad:
         print(f"fetch_err {name} {hx(b)} {why}")
+    kf = bytes(range(0x40, 0x50))
+    for name, b in [("key", key(0x12345678, 7)), ("range", rng(2, 10, 20)),
+                    ("block", block(1 << 40))]:
+        print(f"fetch_auth {name} {hx(kf)} {hx(b)} {hx(seal(b, kf))}")
+    good = seal(key(1, 1), kf)
+    for name, b, why in [
+        ("bad_tag", good[:39] + bytes([good[39] ^ 1]), "Tag"),
+        ("other_key", seal(key(1, 1), bytes(16)), "Tag"),
+        ("plain", key(1, 1), "Short"),
+        ("tagged_bad_body", seal(fetch(9, bytes(24)), kf), "Kind"),
+    ]:
+        print(f"fetch_auth_err {name} {hx(kf)} {hx(b)} {why}")
     cases = [
         ("in_order", [1, 2, 3, 4]),
         ("repeat_and_reorder", [1, 3, 2, 3, 1, 5, 4]),
