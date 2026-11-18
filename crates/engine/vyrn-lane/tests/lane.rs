@@ -801,3 +801,326 @@ fn canceling_a_pending_replace_writes_one_journal_entry() {
     lb.journal(lid(0), LaneSeq(0), LaneSeq(5), |j| seqs.push(j.seq.0));
     assert_eq!(seqs, vec![2, 4, 5]);
 }
+
+#[test]
+fn pooled_lanes_hand_the_bbo_the_pool_wide_account_index() {
+    // 05 §6.9: STP across the pool compares the pool-wide account index. Lanes 0 and 1 are
+    // pooled; lane 0's account 1 and lane 1's account 2 are one pooled account, index 7. Lane 0
+    // rests sell 1 @ 105; lane 1 sends a CancelNewest buy 1 @ 105. Same account: Reject STP with
+    // the resting handle, no trade (04 §6.8). With lane-local indices (1 and 2) they would trade.
+    let run = |pool_ix: bool| {
+        let (mut bbo, mut w) = setup_pool(0b011);
+        let mut x = w.rig();
+        if pool_ix {
+            assert!(x.lanes[0].set_pool_index(vyrn_risk::AcctSlot(1), 7));
+            assert!(x.lanes[1].set_pool_index(vyrn_risk::AcctSlot(2), 7));
+        }
+        x.send(0, 1, 1_000, &[new(day(Side::Sell), 105, 1, 11)]);
+        x.settle(&mut bbo);
+        let f = vyrn_bbo::OrderFlags::new(
+            Side::Buy,
+            vyrn_bbo::Tif::Day,
+            false,
+            vyrn_bbo::Stp::CancelNewest,
+        );
+        x.send(1, 2, 2_000, &[new(f, 105, 1, 22)]);
+        x.settle(&mut bbo);
+        let lb = vyrn_lane::LaneBook::new(&x.views);
+        let ix = lb.slot(lid(0), 1).unwrap().acct_ix;
+        (ix, x.records(1, 2))
+    };
+    let (ix, taker) = run(true);
+    assert_eq!(ix, 7, "OrderSlot.acct_ix is the pool-wide index");
+    // 04 §6.8 says `Reject STP` (detail = the resting handle) for an aggressor with no fill;
+    // vyrn-bbo answers `Out STP` today, on one lane too. That record is the BBO's (fill TX
+    // core); reported to the bbo owner. What the lane owns: the self-trade is caught.
+    assert_eq!(
+        taker,
+        vec![Record::Out {
+            index: 0,
+            cause: vyrn_bbo::OUT_STP,
+            handle: Handle::new(1, 1).unwrap(),
+            qty: Qty(1),
+            client_tag: 22
+        }]
+    );
+    let (ix, taker) = run(false);
+    assert_eq!(ix, 1);
+    assert!(
+        taker.iter().any(|r| matches!(r, Record::Fill { .. })),
+        "control: {taker:?}"
+    );
+}
+
+#[test]
+fn a_replayed_log_reproduces_the_original_forwarding() {
+    // 05 §10: in replay, op (l, q) is forwarded iff a StepRecord has src = (l, q). Original run:
+    // with no ask, sell 5 @ 110 improves and is forwarded (05 §6.5): Improve step, src (0, 1).
+    // Replay: lane 0's snapshot says ask 100, so classify would make the sell a local join; the
+    // forced route still forwards it, and the step and records are the original's.
+    let original = {
+        let (mut bbo, mut w) = setup();
+        let mut x = w.rig();
+        x.send(0, 1, 1_000, &[new(day(Side::Sell), 110, 5, 11)]);
+        x.settle(&mut bbo);
+        let s = x.steps[0].entry;
+        ((s.kind, s.src_lane.0, s.src_lane_seq), x.records(0, 1))
+    };
+    assert_eq!(original.0, (StepKind::Improve.code(), 0, LaneSeq(1)));
+    let doctored = |x: &Rig<'_>| vyrn_cut::Snapshot {
+        ask: Tick(100),
+        ..x.snapshot()
+    };
+    // Control: the live path on the doctored snapshot keeps the op local.
+    {
+        let (_bbo, mut w) = setup();
+        let mut x = w.rig();
+        let s = doctored(&x);
+        x.pin_snapshot(0, &s);
+        x.send(0, 1, 1_000, &[new(day(Side::Sell), 110, 5, 11)]);
+        assert_eq!(x.counter(0).fwd_pend, LaneSeq(0), "classified local");
+    }
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    let s = doctored(&x);
+    x.pin_snapshot(0, &s);
+    let r = x.replay(
+        0,
+        1,
+        1_000,
+        &[new(day(Side::Sell), 110, 5, 11)],
+        &[],
+        &[(LaneSeq(1), vyrn_risk::Route::Improve)],
+    );
+    assert_eq!(r, Rx::Accepted);
+    assert_eq!(x.counter(0).fwd_pend, LaneSeq(1), "forwarded");
+    x.settle(&mut bbo);
+    let s = x.steps[0].entry;
+    assert_eq!(
+        ((s.kind, s.src_lane.0, s.src_lane_seq), x.records(0, 1)),
+        original
+    );
+}
+
+#[test]
+fn a_reduce_settles_even_when_its_successor_filled_first() {
+    // Codex review 2: sell 10 @ 106, then reduce by 4 (LaneSeq 2, local), then lane 1 buys 6
+    // @ 106. In L the reduce comes first: CancelAck 4, then the 6 remaining lots fill
+    // (04 §6.4), and nothing stays reserved (10 §4.4).
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    x.send(0, 1, 1_000, &[new(day(Side::Sell), 106, 10, 11)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 1);
+    x.send(
+        0,
+        1,
+        2_000,
+        &[Msg::Reduce {
+            handle: h,
+            by: Qty(4),
+            client_tag: 44,
+        }],
+    );
+    x.send(1, 1, 3_000, &[new(day(Side::Buy), 106, 6, 1)]);
+    x.settle(&mut bbo);
+    assert!(
+        x.records(0, 1).contains(&Record::CancelAck {
+            index: 0,
+            handle: h,
+            canceled: Qty(4),
+            client_tag: 44
+        }),
+        "{:?}",
+        x.records(0, 1)
+    );
+    assert_eq!(base_resv(&mut x, 0, 1), 0);
+}
+
+#[test]
+fn a_shed_entry_with_dependencies_answers_busy_without_a_fault() {
+    // Codex review 2: lane 1 [sell 1 @ 106, buy 3 @ 106] forwards the buy with a Join
+    // dependency; the BBO core's clock is past FwdEntry.deadline, so it runs a Shed step
+    // (05 §6.8): both are answered BUSY, nothing trades, and both reservations come back
+    // (10 §3.11). The Dep(BUSY) event has no handle; the lane must not fault on it.
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    ask_105(&mut x, &mut bbo);
+    x.send(
+        1,
+        1,
+        3_000,
+        &[
+            new(day(Side::Sell), 106, 1, 21),
+            new(day(Side::Buy), 106, 3, 22),
+        ],
+    );
+    let s = x.bbo_step_at(&mut bbo, 1_000_000).unwrap();
+    assert_eq!(StepKind::from_code(s.entry.kind), Some(StepKind::Shed));
+    x.settle(&mut bbo);
+    let busy: Vec<u8> = x
+        .records(1, 1)
+        .iter()
+        .filter_map(|r| match r {
+            Record::Reject {
+                index,
+                reason: RejectReason::Busy,
+                ..
+            } => Some(*index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(busy, vec![0, 1], "{:?}", x.records(1, 1));
+    assert_eq!(base_resv(&mut x, 1, 1), 0);
+    assert_eq!(
+        x.lanes[1]
+            .account_mut(vyrn_risk::AcctSlot(1))
+            .unwrap()
+            .1
+            .quote_resv,
+        0
+    );
+}
+
+#[test]
+fn a_per_session_cancel_all_tombstones_a_pending_replace_predecessor() {
+    // Codex review 2, 05 §4.7: account 2 has two sessions, so CancelAll writes tombstones.
+    // Seqs: 1 ask_105, 2 sell 3 @ 110 (local), 3 Replace to 104 (forwarded, pending), 4
+    // CancelAll. Both versions of the order get tomb_seq 4: if the BBO sheds the replace, the
+    // version @ 110 is current again and must already be canceled.
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    x.open(0, 20, 2, vyrn_risk::SessionBuckets::default());
+    ask_105(&mut x, &mut bbo);
+    x.send(0, 2, 2_000, &[new(day(Side::Sell), 110, 3, 12)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 2);
+    x.send(
+        0,
+        2,
+        3_000,
+        &[
+            replace(h, Side::Sell, 104, 3),
+            Msg::CancelAll { client_tag: 9 },
+        ],
+    );
+    let lb = vyrn_lane::LaneBook::new(&x.views);
+    assert_eq!(
+        lb.slot(lid(0), 2).unwrap().tomb_seq,
+        LaneSeq(4),
+        "the version @ 110"
+    );
+    assert_eq!(
+        lb.slot(lid(0), 3).unwrap().tomb_seq,
+        LaneSeq(4),
+        "the pending replace"
+    );
+}
+
+#[test]
+fn a_local_replace_out_of_range_is_applied_before_a_later_forward() {
+    // Codex review 2, 05 §6.6: packet [Replace sell 105 → 110 (local join, LaneSeq 2), buy 3 @
+    // 106 (cross, LaneSeq 3)]. The old version @ 105 is in the buy's range and the new one is
+    // not, so pass 2 applies the replace before the push: applied_back = 3 − 2 = 1.
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    let h = ask_105(&mut x, &mut bbo);
+    x.send(
+        0,
+        1,
+        2_000,
+        &[
+            replace(h, Side::Sell, 110, 5),
+            new(day(Side::Buy), 106, 3, 13),
+        ],
+    );
+    let e = x.peek_fwd(0);
+    assert_eq!((e.lane_seq, e.applied_back), (LaneSeq(3), 1));
+}
+
+#[test]
+fn scripted_boundaries_stay_scripted_after_the_last_one() {
+    // Codex review 2, 05 §10: with `mids` the packet's boundaries are exactly the listed ones.
+    // Lane 1 crosses lane 0's ask twice (steps a, b); lane 0 has applied neither. Lane 0's
+    // packet names one boundary at (a, C_a) before op 3; step b must not run inside it.
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    ask_105(&mut x, &mut bbo);
+    x.send(1, 1, 2_000, &[new(day(Side::Buy), 105, 1, 1)]);
+    let a = x.bbo_step(&mut bbo).unwrap();
+    x.send(1, 1, 2_100, &[new(day(Side::Buy), 105, 1, 2)]);
+    let b = x.bbo_step(&mut bbo).unwrap();
+    assert!(b.entry.step > a.entry.step);
+    let at = vyrn_cut::LaneCutEntry {
+        step: a.entry.step,
+        cut: a.cuts[0],
+    };
+    x.publish(); // lane 0's snapshot line now has done_step = b: a live poll would run b
+    let n = x.log[0].len();
+    let m = [
+        new(day(Side::Sell), 110, 1, 2),
+        new(day(Side::Sell), 111, 1, 3),
+    ];
+    x.send_at(
+        0,
+        2,
+        3_000,
+        3_000,
+        &m,
+        &[Mid {
+            pass: 1,
+            next: LaneSeq(3),
+            at,
+        }],
+    );
+    let adv: Vec<StepId> = packets(&x, 0)[n..]
+        .iter()
+        .filter(|p| p.flags & PacketFlags::ADVANCE != 0)
+        .map(|p| p.fills_applied)
+        .collect();
+    assert_eq!(adv, vec![a.entry.step]);
+}
+
+#[test]
+fn a_same_tick_replace_reduction_pays_the_reduce_message_bucket() {
+    // Codex review 1 P2 (test 16), 04 §9.1: session MSG bucket of burst 4, one token per second.
+    // The New takes 1; three same-tick Replace reductions take the other 3; the fourth is
+    // Reject RATE_LIMIT with the session MSG bucket id 2, and the order keeps 10 − 3 = 7.
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    let b = vyrn_risk::SessionBuckets {
+        msg: vyrn_risk::Gcra::new(1_000_000_000, 4),
+        ..Default::default()
+    };
+    x.open(0, 30, 3, b);
+    x.send(0, 30, 1_000, &[new(day(Side::Sell), 110, 10, 7)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 30);
+    let m: Vec<Msg> = [9, 8, 7, 6]
+        .iter()
+        .map(|q| replace(h, Side::Sell, 110, *q))
+        .collect();
+    x.send(0, 30, 2_000, &m);
+    x.settle(&mut bbo);
+    let recs = x.records(0, 30);
+    assert!(
+        recs.contains(&Record::Reject {
+            index: 3,
+            reason: RejectReason::RateLimit,
+            detail: 2,
+            client_tag: 7
+        }),
+        "{recs:?}"
+    );
+    let acks = recs.iter().filter(|r| {
+        matches!(
+            r,
+            Record::CancelAck {
+                canceled: Qty(1),
+                ..
+            }
+        )
+    });
+    assert_eq!(acks.count(), 3);
+    assert_eq!(base_resv(&mut x, 0, 3), 7);
+}

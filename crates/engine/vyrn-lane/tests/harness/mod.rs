@@ -20,7 +20,7 @@
     clippy::as_conversions
 )]
 
-use vyrn_bbo::admit::{FixedClock, NeverLate};
+use vyrn_bbo::admit::{Clock, FixedClock, NeverLate};
 use vyrn_bbo::{
     Bbo, ControlCons, ControlRing, FillEvent, FillKind, FillProd, FwdCons, OrderFlags, Phase, Poll,
     Record, Side, StepEntry, StepLogProd, Stp, Tif, TxProd,
@@ -34,7 +34,7 @@ use vyrn_lane::{
     Arena, ArenaConfig, ArenaView, Config, Lane, LaneBook, LogRec, Mid, PathTable, Ports, RespPkt,
     Rx, RxIn, SessionSpec, lane::FWD_DEADLINE_NS,
 };
-use vyrn_risk::{AcctRisk, AcctSlot, BookSpec, SessionBuckets};
+use vyrn_risk::{AcctRisk, AcctSlot, BookSpec, Route, SessionBuckets};
 use vyrn_types::{
     AccountId, BookId, Epoch, Handle, LaneId, LaneSeq, MAX_REQ_PAYLOAD, Nanos, PktHash, Qty,
     SessionId, StepId, Tick,
@@ -46,7 +46,7 @@ pub const NA: usize = 16;
 pub const BOOK: BookId = BookId(7);
 pub const TICK_MAX: u32 = 512;
 
-pub fn bbo_cfg() -> vyrn_bbo::Config {
+pub fn bbo_cfg_pool(pool: u64) -> vyrn_bbo::Config {
     vyrn_bbo::Config {
         n_lanes: u8::try_from(N).unwrap(),
         epoch: Epoch(0),
@@ -59,9 +59,16 @@ pub fn bbo_cfg() -> vyrn_bbo::Config {
         band_half: 0,
         band_hyst: 0,
         band_ref: Tick(100),
-        pool: 0, // no pooled lanes (05 §6.9 pools are a lane follow-up)
+        pool,
     }
 }
+
+pub fn bbo_cfg() -> vyrn_bbo::Config {
+    bbo_cfg_pool(0)
+}
+
+/// Sessions per lane the harness can address (`sid(l, a)` with `a` below this).
+pub const NS: usize = 64;
 
 pub fn arena_cfg() -> ArenaConfig {
     ArenaConfig {
@@ -249,7 +256,9 @@ impl World {
             cw: [CutWriter::new(), CutWriter::new()],
             hold: [false; N],
             cut: [LaneSeq(0); N],
-            pkt: [[0; NA]; N],
+            pkt: [[0; NS]; N],
+            tr: None,
+            seen: ([0; N], [0; N], 0),
             steps: Vec::new(),
             resp: (0..N).map(|_| Vec::new()).collect(),
             log: (0..N).map(|_| Vec::new()).collect(),
@@ -302,7 +311,11 @@ pub struct Rig<'a> {
     /// `C_f[l]` of the newest step.
     pub cut: [LaneSeq; N],
     /// Last `pkt_seq` sent per lane and session.
-    pkt: [[u32; NA]; N],
+    pkt: [[u32; NS]; N],
+    /// The language-neutral transcript (tests/golden/lane/README.md), when recording.
+    pub tr: Option<Vec<String>>,
+    /// Responses, log records and steps already written to `tr`.
+    seen: ([usize; N], [usize; N], usize),
     pub steps: Vec<Step>,
     /// Everything each lane produced, in order.
     pub resp: Vec<Vec<RespPkt>>,
@@ -325,6 +338,32 @@ impl Rig<'_> {
         msgs: &[Msg],
         mids: &[Mid],
     ) -> Rx {
+        self.send_impl(l, a, rx_ts, now, msgs, mids, None)
+    }
+
+    /// Replay of one packet with forced routes (`Lane::replay_packet`, 05 §10).
+    pub fn replay(
+        &mut self,
+        l: usize,
+        a: u32,
+        rx_ts: u64,
+        msgs: &[Msg],
+        mids: &[Mid],
+        routes: &[(LaneSeq, Route)],
+    ) -> Rx {
+        self.send_impl(l, a, rx_ts, rx_ts, msgs, mids, Some(routes))
+    }
+
+    fn send_impl(
+        &mut self,
+        l: usize,
+        a: u32,
+        rx_ts: u64,
+        now: u64,
+        msgs: &[Msg],
+        mids: &[Mid],
+        routes: Option<&[(LaneSeq, Route)]>,
+    ) -> Rx {
         let ai = usize::try_from(a).unwrap();
         self.pkt[l][ai] += 1;
         let hdr = ReqHeader::new(sid(l, a), self.pkt[l][ai], Epoch(0).low16(), BOOK, false);
@@ -335,13 +374,123 @@ impl Rig<'_> {
             rx_ts: Nanos(rx_ts),
             pkt_hash: PktHash(u64::from(self.pkt[l][ai])),
         };
-        let r = self.lanes[l].process_packet(&Hw, rx, &FixedClock(now), mids);
+        if self.tr.is_some() {
+            let mut line = format!("pkt {l} {:#x} rx={rx_ts} now={now}", sid(l, a).0);
+            for m in mids {
+                line += &format!(
+                    " mid={}:{}@{}/{}",
+                    m.pass, m.next.0, m.at.step.0, m.at.cut.0
+                );
+            }
+            line += &format!(" {}", hex(&buf[..n]));
+            self.note(line);
+        }
+        let r = match routes {
+            None => self.lanes[l].process_packet(&Hw, rx, &FixedClock(now), mids),
+            Some(rt) => self.lanes[l].replay_packet(&Hw, rx, &FixedClock(now), mids, rt),
+        };
         self.hold[l] = false;
         if r == Rx::Shed {
             self.pkt[l][ai] -= 1; // not accepted: the client resends this pkt_seq (05 §6.8)
         }
         self.collect(l);
+        self.note_out();
         r
+    }
+
+    /// Lane `l` keeps its snapshot and runs no idle polls until its next packet.
+    pub fn hold(&mut self, l: usize) {
+        self.note(format!("hold {l}"));
+        self.hold[l] = true;
+    }
+
+    /// Lane `l`'s snapshot line holds `s` until its next packet (a held lane, 05 §2.5).
+    pub fn pin_snapshot(&mut self, l: usize, s: &Snapshot) {
+        self.lane_snaps[l].publish(&Hw, s);
+        self.hold[l] = true;
+    }
+
+    /// Opens another session `a` on lane `l` for lane-local account `acct`.
+    pub fn open(&mut self, l: usize, a: u32, acct: u32, buckets: SessionBuckets) {
+        assert!(self.lanes[l].open_session(&SessionSpec {
+            id: sid(l, a),
+            acct: AcctSlot(acct),
+            k_seq: kseq(l, a),
+            book: BOOK,
+            buckets,
+        }));
+    }
+
+    /// Takes lane `l`'s next forward-ring entry before the BBO core sees it (its header line;
+    /// the dependency lines stay in the ring, so do not step the BBO after this).
+    pub fn peek_fwd(&mut self, l: usize) -> vyrn_bbo::FwdEntry {
+        vyrn_bbo::FwdEntry::decode(&self.fwd_c[l].pop(&Hw).unwrap())
+    }
+
+    fn note(&mut self, line: String) {
+        if let Some(t) = &mut self.tr {
+            t.push(line);
+        }
+    }
+
+    /// Writes every output produced since the last call to the transcript.
+    fn note_out(&mut self) {
+        let Some(mut t) = self.tr.take() else { return };
+        for st in &self.steps[self.seen.2..] {
+            let e = &st.entry;
+            let cuts: Vec<String> = st.cuts.iter().map(|c| c.0.to_string()).collect();
+            t.push(format!(
+                "  step {} kind={} src={}:{} flags={} cut={}",
+                e.step.0,
+                e.kind,
+                e.src_lane.0,
+                e.src_lane_seq.0,
+                e.flags,
+                cuts.join(",")
+            ));
+            for (l, v) in &st.events {
+                t.push(format!(
+                    "    ev {l} {} vslot={} h={:#x} tick={} qty={} liq={} cause={:#x}",
+                    v.kind, v.vslot, v.handle.0, v.tick.0, v.qty, v.liq, v.cause
+                ));
+            }
+            for (h, recs) in &st.tx {
+                t.push(format!(
+                    "    tx {:#x} resp={} echo={} role={}{}",
+                    h.session.0,
+                    h.resp_seq,
+                    h.pkt_seq,
+                    h.role,
+                    recs_hex(recs)
+                ));
+            }
+        }
+        self.seen.2 = self.steps.len();
+        for l in 0..N {
+            for p in &self.resp[l][self.seen.0[l]..] {
+                let gate = match p.gate {
+                    vyrn_lane::Gate::None => "none".to_string(),
+                    vyrn_lane::Gate::Packet(q) => format!("pkt:{}", q.0),
+                    vyrn_lane::Gate::Step(f) => format!("step:{}", f.0),
+                };
+                t.push(format!(
+                    "  resp {l} {:#x} resp={} echo={} gate={gate}{}",
+                    p.session.0,
+                    p.resp_seq,
+                    p.echo_pkt,
+                    recs_hex(p.records())
+                ));
+            }
+            for LogRec::Packet(r) in &self.log[l][self.seen.1[l]..] {
+                t.push(format!(
+                    "  log {l} {:#x} pkt={} count={} flags={:#x} first={} fills_applied={}",
+                    r.session.0, r.pkt_seq, r.count, r.flags, r.first_lane_seq.0, r.fills_applied.0
+                ));
+            }
+            self.seen.0[l] = self.resp[l].len();
+            self.seen.1[l] = self.log[l].len();
+        }
+        self.tr = Some(t);
     }
 
     fn collect(&mut self, l: usize) {
@@ -377,6 +526,21 @@ impl Rig<'_> {
     /// Publishes, then polls the BBO until one step is decided; the stream core then writes
     /// every lane's `LaneCut`. `None` if the BBO had nothing to do.
     pub fn bbo_step(&mut self, bbo: &mut Bbo) -> Option<Step> {
+        self.note("step".into());
+        let s = self.step_inner(bbo, &NeverLate);
+        self.note_out();
+        s
+    }
+
+    /// As [`Self::bbo_step`] with the BBO core's clock at `now` (its deadline test, 05 §6.8).
+    pub fn bbo_step_at(&mut self, bbo: &mut Bbo, now: u64) -> Option<Step> {
+        self.note(format!("step now={now}"));
+        let s = self.step_inner(bbo, &FixedClock(now));
+        self.note_out();
+        s
+    }
+
+    fn step_inner<C: Clock>(&mut self, bbo: &mut Bbo, clock: &C) -> Option<Step> {
         self.publish();
         for _ in 0..4 {
             let r = {
@@ -392,7 +556,7 @@ impl Rig<'_> {
                     floor: self.floor,
                 };
                 let book = LaneBook::new(&self.views);
-                bbo.poll(&Hw, &mut ports, &book, &NeverLate)
+                bbo.poll(&Hw, &mut ports, &book, clock)
             };
             match r {
                 Poll::Step(_) => return Some(self.read_step(bbo)),
@@ -458,6 +622,13 @@ impl Rig<'_> {
 
     /// Lane `l` runs every boundary that is due (05 §6.1 idle polls).
     pub fn lane_poll(&mut self, l: usize) -> usize {
+        self.note(format!("poll {l}"));
+        let n = self.poll_inner(l);
+        self.note_out();
+        n
+    }
+
+    fn poll_inner(&mut self, l: usize) -> usize {
         if self.hold[l] {
             return 0;
         }
@@ -482,13 +653,15 @@ impl Rig<'_> {
 
     /// BBO steps and lane polls until nothing is left to do.
     pub fn settle(&mut self, bbo: &mut Bbo) {
+        self.note("settle".into());
         for _ in 0..64 {
-            let stepped = self.bbo_step(bbo).is_some();
+            let stepped = self.step_inner(bbo, &NeverLate).is_some();
             let mut polled = 0;
             for l in 0..N {
-                polled += self.lane_poll(l);
+                polled += self.poll_inner(l);
             }
             if !stepped && polled == 0 {
+                self.note_out();
                 return;
             }
         }
@@ -557,8 +730,23 @@ impl Rig<'_> {
     }
 }
 
+pub fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn recs_hex(recs: &[Record]) -> String {
+    recs.iter()
+        .map(|r| format!(" {}", hex(&r.encode())))
+        .collect()
+}
+
 pub fn setup() -> (Bbo, Box<World>) {
-    let bbo = Bbo::new(bbo_cfg());
+    setup_pool(0)
+}
+
+/// A box whose lanes in `pool` (bit `l`) are pooled (05 §6.9).
+pub fn setup_pool(pool: u64) -> (Bbo, Box<World>) {
+    let bbo = Bbo::new(bbo_cfg_pool(pool));
     let w = World::new(&bbo.initial_snapshot());
     (bbo, w)
 }

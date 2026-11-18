@@ -14,6 +14,7 @@ enough to regenerate the protocol files.
 | `siphash.txt` | SipHash-2-4, 64 lengths (the packet MAC, 01 §4) | [veorq/SipHash](https://github.com/veorq/SipHash) `vectors.h` at `32d0676`, `vectors_sip64` |
 | `blake3_test_vectors.json` | BLAKE3 hash, keyed hash and `derive_key` (01 §4) | [BLAKE3-team/BLAKE3](https://github.com/BLAKE3-team/BLAKE3) `test_vectors/test_vectors.json` at `657284b`, byte for byte |
 | `ed25519-edge.txt` | Ed25519 edge cases with ZIP-215 verdicts (spec/11-build.md §2.5) | [novifinancial/ed25519-speccheck](https://github.com/novifinancial/ed25519-speccheck) `cases.json` at `6551933`; verdicts from the Zebra row of its README |
+| `lane/streams.txt` | 8 whole runs of the lanes and BBO core: every input packet, step and poll, and every step entry, fill event, fill TX packet, response and `PacketRecord` (05 §3, §6–§8). See `lane/README.md` | written by `crates/engine/vyrn-lane/tests/golden.rs`; each scenario's records are asserted from the spec in `crates/engine/vyrn-lane/tests/lane.rs` |
 
 The upstream rows were last compared with those commits on 2026-11-17. The NIC frame vectors
 (06 §6.2) live with their backend, in `crates/vyrn-nic/tests/frame_vectors.txt`.
