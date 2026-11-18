@@ -131,7 +131,7 @@ isolated, pinned core after `seal()`.
 | Crate | Pinned | Responsibility |
 |---|---|---|
 | `vyrn-types` | yes | The newtypes of 01 §3, the constants of 01 §5 as `pub const`, `StepKind`, `HomeCode`, `Mode`, and the record structs of 01 §6.6. No logic beyond checked arithmetic on `Qty`, `Tick` and notional (01 §11.4). No dependencies. |
-| `vyrn-crypto` | yes | SipHash-2-4 (in-house, §2.4), BLAKE3 wrappers, Ed25519 verify and sign with ZIP-215 rules, X25519, and the `derive_key` contexts of 01 §4. It exposes `#[inline(always)]` MAC check functions for the lane loop. |
+| `vyrn-crypto` | yes | SipHash-2-4 (in-house, §2.4), BLAKE3 wrappers, Ed25519 verify and sign with ZIP-215 rules, the hybrid Ed25519 + ML-DSA scheme of 01 §14.20 (§2.5a), X25519, and the `derive_key` contexts of 01 §4. It exposes `#[inline(always)]` MAC check functions for the lane loop. |
 | `vyrn-wire` | yes | Parse and build the packets and records of 01 §6.1–6.5, using `zerocopy` so that parsing needs no `unsafe`. It defines the `RxRing` and `TxRing` traits that every NIC backend implements. Every parse returns a `Result` with a 01 §6.5 reason. Nothing in it panics on input bytes. |
 | `vyrn-cut` | yes | Every cross-core primitive: the lane counters, the cut publication (two half-cut lines, one per cut core, 01 §14.3), the per-lane order rings (01 §14.5), the versioned BBO snapshot (a seqlock), the SPSC rings (lane → BBO, BBO → lane fill events, BBO → TX-A, TX-B and TX-C), and the pool primitives of 01 §14.15 (per-account `PoolTok` CAS, per-queue steal locks, the sibling-segment `fetch_and`). It is generic over a `Visibility` backend: `Hw` uses atomics, `Sim` delays visibility by a seeded amount so that `vyrn-sim` sees stale cuts and stale snapshots (§6.4). |
 | `vyrn-risk` | yes | Lane-local accounts: balances, reservations (01 §12.1), order counts, rate limits, fees, positions. Every check returns a 01 §6.5 reject. |
@@ -234,6 +234,8 @@ and `tools/`.
 | `curve25519-dalek`, `ed25519-dalek`, `x25519-dalek` | S | `vyrn-crypto` (non-hot API), `vyrn-chain` | Ed25519 and X25519 in Rust. Verification uses the ZIP-215 rules (§2.5). |
 | `k256` | S | `vyrn-chain` | secp256k1 verify for EVM wallet session opens (01 §4), pure Rust. Chain mode only. |
 | `sha3` (with `keccak`) | S | `vyrn-chain` | Keccak-256 for the L1-facing EIP-712 digests and withdrawal tree only (01 §14.11). RustCrypto; `keccak` selects the ARMv8 SHA3 instructions at run time and falls back to portable code, so the binary runs on CPUs without them. Default features off. |
+| `libcrux-ml-dsa` (with `libcrux-sha3`, `libcrux-intrinsics`, `libcrux-platform`, `libcrux-secrets`, `libcrux-traits`, `libcrux-macros`) | S | `vyrn-crypto` (non-hot API) | ML-DSA-44 and -65 for the hybrid scheme (01 §14.20). Fastest Rust candidate measured: 97 µs sign mean and 30 µs verify for ML-DSA-44, against 107 / 30 for `aws-lc-rs` and 486 / 61 for RustCrypto `ml-dsa`. Arithmetic, NTT and serialization are formally verified with hax and F\* (crate README). `unsafe` sits in its AVX2 path and `libcrux-intrinsics` only; aarch64 uses the portable path. Enabled features: `mldsa44`, `mldsa65`, `simd256` on x86-64. Pinned to an exact 0.0.x version; 01 §14.20 open question PQ-2 decides whether an independent audit must come first. |
+| `ml-dsa` (RustCrypto) | T | `vyrn-crypto` tests, `fuzz/` | Pure-Rust, no-`unsafe` second implementation: the differential reference of §2.5a. Never in a production binary: 5× slower to sign. |
 | `commonware-consensus` | S | `vyrn-consensus` | Simplex (DESIGN §5). |
 | `commonware-p2p` | S | `vyrn-consensus`, `vyrn-data` (control channel) | Authenticated peer connections between replicas. |
 | `commonware-runtime` | S, T | `vyrn-consensus`, `vyrn-sim` | Tokio runtime in production, the `deterministic` runtime in `vyrn-sim` (§6.4). One trait boundary gives both. |
@@ -253,7 +255,7 @@ and `tools/`.
 | `rand`, `rand_chacha` | T | `vyrn-sim`, `vyrn-bench` | Seeded randomness. ChaCha8 gives the same stream on every platform. |
 | `hdrhistogram` | T, S | `vyrn-bench`, the metrics exporter | Merging and quantiles off the pinned cores. The pinned cores use the fixed-bucket histogram of §8.2. |
 
-**Not allowed anywhere:** `openssl`, `ring` (one crypto stack, not two), any crate that spawns
+**Not allowed anywhere:** `openssl`, `ring`, `aws-lc-rs`, `aws-lc-sys` (one crypto stack, not two), any crate that spawns
 threads in a library, any crate that reads environment variables in an engine path, async
 runtimes other than tokio, `crossbeam` (the rings are ours and loom-checked), any crate with a
 `build.rs` that downloads anything. `deny.toml` lists them under `[bans]`.
@@ -303,6 +305,26 @@ function, and both the Rust and the Vx clients call it through the Rust shell (�
 file `tests/golden/ed25519-edge.txt` holds the edge-case vectors (small-order points,
 non-canonical `R` and `A`). The same vectors run against Commonware's verification path, and CI
 fails if any verdict differs.
+
+### 2.5a Hybrid and ML-DSA verification rules
+
+All validators must also agree on every hybrid verdict (01 §14.20).
+
+- `vyrn-crypto::sig::verify(scheme, key, msg, sig)` is the only verify function for every scheme,
+  and both clients call it through the Rust shell, as for Ed25519. It returns valid only if the
+  Ed25519 part passes §2.5 and the ML-DSA part passes FIPS 204 `ML-DSA.Verify` with an empty
+  context, each over `scheme ‖ msg`. Lengths are exact; a short or long part is invalid, never
+  truncated or padded.
+- `vyrn-crypto::sig::sign` uses hedged signing with 32 bytes from the OS RNG per attempt, and runs
+  `PQ_HEDGE` attempts on the PQ cores named by the caller (01 §5, §10). It never sits behind a
+  `poll()` on a hot core (§3.1): the hot core only pushes bytes onto a ring and reads a slot.
+- **Golden and differential tests.** `tests/golden/mldsa-acvp/` holds NIST ACVP vectors for
+  ML-DSA-44 and -65 (keygen, sign with given randomness, verify), plus `tests/golden/hybrid-edge.txt`:
+  one part valid and the other not (both orders), swapped parts, a scheme-0 signature presented as
+  scheme 1, wrong scheme byte, wrong lengths. Every vector runs against `libcrux-ml-dsa` and
+  against RustCrypto `ml-dsa`; CI fails if any verdict differs (B4 runs them on every target).
+- The ML-DSA dependencies' `unsafe` is outside our crates, so `tools/unsafe-audit` (§3.2) does not
+  count it; `cargo vet` covers it as a dependency (§2.6).
 
 ### 2.6 Pinning, vendoring, audit
 
@@ -1315,6 +1337,7 @@ timestamps as real time, nightly.
 | `fz_consensus_msg` | arbitrary bytes as our consensus wrappers | no panic (Commonware's own fuzz crates cover its internals) |
 | `fz_handoff` | arbitrary `HandoffRecord` plus certificate | only a valid certificate verifies |
 | `fz_session_open` | arbitrary session-open transactions (chain) | no panic; only valid signatures accepted, identically for Ed25519 and secp256k1 paths |
+| `fz_hybrid_sig` | arbitrary (scheme, key, message, signature) | no panic; `libcrux-ml-dsa` and RustCrypto `ml-dsa` give the same verdict for every input; a hybrid signature with one invalid part is rejected (§2.5a) |
 | `fz_config` | arbitrary TOML | `vyrn-admin config check` never panics |
 
 Per PR: 60 s per target on the corpus. Nightly: 8 h per target on Linux lab machines, with
@@ -1806,6 +1829,7 @@ requirement, it passes on the maximum (§7.1 rule 2).
 | IDs | Owner | What they check |
 |---|---|---|
 | B21–B39 | 02 §13 | B21 lane queueing; B22 BBO queueing; B23 adversarial suite; B24 rate envelope; B25 revert condition; B26 failure-class drills; B27 readiness and extension; B28 handoff correctness; B29 chain authentication and forced path; B30 chain commitments, custody, DA, slashing; B31 platform and supply audit; B32 24 h soak; B33 low load and idle; B34 replica catch-up; B35 drop copy; B36 book group; B37 WAN follow; B38 upgrade at a boundary; B39 capacity variants |
+| B-PQ-1 … B-PQ-3 | 07 | hedged ML-DSA sign tail and verify on `REF`; scheme-1 finality with the gate and stream-core load re-run; the scheme switch at `E_pq` (01 §14.20) |
 | B-REP-1 … B-REP-12, B-REP-VX | 07 | fill-to-finality across real facilities; frame lead; path skew; stream-core load (cores 4 and 7); sliced signing; hasher load (core 50, 01 §10); replay speed; promotion time; NVMe; archive and `pbz` ratios; path loss and kill run; Vx replay speed |
 | PLT-B-PPS, -SW, -HOP, -MEM, -FREQ, -MIT, -SKEW, -AWS-PPS, -ENA-RSS, -X3D, -INJ, -TSME | 06 | packet rate per port; switch latency; cross-CCD hop; memory; frequency slider; mitigations; cross-NIC PHC skew; AWS packet rate; ENA RSS steering; X3D cache; NIC cache injection; TSME |
 | EPO-T1 … EPO-T13 | 08 | handoff tests under kills, partitions, skew, byzantine members and client misbehaviour; they run in `vyrn-sim` and on staging |
@@ -2011,8 +2035,14 @@ Examples of what each role records:
 
 ### 9.5 Signing and release artifacts
 
-- **Keys.** Three Ed25519 release keys on hardware tokens, held by three maintainers. A release
-  needs two signatures (`BLD_RELEASE_SIGS` = 2 of 3) over the release manifest.
+- **Keys.** Three release keys on hardware tokens, held by three maintainers. A release needs two
+  signatures (`BLD_RELEASE_SIGS` = 2 of 3) over the release manifest. The keys are hybrid Ed25519 +
+  ML-DSA-65 (scheme 2, 01 §14.20): a release signature is valid only if both parts verify. Why
+  ML-DSA-65 here and ML-DSA-44 on the live path: release keys live for years, sign a few times a
+  month, and a forged release takes every box; 150 µs more per signature costs nothing. Rotation:
+  the old Ed25519 keys sign one last manifest that names the three hybrid keys, and from then on a
+  box accepts only hybrid signatures. Every manifest from the switch on carries `pq_anchor`
+  (01 §14.20 SG6). Which hardware token holds the ML-DSA half is open question PQ-7.
 - **Verification.** `vyrn-admin release verify` checks the signatures and every file hash before a
   bundle can be staged (§10.3). Boxes reject an unsigned bundle.
 - **Artifacts** (per architecture: Linux x86-64, Linux aarch64; macOS aarch64 for DEV only):

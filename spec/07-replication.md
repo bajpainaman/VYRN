@@ -18,7 +18,7 @@ Draft 0.2, 2026-11-13. Normative for `vyrn-seq` stream cores 4 and 7, the frame 
 | D6 | Repair: a replica NACKs the sequencer first (the substream's stream core re-posts a buffered frame), then a peer. | Re-posting a descriptor costs ~15 ns. Peers cover the rest (§4.10). |
 | D7 | One `vyrn-data` box per facility. A session sends its data copy to one data home. The data home dedupes, stores and fans out to every replica. | 50 Gbps in and ≤ 124 Gbps out per data box fits COTS NICs (§5). |
 | D8 | `data_root` is computed over the **full** 32-byte BLAKE3 of every packet. The 8-byte `pkt_hash` is a locator and an early check only. | An 8-byte hash allows a 2^32 birthday attack by a client that controls both copies (§5.6). |
-| D9 | Simplex (`commonware-consensus::simplex`, Ed25519 scheme) runs over **ranges of sequencer-signed headers**. Only the n voting replicas vote and lead. `vyrn-seq` **never votes** (01 §14.4). | Proposal traffic stays off the sequencer, a dead sequencer never costs a leader timeout, and a failover never changes the voting set (§6.3). |
+| D9 | Simplex (`commonware-consensus::simplex`, Ed25519 scheme; hybrid Ed25519 + ML-DSA-44 from `E_pq`, 01 §14.20) runs over **ranges of sequencer-signed headers**. Only the n voting replicas vote and lead. `vyrn-seq` **never votes** (01 §14.4). | Proposal traffic stays off the sequencer, a dead sequencer never costs a leader timeout, and a failover never changes the voting set (§6.3). |
 | D10 | A replica votes only when it holds every referenced payload, every root checks, CHAIN tags verify, and no divergence is flagged. Votes never wait for replay. | Finality must not depend on replay lag (§6.4). |
 | D11 | Finality = block close + seal + 4 metro hops (header, proposal, notarize, finalize): **~2.6 ms typical, ≤ 5.65 ms max with no fault, ≤ 8.65 ms max with one fault.** | Every accepted order is final ≤ 10 ms (§6.6). |
 | D12 | State roots every 1000 blocks in both modes, certified with `commonware-consensus::aggregation`. A missing root certificate stops votes after 5000 blocks. A mismatch stops votes at once. | Client diversity must halt the book, not fork it (§7.4, §11). |
@@ -134,7 +134,7 @@ certificate (§6.6) or is an ancestor of a final block.
 off size field
   0   2  magic       u16   0x4250 ("PB")
   2   1  version     u8    1
-  3   1  kind        u8    1 ORDER, 2 HASH, 3 HEADER, 4 HEARTBEAT
+  3   1  kind        u8    1 ORDER, 2 HASH, 3 HEADER, 4 HEARTBEAT, 5 HEADER_PQ (01 §14.20)
   4   2  book        BookId
   6   2  epoch16     u16   low 16 bits of the epoch
   8   8  frame_seq   u64
@@ -159,6 +159,7 @@ frame. **INV-REP-3:** for a fixed `(epoch, tenure, stream, frame_seq)`, the byte
 | HASH | sections `HashRun` for its own lanes | the substream's stream core | DMA on its port of each path |
 | HEADER | one 190-byte `BlockHeader` | core 4 (substream A only) | DMA on both of core 4's ports |
 | HEARTBEAT | `last_step` u64, `last_height` u64, `ptp_now` u64 | each stream core, on its substream | CTPIO on its port of each path |
+| HEADER_PQ | `height` u64, then the 2,420-byte ML-DSA-44 part of `seq_sig` (scheme 1 only, §3.10) | core 4 (substream A only), from the PQ cores' result | DMA on both of core 4's ports |
 
 ### 3.4 Sections
 
@@ -421,6 +422,16 @@ off size field                         (01 §6.6, field order kept)
 190      end
 ```
 
+**Scheme 1 (hybrid, 01 §14.20).** The HEADER frame keeps this 190-byte layout, with bytes 126..190
+the Ed25519 part of a hybrid `seq_sig`. The 2,420-byte ML-DSA-44 part follows in a HEADER_PQ frame
+for the same height, at most `PQ_SIGN_MAX_US` (400 µs, `PQ_HEDGE` = 4) after the HEADER frame. The
+logical `BlockHeader` is the concatenation, 2,610 B; the journal (§8.2), snapshots, the WAN feed
+and every certificate that embeds a header store all 2,610 B. Both parts sign
+`scheme ‖ "vyrn      v1 block" ‖ bytes 0..126`. A header is valid only when both parts verify
+(§6.4 item 1). `header_hash` is unchanged, because it covers bytes 0..126 only (§2.2). Why split:
+the Ed25519 part is ready ≤ `REP_SEAL_US` after close as today, and the large part neither delays
+the HEADER frame nor occupies core 4 for the 2.4 KB copy.
+
 `seq_key` is the sequencer key that `REP_Membership` (§13) registers for the sender. A seal block
 (§9.4) has `seq_sig` = 64 zero bytes and is valid only with its seal certificate.
 
@@ -497,7 +508,8 @@ pair of replication ports on one leaf, one per substream (06 §2.3); the table s
 | HashRun payload | 100M/s | 8 | 800 |
 | HASH frame overhead (9000 B frames) | ~0.1M/s | 90 | 9 |
 | HEADER, BlockMark, HEARTBEAT, SessionBind | ~25k/s | ≤ 220 | < 1 |
-| **Total per path** | | | **3,310 MB/s ≈ 26.5 Gbps** |
+| HEADER_PQ (scheme 1 only, 01 §14.20) | 1k/s per book | ~2,540 | 2.5 |
+| **Total per path** | | | **3,310 MB/s ≈ 26.5 Gbps** (3,313 under scheme 1) |
 
 Record payload (O + H + steps) is 2.24 GB/s ≈ 17.9 Gbps. Frame overhead is the rest, and it falls
 when flushes coalesce under load (§4.5). On the sequencer each path is two 100GbE ports at ≤ 14%
@@ -1078,6 +1090,15 @@ About 200 slices finish one signature. Core 4 spends ≥ 50% of its time outside
 memory only. It is loaded from the secret store at tenure start and is never written to disk (06
 owns the secret store).
 
+**Scheme 1 (01 §14.20).** Core 4 keeps the sliced Ed25519 part unchanged. When the roots are
+ready it also pushes the 126 signed bytes onto an SPSC ring (`vyrn-cut`) read by the four PQ
+cores 52–55 (01 §10), about 20 ns of core 4's time. Each PQ core runs one hedged ML-DSA-44 attempt
+with its own 32 random bytes; the first to finish writes the 2,420-byte part into a slot, and the
+others abandon theirs. Core 4 posts the HEADER_PQ DMA descriptor when it polls the slot (about
+5 ns). The ML-DSA half of the seq key lives on the PQ cores only, with the same storage rule.
+Measured: the ML-DSA-44 sign at four attempts is 45 µs p50, 111 µs p99 and ≤ 367 µs at 10⁻⁹
+(model, 01 §14.20 B). A PQ core is busy ≤ 10% at 1 kHz.
+
 ### 6.3 Simplex mapping
 
 | Item | VYRN use (`commonware-consensus` v2026.10.0, module `simplex`) |
@@ -1144,6 +1165,13 @@ certificates, and those trail by up to 5000 blocks.
 Cost per block at peak, on top of continuous work: finishing two BLAKE3 hashes and up to 16
 Ed25519 verifies (~40 µs each budget, batched). That is ≤ 0.1 ms (max, budget).
 
+Under scheme 1, item 1 also needs the HEADER_PQ part of each header, and checks it under the ML-DSA
+half of `seq_key` (`PQ_VERIFY_US` = 35 µs each, budget; 30 µs measured). A header usually
+verifies as its HEADER_PQ frame arrives, in parallel with the data join of items 2–3, so the
+pending `verify` gains nothing. Each header is checked once, when its HEADER_PQ frame arrives,
+and the verdict is cached. A catch-up proposal of 16 headers after a nullified view therefore
+re-reads 16 cached verdicts and verifies nothing new.
+
 ### 6.5 Notarization, finalization, certificates
 
 Simplex's own messages carry `notarize(c, v)`, `nullify(v)` and `finalize(c, v)`. A notarization
@@ -1171,6 +1199,50 @@ digest }` under namespace `b"vyrn-v1"`. The exact signed bytes are those of the 
 -> Result<(), CertErr>`. No other crate reimplements the check. A Vx verifier links that function
 through FFI. A certificate is about 0.37 KB (Q = 4).
 
+**Sizes by scheme** (header 105 B plus `count` × (1 + signature)):
+
+| Certificate | Scheme 0 | Scheme 1 (hybrid, 2,484 B signatures) | Growth |
+|---|---|---|---|
+| `REP_FinalityCert`, BASE (Q = 3) | 301 B | 7,561 B | ×25 |
+| `REP_FinalityCert`, CHAIN (Q = 4) | 366 B | 10,046 B | ×27 |
+| `REP_FinalityCert`, all 5 CHAIN votes | 431 B | 12,531 B | ×29 |
+| `REP_RootCert` (same layout, 40 B in place of the 85 B proposal), Q = 4 | 321 B | 10,001 B | ×31 |
+
+At 1,000 certificates per second per book a voter sends each certificate to the sequencer and
+the standby: 2 × 10 MB/s ≈ 0.16 Gbps per voter in CHAIN, still inside the < 0.5 Gbps consensus
+budget of §3.13 with the votes (2.5 KB each, 3 kinds, ~1 kHz, n − 1 peers ≈ 0.24 Gbps).
+[Likely: budget, from the sizes above]
+
+### 6.5a Speculative vote signing (scheme 1)
+
+An ML-DSA-44 signature is ≤ 750 µs at `PQ_HEDGE` = 2 on a voter, nearly a metro hop. Signed after
+the event that triggers each vote, three votes per view would add ~2.2 ms to finality. So a voter
+signs before it knows it will send:
+
+- **Notarize.** When a voter holds a header range with valid Ed25519 `seq_sig` parts, it computes
+  the proposal the leader must make under the rule of §6.3 (every contiguous header after the
+  parent, up to 16) and signs that notarize on its two PQ cores,
+  in parallel with `verify`. It sends the vote only if the leader's proposal matches and `verify`
+  returns true; otherwise it drops it and signs the actual proposal. The voter's PQ cores are
+  replica cores 0 and 63 (§7.2).
+- **The leader never misses.** It signs the range it holds when its own `verify` completes and
+  then proposes exactly that range, so its notarize is ready when it proposes.
+- **A voter can miss in the fault-free case.** §6.3 lets the leader take every header it holds
+  when its `verify` completes, and frame arrival and the data join differ across facilities, so a
+  voter may predict a range one header shorter or longer. A miss costs one signature after the
+  proposal arrives, ≤ `PQ_SIGN_MAX_US` = 0.75 ms at `PQ_HEDGE` = 2. §6.6 budgets one miss per
+  block on the notarize hop; finalize and nullify never miss, because their content is fixed when
+  signing starts. Open question PQ-8 (01 §14.20) asks for a range rule that removes the miss.
+- **Finalize.** A voter starts the finalize signature when it sends its notarize, in parallel with
+  hop 3. It sends it only if Simplex would (a notarization seen and no nullify sent).
+- **Nullify** is signed when its timer starts, `t_l` before it can be sent.
+- **Safety.** Signing is not voting: an unsent signature is never stored, logged or sent, and is
+  zeroed after the view. The persisted high-water mark of 09 §2.5 is written before **sending**,
+  as today. A crash between signing and sending leaks nothing. [Certain: the one-vote rule counts
+  sent votes] The extra CPU is at most one wasted signature per view when the prediction misses.
+- **Dependency.** This needs Simplex to let the application produce a vote's signature
+  asynchronously. Open question PQ-3 (01 §14.20) asks whether `commonware-consensus` allows it.
+
 A **fill is final** when the block holding its step is final. The finality event is the moment
 the local voter has `Q` finalize votes. 02 owns where that is measured. Finality is a different
 fact from durability, and §6.9 keeps them apart.
@@ -1189,18 +1261,18 @@ links break it counts as the one fault f.
 | Stage | Typical (ms) | Max (ms, budget) | Notes |
 |---|---|---|---|
 | Fill → block close | 0.50 | 1.00 | uniform in a 1 ms block |
-| Seal: roots, seq_sig, HEADER out | 0.03 | 0.10 | §6.2 |
+| Seal: roots, seq_sig, HEADER out | 0.03 | 0.10 | §6.2; under scheme 1 the HEADER_PQ part follows ≤ 0.40 later and is checked inside the data-lag row, which already allows 0.71 beyond hop 1 |
 | Hop 1: HEADER → leader and voters | 0.50 | 0.80 | metro one-way, ~0.5 ms as DESIGN §5 assumes |
 | Data lag beyond the order path | 0.00 | 0.71 | the data home is in another facility (§5.1): client → data box → replica is two metro hops, client → seq → replica one; less the seal |
 | One frame repair | 0.00 | 0.39 | cross-metro, ≤ 0.60 (§4.10); it runs in parallel with the data lag, and `verify` waits for the later, so the pair costs ≤ 0.71 and this row is 0.39 of reserve |
 | `verify` completion | 0.02 | 0.10 | §6.4 |
 | Hop 2: leader's notarize (the proposal) | 0.50 | 0.80 | |
-| Hop 3: notarize votes; certify; send finalize | 0.51 | 0.85 | |
+| Hop 3: notarize votes; certify; send finalize | 0.51 | 0.85 (1.60 scheme 1) | scheme 1: +0.75 for one voter's missed notarize prediction, re-signed after the proposal arrives (§6.5a); the budget assumes the miss hits a vote the quorum needs |
 | Hop 4: finalize votes → Q at each voter | 0.50 | 0.80 | |
-| Vote signature checks | 0.03 | 0.10 | |
-| **Total, no fault** | **2.59** | **5.65** | |
+| Vote signature checks | 0.03 (0.08 scheme 1) | 0.10 (0.15 scheme 1) | scheme 1: Ed25519 parts batched on core 4, ML-DSA parts at 35 µs each on a PQ core, in parallel |
+| **Total, no fault** | **2.59** (2.69 scheme 1) | **5.65** (6.45 scheme 1) | |
 | One fault (f = 1) | | +3.00 | the larger of a nullified view (`t_l` 2 ms + 1 hop ≈ 2.8) and a data-box stall (§5.7, 3.0) |
-| **Total, one fault** | | **8.65** | ≤ `FINALITY_MAX_MS` = 10; reserve 1.35 |
+| **Total, one fault** | | **8.65** (9.45 scheme 1) | ≤ `FINALITY_MAX_MS` = 10; reserve 1.35 (0.55 scheme 1) |
 | Sequencer fault | | ≤ 9.0 | the seal finalizes the tail ≤ 7.85 ms after the last frame (§9.7) |
 
 A fill at the end of its block sees ~3.1 ms typical, which is DESIGN §5's "~3 ms". In a single
@@ -1231,7 +1303,8 @@ block `h + 9` opens only when block `h` is final. 09 §4.6 (`INV-CHN-TXGATE`) us
 - **Voters → sequencer.** Every voter sends its finalize vote to the sequencer's and the
   standby's `REP_UDP_CTRL` as well as to the other voters (09 §4.6), and later the
   `REP_FinalityCert`. The finality listener, a thread of control on core 51 (01 §10), batch-verifies
-  the votes (≤ 4 × ~40 µs per block at ≤ 1 kHz, ≤ 16% of core 51) and stores `final_height` once
+  the votes (≤ 4 × ~40 µs per block at ≤ 1 kHz, ≤ 16% of core 51; under scheme 1 the ML-DSA parts,
+  4 × 35 µs, run in parallel on the sequencer's core 63, ≤ 14% of it) and stores `final_height` once
   it holds Q valid votes for a proposal. So the sequencer learns finality at hop 4, like the
   voters, not one hop later. No single voter can forge it.
 - **Core 4** checks at every flush: `lag = closed_height − final_height`. If `lag >
@@ -1244,7 +1317,9 @@ block `h + 9` opens only when block `h` is final. 09 §4.6 (`INV-CHN-TXGATE`) us
   reopening auction (08).
 - **It never trips within f = 1.** Block `h` is final at every voter and at the sequencer ≤ 7.65 ms
   after it closes (§6.6, signature checks included). `h + 8` closes 8 ms after `h` closes, so ≤ 8
-  closed blocks are open (0.35 ms spare). In CHAIN the bound is 7.11 ms after close (09 §4.8).
+  closed blocks are open (0.35 ms spare). Under scheme 1 the bound is 8.45 ms after close, with a
+  missed notarize prediction (§6.5a), so `FIN_GATE_BLOCKS` is 9 from `E_pq` (01 §14.20 D): `h + 9`
+  closes 9 ms after `h`, 0.55 ms spare. In CHAIN the bound is 7.11 ms after close (09 §4.8).
 - **What it bounds.** Outside the fault model (no Q, a slow metro), at most ~9 ms of fills are
   released unfinal before the halt, none reverted; they finalize when Q returns. Draft 0.1's
   100 ms halt (a 10 ms escape) is removed.
@@ -1303,7 +1378,7 @@ either client. `vyrn-sim` checks this on every CI run with the Rust engine, `vyr
 
 | Cores | Use |
 |---|---|
-| 0 | isolated spare (TX-C after a promotion, §9.5) |
+| 0 | isolated spare (TX-C after a promotion, §9.5); under scheme 1 also PQ core 1 of a voter: ML-DSA vote signing and the ML-DSA half of vote and header checks (§6.5a) |
 | 1 | order RX on the 2 replication ports, both substreams: dedupe by `(stream, frame_seq)`, hole detection, NACK, `RepAck` |
 | 2 | replay BBO core (the same core as live, so the standby's promotion keeps it in place) |
 | 3 | order decoder for both substreams, step merge by StepId (§3.8), structural checks, `order_root`, data join, `data_root` |
@@ -1312,7 +1387,7 @@ either client. `vyrn-sim` checks this on every CI run with the Rust engine, `vyr
 | 6 | peer repair server, block server for the facility's archive node (§8.4, §12); on R3 also the recovery service's resend server (§8.5) |
 | 7 | storage writer (`io_uring`, `O_DIRECT`), snapshot serializer |
 | 8–49 | replay lanes 0–41, one to one with the live map; in CHAIN also the `tag_com` pass (§6.4 item 4) |
-| 50, 52–55, 63 | data RX from the 2 data ports, data index, full BLAKE3, mismatch checks |
+| 50, 52–55, 63 | data RX from the 2 data ports, data index, full BLAKE3, mismatch checks. Under scheme 1 a voter moves core 63 to PQ core 2 and runs data RX on 5 cores (open question 13). After a promotion the standby no longer receives data frames, so 52–55 become the sequencer's PQ signing cores (01 §10) and 63 its listener's ML-DSA core |
 | 51 | OS, IRQs, housekeeping (06 `HK`, the one non-isolated core on every REF box) |
 | 56–62 | replay lanes 42–48, the pool, one to one with the live map; they apply `AcctTake` records in log order (§3.6) |
 
@@ -1357,7 +1432,7 @@ the age of state roots and of market data (10).
   test vector set.
 - **Vote.** Each participant signs `digest = BLAKE3("vyrn v1 root" ‖ epoch ‖ h ‖ R(h))` and
   submits it to a `commonware-consensus::aggregation` engine. Item index = `(h + 1) / 1000 − 1`,
-  Ed25519 scheme, namespace `b"vyrn-v1-root"`. Q signatures form `REP_RootCert`, which has
+  Ed25519 scheme (hybrid from `E_pq`), namespace `b"vyrn-v1-root"`. Q signatures form `REP_RootCert`, which has
   the layout of `REP_FinalityCert` with `proposal` replaced by `(h u64, R(h) [32])`.
 - **Gate (INV-REP-7).** `verify(P)` requires a `REP_RootCert` for every root height `≤
   P.last_height − REP_ROOT_GATE_BLOCKS`, where `REP_ROOT_GATE_BLOCKS` = 5000. Normal operation
@@ -1981,6 +2056,7 @@ then stops new order finality at once, and the gate stops it within 5000 blocks 
 
 ```
 REP_Membership { epoch_from: Epoch, home: HomeCode, mode: u8, n: u8, q: u8,
+  sig_scheme: SigScheme (01 §3; every key below is of this scheme),
   voters: n × { index u8, vote_key PubKey, client u8 (0 Rust, 1 Vx), facility u8,
                 data_addr [18] (IPv6 or v4-mapped, plus port), repl_addr [18] },
   seq_order: [{ index u8, role u8 (0 primary, 1 standby, 2 spare), seq_key PubKey, facility u8,
@@ -2057,6 +2133,9 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | B-REP-3 | Path skew between A and B | ≤ 2 µs |
 | B-REP-4 | Each stream core's load at the peak mix | ≤ 0.50 |
 | B-REP-5 | Sliced Ed25519 sign on core 4: CPU per signature, longest slice | ≤ 12 µs, ≤ 50 ns |
+| B-PQ-1 | Scheme 1 on `REF`: ML-DSA-44 sign with `PQ_HEDGE` = 4 on cores 52–55 and = 2 on a voter, 10⁹ signatures; verify per signature | max ≤ `PQ_SIGN_MAX_US` (400, 750 µs); verify ≤ `PQ_VERIFY_US` |
+| B-PQ-2 | Scheme 1 finality: B-REP-1 with hybrid keys and speculative signing (§6.5a); the frame gate (B-REP-13) and stream-core load (B-REP-4) re-run | max ≤ 6.45 ms no fault, ≤ 9.45 ms one fault, with prediction misses counted; B-REP-13 and B-REP-4 pass values unchanged |
+| B-PQ-3 | The switch at `E_pq` in `vyrn-sim`: scheme-0 votes and headers for epoch ≥ `E_pq` injected, history before it replayed | every injected signature rejected; replay from genesis bit for bit (01 §14.20 SG1–SG6) |
 | B-REP-6 | Sequencer core 50 BLAKE3 load | ≤ 0.60 |
 | B-REP-7 | Replay speed at peak and at average load | ≥ 1.5×, ≥ 10× |
 | B-REP-8 | Promotion time of the standby | ≤ 3 ms |
@@ -2106,7 +2185,7 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | `REP_STREAMS` | 2 (REF), 1 (CONSUMER, AWS) | — | substreams, one per stream core (§2.2) |
 | `need_A`, `need_B` | StepId | — | the newest step per half that a response of a step depends on (§4.1) |
 | `REP_SIGN_SLICE_NS` | 50 | budget | longest signer slice on core 4 |
-| `REP_SEAL_US` | 100 | budget | block close → HEADER out, max |
+| `REP_SEAL_US` | 100 | budget | block close → HEADER out, max; HEADER_PQ follows ≤ `PQ_SIGN_MAX_US` later under scheme 1 (§3.10) |
 | `REP_HB_US`, `REP_ACK_US` | 50, 50 | budget | heartbeat and replica-ack periods |
 | `REP_SELF_FENCE_US`, `REP_ACK_LIVE_US`, `REP_FENCE_ACKS` | 250, 100, 3 | budget | the self-fence: fresh-ack window, ack only while receiving, voters needed (§4.8) |
 | `REP_HOP_MAX_MS` | 0.8 | budget | metro one-way bound of a timely network (§6.6) |
@@ -2197,3 +2276,4 @@ Resolved by 01 and removed: `PacketRecord.flags` (§6.6: `SHED`, `ADVANCE`), INV
 | 10 | The archive's feed is ≤ 25 Gbps at sustained peak against ~180 Gbps of ingest, so a peak longer than the ≥ 6 h on-box window leaves an archive gap. Is a direct archive subscription to frames and data needed? | 06 / 07 | B-REP-9 at sustained peak for 8 h |
 | 11 | Replay order of a pooled account across pool lanes: does `AcctTake.ver` alone order every cross-lane dependency, including fills settled on the account while another pool core holds its token? | 05 | T-REP-1 with pooled accounts; B4 |
 | 12 | Do both ports of an X2542, each with its own CTPIO writer, keep the wire lead of B-REP-2W, and does a spanning step stay ≤ 142 ns? | 06 | B-REP-2W, B-REP-13 |
+| 13 | Under scheme 1 (01 §14.20), does data RX on 5 cores (50, 52–55) keep up with 155 Gbps of data frames at peak, now that core 63 signs votes? If not, voters need a larger box or `PQ_HEDGE` = 1 with the 1.35 ms tail budgeted. | 06 | B-REP-9 data mix plus B-PQ-1 on one voter |

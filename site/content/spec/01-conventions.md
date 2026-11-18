@@ -63,6 +63,8 @@ over the listed integer type, defined in crate `vyrn-types`.
 | `Hash` | [u8; 32] | BLAKE3-256. |
 | `PktHash` | u64 | The first 8 bytes of BLAKE3-256 of a packet's bytes 0..end-of-messages (the tags excluded). |
 | `Tag` | u64 | SipHash-2-4 MAC output. |
+| `SigScheme` | u8 | Signature scheme of a key and of every signature it makes (§14.20): 0 Ed25519, 1 hybrid Ed25519 + ML-DSA-44, 2 hybrid Ed25519 + ML-DSA-65. Fixed per key in its certificate and per epoch in `EpoConfig.sig_scheme` (08 §2.3); the wire carries no scheme byte. |
+| `PubKey`, `Sig` | bytes | A public key and a signature of the scheme in force: 32 and 64 B (scheme 0), 1,344 and 2,484 B (scheme 1), 1,984 and 3,373 B (scheme 2). A hybrid value is the Ed25519 part followed by the ML-DSA part. `Ed25519Sig` = `[u8; 64]`. |
 
 ## 4. Cryptography
 
@@ -70,8 +72,9 @@ over the listed integer type, defined in crate `vyrn-types`.
 |---|---|
 | Packet MAC | SipHash-2-4, 128-bit key, 64-bit tag. The first failed MAC on a session closes the session. |
 | Hash | BLAKE3-256 everywhere (blocks, data, log chain, KDF via `derive_key`). |
-| Validator votes, sequencer block signatures, certificates | Ed25519. A certificate is a list of (validator index, signature). |
-| Session open (wallet signature) | Ed25519 or secp256k1 (EVM wallets). Chain mode only. |
+| Validator votes, sequencer block signatures, certificates | Ed25519 (scheme 0) until the post-quantum switch, then hybrid Ed25519 + ML-DSA-44 (scheme 1, FIPS 204). A hybrid signature is valid only if both parts verify. `EpoConfig.sig_scheme` selects the scheme per epoch (§14.20). A certificate is a list of (validator index, signature). |
+| Release keys, operator identity keys (cold, long-lived) | Hybrid Ed25519 + ML-DSA-65 (scheme 2, §14.20). |
+| Session open (wallet signature) | Ed25519 or secp256k1 (EVM wallets). Chain mode only. Not post-quantum; 09 §6.8 states the exposure and the migration hook. |
 | Key agreement for session keys | X25519 with each validator's static key, then BLAKE3 `derive_key` with context `"vyrn v1 session"`. |
 | State commitment (chain mode) | A lattice hash (LtHash-style) over the per-second net diff. Details in `09-chain.md`. |
 
@@ -115,6 +118,9 @@ the only definition of that name.
 | `SNAPSHOT_REFRESH` | once per inbound packet | When a lane re-reads the BBO snapshot |
 | `REPL_PATHS` | 2 | Independent switch paths for order frames |
 | `CACHE_LINE` | 64 (x86-64, Graviton), 128 (Apple M-series) | Alignment of every hot shared structure |
+| `PQ_HEDGE` | 4 on `vyrn-seq` (and the standby once promoted), 2 on a voter, 8 for a `HandoffSig` | Parallel ML-DSA signing attempts per hybrid signature, each with fresh randomness, one per PQ core; the first to finish is used (§14.20) |
+| `PQ_SIGN_MAX_US` | 400 at 4 attempts, 750 at 2, 250 at 8 | **Maximum** (budget) from the signed bytes to the ML-DSA-44 part (§14.20). Exceeded with probability ≤ 10⁻⁹ per signature (analytic, from the rejection-loop model fitted to the measured distribution); a later signature counts as a slow box, which is the one fault f |
+| `PQ_VERIFY_US` | 35 | ML-DSA-44 verification per signature (budget; 29–32 µs measured, §14.20) |
 
 ## 6. Wire layouts
 
@@ -229,7 +235,7 @@ RouteRecord   { lane: LaneId, lane_seq: LaneSeq, cross: bool }
                                           // (05 §10, 10 M8)
 BlockHeader   { height: Height, epoch: Epoch, book: BookId, first_step: StepId,
                 last_step: StepId, prev: Hash, order_root: Hash, data_root: Hash,
-                seq_sig: Ed25519Sig }
+                seq_sig: Sig }            // scheme of `epoch` (§14.20): 64 B, or 2,484 B hybrid
 AcctTake      { lane: LaneId, account: AccountId, ver: u32, lane_seq: LaneSeq }
                                           // pooled lanes only: one per token take (§14.17.4)
 HandoffRecord { book: BookId, epoch: Epoch, last_step: StepId, last_height: Height,
@@ -309,9 +315,9 @@ Languages are fixed: Rust for every binary, C only for `vyrn-nic-shim`, Vx for `
 | 8–49 | 1–6 | 42 dedicated lanes (lanes 0–41; one firm each) |
 | 50 | 6 | order hasher (BLAKE3 for the HASH frames) |
 | 51 | 6 | OS, IRQs, housekeeping, control (admin, epoch, metrics, lane watchdog); the only core that is not isolated |
-| 52–55 | 6 | spare cores for planned, cooperative lane evacuation only; a lane silent for > 1 ms fail-stops the sequencer |
+| 52–55 | 6 | spare cores for planned, cooperative lane evacuation; a lane silent for > 1 ms fail-stops the sequencer. Under scheme 1 they are also the PQ signing cores: the four attempts of `seq_sig`'s ML-DSA part (`PQ_HEDGE`, §14.20). An evacuation may take 55 and 54 only, which lowers `PQ_HEDGE` to 3 or 2 while it lasts; 52 and 53 are never taken under scheme 1 |
 | 56–62 | 7 | the pooled lane group: lanes 42–48, 7 cores in one CCD (§14.15) |
-| 63 | 7 | spare |
+| 63 | 7 | spare; under scheme 1, the ML-DSA half of the finality listener's vote checks (07 §6.8) |
 
 ## 11. Determinism rules (for all engine code)
 
@@ -443,7 +449,7 @@ Core 1 reads lanes 0–24 and core 6 reads lanes 25–48. Each writes its own ha
 
 ### 14.9 Chain gate and forced inclusion
 
-- `FIN_GATE_BLOCKS` = 8. In both modes, the sequencer never runs more than 8 blocks ahead of finality. If finality lags more than that, the book halts rather than issue fills that cannot be final within 10 ms.
+- `FIN_GATE_BLOCKS` = 8 (9 from `E_pq`, §14.20 D). In both modes, the sequencer never runs more than 8 blocks ahead of finality. If finality lags more than that, the book halts rather than issue fills that cannot be final within 10 ms.
 - A forced packet, under an honest sequencer, is positioned at the first block boundary after the block that includes it is notarized. It is final ≤ 10 ms after it is sent, like any order. `FIN_GATE_BLOCKS` = 8 is only the deadline after which validators treat its absence as censorship (evidence plus failover, §14.0 fact 3).
 - Orders through the normal path are final ≤ `FINALITY_MAX_MS` = 10 ms.
 
@@ -695,3 +701,176 @@ settlement. The rule is:
 
 12 (`12-commitment.md`) states the whole lifecycle. 13 and 14 hold the data-availability model and
 the workload envelope.
+
+### 14.20 Post-quantum signatures (decided 2026-11-18)
+
+**Why.** Every signature in draft 0.3 is classical: Ed25519 for votes, `seq_sig`, certificates,
+`NodeCert`s, operator identity keys and release keys; secp256k1 for EVM wallets and the L1 bridge
+(09). A large quantum computer recovers the private key of either from its public key (Shor), so
+an attacker who has one forges votes, headers and release manifests at will, live or after the
+fact. [Certain] The hashes (BLAKE3, Keccak-256, SHA-256) keep about 128-bit security against
+Grover-style search and need no change. [Likely] The owner approved the change with speed as the
+main concern, so this section keeps every signature off the per-message path and keeps the
+finality budget of 07 §6.6.
+
+**A. The scheme.** `SigScheme` (§3) names the scheme of a key and of every signature it makes.
+
+| Code | Scheme | Public key | Signature | Used for |
+|---|---|---|---|---|
+| 0 | Ed25519 (today) | 32 B | 64 B | everything, until the switch |
+| 1 | hybrid Ed25519 + ML-DSA-44 (FIPS 204, NIST category 2) | 32 + 1,312 = 1,344 B | 64 + 2,420 = 2,484 B | live keys after the switch: `VK`, `SK`, `NK`, vote and handoff signatures, `seq_sig`, every certificate |
+| 2 | hybrid Ed25519 + ML-DSA-65 (category 3) | 32 + 1,952 = 1,984 B | 64 + 3,309 = 3,373 B | cold, long-lived keys: operator identity keys `OIK` (09 §2.2), release keys (11 §9.5) |
+
+- **Validity.** A hybrid signature is valid only if both parts verify. Each part signs
+  `scheme ‖ msg`, where `msg` is the byte string the scheme-0 rule signs today (the `derive_key`
+  digest with its context, 09 §17.3). The leading scheme byte stops a stripped Ed25519 part from
+  passing as a scheme-0 signature. A key is never reused across schemes: a hybrid key's Ed25519
+  half is fresh.
+- **Parts and rules.** The Ed25519 part follows the ZIP-215 rules (11 §2.5). The ML-DSA part is
+  pure ML-DSA (not HashML-DSA), hedged signing with 32 fresh random bytes per attempt, verified
+  under FIPS 204 Algorithm 3 with an empty context string (11 §2.5a). Hedged signing means two
+  signatures of one message differ. Nothing that is hashed into state or chained depends on
+  signature bytes: `header_hash` covers header bytes 0..126 (07 §2.2), and equivocation is two
+  different signed bytes 0..126 at one height, never two signatures of the same bytes (09 §8.2).
+- **Why ML-DSA-44 for live keys.** It is the fastest FIPS 204 set and the smallest, and the
+  Ed25519 half keeps classical security if a lattice attack appears. Live keys rotate by
+  `NodeCert` (09 §2.3). ML-DSA-65 costs 1.5–1.7× in time and 889 B more per signature (table B)
+  on every block and vote, which buys nothing the cold keys need speed for. [Likely] Open
+  question PQ-1 asks the owner whether category 2 is enough for live keys.
+- **Not ML-DSA-87, not SLH-DSA, not Falcon.** ML-DSA-87 is larger and slower again. SLH-DSA
+  signatures are 7.8 KB at the smallest and signing takes milliseconds. Falcon (FN-DSA) needs
+  floating-point sampling, which §11 forbids in anything every replica must reproduce, and it has
+  no final FIPS yet. [Likely]
+
+**B. Measured cost.** Measured 2026-11-18 on an Amp orb: Intel Xeon @ 2.6 GHz, x86_64 with AVX2
+and AVX-512, 2 vCPUs, Linux, rustc 1.100.0, `--release` with `lto = "thin"`, `codegen-units = 1`
+and this repository's `target-cpu=x86-64-v3`. The message is 126 bytes (a header's signed part).
+Each mean is the median of 7 rounds of 2,000 calls. The sign distribution is 20,000 single calls
+with distinct messages. A scratch benchmark produced the numbers; it is not in the repository.
+These are DEV figures, not `REF` results (01 §10): `REF`'s EPYC 9575F clocks higher, so the
+budgets that follow use these numbers unscaled. [Certain for the numbers on this machine;
+Likely that `REF` is not slower]
+
+| Crate, version | Set | Keygen | Sign mean | Sign p50 / p99 / p99.9 / max (µs) | Verify |
+|---|---|---|---|---|---|
+| `ed25519-dalek` 3.0.0 (in the workspace today) | Ed25519 | — | 16.7 | 15.9 / 31.3 / 48.4 / 598 (one outlier) | 34.5 (strict 39.5; batch of 4: 22.9 per signature) |
+| `libcrux-ml-dsa` 0.0.11, `simd256` | ML-DSA-44 | 28 | 97 | 78 / 331 / 467 / 696 | 29.8 |
+| `libcrux-ml-dsa` 0.0.11, `simd256` | ML-DSA-65 | 49 | 149 | 130 / 547 / 798 / 1,273 | 51.4 |
+| `aws-lc-rs` 1.19.0 (AWS-LC, C and assembly) | ML-DSA-44 | 31 | 107 | 90 / 396 / 570 / 997 | 29.3–31.1 |
+| `aws-lc-rs` 1.19.0 | ML-DSA-65 | 56 | 174 | 132 / 557 / 802 / 1,358 | 48.5–51.6 |
+| `ml-dsa` 0.1.2 (RustCrypto, pure Rust) | ML-DSA-44 | 151 | 486 | 395 / 2,171 / 3,300 / 5,621 | 61.0–68.4 |
+| `ml-dsa` 0.1.2 | ML-DSA-65 | 242 | 973 | 687 / 4,031 / 6,408 / 17,069 | 84.0–87.7 |
+
+ML-DSA signing is a rejection loop: each attempt repeats a step until the candidate passes, 4.25
+repetitions on average for ML-DSA-44 (FIPS 204), with a geometric tail. That tail, not the mean,
+is the cost that matters at 1 kHz. The model `t = 27 µs + 17 µs × repetitions`, with repetitions
+geometric at p = 1/4.25, matches the measured libcrux ML-DSA-44 percentiles within 2 µs (p50 78,
+p90 181, p99 331, p99.9 467). [Certain for the fit]
+
+**Hedging.** `PQ_HEDGE` attempts run at once on separate cores, each with its own randomness, and
+the first to finish wins. The minimum of k attempts has a tail k times steeper. Measured as the
+minimum of consecutive single calls (a simulation of parallel cores, not a run on parallel
+cores; B-PQ-1 measures the real thing):
+
+| libcrux ML-DSA-44 | p50 | p99 | p99.9 | max over the run | ≤ 10⁻⁹ bound (model) = `PQ_SIGN_MAX_US` |
+|---|---|---|---|---|---|
+| 1 attempt | 78 | 331 | 467 | 696 | 1,353 |
+| 2 attempts | 59 | 184 | 249 | 401 | 690 → **750** |
+| 4 attempts | 45 | 111 | 135 | 199 | 367 → **400** |
+| 8 attempts | — | — | — | — | 197 → **250** |
+
+**C. Crate.** `libcrux-ml-dsa` (Cryspen), on the 11 §2.2 allowlist at tier S, with RustCrypto
+`ml-dsa` at tier T as the differential reference.
+
+| | `libcrux-ml-dsa` 0.0.11 | `aws-lc-rs` 1.19.0 | RustCrypto `ml-dsa` 0.1.2 |
+|---|---|---|---|
+| Speed (ML-DSA-44 sign mean / verify) | 97 / 30 µs, fastest | 107 / 30 µs | 486 / 61 µs: 5× slower to sign; at 4 attempts its measured p99.9 is 841 µs and the 10⁻⁹ bound ≈ 1.8 ms, past a metro hop |
+| Language, `unsafe` | Rust; `#![deny(unsafe_code)]` at the root, `unsafe` only in the AVX2 instantiation (32 uses) and in `libcrux-intrinsics` (101 in the AVX2 module); portable path for aarch64 | C and assembly through FFI, plus a 68 MB vendored C tree built by `aws-lc-sys` | pure Rust, no `unsafe` in the crate |
+| Assurance | README: field arithmetic, NTT and serialization formally verified with hax and F\*, portable and AVX2. Independent audit: unknown, not checked | AWS-LC has a FIPS 140-3 module (`aws-lc-fips-sys`); whether its validated version covers ML-DSA: unknown, not checked | README: "never been independently audited" |
+| Dependencies (normal + build) | 17 crates, all Cryspen plus `rand` | 21, plus cmake/clang for the C build | 36 |
+| Policy fit (11 §2.2) | fits | a second crypto stack in C, which the ban on `openssl` and `ring` ("one crypto stack, not two") rules out | fits; too slow for the live path |
+
+[Certain for the table's facts, from the crates' sources and READMEs at these versions. Web
+search was unavailable when this was written, so audit and validation status beyond the READMEs
+is unknown, not assumed.] Open question PQ-2 asks the owner to accept libcrux at a 0.0.x version
+or to fund an audit first.
+
+**D. Where the cost goes, and the hot path.**
+
+- **The hot path is unchanged.** No lane, cut, BBO, TX or hasher core runs any new instruction;
+  packets stay authenticated by SipHash tags (09 §5.1: a signature per packet would need ~2,900
+  cores). On core 4 the only change is to push the 126 signed bytes onto an SPSC ring to the PQ
+  cores and later post one DMA descriptor for the HEADER_PQ frame (07 §3.3): about 25 ns per 1 ms
+  block (budget), 0.0025% of the core. The frame gate does not move, because HEADER_PQ goes by
+  DMA, not CTPIO (07 §4.4). [Likely: budget, not measured; B-REP-13 and B-REP-4 re-run with
+  scheme 1 check it]
+- **The per-step budgets of §5 are unchanged:** `LAT_MAX_NS`, `LANE_NS_PER_MSG`, `BBO_CROSS_NS`,
+  `BBO_IMPROVE_NS`, `CUT_REFRESH_NS` and `BLOCK_NS` keep their values. [Certain: nothing in them
+  signs or verifies]
+- **Sizes.** The `BlockHeader` grows from 190 B to 2,610 B (126 + 2,484). A `REP_FinalityCert`
+  grows from 301 B to 7,561 B at Q = 3 (BASE) and from 366 B to 10,046 B at Q = 4 (CHAIN); with all
+  5 CHAIN signatures it is 12,531 B. A `HandoffCert` grows from 315 B to 8,887 B (BASE) and from
+  380 B to 11,372 B (CHAIN), because `next_seq_key` grows to 1,344 B (08 §5.1). Bandwidth per
+  replication path rises by about 2.5 MB/s of HEADER_PQ frames (1,000/s × ~2.54 KB with framing), 0.08% of 3,310 MB/s (07 §3.13).
+- **Per-block budgets.** The ML-DSA part of `seq_sig` travels in its own frame and is checked in
+  parallel with the data lag, so it adds nothing to the maximum (07 §6.6). Votes are signed
+  speculatively, in parallel with the hops that precede them (07 §6.5a). Finalize and nullify
+  never miss, and the leader never misses, but a voter can mispredict the notarize range in the
+  fault-free case and re-sign: ≤ 0.75 ms on the notarize hop. Vote checking costs 0.10 → 0.15 ms
+  (max, budget). Finality: typical 2.59 → 2.69 ms, max with no fault 5.65 → 6.45 ms, max with one
+  fault 8.65 → 9.45 ms (reserve 0.55 ms to `FINALITY_MAX_MS`). CHAIN's worst case moves from 8.11
+  to 8.91 ms from block start (09 §4.8). [Likely: budgets built from the measured figures; the
+  speculative signing depends on open question PQ-3]
+- **The finality gate.** Block h is final ≤ 8.45 ms after it closes (BASE), past the 8 closed
+  blocks that `FIN_GATE_BLOCKS` = 8 allows. So `FIN_GATE_BLOCKS` = **9** from `E_pq` in both modes
+  (BASE spare 0.55 ms, CHAIN 1.09 ms; 07 §6.8, 09 §4.6). The cost: outside the fault model, ≤ 1 ms
+  more of fills are released unfinal before the halt. The 1 µs answer and the 10 ms finality
+  maximum are unchanged. PQ-8 would bring both budgets back down by removing the miss. [Likely]
+- **If speculative signing is not possible**, the leader's notarize and each voter's notarize
+  are signed after `verify`, at ≤ 0.75 ms each, and the one-fault maximum becomes ~10.2 ms, above
+  `FINALITY_MAX_MS` = 10. Scheme 1 must then not activate until votes run with `PQ_HEDGE` ≥ 4 on
+  voters too. [Likely]
+
+**E. The switch.** Rules SG1–SG6 follow 04 §12's VR4: the set of accepted schemes changes only at
+an epoch boundary.
+
+| ID | Rule |
+|---|---|
+| SG1 | `EpoConfig(e).sig_scheme` (08 §2.3) fixes the scheme of every live signature made for epoch e: votes, `seq_sig`, `HandoffSig`, root and commit votes. A verifier takes the scheme from the epoch the message names, never from the message. |
+| SG2 | A scheme-0 signature is accepted only on a message of an epoch e < `E_pq`, the first epoch with `sig_scheme` ≥ 1. Old signatures stay valid as history; a new one under the old scheme is rejected, so a forged Ed25519 vote for a current epoch is worthless. |
+| SG3 | `sig_scheme` never decreases. A broken ML-DSA is covered by the Ed25519 half, so no rollback is needed; a downgrade would hand a quantum attacker every later epoch. |
+| SG4 | Hybrid keys are included at least `CHN_KEY_LEAD_EPOCHS` (4) before `E_pq` and become active at `E_pq` (CHAIN: `NodeCert` with `scheme` = 1 and `valid_from = E_pq`, 09 §2.3; BASE: `REP_Membership` with `epoch_from = E_pq`, 07 §13). A key of one scheme is never in force in an epoch of another. The roster of `EpoConfig(E_pq)` then holds only hybrid keys, and `HandoffCert(E_pq − 1)`, the last certificate signed with scheme 0, certifies them. |
+| SG5 | CHAIN activates `E_pq` by an `Upgrade` with the 72 h timelock and both clients ready (09 §14.2); BASE by an admin record. Both client kinds verify both schemes before any switch is scheduled (U5, 08 §9.4). |
+| SG6 | `pq_anchor` = the hash of `HandoffRecord(E_pq − 1)` goes into every release manifest from the switch on, signed by the hybrid release keys (11 §9.5). A light client or a node syncing from genesis accepts only a history through that record. A quantum attacker who forges an older Ed25519 history cannot also forge the anchor. |
+
+**F. What cannot be made post-quantum here, and how VYRN handles it.** 09 §6.8 holds the detail.
+
+- **The L1 bridge.** The contract checks secp256k1 through `ecrecover`, the only signature check
+  Ethereum prices low enough (09 §6.1), and the bridge and guardian keys reveal their public keys
+  on L1 whenever they sign. A quantum attacker who recovers 5 bridge keys can override a veto with
+  5-of-5 at once, so every defense of 09 §6.4–6.6 falls and the whole balance of the contract is
+  exposed. VYRN cannot fix this inside an immutable contract. It states the exposure and adds a
+  migration hook: a second bridge with a pluggable verifier, deposits moved by users, and a
+  `PqAlarm` under which tooling stops new deposits to the old bridge and posts go only to recorded
+  exit addresses; the contract itself is not paused (09 §6.8). [Certain for the dependency on
+  `ecrecover`; Guessing on when Ethereum offers a post-quantum precompile]
+- **EVM wallet sessions.** An account whose `OwnerKey` is secp256k1 is as safe as that key.
+  Hook: a hybrid `OwnerKey` variant and a `SetOwnerKey` item; after a governance cutoff epoch,
+  classical owner keys are frozen to their exit address for good, even after a later key change (09 §6.8).
+- **Key agreement.** X25519 for `K_seq`, `K_out`, `K_com` transport and the p2p handshake is also
+  quantum-breakable, and an attacker who recovers a validator's static `XK` derives every
+  session's MAC keys. This section covers signatures only. Open question PQ-6 asks for a hybrid
+  X25519 + ML-KEM-768 change. [Certain that X25519 is not post-quantum]
+
+**Open questions for the owner**
+
+| # | Question | Default if not decided | Settled by |
+|---|---|---|---|
+| PQ-1 | Is ML-DSA-44 (category 2) enough for live keys, or should they use ML-DSA-65 at +54% sign time and +889 B per signature? | ML-DSA-44 | owner |
+| PQ-2 | Accept `libcrux-ml-dsa` at 0.0.11 with our own cargo-vet audit, or require an independent audit (or a 1.0 release) before `E_pq`? | own audit plus the differential tests of 11 §2.5a; no switch before both pass | owner |
+| PQ-3 | Can `commonware-consensus::simplex` take a custom hybrid scheme and speculative signing (07 §6.5a)? Its schemes are Ed25519, BLS12-381 and secp256r1. | a hybrid `Scheme` implemented in `vyrn-crypto`; a patch upstream if the trait does not allow speculative signing | 07: a `vyrn-sim` run of B-PQ-2 |
+| PQ-4 | When is `E_pq`? It needs a date or a trigger (a published estimate of a cryptographically relevant quantum computer), and an earlier switch costs only the budgets above. | at the first epoch after B-PQ-1 to B-PQ-3 pass on `REF` | owner |
+| PQ-5 | The L1 bridge: when does governance deploy the post-quantum bridge and raise `PqAlarm`, and is a 10% daily cap on the old bridge acceptable until then? | at the first Ethereum post-quantum verifier VYRN can afford (09 §6.8) | owner, 09 |
+| PQ-6 | Make key agreement hybrid (X25519 + ML-KEM-768) for session keys and the p2p handshake? | not in this change | owner, 04, 09 |
+| PQ-7 | Release keys on hardware tokens (11 §9.5): which token holds an ML-DSA-65 key? | an HSM with ML-DSA support for the ML-DSA half, the current tokens for the Ed25519 half | owner, 11 |
+| PQ-8 | Remove the voter's notarize misprediction (07 §6.5a): fix the proposal range by a rule every voter can compute before the proposal arrives (for example, every header closed at least `REP_HOP_MAX_MS` before the view started). That brings the maxima back to 5.70 / 8.70 ms and `FIN_GATE_BLOCKS` back to 8, but it delays each header's proposal by up to one hop. | budget the miss; `FIN_GATE_BLOCKS` = 9 from `E_pq` | owner, 07 |

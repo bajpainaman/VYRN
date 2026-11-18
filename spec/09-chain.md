@@ -124,8 +124,8 @@ starts with a domain-separation context (§17.3).
 
 | Key | Scheme | Where it lives | Rotation |
 |---|---|---|---|
-| `OIK_i` | Ed25519 | Air-gapped Linux machine or COTS HSM | Governance (§2.10), timelocked |
-| `NK`, `VK`, `SK`, `XK` | Ed25519 / X25519 | The node's boxes, in memory, loaded from an encrypted file at start | New `NodeCert`; active from the node's next active epoch |
+| `OIK_i` | Ed25519; hybrid Ed25519 + ML-DSA-65 (scheme 2) before `E_pq` (01 §14.20) | Air-gapped Linux machine or COTS HSM | Governance (§2.10), timelocked |
+| `NK`, `VK`, `SK`, `XK` | Ed25519 / X25519; `NK`, `VK`, `SK` hybrid Ed25519 + ML-DSA-44 (scheme 1) from `E_pq`; `XK` stays X25519 (01 §14.20 F, PQ-6) | The node's boxes, in memory, loaded from an encrypted file at start | New `NodeCert`; active from the node's next active epoch |
 | `BK_i` | secp256k1 | COTS HSM on the commit box | L1 signer rotation (§6.7) |
 | `GK_i` | secp256k1 | Online watcher process on the commit box | L1 signer rotation |
 
@@ -143,14 +143,22 @@ NodeCert {
     home:         HomeCode,
     serial:       u32,          // +1 per rotation of this node's keys
     valid_from:   Epoch,        // first epoch in which these keys may sign
-    node_key:     [u8; 32],     // Ed25519
-    vote_key:     [u8; 32],     // Ed25519
-    seq_key:      [u8; 32],     // Ed25519
+    scheme:       SigScheme,    // 0 or 1 (01 §3): the scheme of node_key, vote_key, seq_key
+    node_key:     PubKey,       // 32 B (scheme 0) or 1,344 B (scheme 1)
+    vote_key:     PubKey,
+    seq_key:      PubKey,
     xchg_key:     [u8; 32],     // X25519
     client_kind:  u8,           // 0 Rust, 1 Vx
-    sig:          [u8; 64],     // Ed25519 by OIK_op over ctx "vyrn      v1 nodecert" ‖ fields
+    sig:          Sig,          // by OIK_op, in OIK's scheme, over ctx "vyrn      v1 nodecert" ‖ fields
 }
 ```
+
+**Scheme of the cert in force.** For epoch e, the cert in force is the newest one with
+`valid_from ≤ e` **and** `scheme = EpoConfig(e).sig_scheme`. A hybrid `NodeCert` for the switch
+has `valid_from = E_pq` and is included in a chain block of an epoch ≤ `E_pq −
+CHN_KEY_LEAD_EPOCHS` (the lead rule below, 01 §14.20 SG4). So the hybrid keys never sign in an
+epoch that still requires scheme 0, and the scheme-0 cert stays in force up to `E_pq − 1`. A
+scheme-0 `NodeCert` is not in force for any epoch ≥ `E_pq`, and a hybrid one for none before it.
 
 A `NodeCert` takes effect only when a chain block includes it, and only from `valid_from`, which
 must be at least `CHN_KEY_LEAD_EPOCHS` (4) after the including block's epoch. The lead time exists
@@ -452,7 +460,8 @@ up to 1B messages per second.
 | book | Resting order | `(LaneId, Handle)` | account, side, tick, open qty, rx_ts | the account's lane; filled qty by the BBO core |
 | book | Lane session state | `SessionId` | `K_seq`, `K_out`, bound address, `pkt_seq` window, suspended flag | the session's lane |
 
-`OwnerKey = Ed25519([u8; 32]) | Secp256k1([u8; 20])` (an EVM address). An account is created by its
+`OwnerKey = Ed25519([u8; 32]) | Secp256k1([u8; 20])` (an EVM address)
+`| Hybrid(PubKey)` (scheme 1, from `E_pq`; §6.8). An account is created by its
 first credited deposit, which names the owner (§6.3). `AccountId`s are assigned in credit order,
 starting at 1. The lane of an account in a book group is assigned by `10-accounts-risk-md.md`.
 
@@ -544,8 +553,8 @@ TxEnvelope {
     nonce:   u64,             // per signer; must be last + 1
     max_fee: u64,             // in USDC micro-units; the fee charged is ≤ this
     body:    [u8; body_len],
-    scheme:  u8,              // 0 Ed25519, 1 secp256k1 (EIP-712)
-    sig:     [u8; 64 or 65],
+    scheme:  u8,              // 0 Ed25519, 1 secp256k1 (EIP-712), 2 hybrid Ed25519 + ML-DSA-44 (§6.8)
+    sig:     [u8; 64, 65 or 2,484],
 }
 ```
 
@@ -700,9 +709,9 @@ delay bound of the model (01 §14.0 fact 3):
 | `verify` completion | 0.10 | |
 | `tag_com` of the last payload, exclusion list | 0.05 | 20 ns per packet, incremental; keys precomputed (§5.4) |
 | Hops 2–4: proposal, notarize, finalize → `Q_CHAIN` at every voter and at the sequencer | 2.45 | |
-| Vote signature checks | 0.10 | |
-| **No fault** | **5.31** | was 4.85 with F1 data homes |
-| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault |
+| Vote signature checks | 0.10 | 0.15 under scheme 1 (hybrid, 01 §14.20): the ML-DSA parts run in parallel with the batched Ed25519 parts |
+| **No fault** | **5.31** | was 4.85 with F1 data homes; 6.11 under scheme 1 (+0.05 checks, +0.75 one notarize re-sign) |
+| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault; under scheme 1, 8.91 with a missed notarize prediction (07 §6.5a), against the 10.00 ms gate of `FIN_GATE_BLOCKS` = 9 (01 §14.20 D), margin 1.09 ms |
 | or a data box redirect (07 §5.7, 3 ms in place of 0.71) | **7.60** | |
 | or the sequencer is the fault | 07 failover; its seal must be final ≤ 9 ms after the last frame | |
 
@@ -1247,6 +1256,64 @@ with the other per-epoch keys (08 §9.5). A set that governance approves activat
 boundary after approval, and every activated set stays readable by rotation number, because posts
 accepted under it stay claimable (step 4). `vyrn-chain` reads it through `Epochs::bridge_signers`.
 
+### 6.8 What stays classical: the bridge and EVM wallets
+
+01 §14.20 makes every VYRN-internal signature hybrid. Two keys cannot follow, because the other
+side checks them.
+
+**Exposure.**
+
+- **The bridge.** The contract verifies `BK` and `GK` with `ecrecover` (§6.1). `ecrecover` is
+  secp256k1 only, and verifying ML-DSA in Solidity has no precompile and no known affordable cost.
+  [Certain for `ecrecover`; Guessing on the gas of a Solidity ML-DSA verifier, which this chapter
+  did not measure] Every bridge or guardian signature on L1 reveals its public key. An attacker with
+  a cryptographically relevant quantum computer recovers the private keys from it. With all 5
+  `BK`s it signs a false post, overrides any veto with 5-of-5 (§6.5) and rotates the signer set
+  (§6.7). With the `GK`s it vetoes or pauses honest posts. The 10% daily cap (§6.4) still holds
+  inside the contract, so the loss is ≤ 10% of the balance per day while the attack lasts; the
+  escape hatch (§6.6) does not help, because a forged post is accepted. [Likely]
+- **EVM wallet sessions.** An account with a `Secp256k1` `OwnerKey` is as safe as that key. Its
+  public key is on Ethereum once it has sent an L1 transaction. A quantum attacker can then open
+  sessions and `Withdraw` as the owner. `exit_address` (§6.2) bounds where the funds go only if the
+  attacker cannot also change it, and `SetExitAddress` is signed by the same owner key.
+- **Ed25519 `OwnerKey`s and session keys** have the same exposure until the owner moves to a
+  `Hybrid` key. Session `sign_pub` keys live ≤ 3 epochs, which limits but does not remove it.
+- **What stays safe.** Votes, `seq_sig`, every certificate, the chain's state and the light-client
+  history (§10) are post-quantum from `E_pq`, with `pq_anchor` (01 §14.20 SG6) fixing the switch.
+  A quantum attacker cannot forge VYRN's history or its finality; it can only steal through the
+  classical keys above.
+
+**Migration hook.**
+
+1. **Hybrid owner keys.** `OwnerKey::Hybrid` and an item `SetOwnerKey { new: OwnerKey }`, signed by
+   the current owner key, are available from `E_pq`. Wallets that support ML-DSA move first; an
+   EVM wallet keeps its `Secp256k1` key until it can.
+2. **Classical cutoff.** Governance sets `CHN_PQ_OWNER_CUTOFF` (an epoch, unset by default) with the
+   72 h timelock. At that epoch every account whose `OwnerKey` is still classical gets a permanent
+   flag `exit_frozen` and keeps the `exit_address` in force at the cutoff. The flag is account
+   state and survives every later `SetOwnerKey`: a frozen account never accepts `SetExitAddress`,
+   and all its withdrawals go to the frozen address, whoever holds the owner key. A classical key
+   may still sign `SetOwnerKey` (so the owner can trade again under a hybrid key), `Withdraw` and
+   `CancelWithdraw`. A quantum attacker who recovers the classical key and installs its own hybrid
+   key can therefore trade the account but can send funds only where the owner already said. An
+   owner who loses access to the frozen address recovers through governance, out of band. Accounts
+   that move to a hybrid key before the cutoff are not frozen.
+3. **A second bridge.** The contract is immutable (§6.1), so the post-quantum bridge is a new
+   contract that governance adds and users opt into. Its signature check is a pluggable verifier
+   address fixed at deployment: a precompile when Ethereum offers one, or a proof that VYRN's
+   hybrid `CommitCert` verifies. Bridge keys `BK′` are then hybrid. Its design is out of scope.
+4. **`PqAlarm`.** A governance action (tightening, so it acts at once, §2.10). The immutable
+   contract has no deposit-only switch, and `pause()` (§6.6) also blocks proposals and claims, so
+   `PqAlarm` does not pause it. Instead: the validators sign only posts whose withdrawals all go to
+   recorded exit addresses (frozen ones included); the SDK, wallet integrations and the public RPC
+   refuse to build deposits to the old bridge and point to the new one; and deposits that still
+   arrive are credited as usual, so no funds are stranded. Guardians keep `pause()` for an attack in
+   progress, as today. The old bridge then holds a shrinking balance that its 10% cap protects.
+   [Likely: deposits stop by tooling, not by the contract]
+5. **Disclosure.** The service contract states: "Funds in the L1 bridge and accounts with classical
+   owner keys are not protected against a quantum attacker. VYRN's ordering, finality and history
+   are." 01 §14.20 open question PQ-5 asks the owner when to deploy step 3 and raise step 4.
+
 ## 7. Forced inclusion
 
 ### 7.1 Path
@@ -1326,7 +1393,7 @@ checks.
 
 Anyone submits an `Evidence` item. Its handling is automatic:
 
-1. The state machine verifies the evidence against chain state: Ed25519 verification for votes and
+1. The state machine verifies the evidence against chain state: Ed25519 (hybrid from `E_pq`, 01 §14.20) verification for votes and
    `seq_sig`s, `ecrecover` for bridge signatures, recomputation for `WrongExclusion` and `BadPost`.
    Each check is deterministic.
 2. Evidence older than `CHN_EVIDENCE_EPOCHS` (42 epochs, 14 days) is rejected. Duplicate evidence
@@ -1340,7 +1407,9 @@ Anyone submits an `Evidence` item. Its handling is automatic:
 ```
 Evidence =
   | SeqEquivocation { a: BlockHeader, b: BlockHeader }
-        // same book and height, different hashes, both seq_sig valid under one SK
+        // same book and height, different hashes, both seq_sig valid under one SK. Under
+        // scheme 1 "different" means different bytes 0..126: hedged signing gives two valid
+        // signatures of one header, which is not evidence (01 §14.20 A)
   | DoubleVote { a: VoteMsg + sig, b: VoteMsg + sig }
         // same operator and (epoch, view); Notarize/Notarize or Finalize/Finalize with
         // different blocks, or Finalize/Nullify. Keys may be any two of the operator's VKs.
@@ -1851,6 +1920,7 @@ No path changes the rules without 72 h of notice.
 | Client | spends proceeds of a busted fill | bust debt, insurance fund | insurance fund loss |
 | L1 reorg | undoes a deposit | finalized checkpoints only | requires 1/3 of L1 stake slashed |
 | Thief of 4 bridge keys | signs a false post | guardian veto, 1 h challenge, 10% daily cap | up to 10% of TVL per day if every guardian fails |
+| Quantum attacker (Shor) | recovers secp256k1 and Ed25519 private keys from public keys | hybrid keys from `E_pq` for every VYRN signature; `pq_anchor`; `SetOwnerKey`, the classical cutoff, a second bridge and `PqAlarm` (§6.8) | the old bridge (up to 10% of TVL per day) and classical owner keys until users migrate |
 | Thief of one operator key | governance actions | 4-of-5; the others `Jail` | none |
 | Lying RPC server | false balance or history | proofs (§10) | none |
 | Long-range attacker | fake history from old keys | weak subjectivity, L1 checkpoint | clients that skip re-anchoring |
@@ -1968,7 +2038,7 @@ qty`, where `qty` is the reversed quantity of the original fill.
 | `"vyrn v1 kcom head"`, `"vyrn v1 kcom"` | TESLA chain head; `K_com` per interval |
 | `"vyrn v1 gkey wrap"` | Transport of committee private keys |
 | `"vyrn v1 sample key"`, `"vyrn v1 sample"` | `K_sample`; the FQ sample predicate |
-| `"vyrn v1 vote"`, `"vyrn v1 commit"`, `"vyrn v1 seqsig"` | Consensus votes, commit votes, `seq_sig` |
+| `"vyrn v1 vote"`, `"vyrn v1 commit"`, `"vyrn v1 seqsig"` | Consensus votes, commit votes, `seq_sig`. Under a hybrid scheme each part signs `scheme ‖` this message (01 §14.20) |
 | `"vyrn v1 nodecert"`, `"vyrn v1 gov"`, `"vyrn v1 tx"` | Certificates, governance, items |
 | `"vyrn v1 genesis"`, `"vyrn v1 log"`, `"vyrn v1 epochkeys"` | Genesis hash, log hash, key-table hash |
 | `"vyrn v1 smt leaf"`, `"vyrn v1 smt node"` | SMT hashing |
@@ -2029,3 +2099,4 @@ qty`, where `qty` is the reversed quantity of the original fill.
 | 9 | False-positive rate of FQ-1–FQ-3 with an honest sequencer, and detection power against a simulated front-runner | 11 | B-CHN-5: `vyrn-sim` with an injected 300 ns front-running strategy |
 | 10 | The SMT and LtHash code on the commit box is Rust for every operator. Is that a common-mode risk that needs a Vx implementation? | 11 | Review after B-CHN-2; diff test of both if built |
 | 11 | How many BUSY sheds do item ops at block boundaries cause, and is `CHN_ITEM_OPS_PER_BLOCK` = 16 right? | 05 | B3 with a bust over 10k accounts and 500 items per chain block |
+| 12 | When does governance deploy the post-quantum bridge and raise `PqAlarm`, and when does `CHN_PQ_OWNER_CUTOFF` take effect (§6.8, 01 §14.20 PQ-5)? | owner | a published estimate of a cryptographically relevant quantum computer, and an Ethereum post-quantum verifier VYRN can afford |
