@@ -415,7 +415,8 @@ only when they hold every payload it references (07), and window blocks are fina
 
 **Keys across the boundary (reading, `vyrn-data`).** A data home holds one key table per epoch it
 serves. With one table it checks no `epoch16`, as replicas filter none (07 §5.4). From T the new
-home also holds e + 1's keys (`K_seq(e+1, ·)` or `K_com(e+1, ·)`); `epoch16` then picks the
+home also holds the next epoch's keys (`K_seq(e+1, ·)` or `K_com(e+1, ·)`), and the owner names both
+epochs rather than assuming consecutive numbers; `epoch16` then picks the
 table, and a copy whose `epoch16` is neither e nor e + 1 is dropped and counted before its MAC is
 checked, so it raises no `DataBadMac` (F5, P8). Dedupe windows and the ring span both epochs,
 because sessions and `pkt_seq` carry over (04 H8): a resend under e + 1 of a packet first sent

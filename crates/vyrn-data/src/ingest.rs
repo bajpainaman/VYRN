@@ -162,13 +162,14 @@ impl DataHome {
         }
     }
 
-    /// From T (08 §4.6): also accept copies with the low 16 bits of `epoch` under `keys`, its
-    /// `K_seq(e+1, ·)` or `K_com(e+1, ·)`. The table held now becomes epoch − 1's alone, and a
+    /// From T (08 §4.6): also accept copies with the low 16 bits of `next` under `keys`, its
+    /// `K_seq(next, ·)` or `K_com(next, ·)`. The table held now becomes `current`'s alone; the
+    /// caller names it, since a hold or a planned skip means `next` need not be `current + 1`. A
     /// table already added is replaced. Cold path: new sessions get their dedupe windows here.
-    pub fn add_epoch(&mut self, epoch: u32, keys: BTreeMap<SessionId, [u8; 16]>) {
-        let e16 = epoch16_of(epoch);
+    pub fn add_epoch(&mut self, current: u32, next: u32, keys: BTreeMap<SessionId, [u8; 16]>) {
+        let e16 = epoch16_of(next);
         if let Some(k) = &mut self.keys {
-            k.epoch16 = Some(e16.wrapping_sub(1));
+            k.epoch16 = Some(epoch16_of(current));
         }
         self.dedupe.add_sessions(keys.keys().copied());
         self.next = Some(Keys {

@@ -591,16 +591,18 @@ fn the_two_epoch_boundary_keys_copies_by_epoch16() {
     r.node.poll(Nanos(0));
     assert_eq!(r.node.counters().stored, 2);
 
-    r.node.add_epoch(10, BTreeMap::from([(SessionId(5), K2)]));
+    // A skipped number: the held table is named, not taken as next − 1.
+    r.node
+        .add_epoch(9, 12, BTreeMap::from([(SessionId(5), K2)]));
     let serves = |r: &Rig, e: u16| r.node.home().serves(e);
-    assert!(serves(&r, 9) && serves(&r, 10) && !serves(&r, 11) && !serves(&r, 77));
+    assert!(serves(&r, 9) && serves(&r, 12) && !serves(&r, 10) && !serves(&r, 77));
     assert_eq!(r.node.home().key(SessionId(5)), Some(&K2));
     r.send(&pkt(3, 9, &K, false), 1); // epoch e, its key
-    r.send(&pkt(4, 10, &K2, false), 1); // epoch e + 1, its key
-    r.send(&pkt(3, 10, &K2, true), 1); // resend of 3 under e + 1: a variant
-    r.send(&pkt(5, 11, &K2, false), 1); // neither epoch
+    r.send(&pkt(4, 12, &K2, false), 1); // the next epoch, its key
+    r.send(&pkt(3, 12, &K2, true), 1); // resend of 3 under the next epoch: a variant
+    r.send(&pkt(5, 10, &K2, false), 1); // neither epoch
     r.send(&pkt(6, 77, &K, false), 1); // the old table no longer takes any epoch16
-    r.send(&pkt(7, 10, &K, false), 1); // e + 1 under e's key: a real bad MAC
+    r.send(&pkt(7, 12, &K, false), 1); // the next epoch under e's key: a real bad MAC
     r.node.poll(Nanos(1));
     let k = *r.node.counters();
     assert_eq!((k.stored, k.epoch, k.bad_mac, k.conflicts), (5, 2, 1, 0));
@@ -614,16 +616,16 @@ fn the_two_epoch_boundary_keys_copies_by_epoch16() {
     );
 
     r.node.retire_epoch(9);
-    assert!(!serves(&r, 9) && serves(&r, 10));
+    assert!(!serves(&r, 9) && serves(&r, 12));
     r.send(&pkt(8, 9, &K, false), 2);
-    r.send(&pkt(9, 10, &K2, false), 2);
+    r.send(&pkt(9, 12, &K2, false), 2);
     r.node.poll(Nanos(2));
     let k = *r.node.counters();
     assert_eq!((k.stored, k.epoch, k.bad_mac), (6, 3, 1));
 
-    r.node.retire_epoch(10);
-    assert!(!serves(&r, 10));
-    r.send(&pkt(10, 10, &K2, false), 3);
+    r.node.retire_epoch(12);
+    assert!(!serves(&r, 12));
+    r.send(&pkt(10, 12, &K2, false), 3);
     r.node.poll(Nanos(3));
     assert_eq!(r.node.counters().epoch, 4);
 }

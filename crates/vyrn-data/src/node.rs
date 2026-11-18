@@ -289,8 +289,8 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
     }
 
     /// The two-epoch boundary (08 §4.6): [`DataHome::add_epoch`] on this box's home.
-    pub fn add_epoch(&mut self, epoch: u32, keys: BTreeMap<SessionId, [u8; 16]>) {
-        self.home.add_epoch(epoch, keys);
+    pub fn add_epoch(&mut self, current: u32, next: u32, keys: BTreeMap<SessionId, [u8; 16]>) {
+        self.home.add_epoch(current, next, keys);
     }
 
     /// [`DataHome::retire_epoch`] on this box's home.
