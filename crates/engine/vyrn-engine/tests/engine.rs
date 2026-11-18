@@ -587,6 +587,43 @@ fn replay_routes_a_forwarded_op_by_its_cross_bit_not_its_step_kind() {
 }
 
 #[test]
+fn replay_takes_the_logged_route_not_a_newer_snapshot() {
+    // Found by #84: Sell 97 rests on lane 1, then one lane-0 packet holds Buy 98 and Buy 99.
+    // The lane classifies both as Cross against its snapshot; Buy 98 takes the ask, so Buy 99
+    // logs as an Improve step with STEP_CROSS. Replay must take that logged route (before
+    // #86 it re-derived Improve and failed with Step(Kind)).
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let s = vec![
+        Act::Pkt {
+            l: 1,
+            a: 1,
+            rx_ts: 1_000,
+            now: 1_000,
+            msgs: vec![new(Sell, Day, 97, 1, 11)],
+        },
+        Act::Run,
+        Act::Pkt {
+            l: 0,
+            a: 1,
+            rx_ts: 2_000,
+            now: 2_000,
+            msgs: vec![new(Buy, Day, 98, 1, 21), new(Buy, Day, 99, 1, 22)],
+        },
+        Act::Run,
+    ];
+    let (j, store, _, _) = live(&s);
+    let (r, rep) = replay_checked(&j.recs, &store, &j);
+    assert_eq!(r, Ok(()));
+    assert!(logical(&rep.recs) == logical(&j.recs));
+    let (lanes, routes, steps) = to_wire(&j.recs);
+    assert_eq!(
+        replay_wire(&lanes, &routes, &steps, &store, Some(&j)).0,
+        Ok(())
+    );
+}
+
+#[test]
 fn replay_rejects_a_changed_record_at_its_index() {
     let (j, store, _, _) = live(&script());
     // A packet record whose fills_applied differs from the replayed lane's.

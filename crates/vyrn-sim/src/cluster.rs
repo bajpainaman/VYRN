@@ -8,7 +8,7 @@ use rand_chacha::ChaCha8Rng;
 use vyrn_bbo::admit::FixedClock;
 use vyrn_bbo::{Bbo, OrderFlags, Phase, Record, Side, Stp, Tif, TxEntry};
 use vyrn_cut::Hw;
-use vyrn_engine::{Engine, OwnedRec, Payloads, Rec, Shared, Sink};
+use vyrn_engine::{Engine, NoResponses, OwnedRec, Payloads, Rec, Shared, Sink};
 use vyrn_lane::{
     ArenaConfig, Config as LaneConfig, Gate, Lane, PathTable, RespPkt, Rx, RxIn, SessionSpec,
 };
@@ -881,6 +881,8 @@ pub fn run(seed: u64, schedule: &Schedule) -> Report {
                             .collect(),
                     });
                 }
+                // A route record (07 §3.6) is checked by replay (INV-DET), not here.
+                OwnedRec::Route(_) => {}
             }
         }
         seen_rec = out.recs.len();
@@ -948,13 +950,17 @@ pub fn run(seed: u64, schedule: &Schedule) -> Report {
                             p.fills_applied.0 = p.fills_applied.0.wrapping_add(1)
                         }
                         OwnedRec::Step(s, _) => s.n_fills = s.n_fills.wrapping_add(1),
+                        OwnedRec::Route(x) => x.cross = !x.cross,
                     }
                 }
             }
             let (bbo, mut rsh) = new_box(cfg.lanes);
             let mut re = engine(bbo, &mut rsh, &cfg);
             let mut rout = Out::default();
-            let res = re.replay(&recs, &store, &mut rout);
+            // No response log: the live run also answers packets outside the order stream
+            // (`Gate::None`), which replay cannot reproduce, so the responses are compared
+            // below with `in_stream` instead.
+            let res = re.replay(&recs, &store, &mut NoResponses, &mut rout);
             let detail = match res {
                 Err(d) => Some(format!(
                     "replica {r} diverged at record {}: {:?}",
