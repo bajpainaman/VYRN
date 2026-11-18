@@ -26,7 +26,7 @@ use crate::membership::{Committee, VoterOrder};
 use crate::observer::FinalizeVote;
 use crate::proposal::{MAX_HDRS_PER_PROPOSAL, MAX_SEAL_RANGE, Proposal};
 use crate::source::{
-    BlockSource, Genesis, Seal, Tip, Verdict, chain_after, proposal_for, proposal_range,
+    BlockSource, Genesis, Seal, SigCache, Tip, Verdict, chain_after, proposal_for, proposal_range,
 };
 use crate::tail::{SealExt, seal_digest, seal_proposal};
 use commonware_actor::Feedback;
@@ -174,6 +174,8 @@ pub struct App<E, S> {
     epoch: Epoch,
     seq_key: PubKey,
     known: Arc<Mutex<Known>>,
+    /// `seq_sig` verdicts under `seq_key`, each header checked once (07 §6.4).
+    sigs: Arc<SigCache>,
 }
 
 impl<E, S: Clone> Clone for App<E, S> {
@@ -184,6 +186,7 @@ impl<E, S: Clone> Clone for App<E, S> {
             epoch: self.epoch,
             seq_key: self.seq_key,
             known: self.known.clone(),
+            sigs: self.sigs.clone(),
         }
     }
 }
@@ -216,7 +219,14 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
             (parent.height, parent.last_step)
         } else {
             let max = usize::try_from(MAX_SEAL_RANGE - 1).unwrap_or(63);
-            let run = chain_after(&self.source, self.epoch, &self.seq_key, parent, max);
+            let run = chain_after(
+                &self.source,
+                self.epoch,
+                &self.seq_key,
+                parent,
+                max,
+                &self.sigs,
+            );
             let last = run.iter().find(|r| header_hash(r) == h.prev)?;
             (last.height, last.last_step)
         };
@@ -301,6 +311,7 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
                 &self.seq_key,
                 *low,
                 RECOVER_HEIGHTS,
+                &self.sigs,
             );
             let max = usize::try_from(MAX_HDRS_PER_PROPOSAL).unwrap_or(16);
             hit = (0..walk.len()).find_map(|i| {
@@ -340,7 +351,14 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
     /// The candidate after `parent` whose digest is `payload`.
     fn find(&self, parent: Tip, payload: &Digest) -> Option<(Proposal, Tip)> {
         let max = usize::try_from(MAX_HDRS_PER_PROPOSAL).unwrap_or(16);
-        let run = chain_after(&self.source, self.epoch, &self.seq_key, parent, max);
+        let run = chain_after(
+            &self.source,
+            self.epoch,
+            &self.seq_key,
+            parent,
+            max,
+            &self.sigs,
+        );
         run.iter().find_map(|last| {
             let p = proposal_for(&self.source, self.epoch, parent, last);
             (Digest(p.digest().0) == *payload).then(|| (p, tip_at(&p, last)))
@@ -386,7 +404,8 @@ where
                     if app.source.seal(app.epoch).is_some() {
                         return; // Deposed, and the seal does not extend this parent.
                     }
-                    let run = chain_after(&app.source, app.epoch, &app.seq_key, parent, max);
+                    let run =
+                        chain_after(&app.source, app.epoch, &app.seq_key, parent, max, &app.sigs);
                     if let Some(last) = run.last() {
                         let p = proposal_for(&app.source, app.epoch, parent, last);
                         match app
@@ -532,6 +551,7 @@ impl<E: Clock + Spawner, S: BlockSource> Finalized<E, S> {
         sigs.sort_by_key(|(i, _)| *i);
         let view = f.proposal.round.view().get();
         lock(&self.app.known).prune(view, proposal.last_height);
+        self.app.sigs.prune(proposal.last_height);
         Some(FinalityCert {
             epoch: self.epoch,
             view,
@@ -682,6 +702,7 @@ where
         epoch: cfg.epoch,
         seq_key: cfg.seq_key,
         known: known.clone(),
+        sigs: Arc::default(),
     };
     let reporter = Finalized {
         app: app.clone(),
@@ -821,6 +842,7 @@ mod tests {
                 epoch: EPOCH,
                 seq_key: vyrn_crypto::ed25519::public_key(&SEQ),
                 known,
+                sigs: Arc::default(),
             };
             f(app, src, g).await;
         });

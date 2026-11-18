@@ -35,6 +35,9 @@ pub struct Config {
     pub dev_session: Vec<DevSession>,
     #[serde(default)]
     pub repair: Option<Repair>,
+    /// Optional: the finality listener (`finality.rs`).
+    #[serde(default)]
+    pub consensus: Option<Consensus>,
 }
 
 /// `SeqDataReq` service (07 §5.5 source 3, `repair.rs`). Omitted: the box retains nothing.
@@ -64,6 +67,23 @@ fn d_pps() -> u64 {
 
 fn d_session_pps() -> u64 {
     crate::repair::DAV_SESSION_REPAIR_PPS
+}
+
+/// `[consensus]`: the finality listener; its committee comes from the roster (08 §9.6).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Consensus {
+    /// This box's `REP_UDP_CTRL` (07 §3.1: port 7401); port 0 asks for an ephemeral one.
+    pub ctrl: SocketAddrV4,
+    /// The roster bytes (08 §9.6), raw or as hex text.
+    pub roster: std::path::PathBuf,
+    /// `EpoConfig.roster_hash`, hex.
+    pub roster_hash: String,
+    /// `Domain.genesis_hash`, hex.
+    pub genesis_hash: String,
+    /// `EpoConfig.seq_order`; default the home's first two `vyrn-seq` boxes, `[n, n + 1]`.
+    #[serde(default)]
+    pub seq_order: Option<[u8; 2]>,
 }
 
 #[derive(Debug, Deserialize)]

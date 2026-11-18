@@ -241,6 +241,7 @@ and `tools/`.
 | `ml-kem` (RustCrypto) | T | `vyrn-crypto` tests, `fuzz/` | Pure-Rust, no-`unsafe` ML-KEM: the differential reference of §2.5a. Never in a production binary. |
 | `commonware-consensus` | S | `vyrn-consensus` | Simplex (DESIGN §5). |
 | `commonware-p2p` | S | `vyrn-consensus`, `vyrn-data` (control channel) | Authenticated peer connections between replicas. |
+| `commonware-stream` | S | `vyrn-consensus` | The authenticated, encrypted handshake (SAKE over CUPS) that `commonware-p2p` `authenticated::lookup` takes for the voters' Simplex network (07 §3.1). Same release tag as the other `commonware-*` crates. |
 | `commonware-runtime` | S, T | `vyrn-consensus`, `vyrn-sim` | Tokio runtime in production, the `deterministic` runtime in `vyrn-sim` (§6.4). One trait boundary gives both. |
 | `commonware-cryptography` | S | `vyrn-consensus` | The signing scheme types that consensus expects. `vyrn-crypto` adapts its Ed25519 keys to it. |
 | `commonware-codec`, `commonware-storage` | S | `vyrn-consensus`, `vyrn-log` | Message encoding for consensus, journal storage for blocks. |
