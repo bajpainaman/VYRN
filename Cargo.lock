@@ -3547,8 +3547,6 @@ dependencies = [
  "k256",
  "thiserror",
  "vyrn-crypto",
- "vyrn-epoch",
- "vyrn-replica",
  "vyrn-types",
 ]
 
