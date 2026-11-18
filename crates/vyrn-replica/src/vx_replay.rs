@@ -50,8 +50,9 @@ const IN_ROUTES: usize = 64;
 const MAX_ROUTES: usize = 10;
 const IN_PAYLOAD: usize = 224;
 const IN_TAKE: usize = 416;
-/// Fed takes kept per account to find a take's predecessor and repeats (a bound, not a rule:
-/// an older repeat differs from the client's `ver` counter and diverges there).
+/// Fed takes kept per account across blocks, to find a later block's predecessors and repeats
+/// (a bound, not a rule: an older repeat differs from the client's `ver` counter and diverges
+/// there). A block's own takes are all kept until its slots are built.
 const TAKE_KEEP: usize = 4096;
 const ERRS: [&str; 10] = [
     "",
@@ -455,9 +456,6 @@ impl<P: Payloads, const N: usize> ReplayEngine<N> for VxReplay<P> {
                     blk.header.height.0
                 )));
             }
-            while f.len() > TAKE_KEEP {
-                f.pop_first();
-            }
         }
         let pred = |t: &AcctTake| -> (AcctTake, u32, u8) {
             self.fed
@@ -492,6 +490,13 @@ impl<P: Payloads, const N: usize> ReplayEngine<N> for VxReplay<P> {
             }
             let take = takes.get(i).map(pred);
             lanes[l].push(self.slot(*i, p, own, take)?);
+        }
+        // Pruned only once this block's predecessors are in its slots (Codex r4612264470): a
+        // later block needs only each account's newest takes.
+        for f in self.fed.values_mut() {
+            while f.len() > TAKE_KEEP {
+                f.pop_first();
+            }
         }
         let mut steps = Vec::new();
         for s in &blk.steps {
