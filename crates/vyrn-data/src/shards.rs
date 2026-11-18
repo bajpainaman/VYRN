@@ -229,6 +229,12 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
         self.pending.len()
     }
 
+    /// The end of a stop whose drain ran out of time (a shard that never empties its ring):
+    /// drops every queued redirect and counts it in `redirect_dropped`. Returns how many.
+    pub fn drop_redirects(&mut self) -> usize {
+        self.pending.drop_all(&mut self.counters)
+    }
+
     /// One turn: an ingest burst to the shards, then a fetch burst to its owners. `shards` are
     /// the producers of every shard's ring, in shard order. Returns the frames handled.
     pub fn poll(

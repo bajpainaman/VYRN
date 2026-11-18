@@ -358,3 +358,88 @@ fn shards_forward_one_data_seq_per_dest_and_answer_key_fetches_from_the_owner() 
         .sum();
     assert_eq!(shard_retries, 0, "the shards' TX queues never refused one");
 }
+
+/// #183 (a) on a sharded box: a redirect the shard's TX queue refuses waits in the shard's own
+/// retry queue and goes out after a later turn's reap, in order, none dropped. A 4-slot TX
+/// queue refuses inside every 16-entry turn; the path is `send_or_queue`, shared with
+/// `DataNode`.
+#[test]
+fn a_shard_retries_redirects_its_full_tx_queue_refused_in_order() {
+    let ports = (0..4u8)
+        .map(|i| PortConfig {
+            id: PortId(i),
+            ip: Ipv4Addr::new(10, 0, 0, i + 1),
+        })
+        .collect();
+    let mut nc = NicConfig::new(BackendKind::Sim, ports);
+    nc.tx_slots = 4;
+    let mut nic = SimNic::open(&nc).unwrap();
+    let bind = |e: Endpoint, port: u8| RxBind {
+        lane: LaneId(0),
+        port: PortId(port),
+        ip: e.ip,
+        udp_port: e.port,
+    };
+    let (me_in, me_fetch, client, dest) = (ep(1, 19998), ep(1, 19997), ep(4, 4000), ep(2, 20000));
+    let ingest = nic.rx_ring(&bind(me_in, 0)).unwrap();
+    let fetch = nic.rx_ring(&bind(me_fetch, 0)).unwrap();
+    let mut replica = nic.rx_ring(&bind(dest, 1)).unwrap();
+    let mut client_rx = nic.rx_ring(&bind(client, 3)).unwrap();
+    let mut txq = || nic.tx_ring(PortId(0), TxClass::OrderStream).unwrap();
+    let shard_tx = vec![txq()];
+    let tx = txq();
+    let s = 5u32;
+    let home = HomeConfig {
+        mode: Mode::Base,
+        books: vec![BOOK],
+        keys: BTreeMap::from([(SessionId(s), key(s))]),
+        ring_slots: 64,
+        index_key: [0x42; 16],
+    };
+    let cfg = NodeConfig::new(home, 1, me_in, vec![dest]);
+    let (mut rx, mut cores, mut sender) = shards::split(&cfg, ingest, fetch, shard_tx, tx);
+    let store = MemStore::default();
+    let mut shard_ring = ShardRing::new(&Hw);
+    let mut sender_rings: Vec<SenderRing> = (0..2).map(|_| SenderRing::new(&Hw)).collect();
+    let (to, [mut shard_in]) = shard_ring.split().unwrap();
+    let mut to_shard = vec![to];
+    let (mut to_sender, mut sender_in): (Vec<_>, Vec<_>) = sender_rings
+        .iter_mut()
+        .map(|r| {
+            let (p, [c]) = r.split().unwrap();
+            (p, c)
+        })
+        .unzip();
+    let (shard_out, rx_out) = to_sender.split_at_mut(1);
+    let mut got = vec![];
+    macro_rules! turn {
+        ($t:expr) => {{
+            rx.poll(Nanos($t), &mut to_shard, &mut rx_out[0]);
+            cores[0].poll(&mut shard_in, &mut shard_out[0], &store);
+            sender.poll(Nanos($t), &mut sender_in);
+            drain(&mut replica);
+            got.extend(drain(&mut client_rx));
+        }};
+    }
+    // The box learns the session's address from its first copy.
+    inject(&nic, client, me_in, &req(s, 1));
+    for t in 0..4 {
+        turn!(t);
+    }
+    let total = 100u32;
+    let asked: Vec<(SessionId, u32)> = (0..total).map(|i| (SessionId(s), i)).collect();
+    assert_eq!(rx.redirect(0, 1, &asked, &mut to_shard), total as usize);
+    for t in 0..100 {
+        turn!(10 + t);
+    }
+    let from: Vec<u32> = got
+        .iter()
+        .map(|b| Redirect::open(b, &key(s)).unwrap().resend_from)
+        .collect();
+    assert_eq!(from, (0..total).collect::<Vec<_>>(), "all sent, in order");
+    let k = cores[0].counters();
+    assert!(k.redirect_retried > 0, "the TX queue refused some: {k:?}");
+    assert_eq!(k.redirect_dropped, 0);
+    assert_eq!(k.redirects, u64::from(total));
+    assert_eq!(cores[0].pending(), 0);
+}

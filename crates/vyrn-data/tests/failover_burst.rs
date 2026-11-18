@@ -241,4 +241,14 @@ fn a_failover_burst_twice_the_hop_ring_is_paced_not_dropped() {
     assert_eq!(rx.pending(), 0);
     assert_eq!(got - base, 2 * SESSIONS as usize, "{:?}", rx.counters());
     assert_eq!(rx.counters().redirect_dropped, 0);
+
+    // A stop whose drain runs out of time (the shard never takes its ring here): what is left
+    // is counted dropped, not lost silently.
+    rx.redirect(0, 1, &sessions, &mut to_shard);
+    rx.redirect(0, 1, &sessions, &mut to_shard);
+    let left = rx.pending();
+    assert!(left > 0);
+    assert_eq!(rx.drop_redirects(), left);
+    assert_eq!(rx.pending(), 0);
+    assert_eq!(rx.counters().redirect_dropped, left as u64);
 }
