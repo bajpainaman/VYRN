@@ -184,8 +184,9 @@ pub struct PeerServer {
     kept: BTreeMap<(SessionId, u32), Vec<Vec<u8>>>,
     order: VecDeque<(SessionId, u32)>,
     buf: FrameBuf,
-    /// Keys whose variants outnumber the tokens one answer gets: where the next answer starts.
-    resume: BTreeMap<(SessionId, u32), usize>,
+    /// Per requester IPv4 and key whose variants outnumber the tokens one answer got: where
+    /// its next answer starts, so requesters interleaving fetches of one key each progress.
+    resume: BTreeMap<(Ipv4Addr, SessionId, u32), usize>,
 }
 
 impl PeerServer {
@@ -287,7 +288,7 @@ impl PeerServer {
             counts.limited = counts.limited.saturating_add(1);
             return Vec::new();
         }
-        let key = (session, pkt_seq);
+        let key = (from, session, pkt_seq);
         if take < vars.len() {
             let total = vars.len();
             let start = self.resume.get(&key).copied().unwrap_or(0) % total;
@@ -542,27 +543,39 @@ mod tests {
     }
 
     /// More variants than a full bucket: each answer sends what its tokens buy and the next
-    /// resumes after it, so two answers cover all of them.
+    /// resumes after it, so two answers cover all of them, for each requester.
     #[test]
     fn variants_past_the_bucket_are_served_over_answers() {
         let mut j = DataJoin::default();
         let mut all = Vec::new();
-        for e in 0..200 {
-            for n in 1..=3 {
+        // 1,000 variants, two full buckets: a cursor shared by both requesters would give each
+        // the same half every time.
+        for e in 0..250 {
+            for n in 1..=4 {
                 j.put(sid(), 1, pkt_e(n, e));
                 all.push(pkt_e(n, e));
             }
         }
         all.sort_unstable();
-        let mut srv = PeerServer::new(&[a(11)], None);
+        // Two requesters interleave: each one's answers still cover every variant.
+        let other = Ipv4Addr::new(127, 0, 0, 2);
+        let mut srv = PeerServer::new(&[a(11), SocketAddrV4::new(other, 11)], None);
         let mut c = Counts::default();
-        let first = packets(&srv.serve(&j, PEER, &fetch(1), 0, &mut c));
-        assert_eq!(first.len(), 500, "a full bucket");
-        let second = packets(&srv.serve(&j, PEER, &fetch(1), BURST_NS, &mut c));
-        let mut got: Vec<_> = first.into_iter().chain(second).collect();
-        got.sort_unstable();
-        got.dedup();
-        assert_eq!(got, all);
+        let mut got = [Vec::new(), Vec::new()];
+        for (t, (who, ip)) in [(0, PEER), (1, other), (0, PEER), (1, other)]
+            .into_iter()
+            .enumerate()
+        {
+            let now = u64::try_from(t).unwrap() * BURST_NS;
+            let ans = packets(&srv.serve(&j, ip, &fetch(1), now, &mut c));
+            assert_eq!(ans.len(), 500, "a full bucket");
+            got[who].extend(ans);
+        }
+        for mut g in got {
+            g.sort_unstable();
+            g.dedup();
+            assert_eq!(g, all);
+        }
         assert_eq!(c.limited, 0);
     }
 
