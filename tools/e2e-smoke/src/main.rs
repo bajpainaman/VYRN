@@ -136,8 +136,12 @@
 //!   by 51–55 ms; the backup then sends its per-entry `DataRedirect`s at about 50 per ms (one
 //!   shard core, 16 per turn, sharing the CPUs), so the last live session's first redirect
 //!   reaches the client at about 82 ms; the client applies each within 2.6 ms. The backup's
-//!   `hop_full` at this scale (three rounds of 1 600 entries into a 4 096-entry hop ring) is
-//!   `vyrn-data`'s shard-hop pacing follow-up, not this rule's.
+//!   refused redirects are retried since #194 (`redirect_retried`), and `failover` needs
+//!   `redirect_dropped` = 0. Two losses still fail a run on a 2-vCPU orb, both outside this
+//!   rule: an ingest packet meeting the shard ring the redirect burst fills (`hop_full`), and a
+//!   lost first copy at the backup's socket. Either costs the backup a session's address, since
+//!   it learns it from one first copy (07 §5.7 interim reading), so that session never moves;
+//!   CI runs R15 with `continue-on-error`.
 //!   The client opens a `DataRedirect` with the key of the session in its bytes 8..12: trying
 //!   every session's key fell behind a burst of 1 600 redirects and moved half the sessions.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
@@ -2443,6 +2447,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 .unwrap_or("")
                 .to_owned();
             let admitted = field(&st, "redirects").and_then(|v| v.parse::<u64>().ok());
+            // #194: a redirect a full shard ring refused is retried (`redirect_retried`), and
+            // dropped only past its queue (`redirect_dropped`), which R15's burst must not reach.
+            if field(&st, "redirect_dropped").is_some_and(|v| v != "0") {
+                errs.push(format!("backup redirect_dropped={:?}", field(&st, "redirect_dropped")));
+            }
             if admitted.unwrap_or(0) == 0 || field(&st, "redirect_unknown") != Some("0") {
                 errs.push(format!(
                     "backup redirects={admitted:?} redirect_unknown={:?}: it must admit a sealed REDIRECT and know every session's source",

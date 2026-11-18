@@ -42,7 +42,7 @@
 //! loop (a full queue drops and counts the line), and at exit `STATS stored=<n> data_frames=<n>
 //! heartbeats=<n> duplicate=<n> fetch_unauth=<n> fetch_limited=<n> bad_mac=<n> events_dropped=<n>
 //! events_unprinted=<n> fetch_ring_hit=<n> fetch_log_hit=<n> fetch_miss=<n> fetch_resent=<n>
-//! hop_full=<n> redirects=<n> redirect_unknown=<n> shards=<n>`, every counter summed over the
+//! hop_full=<n> redirects=<n> redirect_unknown=<n> redirect_retried=<n> redirect_dropped=<n> shards=<n>`, every counter summed over the
 //! cores.
 //! A stop waits up to 1 s for queued events to print and counts the rest
 //! in `events_unprinted`, so `EVENT` lines + `events_unprinted` + `events_dropped` = `bad_mac` +
@@ -812,7 +812,7 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
     // A closed stdout (the supervisor went away) is not a reason to fail the stop.
     let _ = writeln!(
         std::io::stdout(),
-        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} bad_mac={} events_dropped={} events_unprinted={unprinted} fetch_ring_hit={} fetch_log_hit={} fetch_miss={} fetch_resent={} hop_full={} redirects={} redirect_unknown={} shards={n}",
+        "STATS stored={} data_frames={} heartbeats={} duplicate={} fetch_unauth={} fetch_limited={} bad_mac={} events_dropped={} events_unprinted={unprinted} fetch_ring_hit={} fetch_log_hit={} fetch_miss={} fetch_resent={} hop_full={} redirects={} redirect_unknown={} redirect_retried={} redirect_dropped={} shards={n}",
         c.stored,
         c.data_frames,
         c.heartbeats,
@@ -827,7 +827,9 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
         c.fetch_resent,
         c.hop_full,
         c.redirects,
-        c.redirect_unknown
+        c.redirect_unknown,
+        c.redirect_retried,
+        c.redirect_dropped
     );
     Ok(())
 }
