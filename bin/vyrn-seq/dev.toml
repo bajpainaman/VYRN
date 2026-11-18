@@ -1,0 +1,48 @@
+# vyrn-seq DEV config. MINIMAL schema 1: a labelled subset of spec/11-build.md §10.1 (whose
+# example says schema 3); main.rs documents every field. Not for production boxes.
+schema = 1
+protocol = 1
+role = "seq"
+mode = "BASE"
+home = "LDN"
+book = 7
+epoch = 0
+
+[engine]
+dedicated = 2          # lanes 0-1; pooled lanes are not wired
+pooled = 0
+tick_min = 1
+tick_max = 512
+win_center = 100
+
+[nic]
+backend = "kernel_udp" # kernel_udp | sim
+ip = "127.0.0.1"
+port_base = 7000       # lane l listens on 7000 + l
+
+[cores]
+pin = false            # true is refused until vyrn-nic::sys has an affinity call
+engine = 2             # REF core 2 (BBO); reported only
+stream = 4             # REF core 4 (STREAM-A); reported only
+seal = "count"         # abort | count | off
+
+[replication]
+order = ["127.0.0.1:7100"]
+block_ms = 5
+
+[keys]
+seq = "env:VYRN_SEQ_SEED"   # 32-byte Ed25519 seed, hex (DEV: 42 × 32)
+
+[epoch_boundary]
+next = 1
+t_ns = 1900000000000000000
+to_home = "LDN"
+
+[[dev_session]]
+lane = 0
+slot = 1
+account = 1
+k_seq = "11111111111111111111111111111111"
+k_out = "22222222222222222222222222222222"
+quote = 1000000000000
+base = 1000000000

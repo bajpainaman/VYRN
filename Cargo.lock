@@ -3718,12 +3718,19 @@ dependencies = [
  "clap",
  "serde",
  "toml",
- "tracing-subscriber",
+ "vyrn-bbo",
  "vyrn-consensus",
+ "vyrn-crypto",
+ "vyrn-cut",
  "vyrn-engine",
  "vyrn-epoch",
+ "vyrn-lane",
  "vyrn-log",
  "vyrn-nic",
+ "vyrn-replica",
+ "vyrn-risk",
+ "vyrn-types",
+ "vyrn-wire",
 ]
 
 [[package]]
@@ -3763,8 +3770,15 @@ name = "vyrn-validator"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "serde",
+ "toml",
  "vyrn-chain",
+ "vyrn-crypto",
+ "vyrn-log",
+ "vyrn-nic",
  "vyrn-replica",
+ "vyrn-types",
+ "vyrn-wire",
 ]
 
 [[package]]

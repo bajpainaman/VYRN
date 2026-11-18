@@ -1,0 +1,24 @@
+# vyrn-validator DEV config. MINIMAL schema 1: a labelled subset of spec/11-build.md §10.1;
+# main.rs documents every field. Not for production boxes.
+schema = 1
+protocol = 1
+role = "validator"
+mode = "BASE"
+book = 7
+epoch = 0
+lanes = 2
+
+[nic]
+backend = "kernel_udp"
+ip = "127.0.0.1"
+order_port = 7100
+
+[cores]
+order = 3              # 07 §7.2 core 3; reported only
+
+[membership]
+# seq_key of sequencer index 0: the public key of seed 0x42 × 32 (bin/vyrn-seq/dev.toml's test seed).
+seq_keys = ["2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12"]
+
+[keys]
+vote = "hsm:slot=2:label=vyrn-vote-e"
