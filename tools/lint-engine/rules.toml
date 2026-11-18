@@ -41,7 +41,7 @@ crates = ["vyrn-md", "vyrn-chain"]
 
 [[layer]]
 index = 8
-crates = ["vyrn-seq", "vyrn-validator", "vyrn-admin"]
+crates = ["vyrn-seq", "vyrn-validator", "vyrn-admin", "vyrn-data-box"]
 
 [[layer]]
 index = 9

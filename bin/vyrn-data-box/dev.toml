@@ -25,10 +25,14 @@ slots = 65536                # rate × retention
 id = 1
 key = "hex:11111111111111111111111111111111"
 
-# No [[fetch_key]]: open mode, DEV only. In production add one per requester:
-# [[fetch_key]]
-# ip = "10.0.0.2"
-# key = "env:VYRN_KFETCH_R2"
+# No [roster]: open mode, DEV only. In production K_fetch is derived from the roster (08 §9.6):
+# [roster]
+# file = "/etc/vyrn/roster.hex"
+# roster_hash = "<64 hex>"
+# genesis_hash = "<64 hex>"
+# epoch = 1
+# box = 0                          # this box's position in home(e).data
+# xchg_secret = "env:VYRN_DATA_XCHG"
 
 [fetch]
 rate = 20000

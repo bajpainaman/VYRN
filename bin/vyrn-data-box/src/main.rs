@@ -1,6 +1,7 @@
-//! `vyrn-data`, the data box (03 §1, 07 §5; 11 §1.3, §8.4, §10.1): main.rs and config wiring
-//! only. Every decision is made in the library; this file opens the NIC, the log source and the
-//! metrics listener, then runs [`DataNode::poll`] in a loop.
+//! `vyrn-data`, the data box (03 §1, 07 §5; 11 §1.3, §8.4, §10.1), package `bin/vyrn-data-box`:
+//! main.rs and config wiring only. Every decision is made in the library; this file opens the NIC,
+//! the log source and the metrics listener, derives `K_fetch` from the roster, then runs
+//! [`DataNode::poll`] in a loop.
 //!
 //! # Contract
 //!
@@ -18,7 +19,7 @@
 //! | `[ring] slots, index_key` | ring size; the index secret's handle (omitted: `/dev/urandom`) |
 //! | `dests = ["ip:port", ..]` | every voter and the standby, in `dst` order |
 //! | `[[session]] id, key` | a session's MAC key handle (the session gateway is not wired) |
-//! | `[[fetch_key]] ip, key` | `K_fetch` per requester (07 §5.5); none is refused unless `dev` |
+//! | `[roster] file, roster_hash, genesis_hash, epoch, box, xchg_secret` | `K_fetch(e, i, d)` of every requester of `home` from the roster (08 §9.6); omitted is refused unless `dev` |
 //! | `[fetch] rate, burst` | per-source fetch limit (defaults 20,000/s, 256) |
 //! | `[store] dirs = [..]` | `FileStore` drives read as the log source; none: an empty `MemStore` |
 //! | `[metrics] listen` | Prometheus text on this address, default `127.0.0.1:9464` (11 §8.4) |
@@ -51,9 +52,10 @@
 #![forbid(unsafe_code)]
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::io::{BufRead as _, Read as _, Write as _};
-use std::net::{SocketAddrV4, TcpListener};
-use std::path::PathBuf;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -62,7 +64,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::registry::Registry;
-use vyrn_data::config::Config;
+use vyrn_data::config::{Config, hex};
 use vyrn_data::{Counters, DataNode, Event, NodeConfig};
 use vyrn_log::{BlockStore, FileStore, MemStore};
 use vyrn_nic::frame::Endpoint;
@@ -233,9 +235,93 @@ fn ep(a: SocketAddrV4) -> Endpoint {
     }
 }
 
+/// `K_fetch(e, i, d)` of every requester of `home(e)`, by its `repl_addr` IPv4 (08 §9.6), from
+/// `[roster]`. Empty without it (open mode, DEV). This is config wiring: the roster codec and the
+/// derivation are `vyrn-epoch`'s, which the layer-4 library may not link (11 §1.3, §1.4).
+fn fetch_keys(cfg: &Config) -> Result<BTreeMap<Ipv4Addr, [u8; 16]>, String> {
+    let Some(r) = &cfg.roster else {
+        return Ok(BTreeMap::new());
+    };
+    let mode = if cfg.mode == "CHAIN" {
+        vyrn_types::Mode::Chain
+    } else {
+        vyrn_types::Mode::Base
+    };
+    let home = match cfg.home.as_str() {
+        "TYO" => vyrn_types::HomeCode::Tyo,
+        "LDN" => vyrn_types::HomeCode::Ldn,
+        "NYC" => vyrn_types::HomeCode::Nyc,
+        _ => return Err("config home must be TYO, LDN or NYC with [roster]".into()),
+    };
+    let bytes = roster_bytes(&r.file)?;
+    let domain = vyrn_epoch::Domain {
+        genesis_hash: vyrn_types::Hash(hex::<32>(&r.genesis_hash)?),
+        mode,
+    };
+    if vyrn_epoch::Roster::hash_bytes(&domain, &bytes).0 != hex::<32>(&r.roster_hash)? {
+        return Err("roster: the file does not hash to roster_hash".into());
+    }
+    let roster = vyrn_epoch::Roster::decode(mode, &bytes).map_err(|e| format!("roster: {e}"))?;
+    // R3 (08 §9.6): a roster configures only epochs from its `epoch_from`.
+    if roster.epoch_from > vyrn_types::Epoch(r.epoch) {
+        return Err(format!(
+            "roster: epoch_from {} is after the configured epoch {}",
+            roster.epoch_from.0, r.epoch
+        ));
+    }
+    let secret = cfg.resolve::<32>(&r.xchg_secret)?;
+    let keys = roster
+        .box_fetch_keys(
+            &domain,
+            vyrn_types::Epoch(r.epoch),
+            home,
+            r.data_box,
+            &secret,
+        )
+        .ok_or("roster: box is not a data box of home, or xchg_secret is not its key")?;
+    let mut out = BTreeMap::new();
+    for (i, addr, k) in keys {
+        let ip = addr
+            .ipv4()
+            .ok_or(format!("roster: requester {i} has no IPv4 repl_addr"))?;
+        // One key per source address: two requesters behind one address cannot be told apart.
+        if out.insert(ip, k).is_some() {
+            return Err(format!("roster: two requesters share {ip}"));
+        }
+    }
+    // An empty map is open mode (DEV only): a roster that yields no key must not turn it on.
+    if out.is_empty() {
+        return Err("roster: no requester has a usable K_fetch".into());
+    }
+    Ok(out)
+}
+
+/// The roster file: raw bytes, or the same bytes as hex text (whitespace ignored).
+fn roster_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text: String = String::from_utf8_lossy(&raw)
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    if text.is_empty()
+        || !text.len().is_multiple_of(2)
+        || !text.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Ok(raw);
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| {
+            text.get(i..i + 2)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .ok_or_else(|| "roster: bad hex".to_owned())
+        })
+        .collect()
+}
+
 fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), String> {
     let home = cfg.home()?;
-    let fetch_keys = cfg.fetch_keys()?;
+    let fetch_keys = fetch_keys(cfg)?;
     let ip = cfg.nic.ip;
     let ncfg = NicConfig::new(BackendKind::Kernel, vec![PortConfig { id: PortId(0), ip }]);
     let mut nic = KernelUdp::open(&ncfg).map_err(|e| e.to_string())?;

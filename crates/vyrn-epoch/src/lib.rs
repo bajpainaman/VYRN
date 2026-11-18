@@ -88,8 +88,8 @@ pub use roles::{
     lane_seals, may_sign_reassign, reassign_open, win_head,
 };
 pub use roster::{
-    Addr, DataBox, HOMES, Home, ROSTER_CONTEXT, ROSTER_VERSION, Roster, RosterErr, SeqEntry, Voter,
-    key_len, xchg_len,
+    Addr, DataBox, FETCH_CONTEXT, HOMES, Home, ROSTER_CONTEXT, ROSTER_VERSION, Roster, RosterErr,
+    SeqEntry, Voter, fetch_key, key_len, xchg_len,
 };
 pub use schedule::{
     Boundary, EpoConfig, ScheduleErr, ScheduleRecord, Timetable, default_home, slot_start,

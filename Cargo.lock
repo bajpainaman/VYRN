@@ -3632,9 +3632,7 @@ dependencies = [
 name = "vyrn-data"
 version = "0.1.0"
 dependencies = [
- "clap",
  "commonware-p2p",
- "prometheus-client 0.26.0",
  "serde",
  "thiserror",
  "tokio",
@@ -3642,6 +3640,22 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vyrn-crypto",
+ "vyrn-log",
+ "vyrn-nic",
+ "vyrn-types",
+ "vyrn-wire",
+]
+
+[[package]]
+name = "vyrn-data-box"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "prometheus-client 0.26.0",
+ "toml",
+ "vyrn-crypto",
+ "vyrn-data",
+ "vyrn-epoch",
  "vyrn-log",
  "vyrn-nic",
  "vyrn-types",

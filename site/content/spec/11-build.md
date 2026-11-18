@@ -72,7 +72,7 @@ VYRN/
 │   │   └─vyrn-engine/
 │   ├── vyrn-nic/              Rust side of the NIC; links c/vyrn-nic-shim on Linux
 │   ├─vyrn-log/
-│   ├── vyrn-data/             library + binary vyrn-data
+│   ├─vyrn-data/
 │   ├─vyrn-consensus/
 │   ├── vyrn-replica/          library + binary vyrn-replica
 │   ├─vyrn-epoch/
@@ -84,6 +84,7 @@ VYRN/
 ├── bin/                       binary-only packages: main.rs + config wiring, no logic
 │   ├─vyrn-seq/
 │   ├─vyrn-validator/
+│   ├── vyrn-data-box/         binary vyrn-data (§1.3)
 │   └─vyrn-admin/
 │
 ├── c/
@@ -154,7 +155,7 @@ isolated, pinned core after `seal()`.
 | `vyrn-seq` | `bin/vyrn-seq` | `vyrn-engine` (live), `vyrn-nic`, `vyrn-log`, `vyrn-consensus` (as a proposer; it never votes, 01 §14.4), `vyrn-epoch`, `vyrn-data` (its frame and fetch codec only, for `SeqDataReq`, 07 §5.5). The warm standby in F2 is the same binary. |
 | `vyrn-replica` | `crates/vyrn-replica` | `vyrn-engine` (replay), `vyrn-log`, `vyrn-consensus`, `vyrn-epoch`, `libvyrn_vx_client` |
 | `vyrn-validator` | `bin/vyrn-validator` | everything in `vyrn-replica`, plus `vyrn-chain` |
-| `vyrn-data` | `crates/vyrn-data` | `vyrn-data`, `vyrn-nic`, `vyrn-log` |
+| `vyrn-data` | `bin/vyrn-data-box` | `vyrn-data`, `vyrn-nic`, `vyrn-log`, `vyrn-epoch` (the roster codec, to derive `K_fetch`, 08 §9.6). The library `vyrn-data` stays in layer 4. |
 | `vyrn-md` | `crates/vyrn-md` | `vyrn-md`, `vyrn-replica` (replay core), `vyrn-nic` |
 | `vyrn-dropcopy` | `crates/vyrn-md` | `vyrn-md::dropcopy`, `vyrn-replica` |
 | `vyrn-admin` | `bin/vyrn-admin` | config check, deploy, keys, epoch control, trace dump, release verify |
@@ -166,6 +167,9 @@ isolated, pinned core after `seal()`.
 wiring, and nothing else. All logic stays in the named crates, where it is tested. `vyrn-dropcopy`
 is a second binary of `vyrn-md`, because drop copy and market data consume the same replay events
 (10). This is listed in Requests to 01.
+`vyrn-data` has a crate of its own, but its binary lives in `bin/vyrn-data-box` because it
+links `vyrn-epoch` to read the roster and derive `K_fetch` (08 §9.6), and the library `vyrn-data`
+sits below `vyrn-epoch` in §1.4. The package is `vyrn-data-box`; the binary is still `vyrn-data`.
 
 **Why the engine crates sit under `crates/engine/`.** Clippy reads the nearest `clippy.toml`
 walking up from the crate's manifest. One directory gives the eight `INV-DET` crates one strict

@@ -1275,7 +1275,7 @@ Voter   { client: u8 (0 Rust, 1 Vx), facility: u8 (k for Fk), node_key: [K], vot
           xchg_key: [X] (GXK, 09 §2.4), data_addr: Addr, repl_addr: Addr }
 SeqBox  { facility: u8, node_key: [K], seq_key: [K], xchg_key: [X] (XK), client_addr: Addr,
           repl_addr: Addr }
-DataBox { facility: u8, addr: Addr }
+DataBox { facility: u8, addr: Addr, xchg_key: [X] }   // X25519 half keys K_fetch (below)
 Addr    { ip: [u8; 16] (IPv6; IPv4 as ::ffff:a.b.c.d), port: u16 }
 BridgeSet { rotation_no: u64, bridge_keys: [[u8; 20]; 5], guardian_keys: [[u8; 20]; 5] }   // 09 §6.7
 
@@ -1313,12 +1313,27 @@ carried-forward one recomputes it from the carried roster (§2.3).
 the roster, with `seq_order` = `[EpoConfig(e).seq_order[0], seq_order[1]]` and then the other
 boxes in roster order. `HandoffCert(e − 1)` certifies it through `EpoConfig(e)`.
 
-**Size.** A scheme-0 BASE roster with 2 boxes and 4 data boxes per home is 2,649 B; a scheme-0
-CHAIN roster is 6,508 B and a scheme-1 one 177,868 B (computed, `vyrn-epoch` `vectors/roster.txt`).
+**`K_fetch` (07 §5.5).** Requester `i` (a roster index of `home(e)`: its voters, then its
+`vyrn-seq` boxes) and data box `d` (its position in `home(e).data`) share
+
+```
+K_fetch(e, i, d) = derive_key("vyrn      v1 fetch",
+                              X25519(requester xchg, box xchg) ‖ genesis_hash ‖ mode ‖ le(e) ‖ [i] ‖ [d])[0..16]
+```
+
+Each side computes it from its own X25519 private key and the other's public half in the roster,
+so nothing is provisioned and it holds in both modes. The box keys each requester's `K_fetch` by
+the IPv4 address of its `repl_addr`. A requester whose X25519 half is a low-order point gets no
+key. *Known gap:* only the X25519 half is used; under `sig_scheme` 1 the ML-KEM-768 half joins the
+derivation at `E_pq` with PQ-6(a) (B-PQ).
+
+**Size.** A scheme-0 BASE roster with 2 boxes and 4 data boxes per home is 3,033 B; a scheme-0
+CHAIN roster is 6,988 B and a scheme-1 one 196,108 B (computed, `vyrn-epoch` `vectors/roster.txt`).
 A node hashes it once per `EpoConfig`, off every hot path: 178 KB of BLAKE3 is ≤ 0.15 ms (budget).
 
 **Vectors.** `crates/vyrn-epoch/vectors/roster.txt` holds the bytes and `roster_hash` of a BASE and
-a CHAIN scheme-0 roster, the hash and length of a scheme-1 one, and one reject per rule R1–R8.
+a CHAIN scheme-0 roster, the `K_fetch` of LDN data box 0 for every requester at epoch 8, the hash
+and length of a scheme-1 one, and one reject per rule R1–R8.
 
 ## 10. Failure cases
 

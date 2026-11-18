@@ -234,6 +234,8 @@ fn roster() -> String {
          # roster_hash = derive_key(\"vyrn      v1 roster\", genesis_hash || mode || roster).\n\
          # Fixture: testkit::roster. LDN voter i has vote seed [0x41+i; 32] and GXK seed [2, i, 0xC7 x 30];\n\
          # LDN vyrn-seq box j has seq seed [0x90+j; 32] and XK seed [0x98+j; 32].\n\
+         # Data box i of home h has X25519 seed [0x30+8h+i; 32]. fetch_key = K_fetch(8, i, 0) of\n\
+         # LDN data box 0, for each requester i (voters, then vyrn-seq boxes).\n\
          # EpoConfig(8) is LDN with seq_order BASE [n, n+1], CHAIN [n, n+3].\n\
          # verdict is Membership::from_roster; CHAIN passes a signer table whose rotation 0 is the\n\
          # roster's bridge set. A reject_ case edits the fixture as its name says;\n\
@@ -254,6 +256,20 @@ fn roster() -> String {
             let _ = writeln!(s, "roster = {}", hex(&bytes));
         }
         let _ = writeln!(s, "roster_hash = {}", hex(&cfg.roster_hash.0));
+        if scheme == 0 {
+            let keys = r
+                .box_fetch_keys(
+                    &domain,
+                    Epoch(8),
+                    HomeCode::Ldn,
+                    0,
+                    &testkit::data_seed(2, 0),
+                )
+                .unwrap_or_default();
+            for (i, _, k) in keys {
+                let _ = writeln!(s, "fetch_key {i} = {}", hex(&k));
+            }
+        }
         let table = testkit::bridge_table(&r);
         let got = Membership::from_roster(&cfg, &bytes, &domain, table.as_ref());
         let _ = writeln!(

@@ -1,0 +1,30 @@
+[package]
+name = "vyrn-data-box"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish = false
+description = "The data box binary vyrn-data: main.rs and config wiring over the vyrn-data library (11 §1.3)."
+
+[[bin]]
+name = "vyrn-data"
+path = "src/main.rs"
+
+[dependencies]
+vyrn-types = { workspace = true }
+vyrn-data = { workspace = true }
+vyrn-nic = { workspace = true }
+vyrn-log = { workspace = true }
+# The roster codec and K_fetch derivation (08 §9.6); the library stays in layer 4.
+vyrn-epoch = { workspace = true }
+clap = { workspace = true }
+prometheus-client = { workspace = true }
+
+[dev-dependencies]
+vyrn-crypto = { workspace = true }
+vyrn-wire = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true
