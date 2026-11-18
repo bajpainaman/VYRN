@@ -453,12 +453,21 @@ fn replay_routes_a_locally_rejected_cross_from_its_route_record() {
             msgs: vec![new(Sell, Day, 105, 1, 11)],
         },
         Act::Run,
+        // A heartbeat-only packet takes no LaneSeq, so its record shares the next packet's
+        // first_lane_seq; the route records belong to the next packet only.
+        Act::Pkt {
+            l: 0,
+            a: 2,
+            rx_ts: 1_500,
+            now: 1_500,
+            msgs: vec![vyrn_wire::Msg::Heartbeat],
+        },
         Act::Pkt {
             l: 0,
             a: 2,
             rx_ts: 2_000,
             now: 2_000,
-            msgs: vec![po, new(Buy, Day, 100, 1, 23)],
+            msgs: vec![po, new(Buy, Day, 100, 1, 23), po],
         },
         Act::Run,
     ];
@@ -471,14 +480,12 @@ fn replay_routes_a_locally_rejected_cross_from_its_route_record() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        routes,
-        [vyrn_types::RouteRecord {
-            lane: vyrn_types::LaneId(0),
-            lane_seq: LaneSeq(2),
-            cross: true
-        }]
-    );
+    let route = |q| vyrn_types::RouteRecord {
+        lane: vyrn_types::LaneId(0),
+        lane_seq: LaneSeq(q),
+        cross: true,
+    };
+    assert_eq!(routes, [route(2), route(4)]);
     // Journal replay reproduces it, route record included.
     let (r, rep) = replay(&j.recs, &store);
     assert_eq!(r, Ok(()));
@@ -506,8 +513,30 @@ fn replay_routes_a_locally_rejected_cross_from_its_route_record() {
     let (r, rep) = replay_wire(&lanes, &wr, &steps, &store, Some(&j));
     assert_eq!(r, Ok(()));
     assert_eq!(rep.resp, j.resp);
+    // Route records may come in any order (07 §3.6): they match their ops by lane_seq.
+    let rev: Vec<_> = wr.iter().rev().copied().collect();
+    assert_eq!(
+        replay_wire(&lanes, &rev, &steps, &store, Some(&j)).0,
+        Ok(())
+    );
     let (r, _) = replay_wire(&lanes, &[], &steps, &store, Some(&j));
     assert!(r.is_err(), "{r:?}");
+    // A missing, repeated or conflicting route record is refused.
+    for bad in [
+        vec![route(2)],
+        vec![route(2), route(4), route(4)],
+        vec![
+            route(2),
+            route(4),
+            vyrn_types::RouteRecord {
+                cross: false,
+                ..route(4)
+            },
+        ],
+    ] {
+        let (r, _) = replay_wire(&lanes, &bad, &steps, &store, Some(&j));
+        assert!(r.is_err(), "{bad:?}: {r:?}");
+    }
 }
 
 #[test]

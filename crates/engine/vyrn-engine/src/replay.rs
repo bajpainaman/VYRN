@@ -767,7 +767,17 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 };
                 let mut tee = Tee::new(sink, log, buf);
                 let mids = c.mids.get(..c.n_mid).unwrap_or(&[]);
-                let rejected = lanes.routes().filter(|x| in_packet(&c.rec, x));
+                // A route record belongs to this packet only if the lane's next packet starts
+                // above it: a session-only packet (heartbeat) counts its messages but takes no
+                // LaneSeq, so its range overlaps the next packet's.
+                let next_first = (c.end..lanes.len())
+                    .filter_map(|j| lanes.get(j))
+                    .find(|p| p.lane == c.rec.lane && !is_advance(p))
+                    .map(|p| p.first_lane_seq.0);
+                let owns = |x: &RouteRecord| {
+                    in_packet(&c.rec, x) && next_first.is_none_or(|f| x.lane_seq.0 < f)
+                };
+                let rejected = lanes.routes().filter(|x| owns(x));
                 self.lane_call(
                     l,
                     &c.rec,
@@ -781,10 +791,14 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 if tee.bad_resp {
                     return Err(at(Why::Response));
                 }
-                // The call's route records must be the packet's input route records, in order.
-                let mut want_r = lanes.routes().filter(|x| in_packet(&c.rec, x));
-                let same_r = tee.routes().iter().all(|g| want_r.next() == Some(*g));
-                if !same_r || want_r.next().is_some() {
+                // The call's route records must be the packet's input route records, matched by
+                // op in any order (07 §3.6): none missing, extra, repeated or conflicting.
+                let want_r = || lanes.routes().filter(|x| owns(x));
+                let got = tee.routes();
+                let same_r = want_r().count() == got.len()
+                    && want_r().all(|x| got.contains(&x))
+                    && got.iter().all(|g| want_r().any(|x| x == *g));
+                if !same_r {
                     return Err(at(Why::Mismatch));
                 }
                 let want = core::iter::once(&c.rec).chain(mids.iter());
