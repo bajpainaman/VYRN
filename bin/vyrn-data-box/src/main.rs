@@ -349,6 +349,7 @@ fn control<R: RxRing, F: RxRing, T: TxRing, S: BlockStore>(
     line: &str,
     keys: Option<&KeySource>,
     node: &mut DataNode<R, F, T, S>,
+    acks: &std::sync::mpsc::SyncSender<Result<String, String>>,
 ) {
     let mut w = line.split_whitespace();
     let r = match (w.next(), w.next().map(str::parse::<u32>), w.next()) {
@@ -359,14 +360,13 @@ fn control<R: RxRing, F: RxRing, T: TxRing, S: BlockStore>(
         },
         _ => Err(format!("unknown control line {:?}", line.trim())),
     };
-    match r {
-        Ok(()) => {
-            let ep: Vec<String> = node.fetch_epochs().map(|e| e.to_string()).collect();
-            println!("FETCH_EPOCHS {}", ep.join(","));
-            let _ = std::io::stdout().flush();
-        }
-        Err(e) => eprintln!("CONTROL_ERR {e}"),
-    }
+    // Printed by their own thread: a stalled stdout or stderr never blocks the poll loop, and
+    // a full queue drops the line (the keys are installed either way).
+    let ack = r.map(|()| {
+        let ep: Vec<String> = node.fetch_epochs().map(|e| e.to_string()).collect();
+        format!("FETCH_EPOCHS {}", ep.join(","))
+    });
+    let _ = acks.try_send(ack.map_err(|e| format!("CONTROL_ERR {e}")));
 }
 
 /// The roster file: raw bytes, or the same bytes as hex text (whitespace ignored).
@@ -462,6 +462,22 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
     // Control input on stdin, one line each (crate docs, Control): `EPOCH <e>` moves the fetch
     // keys to epochs e and e + 1. EOF stops the box with `--stop-on-stdin-eof`.
     let (ctl_tx, ctl) = std::sync::mpsc::channel::<String>();
+    let (acks, acks_rx) = std::sync::mpsc::sync_channel::<Result<String, String>>(16);
+    std::thread::Builder::new()
+        .name("vyrn-data/control".into())
+        .spawn(move || {
+            for a in acks_rx {
+                match a {
+                    Ok(l) => {
+                        let mut out = std::io::stdout().lock();
+                        let _ = writeln!(out, "{l}");
+                        let _ = out.flush();
+                    }
+                    Err(l) => eprintln!("{l}"),
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
     {
         let stop = Arc::clone(&stop);
         std::thread::Builder::new()
@@ -512,7 +528,7 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
     while !stop.load(Ordering::Acquire) {
         let work = node.poll(now(t0));
         while let Ok(l) = ctl.try_recv() {
-            control(&l, keys.as_ref(), &mut node);
+            control(&l, keys.as_ref(), &mut node, &acks);
         }
         // Never block the poll loop on stdout: a full queue drops and counts the line.
         hand_over(node.drain_events(), &mut unprinted);
