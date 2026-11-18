@@ -16,5 +16,5 @@ pub mod hash;
 pub mod siphash;
 pub mod x25519;
 
-pub use hash::{SESSION_CONTEXT, derive_key, pkt_hash};
+pub use hash::{SESSION_CONTEXT, derive_key, hash_xof, pkt_hash};
 pub use siphash::{FixedState, siphash24, tag_eq};

@@ -17,6 +17,15 @@ pub fn keyed_hash(key: &[u8; 32], bytes: &[u8]) -> Hash {
     Hash(*blake3::keyed_hash(key, bytes).as_bytes())
 }
 
+/// BLAKE3 in extendable-output mode: fills `out` with the first `out.len()` bytes of the XOF of
+/// `bytes`. The first 32 bytes equal [`hash`]. 09 §9.4 uses it for the 2 KB LtHash element.
+#[inline]
+pub fn hash_xof(bytes: &[u8], out: &mut [u8]) {
+    let mut h = blake3::Hasher::new();
+    h.update(bytes);
+    h.finalize_xof().fill(out);
+}
+
 /// BLAKE3 `derive_key(context, material)`. `context` is a hard-coded, globally unique string;
 /// never derive it from input.
 #[inline(always)]
