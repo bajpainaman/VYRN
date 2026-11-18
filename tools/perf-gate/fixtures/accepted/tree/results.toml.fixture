@@ -1,0 +1,35 @@
+schema = 1
+runner = "ref-1"
+commit = "def0"
+
+[[metric]]
+id = "B2.service_ns"
+stat = "mean"
+value = 1026
+better = "lower"
+limit = 5000
+
+[[metric]]
+id = "B2.service_ns"
+stat = "p99"
+value = 2040
+better = "lower"
+
+[[metric]]
+id = "B8.ops_per_s"
+stat = "mean"
+value = 979000
+better = "higher"
+
+[[metric]]
+id = "B8.ops_per_s"
+stat = "p99"
+value = 900000
+better = "higher"
+limit = 950000
+
+[[metric]]
+id = "B6.new_ns"
+stat = "mean"
+value = 10
+better = "lower"

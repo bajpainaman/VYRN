@@ -1,0 +1,2 @@
+results.toml:1: missing-metric
+results.toml:1: missing-metric

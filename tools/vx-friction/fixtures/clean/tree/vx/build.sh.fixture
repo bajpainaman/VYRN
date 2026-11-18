@@ -1,0 +1,2 @@
+#!/bin/sh
+# VX-WORKAROUND W-09 (issue to file): vxc exports every function.

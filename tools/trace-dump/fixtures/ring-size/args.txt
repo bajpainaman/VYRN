@@ -1,0 +1,1 @@
+@CASE/core0.ring

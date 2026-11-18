@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish = false
-description = "CI gate tool (spec/11-build.md)."
+description = "Offline reader of the per-core trace rings (spec/11-build.md §8.3)."
 
 [dependencies]
 

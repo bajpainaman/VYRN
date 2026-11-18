@@ -5,9 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish = false
-description = "CI gate tool (spec/11-build.md)."
+description = "Regression rule of the performance gate (spec/11-build.md §9.3)."
 
 [dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
 
 [lints]
 workspace = true
