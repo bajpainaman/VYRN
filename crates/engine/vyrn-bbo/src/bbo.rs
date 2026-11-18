@@ -22,7 +22,8 @@ use crate::book::{
 use crate::codec::{
     ControlCmd, CutDelta, DEP_ENDED, DEP_JOIN, FillEvent, FillKind, FwdDep, FwdEntry, INDEX_MAKER,
     LIQ_AUCTION, LIQ_MAKER, LIQ_TAKER, MSG_NEW, OUT_AUCTION, OUT_FINISHED, OUT_IOC_REST, OUT_STP,
-    Phase, RESTED_DONE, RESTED_IN_FLIGHT, Record, STEP_CONT, StepEntry, TxEntry, encode_records,
+    Phase, RESTED_DONE, RESTED_IN_FLIGHT, Record, STEP_CONT, STEP_CROSS, StepEntry, TxEntry,
+    encode_records,
 };
 use crate::cut::{Cut, HalfPair, SrcRule, step_cut};
 use crate::io::{Poll, Ports};
@@ -193,6 +194,8 @@ pub struct ReplayStep {
     pub src: Option<(LaneId, LaneSeq)>,
     /// `StepEntry.flags & STEP_CONT`.
     pub cont: bool,
+    /// `StepEntry.flags & STEP_CROSS`: the route the source's lane classified (05 §4.15).
+    pub cross: bool,
     /// The `Rescan` band `(lo, hi)`; read only for a `Rescan` that is not a continuation.
     pub band: (Tick, Tick),
     /// `C_s`, every lane.
@@ -216,6 +219,7 @@ impl ReplayStep {
             kind,
             src: (e.src_lane_seq.0 != 0).then_some((e.src_lane, e.src_lane_seq)),
             cont: e.flags & STEP_CONT != 0,
+            cross: e.flags & STEP_CROSS != 0,
             band: (e.band_lo, e.band_hi),
             cut,
         })
@@ -545,7 +549,7 @@ impl Bbo {
         self.replay_check(rec)
     }
 
-    /// The decided step is the logged one: kind, `CONT`, source and cut.
+    /// The decided step is the logged one: kind, `CONT`, route, source and cut.
     fn replay_check(&self, rec: &ReplayStep) -> Result<(), Diverge> {
         let e = &self.out.entry;
         let src_ok = match rec.src {
@@ -554,6 +558,7 @@ impl Bbo {
         };
         let same = e.kind == rec.kind.code()
             && (e.flags & STEP_CONT != 0) == rec.cont
+            && (e.flags & STEP_CROSS != 0) == rec.cross
             && src_ok
             && self.cut == rec.cut;
         if same { Ok(()) } else { Err(Diverge::Kind) }
@@ -777,7 +782,7 @@ impl Bbo {
         &mut self,
         c: Cut,
         kind: StepKind,
-        src: Option<(usize, LaneSeq, u32)>,
+        src: Option<(usize, &FwdEntry)>,
         cont: bool,
         band: Option<(Tick, Tick)>,
     ) {
@@ -788,11 +793,14 @@ impl Bbo {
         let e = &mut self.out.entry;
         e.step = s;
         e.kind = kind.code();
-        if let Some((l, q, _)) = src {
-            e.src_lane = LaneId(lane_u8(l));
-            e.src_lane_seq = q;
-        }
         e.flags = if cont { STEP_CONT } else { 0 };
+        if let Some((l, f)) = src {
+            e.src_lane = LaneId(lane_u8(l));
+            e.src_lane_seq = f.lane_seq;
+            if f.cross() {
+                e.flags |= STEP_CROSS;
+            }
+        }
         if let Some((lo, hi)) = band {
             e.band_lo = lo;
             e.band_hi = hi;
@@ -811,8 +819,8 @@ impl Bbo {
         }
         // 05 §8.6: the source lane's ops up to its cut were classified against ≥ the entry's
         // `snap_ver`.
-        if let Some((l, _, sv)) = src {
-            let v = self.expand(sv);
+        if let Some((l, f)) = src {
+            let v = self.expand(f.snap_ver);
             if let Some(x) = self.lowver.get_mut(l) {
                 *x = v;
             }
@@ -1463,7 +1471,7 @@ impl Bbo {
         } else {
             StepKind::Improve
         };
-        self.finish(c, kind, Some((lane, e.lane_seq, e.snap_ver)), cont, None);
+        self.finish(c, kind, Some((lane, &e)), cont, None);
     }
 
     /// 05 §2.5 P1, §2.3 `Replace`, the post-only test and the FOK dry run. `true` when the taker
@@ -1735,13 +1743,7 @@ impl Bbo {
             client_tag: e.client_tag(),
         };
         self.out.record(h, 0, r);
-        self.finish(
-            c,
-            StepKind::Shed,
-            Some((lane, e.lane_seq, e.snap_ver)),
-            false,
-            None,
-        );
+        self.finish(c, StepKind::Shed, Some((lane, &e)), false, None);
     }
 
     // -----------------------------------------------------------------------------------------

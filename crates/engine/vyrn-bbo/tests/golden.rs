@@ -53,10 +53,7 @@ fn words<const W: usize>(b: &[u8]) -> [u64; W] {
     core::array::from_fn(|i| u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap()))
 }
 
-#[test]
-fn fwd_entry() {
-    let all = cases();
-    let c = &all["fwd_entry"];
+fn fwd_case(c: &BTreeMap<String, String>) -> FwdEntry {
     let mut msg = [0u8; 16];
     for (i, m) in msg.iter_mut().enumerate() {
         *m = u8::from_str_radix(&c["msg"][2 * i..2 * i + 2], 16).unwrap();
@@ -77,6 +74,34 @@ fn fwd_entry() {
     };
     assert_eq!(line_bytes(&e.encode()).to_vec(), bytes(c));
     assert_eq!(FwdEntry::decode(&words(&bytes(c))), e);
+    e
+}
+
+#[test]
+fn fwd_entry() {
+    fwd_case(&cases()["fwd_entry"]);
+}
+
+#[test]
+fn fwd_entry_cross_shares_byte_2_with_the_index() {
+    let all = cases();
+    let c = &all["fwd_entry_cross"];
+    let e = fwd_case(c);
+    assert_eq!(
+        (e.index(), e.cross(), e.n_dep(), e.msg_type()),
+        (
+            num(c, "index") as u8,
+            num(c, "cross") == 1,
+            num(c, "n_dep") as u8,
+            MSG_NEW
+        )
+    );
+    let mut lines = [[0u64; 8]; 4];
+    assert_eq!(encode_fwd(&e, &[FwdDep::default(); 2], &mut lines), 2);
+    assert!(
+        FwdEntry::decode(&lines[0]).cross(),
+        "encode_fwd keeps the route bit"
+    );
 }
 
 #[test]
@@ -155,6 +180,12 @@ fn step_entry_and_deltas() {
     };
     assert_eq!(line_bytes(&e.encode()).to_vec(), bytes(c));
     assert_eq!(StepEntry::decode(&words(&bytes(c))), e);
+    assert_eq!((STEP_CONT, STEP_CROSS), (1, 2));
+    assert_eq!(
+        STEP_CROSS,
+        StepFlags::CROSS,
+        "StepRecord.flags uses StepEntry's bit"
+    );
     let d = &all["cut_delta_line"];
     let ds = [
         CutDelta {

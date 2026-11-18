@@ -3,7 +3,7 @@
 //! encoding belong to the TX path and `vyrn-log`.
 
 use vyrn_bbo::{MAX_RECORDS, Record};
-use vyrn_types::{LaneSeq, PacketRecord, SessionId, StepId};
+use vyrn_types::{LaneSeq, PacketRecord, RouteRecord, SessionId, StepId};
 
 /// When a response may leave (`INV-FRAME-FIRST`, `INV-ACK-AFTER-CUT`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +64,9 @@ impl RespPkt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogRec {
     Packet(PacketRecord),
+    /// After its op's `PacketRecord`: the op was classified Cross or Improve, then rejected
+    /// by the lane (01 §6.6, 07 §3.6).
+    Route(RouteRecord),
 }
 
 /// Bounded output buffers, preallocated (`INV-NOALLOC`). The engine drains them after each call;

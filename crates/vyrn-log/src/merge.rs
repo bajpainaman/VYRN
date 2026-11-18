@@ -122,6 +122,7 @@ impl<const N: usize> StepMerger<N> {
         let home = home_rec.home.unwrap_or_else(|| crate::stream::Home {
             src_lane: LaneId(0xFF),
             src_lane_seq: LaneSeq(0),
+            flags: 0,
             payload: Vec::new(),
         });
         self.next_step = s.checked_add(1).ok_or(RepErr::Range)?;
@@ -131,6 +132,7 @@ impl<const N: usize> StepMerger<N> {
                 kind: home_rec.kind,
                 src_lane: home.src_lane,
                 src_lane_seq: home.src_lane_seq,
+                flags: home.flags,
                 cut: self.cut,
             },
             payload: home.payload,
@@ -153,6 +155,7 @@ mod tests {
             home: home.then(|| Home {
                 src_lane: LaneId(0xFF),
                 src_lane_seq: LaneSeq(0),
+                flags: 0,
                 payload: Vec::new(),
             }),
             cut: cut.map(LaneSeq).to_vec(),

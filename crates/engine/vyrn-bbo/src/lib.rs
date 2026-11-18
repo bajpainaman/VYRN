@@ -64,11 +64,11 @@ mod view;
 
 pub use bbo::{Bbo, Config, Diverge, ReplayStep};
 pub use codec::{
-    ControlCmd, CutDelta, DEP_CANCEL, DEP_ENDED, DEP_JOIN, FillEvent, FillKind, FwdDep, FwdEntry,
-    INDEX_MAKER, LIQ_AUCTION, LIQ_MAKER, LIQ_TAKER, MAX_RECORDS, MSG_NEW, MSG_REPLACE, OUT_AUCTION,
-    OUT_FINISHED, OUT_IOC_REST, OUT_STP, Phase, RESTED_DONE, RESTED_IN_FLIGHT, ROLE_DEPS,
-    ROLE_MAKER, ROLE_TAKER, Record, STEP_CONT, StepEntry, TxEntry, decode_records, encode_fwd,
-    encode_records, line_bytes, line32_bytes,
+    ControlCmd, CutDelta, DEP_CANCEL, DEP_ENDED, DEP_JOIN, FWD_CROSS, FWD_INDEX, FillEvent,
+    FillKind, FwdDep, FwdEntry, INDEX_MAKER, LIQ_AUCTION, LIQ_MAKER, LIQ_TAKER, MAX_RECORDS,
+    MSG_NEW, MSG_REPLACE, OUT_AUCTION, OUT_FINISHED, OUT_IOC_REST, OUT_STP, Phase, RESTED_DONE,
+    RESTED_IN_FLIGHT, ROLE_DEPS, ROLE_MAKER, ROLE_TAKER, Record, STEP_CONT, STEP_CROSS, StepEntry,
+    TxEntry, decode_records, encode_fwd, encode_records, line_bytes, line32_bytes,
 };
 pub use cut::{Cut, HalfPair, SrcRule, step_cut};
 pub use io::{ControlCons, ControlRing, FillProd, FwdCons, Poll, Ports, StepLogProd, TxProd};

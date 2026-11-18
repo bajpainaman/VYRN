@@ -87,7 +87,7 @@ The fault budget `F` = 1 counts every box of the home, so a faulty sequencer use
 
 | Part | Content | Producer | Peak rate (budget) | Key |
 |---|---|---|---|---|
-| Order stream | `PacketRecord`, `AcctTake`, `StepRecord`, `BlockMark`, `SessionBind`, `TenureStart`, `BlockHeader` | `vyrn-seq` stream cores 4 and 7, hasher core 50 | 3.3 GB/s per path, framed (§3.13) | `(epoch, tenure, stream, frame_seq)` |
+| Order stream | `PacketRecord`, `AcctTake`, `RouteRecord`, `StepRecord`, `BlockMark`, `SessionBind`, `TenureStart`, `BlockHeader` | `vyrn-seq` stream cores 4 and 7, hasher core 50 | 3.3 GB/s per path, framed (§3.13) | `(epoch, tenure, stream, frame_seq)` |
 | Data | the exact UDP payload of each request packet (§6.1 of 01) | `vyrn-data` | 19.2 GB/s to each replica (§5.1) | `(session, pkt_seq)`, checked by `pkt_hash` |
 
 The log of a home is the sequence of blocks. Block `h` is the triple (header `h`, the order bytes of
@@ -190,6 +190,8 @@ struct LaneDec {                       // one per lane
     next_lane_seq: LaneSeq,            // first_lane_seq expected for the next PacketRecord
     prev_rx_ts: Nanos,
     prev_fills_applied: StepId,
+    last_pkt: (LaneSeq, u8),           // (first_lane_seq, count) of the last non-Advance
+                                       // PacketRecord: the base of RouteRecord.back
     slot_session: [SessionId; MAX_SESSIONS_PER_LANE],   // set by SessionBind
     slot_next_pkt_seq: [u32; MAX_SESSIONS_PER_LANE],
     awaiting_hash: Fifo<RecordRef>,    // PacketRecords whose pkt_hash has not arrived
@@ -218,7 +220,8 @@ byte h:   bits 0–3  count              (0..10; 11..15 → REP_E_COUNT); number
 slot      LEB128 u16                   lane-local session slot, < MAX_SESSIONS_PER_LANE (pool-wide
                                        on pooled lanes); REP_SLOT_ADVANCE = MAX_SESSIONS_PER_LANE marks
                                        an Advance record, REP_SLOT_TAKE = MAX_SESSIONS_PER_LANE + 1 an
-                                       AcctTake (below)
+                                       AcctTake, REP_SLOT_ROUTE = MAX_SESSIONS_PER_LANE + 2 a
+                                       RouteRecord (below)
 rx_ts     ZigZag LEB128 of (rx_ts − prev_rx_ts) as i64
 [FA_NZ]   LEB128 (fills_applied − prev_fills_applied)          // non-decreasing per lane
 [LSEQ_EXC] LEB128 (first_lane_seq − next_lane_seq)             // > 0; lane ops that are not packets
@@ -228,7 +231,7 @@ rx_ts     ZigZag LEB128 of (rx_ts − prev_rx_ts) as i64
 Decoding rebuilds the full logical record of 01 §6.6:
 
 ```rust
-fn decode_pkt(l: LaneId, d: &mut LaneDec, r: &mut Reader) -> Rec {   // Rec::Pkt or Rec::Take
+fn decode_pkt(l: LaneId, d: &mut LaneDec, r: &mut Reader) -> Rec {   // Rec::Pkt, Rec::Take or Rec::Route
     let h = r.u8();
     let count = h & 0x0F;
     let shed = h & 0x80 != 0;
@@ -238,6 +241,13 @@ fn decode_pkt(l: LaneId, d: &mut LaneDec, r: &mut Reader) -> Rec {   // Rec::Pkt
         if h != 0 || !is_pool_lane(l) { fail(REP_E_COUNT) }
         return Rec::Take(AcctTake { account: AccountId(r.leb_u32()), ver: r.leb_u64(), lane: l });
     }
+    if slot as usize == REP_SLOT_ROUTE {                         // 05 §10: a lane-rejected route
+        let (first, n) = d.last_pkt;
+        let back = h & 0x0F;
+        if h & 0x70 != 0 || back >= n { fail(REP_E_COUNT) }
+        return Rec::Route(RouteRecord { lane: l, lane_seq: first + (n - 1 - back) as u64,
+                                        cross: h & 0x80 != 0 });
+    }
     let advance = slot as usize == REP_SLOT_ADVANCE;             // 05 §6.2: a boundary, no packet
     if advance && (count != 0 || shed || h & 0x30 != 0) { fail(REP_E_COUNT) }
     let rx_ts = d.prev_rx_ts.checked_add_signed(r.zigzag_i64()).unwrap_or_else(|| fail(REP_E_TS));
@@ -245,6 +255,7 @@ fn decode_pkt(l: LaneId, d: &mut LaneDec, r: &mut Reader) -> Rec {   // Rec::Pkt
     let first_lane_seq = if h & 0x20 != 0 { d.next_lane_seq + r.leb_u64() } else { d.next_lane_seq };
     d.prev_rx_ts = rx_ts; d.prev_fills_applied = fills_applied;
     d.next_lane_seq = first_lane_seq + count as u64;             // a shed packet keeps its LaneSeqs
+    if !advance { d.last_pkt = (first_lane_seq, count) }
     if advance {
         return Rec::Pkt(PacketRecord { lane: l, count: 0, flags: ADVANCE, session: 0, pkt_seq: 0,
                               rx_ts, pkt_hash: PktHash(0), first_lane_seq, fills_applied });
@@ -281,6 +292,18 @@ defines any.
   record before its own take of `ver − 1`, so the pool's work order is replayed exactly. A take
   on a dedicated lane is `REP_E_COUNT`. Size ~7 B. A take happens only when an account changes pool core,
   ≤ 3M/s at peak, ~0.2 B per record over the whole book (budget, §3.13).
+- **`RouteRecord { lane, lane_seq, cross }`** (01 §6.6, 05 §10). A lane logs one for each `New`
+  or new-priority `Replace` that it classified `Cross` or `Improve` (05 §6.5) and then rejected
+  itself, for example `POST_ONLY_WOULD_CROSS` or a cross bucket (10 M8). No `StepRecord` names
+  such an op, and risk charged it by its route, so replay must route it the same way. Wire form:
+  `h` = `back` in bits 0–3, bits 4–6 0, bit 7 `CROSS` (`cross`); `slot` = `REP_SLOT_ROUTE`;
+  nothing else. `lane_seq` = `last − back`, where `last` = `first_lane_seq + count − 1` of the
+  lane's last non-Advance PacketRecord (`LaneDec.last_pkt`); `back ≥ count`, or a reserved bit,
+  is `REP_E_COUNT`. It follows its packet's PacketRecord in the `LaneRun`, after or between that
+  packet's `MID` Advance records, and before the lane's next PacketRecord or non-`MID` Advance
+  record; it need not come right after the PacketRecord. It takes no `LaneSeq`, `rx_ts`, hash or
+  payload. A forwarded op never has one: its route is `StepRecord.flags.CROSS` (§3.8). Size 3 B;
+  it exists only on rejects, ~0 B per record at full load (budget, §3.13).
 - **Pooled slots.** On a pooled lane `slot` indexes the pool's shared session table, and
   `slot_next_pkt_seq` is kept per pool, so consecutive packets of a session may sit on different
   pool lanes. A packet framed out of `pkt_seq` order across pool lanes takes `SEQ_EXC`.
@@ -320,7 +343,8 @@ byte 0:  bits 0–3  kind        0 Cross, 1 Improve, 2 Depletion, 3 Rescan, 4 Id
          bits 5–6  mode        this half's cut delta: 0 SAME, 1 DENSE, 2 SPARSE, 3 → REP_E_CUT
          bit 7     OTHER       the other substream carries a record of this step too
 gap      LEB128 (step − prev_step − 1)                      // steps this substream does not carry
-[HOME]   src_lane u8 (0xFF = none); [src≠0xFF] ZigZag LEB128 (src_lane_seq − cut[src_lane]);
+[HOME]   src u8: 0xFF = none, else bits 0–5 src_lane, bit 6 0, bit 7 CROSS (StepRecord.flags bit 1);
+         [src≠0xFF] ZigZag LEB128 (src_lane_seq − cut[src_lane]);
          [payload] kinds Rescan, Control, Seal, Uncross only: plen LEB128, then plen bytes (05 owns
          them: the Rescan band, the Control code and argument, the uncross cut reference)
 [DENSE]  |H| × LEB128 (cut[l] − prev_cut[l])                 // ≥ 0 by INV-CUT-MONO per half
@@ -337,7 +361,14 @@ step `s` is complete when its home record and, if OTHER is set, its cut-only rec
 when the half is unchanged, and otherwise the shorter of DENSE and SPARSE. Both clients must decode
 every form. The choice does not affect replay, because replay consumes the decoded cut. A decoder
 rejects a SPARSE delta of 0, any decrease, a cut-only record with mode SAME, and a home record whose
-`src_lane` is not in its substream's half (`REP_E_CUT`). The clamped step-cut rule of 05 (01
+`src_lane` is not in its substream's half (`REP_E_CUT`). A `src` byte with bit 6 set names no lane
+(lanes are < 64) and is `REP_E_CUT` too.
+
+**`CROSS`** (bit 7 of `src`) is `StepRecord.flags` bit 1 (01 §6.6), copied from the source's
+`FwdEntry` (05 §4.12, §4.15): the route the lane classified the op with, `Cross` when set,
+`Improve` when clear. Lane risk charged by it (10 M8), and the kind does not show it, so replay
+reads it (05 §10). It is only on a record with a source; an encoder refuses it on `src` 0xFF or
+with any other flag bit (`REP_E_KIND`). It costs no byte. The clamped step-cut rule of 05 (01
 §14.11) is applied before encoding, so the logged cut is the clamped one.
 
 | Kind | `src_lane` | Payload | Meaning in the stream |
@@ -2101,7 +2132,7 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | `REP_HOT_HOURS` | 12 | budget | blocks kept on the replica at ≤ 20% average load (§8.3, 01 §14.16) |
 | `REP_HOT_HOURS_PEAK` | ≥ 6 (7.9 budget) | budget | blocks kept on the replica at sustained peak (§8.3) |
 | `REP_RSP_STORE_BYTES`, `REP_RSP_MAX_PPS` | 1 TB, 2M | budget | recovery-service store and resend cap (§8.5) |
-| `REP_SLOT_ADVANCE`, `REP_SLOT_TAKE` | `MAX_SESSIONS_PER_LANE`, + 1 | — | slot values of an Advance record and an `AcctTake` (§3.6) |
+| `REP_SLOT_ADVANCE`, `REP_SLOT_TAKE`, `REP_SLOT_ROUTE` | `MAX_SESSIONS_PER_LANE`, + 1, + 2 | — | slot values of an Advance record, an `AcctTake` and a `RouteRecord` (§3.6) |
 | `REP_LIVE_LAG_MS` | 10 | budget | "caught up" threshold |
 | `REP_REPLAY_SPEEDUP_PEAK`, `_AVG` | 1.5×, 10× | budget | replay speed vs live |
 | `REP_SUSPECT_ABORT_MS` | 5 | budget | a suspicion without Q is abandoned |

@@ -481,11 +481,21 @@ impl Rig<'_> {
                     recs_hex(p.records())
                 ));
             }
-            for LogRec::Packet(r) in &self.log[l][self.seen.1[l]..] {
-                t.push(format!(
-                    "  log {l} {:#x} pkt={} count={} flags={:#x} first={} fills_applied={}",
-                    r.session.0, r.pkt_seq, r.count, r.flags, r.first_lane_seq.0, r.fills_applied.0
-                ));
+            for rec in &self.log[l][self.seen.1[l]..] {
+                t.push(match rec {
+                    LogRec::Packet(r) => format!(
+                        "  log {l} {:#x} pkt={} count={} flags={:#x} first={} fills_applied={}",
+                        r.session.0,
+                        r.pkt_seq,
+                        r.count,
+                        r.flags,
+                        r.first_lane_seq.0,
+                        r.fills_applied.0
+                    ),
+                    LogRec::Route(r) => {
+                        format!("  route {l} seq={} cross={}", r.lane_seq.0, r.cross)
+                    }
+                });
             }
             self.seen.0[l] = self.resp[l].len();
             self.seen.1[l] = self.log[l].len();

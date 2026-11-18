@@ -82,6 +82,12 @@ pub const MSG_REPLACE: u8 = 0x04;
 // ---------------------------------------------------------------------------------------------
 // FwdEntry, FwdDep
 
+/// `FwdEntry.msg` byte 2, bits 0–3: the message index (05 §4.12).
+pub const FWD_INDEX: u8 = 0x0F;
+/// `FwdEntry.msg` byte 2, bit 7: the lane's route is `Cross`, clear = `Improve` (05 §4.12,
+/// §6.5). The BBO core copies it into `StepEntry.flags` as [`STEP_CROSS`].
+pub const FWD_CROSS: u8 = 0x80;
+
 /// `FwdEntry` (05 §4.12): one forwarded op. Writer: its lane, which writes `lane_seq` last
 /// (the ring's `push_all` publishes the entry and its dependency lines together).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -92,7 +98,8 @@ pub struct FwdEntry {
     pub snap_ver: u32,
     /// Latest BBO step start, low 32 bits of PTP ns (05 §6.8): `rx_ts + FWD_DEADLINE_NS`.
     pub deadline: u32,
-    /// The 16-byte message; byte 2 = message index, byte 3 = number of dependencies.
+    /// The 16-byte message; byte 2 = message index (bits 0–3) and [`FWD_CROSS`] (bit 7),
+    /// byte 3 = number of dependencies.
     pub msg: [u8; 16],
     /// Root slot and generation of the order.
     pub handle: Handle,
@@ -157,8 +164,13 @@ impl FwdEntry {
     pub fn flags(&self) -> OrderFlags {
         OrderFlags(self.m(1))
     }
+    /// Message index 0–9 (bits 0–3 of `msg` byte 2).
     pub fn index(&self) -> u8 {
-        self.m(2)
+        self.m(2) & FWD_INDEX
+    }
+    /// The lane classified the op `Cross` (05 §6.5); `false` = `Improve`.
+    pub fn cross(&self) -> bool {
+        self.m(2) & FWD_CROSS != 0
     }
     pub fn n_dep(&self) -> u8 {
         self.m(3)
@@ -411,6 +423,9 @@ impl FillEvent {
 
 /// `StepEntry.flags` bit 0: this step is a continuation (05 §4.15).
 pub const STEP_CONT: u8 = 1;
+/// `StepEntry.flags` bit 1: the source's `FwdEntry` has [`FWD_CROSS`] (05 §4.15). Set only on
+/// a step with a source; `StepRecord.flags` carries the same bit (01 §6.6).
+pub const STEP_CROSS: u8 = vyrn_types::StepFlags::CROSS;
 
 /// `StepEntry` header (05 §4.15). Writer: the BBO core. Readers: stream cores A and B, fill TX
 /// cores. The changed cut entries follow as `ceil(n_delta / 4)` delta lines.

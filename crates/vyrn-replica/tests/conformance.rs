@@ -121,6 +121,7 @@ fn step(n: u64, kind: StepKind, src: Option<(u8, u64)>, other: bool, cut: [u64; 
         home: Some(Home {
             src_lane: LaneId(src.map_or(0xFF, |s| s.0)),
             src_lane_seq: LaneSeq(src.map_or(0, |s| s.1)),
+            flags: 0,
             payload: Vec::new(),
         }),
         cut: cut.map(LaneSeq).to_vec(),

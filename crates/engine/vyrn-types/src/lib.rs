@@ -20,7 +20,8 @@ mod records;
 pub use codes::{HomeCode, Mode, RejectReason, StepKind};
 pub use dense::{Dense, DenseId};
 pub use records::{
-    AcctTake, BlockHeader, Ed25519Sig, HandoffRecord, PacketFlags, PacketRecord, PubKey, StepRecord,
+    AcctTake, BlockHeader, Ed25519Sig, HandoffRecord, PacketFlags, PacketRecord, PubKey,
+    RouteRecord, StepFlags, StepRecord,
 };
 
 // Every target is 64-bit (01 §10: x86-64 and aarch64), so u64 → usize never truncates.

@@ -402,6 +402,8 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
                             }
                         }
                         LaneRec::Take(t) => st.on_take(t).map_err(FaultKind::Lane)?,
+                        // The decoder checked that it names an op of the preceding packet.
+                        LaneRec::Route(_) => {}
                     }
                     part.recs.push(r);
                 }

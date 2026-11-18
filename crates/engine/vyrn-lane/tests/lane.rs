@@ -33,8 +33,9 @@ fn ask_105(x: &mut Rig<'_>, bbo: &mut vyrn_bbo::Bbo) -> Handle {
 fn packets(x: &Rig<'_>, l: usize) -> Vec<PacketRecord> {
     x.log[l]
         .iter()
-        .map(|r| match r {
-            LogRec::Packet(p) => *p,
+        .filter_map(|r| match r {
+            LogRec::Packet(p) => Some(*p),
+            LogRec::Route(_) => None,
         })
         .collect()
 }
@@ -908,7 +909,8 @@ fn replay_charges_the_lane_route_not_the_step_kind() {
     // improve bucket. Lane 0 rests sell 1 @ 105 (session 1, account 1); session 30 on the same
     // account sends a CancelNewest buy 1 @ 105. Lane classifies it Cross (105 ≥ ask 105, 05
     // §6.5), but STP leaves no fill, so the BBO logs an Improve step. A replay given the step
-    // kind would charge Improve; given the lane's route it reproduces the account state.
+    // kind would charge Improve; given the route the step logs (StepEntry CROSS, from the
+    // FwdEntry route bit, 05 §4.12, §4.15) it reproduces the account state.
     let f = vyrn_bbo::OrderFlags::new(
         Side::Buy,
         vyrn_bbo::Tif::Day,
@@ -929,7 +931,7 @@ fn replay_charges_the_lane_route_not_the_step_kind() {
         assert_eq!(rx, Rx::Accepted);
         x.settle(&mut bbo);
         let step = x.steps.iter().find(|s| s.entry.src_lane_seq == LaneSeq(2));
-        let kind = step.unwrap().entry.kind;
+        let e = step.unwrap().entry;
         let cross = x.lanes[0]
             .account_mut(vyrn_risk::AcctSlot(1))
             .unwrap()
@@ -937,20 +939,82 @@ fn replay_charges_the_lane_route_not_the_step_kind() {
             .buckets
             .cross
             .tat;
-        (kind, cross, x.records(0, 30))
+        (e.kind, e.flags, cross, x.records(0, 30))
     };
     let original = run(None);
     assert_eq!(
-        original.0,
-        StepKind::Improve.code(),
-        "no fill: Improve step"
+        (original.0, original.1),
+        (StepKind::Improve.code(), vyrn_bbo::STEP_CROSS),
+        "no fill: an Improve step that logs the lane's Cross route"
     );
     let from_kind = run(Some(vyrn_risk::Route::Improve));
     assert_ne!(
-        from_kind.1, original.1,
+        from_kind.2, original.2,
         "the step kind loses the Cross charge"
     );
-    assert_eq!(run(Some(vyrn_risk::Route::Cross)), original);
+    assert_eq!(from_kind.1, 0, "an Improve route logs CROSS clear");
+    let logged = if original.1 & vyrn_bbo::STEP_CROSS != 0 {
+        vyrn_risk::Route::Cross
+    } else {
+        vyrn_risk::Route::Improve
+    };
+    assert_eq!(run(Some(logged)), original);
+}
+
+#[test]
+fn a_locally_rejected_cross_logs_its_route_and_replays_with_it() {
+    // G9: a post-only buy @ 105 against ask 105 is a Cross (05 §6.5) that lane risk rejects
+    // POST_ONLY_WOULD_CROSS (10 M8 row 12), so no step names it. The lane logs a RouteRecord
+    // after the packet's PacketRecord. Replay given that route rejects it again; replay that
+    // routes it as a Join (no record) accepts it, which is the silent divergence.
+    let po = vyrn_bbo::OrderFlags::new(Side::Buy, vyrn_bbo::Tif::Day, true, vyrn_bbo::Stp::None);
+    let run = |routes: Option<&[(LaneSeq, vyrn_risk::Route)]>| {
+        let (mut bbo, mut w) = setup();
+        let mut x = w.rig();
+        x.send(0, 1, 1_000, &[new(day(Side::Sell), 105, 1, 11)]);
+        x.settle(&mut bbo);
+        let m = [new(po, 105, 1, 22)];
+        match routes {
+            None => x.send(0, 2, 2_000, &m),
+            Some(rt) => x.replay(0, 2, 2_000, &m, &[], rt),
+        };
+        x.settle(&mut bbo);
+        let routes: Vec<_> = x.log[0]
+            .iter()
+            .filter_map(|r| match r {
+                LogRec::Route(r) => Some(*r),
+                LogRec::Packet(_) => None,
+            })
+            .collect();
+        (routes, x.records(0, 2))
+    };
+    let live = run(None);
+    assert_eq!(
+        live.0,
+        [vyrn_types::RouteRecord {
+            lane: vyrn_types::LaneId(0),
+            lane_seq: LaneSeq(2),
+            cross: true
+        }]
+    );
+    assert!(
+        live.1.iter().any(|r| matches!(
+            r,
+            Record::Reject {
+                index: 0,
+                reason: RejectReason::PostOnlyWouldCross,
+                ..
+            }
+        )),
+        "{:?}",
+        live.1
+    );
+    assert_eq!(run(Some(&[(LaneSeq(2), vyrn_risk::Route::Cross)])), live);
+    assert_ne!(
+        run(Some(&[])).1,
+        live.1,
+        "without the record replay accepts it"
+    );
 }
 
 #[test]

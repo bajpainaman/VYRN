@@ -36,6 +36,28 @@ pub struct PacketRecord {
     pub fills_applied: StepId,
 }
 
+/// `StepRecord.flags` bits (01 §6.6). They use `StepEntry.flags`' numbering (05 §4.15).
+pub struct StepFlags;
+
+impl StepFlags {
+    /// The source's lane classified it `Cross` (05 §6.5); clear = `Improve`. Only on a step
+    /// with a source (`Cross`, `Improve`, `Shed`). Replay charges risk by this route, not by
+    /// the kind (05 §10, 10 M8).
+    pub const CROSS: u8 = 1 << 1;
+}
+
+/// The route a lane classified a `New` or new-priority `Replace` with (05 §6.5) when it then
+/// rejected the op itself, so no `StepRecord` names it (01 §6.6). Replay forces that route, so
+/// risk charges and rejects as live did (10 M8). A forwarded op has none: its step's
+/// `StepFlags::CROSS` carries the route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouteRecord {
+    pub lane: LaneId,
+    pub lane_seq: LaneSeq,
+    /// `true` = `Cross`, `false` = `Improve`.
+    pub cross: bool,
+}
+
 /// One BBO-core step and the cut it used. `N` is the box's lane count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepRecord<const N: usize> {
@@ -44,6 +66,8 @@ pub struct StepRecord<const N: usize> {
     pub src_lane: LaneId,
     /// 0 means "no source" (05 §8.1).
     pub src_lane_seq: LaneSeq,
+    /// [`StepFlags`]; 0 without a source.
+    pub flags: u8,
     pub cut: [LaneSeq; N],
 }
 
