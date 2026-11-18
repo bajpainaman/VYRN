@@ -66,9 +66,11 @@ pub struct Section {
     /// does not vote, needs none.
     #[serde(default)]
     pub storage: Option<PathBuf>,
-    /// The operator's acknowledgement that this voter starts with an empty journal for the
-    /// epoch (also `--fresh`); without it, an empty journal refuses to start ([`Plan::new`]).
-    #[serde(default)]
+    /// `--fresh`: the operator's one-shot acknowledgement that this voter starts with an empty
+    /// journal for the epoch; without it, an empty journal refuses to start ([`Plan::new`]). Not a
+    /// config key (a TOML `fresh` is an unknown field): a persistent value would disarm the guard
+    /// for every later wipe.
+    #[serde(skip)]
     pub fresh: bool,
 }
 
@@ -399,7 +401,7 @@ impl Plan {
         if journal_empty(&part) {
             if !s.fresh {
                 return Err(format!(
-                    "the Simplex journal {} is empty: a voter that lost its votes can equivocate; start with --fresh (or [consensus] fresh = true) only if the committee has not finalized past genesis in epoch {}, or knowingly",
+                    "the Simplex journal {} is empty: a voter that lost its votes can equivocate; start with --fresh only if the committee has not finalized past genesis in epoch {}, or knowingly",
                     part.display(),
                     epoch.0
                 ));
