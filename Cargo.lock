@@ -3514,6 +3514,7 @@ dependencies = [
  "toml",
  "vyrn-crypto",
  "vyrn-types",
+ "vyrn-wire",
 ]
 
 [[package]]
