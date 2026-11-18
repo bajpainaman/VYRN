@@ -560,6 +560,15 @@ checks):
 6. At most `CHN_MAX_ITEMS` (500) items and `CHN_MAX_ITEM_BYTES` (256 KiB) of items.
 7. `log_hash` and the three roots are recomputed and equal.
 
+**Item freeze (scheme 1, 07 §6.3).** The leader fixes its item list when it fixes its book range:
+the items it holds at that moment, in arrival order, up to the caps. Its `RangeFix` carries that
+list's `items_root`, so with the empty-exclusion `excl_root` (07 §6.5a) every field of the
+`ChainHeader` is known before the proposal arrives, and leader and voters pre-sign the whole
+header. An item that reaches the leader after the freeze goes into the next chain block, ≤ 1 view
+later. Each candidate of the next leader (07 §6.3, L1′) freezes its own list. A `RangeFix` whose
+`items_root` differs from the proposal only makes voters sign late, as for any other mismatch;
+they judge the items by checks 4–6 alone. [Likely]
+
 ### 4.4 The transaction path
 
 Non-order actions use their own path, which never touches the 1 µs path.
@@ -568,7 +577,7 @@ Non-order actions use their own path, which never touches the 1 µs path.
   home forwards to the active committee. The NIC flow filter of a sequencer box never sees this
   port.
 - **Mempool:** a validator box that accepts an item gossips it to the next 3 leaders in the
-  schedule. A leader includes items in arrival order, up to the caps.
+  schedule. A leader includes items in arrival order, up to the caps, frozen when it fixes its range (§4.3); an item that arrives later goes into the next chain block.
 - **Envelope:**
 
 ```
@@ -747,7 +756,7 @@ delay bound of the model (01 §14.0 fact 3):
 | Wait for the next proposal | 1.73 | 07 §6.6; 1.65 under scheme 1, where the next leader fixes its range when the previous proposal reaches it (07 §6.3) |
 | Hops 2–4: proposal, notarize, finalize → `Q_CHAIN` at every voter and at the sequencer | 2.45 | |
 | Vote signature checks | 0.10 | 0.15 under scheme 1 (hybrid, 01 §14.20): the ML-DSA parts run in parallel with the batched Ed25519 parts |
-| **No fault** | **7.04** | 5.31 before the next-proposal row (01 §14.20 PQ-10); 7.01 under scheme 1 (+0.05 vote checks, −0.08 wait). The leader pre-signs with the empty-exclusion `excl_root` (PQ-11, 07 §6.5a), so no signature follows its `verify` unless a client caused an exclusion (§5.7) |
+| **No fault** | **7.04** | 5.31 before the next-proposal row (01 §14.20 PQ-10); 7.01 under scheme 1 (+0.05 vote checks, −0.08 wait). The leader pre-signs with the empty-exclusion `excl_root` (PQ-11, 07 §6.5a) and the item list frozen at its range fix (§4.3), so no signature follows its `verify` unless a client caused an exclusion (§5.7) |
 | One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **9.84** | the sequencer never leads, so a leader fault is a member fault; 9.81 under scheme 1. Past the 9.00 ms gate of `FIN_GATE_BLOCKS` = 8: **pending ruling** (01 §14.20 PQ-14) |
 | or a data box redirect (07 §5.7, 4.20 on top of the 0.71) | **pending ruling** | 11.24 (11.70 scheme 1) with today's redirect; 01 §14.20 PQ-13 |
 | or the sequencer is the fault | 07 failover; its seal must be final ≤ 9 ms after the last frame | |
@@ -1026,12 +1035,11 @@ fn exclusion_list(st: &ChainState, blk: &BookBlock, pay: &Payloads) -> Exclusion
   session did after its first bad packet, without trusting the sequencer to stop in time.
 - **What an exclusion costs the view (scheme 1, 01 §14.20 PQ-11).** The leader and the voters
   pre-sign the notarize with the `excl_root` of empty lists (07 §6.5a). A range with an exclusion
-  makes each of them sign late, ≤ `PQ_SIGN_MAX_US` = 0.75 ms after its `verify`, so that view's
-  finality is ≤ 7.76 ms from block start instead of 7.01. Only a client causes an exclusion, and
+  makes each of them sign late, ≤ `PQ_SIGN_MAX_US` = 0.40 ms after its `verify`, so that view's finality is ≤ 7.41 ms from block start instead of 7.01. Only a client causes an exclusion, and
   its first one closes the session and seizes its bond (§5.9): **a client forces late signatures
   only at the price of one bonded session** (≥ `CHN_SESSION_BOND_MIN`), for the views up to its
   suspension (§5.8, ≤ 1 ms). The late signature is not in the 07 §6.6 one-fault sum: a client
-  exclusion in the same view as a member fault would reach 9.81 + 0.75 = 10.56 ms. [Likely]
+  exclusion in the same view as a member fault would reach 9.81 + 0.40 = 10.21 ms. [Likely]
 
 ### 5.8 TagFault and suspension
 

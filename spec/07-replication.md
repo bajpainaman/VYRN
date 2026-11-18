@@ -1575,11 +1575,13 @@ whose `parent_view` and `first_height` match the certificate that moved it there
 notarization or its nullification); the others are never sent. If none matches, because v's
 leader sent it a proposal other than the one the quorum notarized, it fixes again on the
 certified parent and signs late, ≤ `PQ_SIGN_MAX_US`: that leader is the one fault f, and the
-cost (6.96 + 0.75 = 7.71 ms at the maximum) is inside the one-fault total of §6.6. [Likely] If it holds no new header at that moment,
+cost (6.96 + 0.40 = 7.36 ms at the maximum) is inside the one-fault total of §6.6. [Likely] If it holds no new header at that moment,
 it fixes when the first one arrives. The range is every contiguous header after the parent's
 `last_height` that it holds at that moment with a valid Ed25519 part of `seq_sig`, up to 16. It
 sends every voter
-`RangeFix { epoch, view, parent_view, first_height, last_height, last_hash }`, signed with the
+`RangeFix { epoch, view, parent_view, first_height, last_height, last_hash, items_root }`
+(`items_root` is `[0; 32]` in BASE; in CHAIN it is the root of the item list the leader froze with the
+range, 09 §4.3, so the voters' pre-signature covers the whole `ChainHeader`), signed with the
 Ed25519 half of its vote key under context `"vyrn v1 rangefix"` (≤ 17 µs), and then runs
 `verify` on exactly that range. At send time (when it enters the view and its signature is done)
 it proposes the **longest prefix of the range that its `verify` has passed** (L1t): the whole range
@@ -1597,7 +1599,7 @@ after its `verify`; §6.5a gives that cost. Why not a clock rule such as "every 
 started": Simplex views have no start time that all voters agree on. `RangeFix` is not a vote: it
 is never counted, persisted or slashed, and a forged or lost one costs only one signature made
 late. Its Ed25519-only signature is therefore enough: a quantum attacker who forges `RangeFix`es
-every view only returns voters to signing after the proposal (+0.75 ms per view, outside the fault
+every view only returns voters to signing after the proposal (+0.40 ms per view, outside the fault
 model), and cannot stop finality. [Likely]
 
 ### 6.4 The vote rule (when a replica votes)
@@ -1686,35 +1688,46 @@ budget of §3.13 with the votes (2.5 KB each, 3 kinds, ~1 kHz, n − 1 peers ≈
 
 ### 6.5a Speculative vote signing (scheme 1)
 
-An ML-DSA-44 signature is ≤ 750 µs at `PQ_HEDGE` = 2 on a voter, nearly a metro hop. Signed after
+An ML-DSA-44 signature is ≤ 400 µs at `PQ_HEDGE` = 4 on a voter's four PQ cores (pending user ruling, 01 §14.20 PQ-15; ≤ 750 µs
+at 2), half a metro hop. Signed after
 the event that triggers each vote, three votes per view would add ~2.2 ms to finality. So a voter
 signs before it knows it will send:
 
 - **Notarize.** A voter signs the notarize of the range in the leader's `RangeFix` (§6.3) on its
-  two PQ cores (replica cores 0 and 63, §7.2), starting when the `RangeFix` arrives, in parallel
-  with its own `verify`. In BASE `excl_root` is zero. In CHAIN the voter signs with the
-  `excl_root` of empty exclusion lists for the range (01 §14.20 PQ-11, decided), the value of
+  four PQ cores (§7.2), starting when the `RangeFix` arrives and its finalize for the previous view is done, in parallel
+  with its own `verify`. In BASE `excl_root` is zero. In CHAIN the voter signs with the `items_root` of the `RangeFix` and the `excl_root` of empty exclusion lists
+  for the range (01 §14.20 PQ-11, decided), the value of
   every view in which no client misbehaves; every honest member computes the same root
   (`INV-CHN-EXCL`, 09 §17.4). It sends the vote when the proposal passes §6.4 and equals what it
   signed. If the proposal differs (a prefix, or exclusions), it signs the actual proposal late and
   sends that; it never rejects a proposal for differing from a `RangeFix`.
-- **The leader** signs its own notarize (its proposal) from the moment it fixes the range, in
-  parallel with its `verify`, in both modes; in CHAIN with the empty-exclusion `excl_root`. It
-  signs late, ≤ `PQ_SIGN_MAX_US` = 0.75 ms after its `verify`, only if that `verify` finds an
+- **The leader** signs its own notarize (its proposal) from the moment it fixes the range, in parallel with its `verify`, in both modes; in CHAIN with the empty-exclusion `excl_root` and the item
+  list it froze with the range (09 §4.3). It
+  signs late, ≤ `PQ_SIGN_MAX_US` = 0.40 ms after its `verify`, only if that `verify` finds an
   exclusion or the range is cut to a prefix (L1t, §6.3). Only a client can cause an exclusion, and
   its first one costs it its bonded session (09 §5.7). So the honest CHAIN path has no post-verify
   signature, and an honest CHAIN view no longer passes `t_l` at the maximum delays (PQ-11).
 - **No signature is made after the proposal in the fault-free case, in either mode.** At the
   maximum (§6.6) the next leader fixes its range when the previous proposal reaches it, and it
   cannot enter its view before the notarize hop that follows (≤ 0.85 ms); its proposal then takes
-  hop 2. The `RangeFix` reaches every voter ≤ 0.85 ms after the fix, so each notarize signature is
-  done ≤ 1.60 ms after the fix, and the proposal cannot arrive before 1.65 ms after it. The
-  leader's own signature is done ≤ 0.75 ms after the fix, before it can enter the view. Finalize
-  and nullify have content fixed when signing starts. A lost or forged `RangeFix` costs one voter signature
-  after the proposal, ≤ 0.75 ms, and counts as the one fault f. [Likely: from the 07 §6.6 budgets and
+  hop 2. The `RangeFix` reaches every voter ≤ 0.85 ms after the fix, after its finalize for view v is
+  done, so each notarize signature is done ≤ 1.25 ms after the fix, and the proposal cannot arrive
+  before 1.65 ms after it. The leader signs its finalize for v first and then its own notarize, so
+  that is done ≤ 0.80 ms after the fix, before it can enter the view (≤ 0.85 ms). Finalize
+  and nullify have content fixed when signing starts. A lost or forged `RangeFix` costs one voter signature after the proposal, ≤ 0.40 ms, and counts as the one fault f. [Likely: from the 07 §6.6 budgets and
   the measured `PQ_SIGN_MAX_US`; B-PQ-2 measures it]
 - **Finalize.** A voter starts the finalize signature when it sends its notarize, in parallel with
-  hop 3. It sends it only if Simplex would (a notarization seen and no nullify sent).
+  hop 3.
+- **One schedule for the PQ cores (pending user ruling, 01 §14.20 PQ-15).** Finalize for v and notarize for v + 1 (the next
+  leader's candidate) are wanted in the same hop. Each runs on all four PQ cores, finalize first,
+  ≤ 0.40 ms each, so both are done ≤ 0.80 ms after the finalize starts, inside the 0.85 ms
+  notarize hop. With two PQ cores (`PQ_HEDGE` = 2, ≤ 0.75 ms each) the pair takes 1.50 ms:
+  scratch model, no fault 9.16 ms, leader fault 11.11 ms, and half of honest views nullify at the
+  maximum. Fallback if four cores are refused: notarize first, finalize paused, 6.96 / 9.71 ms, but
+  10.41 ms with a crashed voter, past `FINALITY_MAX_MS`. Not allowed: counting a finalization on
+  its Ed25519 parts with the ML-DSA parts later. A hybrid signature is valid only if both parts
+  verify (01 §14.20 A, SG2), so a quantum attacker could forge such a finality. [Likely]
+- **Finalize, sending.** A voter sends its finalize only if Simplex would (a notarization seen and no nullify sent).
 - **Nullify** is signed when its timer starts, `t_l` before it can be sent. The next leader's
   notarize on the nullify path is fixed and signed `PQ_SIGN_MAX_US` before its `t_l` fires (L1′,
   §6.3), so a nullified view costs `t_l` + one hop and no signature after it.
@@ -1765,7 +1778,7 @@ links break it counts as the one fault f.
 | Vote signature checks | 0.03 (0.08 scheme 1) | 0.10 (0.15 scheme 1) | scheme 1: Ed25519 parts batched on core 4, ML-DSA parts at 35 µs each on a PQ core, in parallel |
 | **Total, no fault** | **2.59** (2.69 scheme 1) | **6.99** (6.96 scheme 1) | was 5.65 / 5.70 without the wait row and with the repair reserve inside the sum |
 | One fault: a nullified view | | +2.80 | `t_l` 2 ms + 1 hop; under scheme 1 the next leader's signature is done when the view nullifies (L1′) |
-| **Total, one fault (leader)** | | **9.79** (9.76 scheme 1) | ≤ `FINALITY_MAX_MS` = 10, margin 0.21 (0.24 scheme 1). Under scheme 1 a lost `RangeFix` (+0.75 → 7.71) is a smaller one fault |
+| **Total, one fault (leader)** | | **9.79** (9.76 scheme 1) | ≤ `FINALITY_MAX_MS` = 10, margin 0.21 (0.24 scheme 1). Under scheme 1 a lost `RangeFix` (+0.40 → 7.36) is a smaller one fault |
 | One fault: a data-box stall | | **pending ruling** | §5.7: 4.20 on top of the data lag gives 11.19 (11.65 scheme 1), over the bound; 01 §14.20 PQ-13 |
 | Reserve, outside the sums: one frame repair | 0.00 | 0.39 | cross-metro, ≤ 0.60 (§4.10); it runs in parallel with the data lag, and `verify` waits for the later, so the pair costs ≤ 0.71. Nothing above spends it: under scheme 1 the leader-fault case is 9.76 by the sums and 9.71 in the model, + 0.39 of reserve |
 | Sequencer fault | | ≤ 9.0 | the seal finalizes the tail ≤ 7.85 ms after the last frame (§9.7) |
@@ -1773,8 +1786,9 @@ links break it counts as the one fault f.
 The next-proposal row and the one-fault totals come from a scratch discrete-event model of the
 view pipeline (01 §14.20 PQ-10): 1 kHz headers, every delay at its 07 §6.6 maximum, the same with
 skewed and random delays, and one silent leader or one stalled data box every 37 views. Its worst
-cases are 6.99 / 9.78 ms (scheme 0) and 6.96 / 9.71 ms (scheme 1), and no honest view nullifies
-at the maximum delays. [Likely: a model of the budgets, not a run of the protocol; B-PQ-2
+cases are 6.99 / 9.78 ms (scheme 0) and 6.96 / 9.71 ms (scheme 1), 9.79 / 9.76 ms with one voter crashed for the whole run, and no honest
+view nullifies at the maximum delays. The scheme-1 figures assume four PQ cores per voter
+(§6.5a, pending 01 §14.20 PQ-15). [Likely: a model of the budgets, not a run of the protocol; B-PQ-2
 measures it]
 
 A fill at the end of its block sees ~3.1 ms typical, which is DESIGN §5's "~3 ms". In a single
@@ -1977,7 +1991,7 @@ either client. `vyrn-sim` checks this on every CI run with the Rust engine, `vyr
 | 6 | peer repair server, block server for the facility's archive node (§8.4, §12); on R3 also the recovery service's resend server (§8.5) |
 | 7 | storage writer (`io_uring`, `O_DIRECT`), snapshot serializer |
 | 8–49 | replay lanes 0–41, one to one with the live map; in CHAIN also the `tag_com` pass (§6.4 item 4) |
-| 50, 52–55, 63 | data RX from the 2 data ports, data index, full BLAKE3, mismatch checks. Under scheme 1 a voter moves core 63 to PQ core 2 and runs data RX on 5 cores (open question 13). After a promotion the standby no longer receives data frames, so 52–55 become the sequencer's PQ signing cores (01 §10) and 63 its listener's ML-DSA core |
+| 50, 52–55, 63 | data RX from the 2 data ports, data index, full BLAKE3, mismatch checks. Under scheme 1 a voter moves core 63 to PQ core 2 and runs data RX on 5 cores (open question 13). PQ cores 3 and 4 (pending user ruling, 01 §14.20 PQ-15) are cores of a larger voter box beyond this map, not data RX cores. After a promotion the standby no longer receives data frames, so 52–55 become the sequencer's PQ signing cores (01 §10) and 63 its listener's ML-DSA core |
 | 51 | OS, IRQs, housekeeping (06 `HK`, the one non-isolated core on every REF box) |
 | 56–62 | replay lanes 42–48, the pool, one to one with the live map; they apply `AcctTake` records in log order (§3.6) |
 
@@ -2770,8 +2784,8 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | B-REP-3 | Path skew between A and B | ≤ 2 µs |
 | B-REP-4 | Each stream core's load at the peak mix | ≤ 0.50 |
 | B-REP-5 | Sliced Ed25519 sign on core 4: CPU per signature, longest slice | ≤ 12 µs, ≤ 50 ns |
-| B-PQ-1 | Scheme 1 on `REF`: ML-DSA-44 sign with `PQ_HEDGE` = 4 on cores 52–55 and = 2 on a voter, 10⁹ signatures; verify per signature | max ≤ `PQ_SIGN_MAX_US` (400, 750 µs); verify ≤ `PQ_VERIFY_US`; ML-KEM-768 decapsulation ≤ 40 µs (01 §14.20 G) |
-| B-PQ-2 | Scheme 1 finality: B-REP-1 with hybrid keys and speculative signing (§6.5a); the frame gate (B-REP-13) and stream-core load (B-REP-4) re-run | BASE max ≤ 6.96 ms no fault, ≤ 9.76 ms with one nullified view and ≤ 7.71 ms with one `RangeFix` dropped; CHAIN ≤ 7.01 / 9.81 ms from block start; a forged `RangeFix` never makes a voter reject an honest proposal; the next-proposal wait (L1, L1′, L1t, §6.3) stays within §6.6's 1.65 ms row at the worst end-to-end case, and no honest leader in BASE or CHAIN misses `t_l` = 2 ms (PQ-10, PQ-11); B-REP-13 and B-REP-4 pass values unchanged |
+| B-PQ-1 | Scheme 1 on `REF`: ML-DSA-44 sign with `PQ_HEDGE` = 4 on cores 52–55 and = 4 on a voter's four PQ cores (pending user ruling, 01 §14.20 PQ-15), 10⁹ signatures; verify per signature | max ≤ `PQ_SIGN_MAX_US` (400 µs); verify ≤ `PQ_VERIFY_US`; ML-KEM-768 decapsulation ≤ 40 µs (01 §14.20 G) |
+| B-PQ-2 | Scheme 1 finality: B-REP-1 with hybrid keys and speculative signing (§6.5a); the frame gate (B-REP-13) and stream-core load (B-REP-4) re-run | BASE max ≤ 6.96 ms no fault, ≤ 9.76 ms with one nullified view and ≤ 7.36 ms with one `RangeFix` dropped; CHAIN ≤ 7.01 / 9.81 ms from block start; a forged `RangeFix` never makes a voter reject an honest proposal; the next-proposal wait (L1, L1′, L1t, §6.3) stays within §6.6's 1.65 ms row at the worst end-to-end case, and no honest leader in BASE or CHAIN misses `t_l` = 2 ms (PQ-10, PQ-11); each voter signs finalize(v) then notarize(v + 1) on its four PQ cores, ≤ 9.76 ms with one voter crashed (PQ-15); CHAIN blocks carry items and still meet the bounds (09 §4.3 item freeze); B-REP-13 and B-REP-4 pass values unchanged |
 | B-PQ-3 | The switch at `E_pq` in `vyrn-sim`: scheme-0 votes and headers for epoch ≥ `E_pq` injected; forged scheme-0 `DoubleVote` evidence for epoch `E_pq − 1`, and a forged scheme-0 `CrossHomeVote` carrying a genuine hybrid-signed `NodeCert`, submitted after the switch with and without a pre-switch `EvidenceCommit`; a `SessionOpen`, `CommitteeKey` and p2p handshake for an epoch ≥ `E_pq` without their ML-KEM part; history before it replayed | every injected signature and every classical-only key agreement rejected (KG1); uncommitted classical evidence moves no bond and no jail, committed evidence slashes; replay from genesis bit for bit (01 §14.20 SG1–SG7) |
 | B-REP-6 | Sequencer core 50 BLAKE3 load | ≤ 0.60 |
 | B-REP-7 | Replay speed at peak and at average load | ≥ 1.5×, ≥ 10× |
@@ -2914,6 +2928,6 @@ Resolved by 01 and removed: `PacketRecord.flags` (§6.6: `SHED`, `ADVANCE`), INV
 | 10 | The archive's feed is ≤ 25 Gbps at sustained peak against ~180 Gbps of ingest, so a peak longer than the ≥ 6 h on-box window leaves an archive gap. Is a direct archive subscription to frames and data needed? | 06 / 07 | B-REP-9 at sustained peak for 8 h |
 | 11 | Replay order of a pooled account across pool lanes: does `AcctTake.ver` alone order every cross-lane dependency, including fills settled on the account while another pool core holds its token? | 05 | T-REP-1 with pooled accounts; B4 |
 | 12 | Do both ports of an X2542, each with its own CTPIO writer, keep the wire lead of B-REP-2W, and does a spanning step stay ≤ 142 ns? | 06 | B-REP-2W, B-REP-13 |
-| 13 | Under scheme 1 (01 §14.20), does data RX on 5 cores (50, 52–55) keep up with 155 Gbps of data frames at peak, now that core 63 signs votes? If not, voters need a larger box or `PQ_HEDGE` = 1 with the 1.35 ms tail budgeted. | 06 | B-REP-9 data mix plus B-PQ-1 on one voter |
+| 13 | Under scheme 1 (01 §14.20), does data RX on 5 cores (50, 52–55) keep up with 155 Gbps of data frames at peak, now that core 63 signs votes? If not, voters need a larger box or `PQ_HEDGE` = 1 with the 1.35 ms tail budgeted. The two further PQ cores of 01 §14.20 PQ-15 are not taken from data RX: they come from a larger voter box, so this question is about core 63 only. | 06 | B-REP-9 data mix plus B-PQ-1 on one voter |
 
 Resolved and removed: 14 (a seal `REP_FinalityCert` carries its `REP_SealExt` after the entries; §6.5, §9.4).
