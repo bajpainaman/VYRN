@@ -903,15 +903,19 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
 
     /// 05 §6.8: `Reject BUSY` per message in one packet, a `SHED` record, `pkt_seq` unchanged.
     /// The packet keeps its LaneSeqs and its `pkt_hash` in the record, so a resend of the same
-    /// `pkt_seq` takes new ones. Each `BUSY` has `client_tag` 0 (04 §6, 05 §18 Q17): the
-    /// response depends on the record alone, so replay needs no payload and `data_root` leaves
-    /// the record out (07 §6.1). No byte of the packet is read past its header.
+    /// `pkt_seq` takes new ones. Each `BUSY` has detail = the session's `expected` and
+    /// `client_tag` 0 (04 §3.5, 05 §18 Q17): the response depends on the record and session
+    /// state alone, so replay needs no payload and `data_root` leaves the record out (07 §6.1).
+    /// No byte of the packet is read past its header.
     fn answer_busy(&mut self, si: u16, pkt_seq: u32, count: u8, p: RxIn<'_>) {
         let Some(s) = self.sess.get_mut(si) else {
             return;
         };
         let rs = s.next_resp;
         s.next_resp = s.next_resp.wrapping_add(1);
+        // detail = `expected` (≥ 1, 04 §3.5): it tells a lane shed from a BBO shed (detail 0),
+        // and every `pkt_seq` below it was accepted. Replay reads it from session state.
+        let expected = s.expected;
         let first = LaneSeq(self.seq.0.saturating_add(1));
         self.seq = LaneSeq(self.seq.0.saturating_add(u64::from(count)));
         let mut r = RespPkt::new(s.id, rs, pkt_seq, Gate::Packet(first));
@@ -919,7 +923,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             r.push(Record::Reject {
                 index: ix,
                 reason: RejectReason::Busy,
-                detail: 0,
+                detail: expected,
                 client_tag: 0,
             });
         }

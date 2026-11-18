@@ -125,14 +125,14 @@ V = [
                            cancel_ack(0, 0xFFFFFFFF, 2, 0x77777777)]), False),
     ("V16 req A: New buy IOC 2 @ 100000 (arrives in overload)",
      request(A, 6, E, B, [new(of(0, tif=1), 100_000, 2, 0x88888888)]), True),
-    ("V17 resp A: lane shed of V16, in-stream Reject BUSY at index 0, detail 0, client_tag 0",
-     response(A, 7, E, 6, [reject(0, 24, 0, 0)]), False),
+    ("V17 resp A: lane shed of V16, in-stream Reject BUSY at index 0, detail = expected 6, client_tag 0",
+     response(A, 7, E, 6, [reject(0, 24, 6, 0)]), False),
     ("V18 req A: resend of V16, same pkt_seq and content, bit0 = 1",
      request(A, 6, E, B, [new(of(0, tif=1), 100_000, 2, 0x88888888)], flags=1), True),
     ("V19 req A: New sell Day 1 @ 100005 + Heartbeat (arrives in overload)",
      request(A, 7, E, B, [new(of(1), 100_005, 1, 0x99999999), heartbeat()]), True),
-    ("V20 resp A: lane shed of V19, BUSY run: one Reject BUSY per message, client_tag 0",
-     response(A, 9, E, 7, [reject(0, 24, 0, 0), reject(1, 24, 0, 0)]), False),
+    ("V20 resp A: lane shed of V19, BUSY run: one Reject BUSY per message, detail = expected 7",
+     response(A, 9, E, 7, [reject(0, 24, 7, 0), reject(1, 24, 7, 0)]), False),
 ]
 for name, pkt, req in V:
     dump(name, pkt, req)
@@ -146,14 +146,14 @@ for what, ok in [("V1 verifies with K_SEQ", verify_request(v1, K_SEQ)),
                  ("V10 tag_com = SipHash(K_COM, bytes 0..32)",
                   struct.unpack_from("<Q", v10, 40)[0] == siphash24(K_COM, v10[:32])),
                  ("V13 tag differs from V2 tag", V[12][1][-8:] != V[1][1][-8:]),
-                 ("V17 is in stream (resp_seq 7), echo_pkt 6, Reject BUSY 24 at index 0, detail 0, tag 0",
+                 ("V17 is in stream (resp_seq 7), echo_pkt 6, Reject BUSY 24 at index 0, detail 6 >= 1, tag 0",
                   struct.unpack_from("<I", V[16][1], 4)[0] == 7 and V[16][1][16:18] == b"\x83\x00"
-                  and struct.unpack_from("<HII", V[16][1], 18) == (24, 0, 0)
+                  and struct.unpack_from("<HII", V[16][1], 18) == (24, 6, 0)
                   and struct.unpack_from("<I", V[16][1], 12)[0] == 6),
-                 ("V20 answers every message of V19 (count 2, Heartbeat included) with BUSY, tag 0",
+                 ("V20 answers every message of V19 (count 2, Heartbeat included) with BUSY, detail 7, tag 0",
                   V[19][1][8] == V[18][1][8] == 2 and struct.unpack_from("<I", V[19][1], 12)[0] == 7
                   and all(V[19][1][16 + 16 * i:18 + 16 * i] == bytes([0x83, i])
-                          and struct.unpack_from("<HII", V[19][1], 18 + 16 * i) == (24, 0, 0)
+                          and struct.unpack_from("<HII", V[19][1], 18 + 16 * i) == (24, 7, 0)
                           for i in range(2))),
                  ("V18 has V16's logical content (D3) and verifies", V[17][1][16:32] == V[15][1][16:32]
                   and V[17][1][:9] == V[15][1][:9] and verify_request(V[17][1], K_SEQ))]:

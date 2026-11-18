@@ -125,11 +125,12 @@ fn built() -> Vec<(&'static str, Pkt)> {
         tick: Tick(100_000),
         client_tag: 0x1111_1111,
     };
-    // A lane-shed BUSY (04 §3.5): in stream, at the message's index, detail 0, client_tag 0.
-    let busy = |index| Record::Reject {
+    // A lane-shed BUSY (04 §3.5): in stream, at the message's index, detail = the session's
+    // `expected` (≥ 1; a BBO shed has 0), client_tag 0.
+    let busy = |index, expected| Record::Reject {
         index,
         reason: RejectReason::Busy,
-        detail: 0,
+        detail: expected,
         client_tag: 0,
     };
     let ioc_buy = Msg::New {
@@ -371,7 +372,7 @@ fn built() -> Vec<(&'static str, Pkt)> {
             ),
         ),
         ("V16", r(vec![ioc_buy], a, 6, None, false)),
-        ("V17", p(vec![busy(0)], a, 7, 6, false)),
+        ("V17", p(vec![busy(0, 6)], a, 7, 6, false)),
         ("V18", r(vec![ioc_buy], a, 6, None, true)),
         (
             "V19",
@@ -391,7 +392,7 @@ fn built() -> Vec<(&'static str, Pkt)> {
                 false,
             ),
         ),
-        ("V20", p(vec![busy(0), busy(1)], a, 9, 7, false)),
+        ("V20", p(vec![busy(0, 7), busy(1, 7)], a, 9, 7, false)),
     ]
 }
 
