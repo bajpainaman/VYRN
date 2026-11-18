@@ -26,7 +26,7 @@
 //! | name | passes when |
 //! |---|---|
 //! | `seq` | the box exits 0, `records` equals the packets sent, `seal_violations=0`, at least 2 blocks |
-//! | `validators` | each validator reports heights `0..=H` contiguous with the box's `first_step`/`last_step`, every verdict `Valid`, no `FAULT` |
+//! | `validators` | each validator reports heights `0..=H` contiguous with the box's `first_step`/`last_step`, every verdict `Valid`, no `FAULT` (R5 for `REP_E_HASHLAG`); at least one covers every height |
 //! | `replay` | the tap's `OrderCore` readies the same blocks, holding every packet sent exactly once, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box |
 //! | `replica-out` | each validator that prints `out=<hex>` on its `BLOCK` lines matches the tap's output hash per block; SKIP while no validator replays |
 //! | `finality` | with `--finality`: each validator prints `FINAL height=<h>` up to `H`; SKIP without it |
@@ -44,14 +44,20 @@
 //! - R3. Until `vyrn-data` runs and `vyrn-validator` feeds `vyrn_replica::DataFeed` from it, the tap's `DataJoin` gets copy 2
 //!   of each packet from the client in process, standing in for 07 §5.1.
 //! - R4. `FINAL height=<h>` is this harness's guess at a validator's finality line.
+//! - R5. `REP_E_HASHLAG` (07 §3.7 INV-REP-8) is a 1 ms real-time bound that the validator
+//!   measures with user-space receive times and that 07 §7.2 budgets for pinned cores. On an
+//!   unpinned DEV machine one preemption between an ORDER frame and its HASH frame trips it, so
+//!   by default a validator that stops at it is a `WARN`: its blocks before the fault must still
+//!   be the box's, and at least one validator must cover every height. Any other fault fails.
+//!   `--strict-hashlag` fails it as well.
 //!
 //! **Known gap.** `vyrn-seq` does not frame `RouteRecord`s yet (its `Rec::Route` arm drops
 //! them), so on `wl-smoke.toml`, whose crosses make lanes write some, replay diverges with
 //! `Step(Kind)` after a cross. `wl-smoke-nocross.toml` keeps clear of them and gates CI.
 //!
-//! **Build.** Run release binaries: a debug `vyrn-validator` can spend more than
-//! `REP_HASHLAG_MAX_NS` (1 ms) on one ORDER frame before it reads the HASH frame behind it, and
-//! raises `REP_E_HASHLAG`.
+//! **Build.** Run release binaries: a debug `vyrn-validator` spends more than
+//! `REP_HASHLAG_MAX_NS` (1 ms) on ORDER frames often enough to raise `REP_E_HASHLAG` in most
+//! runs (R5).
 //!
 //! DEV timings on shared machines are not latency results; the harness prints none.
 #![forbid(unsafe_code)]
@@ -118,6 +124,9 @@ struct Cli {
     /// Require finality lines from every validator (R4).
     #[arg(long)]
     finality: bool,
+    /// Fail a validator's REP_E_HASHLAG too (pinned rigs); by default it is a WARN (R5).
+    #[arg(long)]
+    strict_hashlag: bool,
     /// Route payloads through a vyrn-data node.
     #[arg(long)]
     data: bool,
@@ -780,14 +789,29 @@ fn run(cli: &Cli) -> Result<bool, String> {
         if let Err(e) = &reached {
             errs.push(e.clone());
         }
+        let mut full = 0usize;
+        let mut warns = Vec::new();
         for (&i, ok) in vals.iter().zip(&val_ok) {
             let Some(n) = nodes.0.get(i) else { continue };
             let bs = blocks(n);
             let ids: Vec<_> = bs.iter().map(|b| b.0).collect();
-            if let Some(f) = n.lines.iter().find(|l| l.starts_with("FAULT")) {
-                errs.push(format!("{}: {f}", n.name));
+            let fault = n.lines.iter().find(|l| l.starts_with("FAULT"));
+            // R5: on an unpinned DEV machine REP_E_HASHLAG is a scheduling alarm. The blocks
+            // before it must still be the box's, in order.
+            let lag = fault.is_some_and(|f| f.starts_with("FAULT REP_E_HASHLAG "));
+            match fault {
+                Some(f) if lag && !cli.strict_hashlag => warns.push(format!("{}: {f}", n.name)),
+                Some(f) => errs.push(format!("{}: {f}", n.name)),
+                None => {}
             }
-            if ids != seq_blocks {
+            let want = if lag && !cli.strict_hashlag {
+                seq_blocks.get(..ids.len()).unwrap_or(&seq_blocks)
+            } else {
+                &seq_blocks[..]
+            };
+            if ids == seq_blocks {
+                full += 1;
+            } else if ids != want {
                 errs.push(format!(
                     "{}: {} blocks, the box {}; first differs at {:?}",
                     n.name,
@@ -803,11 +827,18 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 errs.push(format!("{}: did not stop cleanly", n.name));
             }
         }
+        if full == 0 {
+            errs.push("no validator reached the last block".into());
+        }
+        for w in &warns {
+            println!("WARN {w} (R5: a 1 ms bound on an unpinned DEV machine; --strict-hashlag fails it)");
+        }
         if errs.is_empty() {
             Ok(format!(
-                "{} validators, heights 0..={}, all Valid",
+                "{full} of {} validators through heights 0..={}, {} stopped at REP_E_HASHLAG, all Valid",
                 vals.len(),
-                top.unwrap_or(0)
+                top.unwrap_or(0),
+                warns.len()
             ))
         } else {
             Err(errs.join("; "))
