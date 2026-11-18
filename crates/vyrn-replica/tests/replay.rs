@@ -165,7 +165,10 @@ fn live07_on(script: &[Act], pool: bool) -> (Journal, Store) {
                 e.poll_lanes(&mut j).unwrap();
             }
             Act::Run => assert!(e.run(&NeverLate, &mut j, 64).unwrap(), "no quiescence"),
-            Act::Cmd(c) => assert!(e.command(c), "control ring full"),
+            Act::Cmd(c) => {
+                assert!(e.command(c), "control ring full");
+                j.cmds.push(*c);
+            }
         }
     }
     (j, store)
@@ -205,6 +208,8 @@ fn frames_on(layout: Layout, j: &Journal, store: &Store, cuts: &[usize]) -> Vec<
     let mut out = Vec::new();
     let mut cut = vec![LaneSeq(0); N];
     let mut pending = false;
+    // Each Control step carries the command the control role queued for it (07 §3.8).
+    let mut cmds = j.cmds.iter();
     for (i, r) in j.recs.iter().enumerate() {
         match r {
             OwnedRec::Packet(p) => {
@@ -227,6 +232,10 @@ fn frames_on(layout: Layout, j: &Journal, store: &Store, cuts: &[usize]) -> Vec<
                 if kind == StepKind::Rescan {
                     payload.extend_from_slice(&e.band_lo.0.to_le_bytes());
                     payload.extend_from_slice(&e.band_hi.0.to_le_bytes());
+                }
+                if kind == StepKind::Control {
+                    let c = cmds.next().expect("a Control step without a command");
+                    payload.extend_from_slice(&vyrn_engine::control_payload(c).unwrap());
                 }
                 let src = (e.src_lane_seq.0 != 0).then_some((e.src_lane, e.src_lane_seq));
                 let flags = if src.is_some() && e.flags & vyrn_bbo::STEP_CROSS != 0 {
@@ -1094,6 +1103,126 @@ fn assert_vx_matches(script: &[Act], splits: impl IntoIterator<Item = usize>) {
         let h: Vec<Hash> = vx.iter().map(|x| x.2).collect();
         assert_eq!(h, rust_hashes, "split after {at}");
     }
+}
+
+/// Control steps (07 §3.8, §6.8): a halt and resume, then an auction phase with a resting
+/// Day order, an IOC that ends `OUT_AUCTION`, a post-only and an auction-only order, and a return
+/// to Continuous whose exact bounds reprice the band.
+/// `auction_best`: the auction-only buy rests at 104 above a Day bid at 100, so after the
+/// resume it would be the best bid if it were live (05 §5.1: it is not), and a sell at 102 trades
+/// with nothing. Otherwise the post-resume sell at 300 enters in a Rescan step (the envelope over
+/// the auction's versions is suspect).
+fn control_script(auction_best: bool) -> Vec<Act> {
+    let (auc_t, day_t, sell_t) = if auction_best {
+        (104, 100, 102)
+    } else {
+        (101, 104, 300)
+    };
+    use Side::{Buy, Sell};
+    use Tif::{Day, Ioc};
+    use vyrn_bbo::{ControlCmd, Phase};
+    let phase = |phase| {
+        Act::Cmd(ControlCmd::Phase {
+            phase,
+            lo: vyrn_types::Tick(0),
+            hi: vyrn_types::Tick(0),
+        })
+    };
+    let p = |l, a, t: u64, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs,
+    };
+    let mut post = new(Sell, Day, 120, 1, 6);
+    if let vyrn_wire::Msg::New { flags, .. } = &mut post {
+        flags.post_only = true;
+    }
+    let auc = new(Buy, Tif::AuctionOnly, auc_t, 1, 7);
+    vec![
+        p(0, 1, 1_000, vec![new(Sell, Day, 105, 2, 1)]),
+        Act::Run,
+        phase(Phase::Halted),
+        Act::Run,
+        p(1, 1, 2_000, vec![new(Buy, Day, 105, 1, 2)]),
+        Act::Run,
+        phase(Phase::Continuous),
+        Act::Run,
+        p(1, 1, 3_000, vec![new(Buy, Day, 105, 1, 3)]),
+        Act::Run,
+        phase(Phase::Auction),
+        Act::Run,
+        p(
+            2,
+            1,
+            4_000,
+            vec![new(Buy, Day, day_t, 1, 4), new(Buy, Ioc, 110, 1, 5)],
+        ),
+        Act::Run,
+        p(1, 2, 5_000, vec![post, auc]),
+        Act::Run,
+        // In the auction the snapshot shows an empty book, so no band binds: a buy at 250 rests
+        // (against the Continuous ask 105 its edge would be 210, 10 §3.5). Canceled before the
+        // auction ends, so nothing crosses.
+        p(2, 1, 5_500, vec![new(Buy, Day, 250, 1, 9)]),
+        Act::Run,
+        p(2, 1, 5_600, vec![cancel(Handle::new(2, 1).unwrap(), 10)]),
+        Act::Run,
+        Act::Poll,
+        phase(Phase::Continuous),
+        Act::Run,
+        p(0, 2, 6_000, vec![new(Sell, Day, sell_t, 1, 8)]),
+        Act::Run,
+        Act::Poll,
+        Act::Run,
+    ]
+}
+
+#[test]
+fn the_vx_client_replays_control_steps() {
+    for auction_best in [false, true] {
+        let (j, _) = live07(&control_script(auction_best));
+        assert_vx_matches(&control_script(auction_best), 0..j.recs.len() - 1);
+    }
+    let (live_j, store, blocks) = blocks_of(&control_script(false), &[]);
+    let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let reasons: Vec<_> = live_j
+        .resp
+        .iter()
+        .flat_map(|(_, p)| p.records())
+        .filter_map(|r| match r {
+            vyrn_bbo::Record::Reject { reason, .. } => Some(*reason),
+            _ => None,
+        })
+        .collect();
+    use vyrn_types::RejectReason::{AuctionPhase, BookHalted};
+    assert!(
+        !reasons.contains(&vyrn_types::RejectReason::BadTick),
+        "{reasons:?}"
+    );
+    // The buy inside the halt; the IOC and the post-only in the auction (04 §6.9).
+    assert_eq!(
+        (
+            reasons.iter().filter(|r| **r == BookHalted).count(),
+            reasons.iter().filter(|r| **r == AuctionPhase).count()
+        ),
+        (1, 2),
+        "{reasons:?}"
+    );
+    // 07 §3.8: an empty Rescan band is all ticks; both engines replay it as such.
+    let Some(lib) = vx_lib() else { return };
+    let mut all = blocks;
+    let r = all[0]
+        .steps
+        .iter_mut()
+        .find(|m| m.rec.kind == StepKind::Rescan)
+        .unwrap();
+    r.payload.clear();
+    let (_, rust_hashes) = replay(&live_j, &store, &all).unwrap();
+    let vx = vx_replay(&store, &all, &lib).unwrap();
+    assert_eq!(vec![vx[0].2], rust_hashes);
 }
 
 /// `snap_lag` (05 §6.5, 07 §7.1) on the Vx client: each packet is classified against the

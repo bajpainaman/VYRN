@@ -18,7 +18,7 @@
 // Every C struct and ring slot is read and written by byte offset (as in the oracle), so the ABI
 // never depends on how vxc lays out a struct. Anything outside the supported subset of v1 stops
 // with PBV_E_UNSUPPORTED rather than guess: Replace, CancelAll, STP that would trigger,
-// in-packet dependencies, Rescan, Control, Seal, Uncross (pbv.h lists the subset).
+// in-packet dependencies, Rescan, Seal, Uncross (pbv.h lists the subset).
 
 import core::ptr;
 import core::num;
@@ -36,7 +36,7 @@ extern "C" {
 // ---- constants ---------------------------------------------------------------------------
 // VX-WORKAROUND W-12 (issue to file): no hex integer literals, so every constant is decimal.
 
-const ABI_VERSION : u64 = 3;
+const ABI_VERSION : u64 = 4;
 const U32_MAX : u64 = 4294967295;
 const U64_MAX : u64 = 18446744073709551615;
 const NS_PER_S : u64 = 1000000000;
@@ -91,6 +91,13 @@ const K_IMPROVE : u64 = 2;
 const K_DEPLETION : u64 = 4;
 const K_IDLE : u64 = 5;
 const K_SHED : u64 = 6;
+const K_RESCAN : u64 = 3;
+const K_CONTROL : u64 = 7;
+const K_SEAL : u64 = 8;
+const K_UNCROSS : u64 = 9;
+// A step slot's payload (07 §3.8): its length at byte 12, its bytes from byte 544.
+const STEP_PLEN : i64 = 12;
+const STEP_PAYLOAD : i64 = 544;
 
 // Reject reasons (01 §6.5).
 const BAD_MAC : u64 = 1;
@@ -126,6 +133,12 @@ const D_LANE_FULL : u64 = 5;
 const CREDIT_QUOTE : u64 = 1;
 const CREDIT_BASE : u64 = 2;
 const PHASE_CONTINUOUS : u64 = 1;
+const PHASE_AUCTION : u64 = 2;
+// 05 Phase codes (Control payloads, Phase events).
+const PH_CONT : u64 = 0;
+const PH_AUCTION : u64 = 1;
+const PH_HALTED : u64 = 2;
+const PH_FROZEN : u64 = 3;
 
 // Buckets (04 §9.1, 10 §3.8): ids are RATE_LIMIT details.
 const BK_PKT : u64 = 1;
@@ -149,6 +162,8 @@ const INDEX_NONE : u64 = 255;
 const LIQ_MAKER : u64 = 0;
 const LIQ_TAKER : u64 = 1;
 const OUT_IOC_REST : u64 = 1;
+const OUT_AUCTION : u64 = 3;
+const RESTED_DONE : u64 = 0;
 const ROLE_TAKER : u64 = 0;
 const ROLE_MAKER : u64 = 2;
 
@@ -157,6 +172,8 @@ const EV_FILL : u64 = 1;
 const EV_RESTED : u64 = 2;
 const EV_OUT : u64 = 3;
 const EV_REJECT : u64 = 4;
+const EV_PHASE : u64 = 5;
+const EV_BAND : u64 = 6;
 
 // Op log kinds.
 const OP_NOP : u64 = 0;
@@ -260,6 +277,8 @@ struct Lane {
   tails : *mut u64, segs_used : *mut u64, segs_base : *mut u64, next_seg : u64,
   ev_tail : u64, fwd_head : u64, rec_at : u64, snap_ver : u64,
   snap_base : u64, pkt_bid : u64, pkt_ask : u64,
+  // The lane order view of the phase (05 §2.5): the last Phase event applied.
+  phase : u64,
 }
 
 struct Bbo {
@@ -274,6 +293,9 @@ struct Bbo {
   bb : u64, ba : u64, ver : u64, lp_b : u64, lp_a : u64,
   vh_ver : *mut u64, vh_b : *mut u64, vh_a : *mut u64, lowver : *mut u64,
   rapp : *mut u64, rver : *mut u64,
+  // The book phase (05 §8.8), the last published one, and each version's "not Continuous"
+  // flag (an envelope over a flagged version is suspect, as in Bbo::envelope).
+  phase : u64, lp_ph : u64, vh_f : *mut u64,
 }
 
 struct Ctx {
@@ -627,8 +649,15 @@ fn check_new(c : *mut Ctx, ln : *mut Lane, si : i64, side : u64, tif : u64, post
     let id = take_pair(ln, now, (*s).g + 1i64, BK_MSG, (*ac).g + 1i64, BK_MSG_A, 1u64, true);
     if id != 0u64 { *detail = id; return RATE_LIMIT; }
     if (*ac).state != 0u64 { *detail = 0u64; return ACCOUNT_KILLED; }
-    // Halt: no Control steps in the supported subset, so the phase is Continuous throughout.
-    if tif == 3u64 { *detail = PHASE_CONTINUOUS; return AUCTION_PHASE; }
+    // M5 and 04 §6.9 in the lane order view (vyrn-lane risk_snap): halted, else Continuous or
+    // (any other phase) Auction.
+    if (*ln).phase == PH_HALTED { *detail = 0u64; return BOOK_HALTED; }
+    if (*ln).phase == PH_CONT {
+      if tif == 3u64 { *detail = PHASE_CONTINUOUS; return AUCTION_PHASE; }
+    } else if (tif != 0u64 && tif != 3u64) || post != 0u64 {
+      *detail = PHASE_AUCTION;
+      return AUCTION_PHASE;
+    } else { }
     let gn = gc(ln, (*ac).g + 3i64);
     let tn = gnext(gn, now, 1u64, 0u64);
     if tn == U64_MAX { *detail = BK_NEW; return RATE_LIMIT; }
@@ -1354,6 +1383,8 @@ fn pass1(c : *mut Ctx, l : i64, ix : u64, m : *mut i8, op : *mut Op, detail : *m
   let ln = lane(c, l);
   unsafe {
     let typ = rd8(m, 0i64);
+    // 05 §2.5 P4: a frozen book takes no book op.
+    if (*ln).phase == PH_FROZEN { *detail = 0u64; return AUCTION_PHASE; }
     let ts = (*ln).cur_ts;
     let si = (*ln).cur_sess;
     let s = sess(ln, si);
@@ -1605,6 +1636,9 @@ fn boundary(c : *mut Ctx, l : i64, f : u64, pass : u64, next : u64) -> void {
 fn apply_event(c : *mut Ctx, l : i64, ev : *mut Ev) -> void {
   let ln = lane(c, l);
   unsafe {
+    // A Phase event moves the lane's phase; a Band event names no order (vyrn-lane B1).
+    if (*ev).kind == EV_PHASE { (*ln).phase = (*ev).cause; return; }
+    if (*ev).kind == EV_BAND { return; }
     let v = (*ev).vslot;
     if v == 0u64 || v >= (*ln).next_slot { fail_lane(ln, E_FAULT); return; }
     let sp = slot(ln, v);
@@ -1902,6 +1936,14 @@ fn key_lt(c : *mut Ctx, la : u64, ra : u64, lb : u64, rb : u64) -> bool {
   }
 }
 
+// 05 §5.1 `live` for a maker or a bound: an auction-only order is live only in an uncross
+// (Bbo::ctx sets `auction: false` elsewhere), so it rests unseen in Continuous and auction
+// steps. Its open quantity, for its own events, is still bopen.
+fn blive(c : *mut Ctx, l : u64, r : u64) -> u64 {
+  unsafe { if (((*bord(c, l, r)).flags >> 1u64) & 3u64) == 3u64 { return 0u64; } }
+  return bopen(c, l, r);
+}
+
 fn bopen(c : *mut Ctx, l : u64, r : u64) -> u64 {
   let o = bord(c, l, r);
   unsafe {
@@ -1948,7 +1990,7 @@ fn best_level(c : *mut Ctx, side : u64, limit : u64) -> u64 {
       let l = (*offset_mut((*b).book_l, i)) as u64;
       let r = (*offset_mut((*b).book_r, i)) as u64;
       let o = bord(c, l, r);
-      if (*o).side != side || bopen(c, l, r) == 0u64 { continue; }
+      if (*o).side != side || blive(c, l, r) == 0u64 { continue; }
       let t = (*o).tick;
       let ok = if side == 1u64 { t <= limit } else { t >= limit };
       if !ok { continue; }
@@ -1967,7 +2009,7 @@ fn next_maker(c : *mut Ctx, side : u64, tick : u64) -> i64 {
       let l = (*offset_mut((*b).book_l, i)) as u64;
       let r = (*offset_mut((*b).book_r, i)) as u64;
       let o = bord(c, l, r);
-      if (*o).side != side || (*o).tick != tick || bopen(c, l, r) == 0u64 { continue; }
+      if (*o).side != side || (*o).tick != tick || blive(c, l, r) == 0u64 { continue; }
       if bi == NONE {
         bi = i;
       } else {
@@ -2093,7 +2135,9 @@ fn envelope(c : *mut Ctx, lo : u64) -> (u64, u64) {
     let mut ma = NO_ASK;
     for v in lo..((*b).ver + 1u64) {
       let i = (v % HIST) as i64;
-      if *offset_mut((*b).vh_ver, i) != v { return ((*c).tick_max, 0u64); }
+      if *offset_mut((*b).vh_ver, i) != v || *offset_mut((*b).vh_f, i) != 0u64 {
+        return ((*c).tick_max, 0u64);
+      }
       mb = max(mb, *offset_mut((*b).vh_b, i));
       ma = min(ma, *offset_mut((*b).vh_a, i));
     }
@@ -2150,6 +2194,7 @@ fn rest_bound(c : *mut Ctx, side : u64, tick : u64) -> void {
 fn idle_bounds(c : *mut Ctx) -> void {
   unsafe {
     let b = (*c).bbo;
+    if (*b).phase != PH_CONT { return; }
     let t = (*b).bb;
     if t != NO_BID && t != NO_ASK && next_maker(c, 0u64, t) == NONE {
       (*b).bb = best_level(c, 0u64, 1u64);
@@ -2198,11 +2243,21 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
     let src_l = rd8(sp, 10i64);
     let cross = rd8(sp, 11i64);
     let src_q = rd64(sp, 16i64);
+    let plen = rd8(sp, STEP_PLEN);
+    let pay : *mut i8 = offset_mut(sp, STEP_PAYLOAD);
+    // 07 §3.8: only Rescan, Control, Seal and Uncross steps carry a payload.
+    if plen > 32u64 || (plen != 0u64 && kind != K_RESCAN && kind != K_CONTROL && kind != K_SEAL
+                         && kind != K_UNCROSS) {
+      fail_bbo(c, E_BAD_RECORD);
+      return;
+    }
     for l in 0i64..n {
       let cl = rd64(sp, 32i64 + 8i64 * l);
       if cl < *offset_mut((*b).cut, l) { fail_bbo(c, E_CUT); return; }
     }
-    band_env(c, sp);
+    // Live, a Continuous step other than Rescan passed the band test, which set (B, A) to the
+    // envelope (Bbo::replay_decide).
+    if (*b).phase == PH_CONT && kind != K_RESCAN { band_env(c, sp); } else { }
     // REP_MERGE: every op the cut covers is applied first.
     for l in 0i64..n {
       let cl = rd64(sp, 32i64 + 8i64 * l);
@@ -2232,6 +2287,20 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
       // A bounds observation; replay reads its kind from the record (05 §8.7).
       if has_src || (*b).has_cont != 0u64 { fail_bbo(c, E_KIND); return; }
       idle_bounds(c);
+    } else if kind == K_CONTROL {
+      if has_src || (*b).has_cont != 0u64 { fail_bbo(c, E_KIND); return; }
+      exec_control(c, pay, plen);
+    } else if kind == K_RESCAN {
+      if has_src || (*b).has_cont != 0u64 || (*b).phase != PH_CONT { fail_bbo(c, E_KIND); return; }
+      // An empty band is the arena's whole tick range (07 §3.8, as Engine::replay_wire reads it).
+      if plen == 0u64 {
+        exec_rescan(c, (*c).tick_min, (*c).tick_max);
+      } else if plen == 8u64 {
+        exec_rescan(c, rd32(pay, 0i64), rd32(pay, 4i64));
+      } else {
+        fail_bbo(c, E_BAD_RECORD);
+        return;
+      }
     } else {
       fail_bbo(c, E_UNSUPPORTED);
       return;
@@ -2268,20 +2337,26 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
     if has_src {
       *offset_mut((*b).lowver, src_l as i64) = (*lop(c, src_l as i64, src_q)).snap_ver;
     }
-    if (*b).bb != (*b).lp_b || (*b).ba != (*b).lp_a {
+    // Outside Continuous the snapshot shows an empty book (Bbo::finish).
+    let cont_ph = (*b).phase == PH_CONT;
+    let pb = if cont_ph { (*b).bb } else { NO_BID };
+    let pa = if cont_ph { (*b).ba } else { NO_ASK };
+    if pb != (*b).lp_b || pa != (*b).lp_a || (*b).phase != (*b).lp_ph {
       (*b).ver = (*b).ver + 1u64;
-      (*b).lp_b = (*b).bb;
-      (*b).lp_a = (*b).ba;
+      (*b).lp_b = pb;
+      (*b).lp_a = pa;
+      (*b).lp_ph = (*b).phase;
       let vi = ((*b).ver % HIST) as i64;
       *offset_mut((*b).vh_ver, vi) = (*b).ver;
-      *offset_mut((*b).vh_b, vi) = (*b).bb;
-      *offset_mut((*b).vh_a, vi) = (*b).ba;
+      *offset_mut((*b).vh_b, vi) = pb;
+      *offset_mut((*b).vh_a, vi) = pa;
+      *offset_mut((*b).vh_f, vi) = if cont_ph { 0u64 } else { 1u64 };
       // The lanes' copy (snap_lag lookups), tag last.
       let si = ((*b).ver % SNAP_HIST) as i64;
       let sp : *mut AtomicU64 = offset_mut((*c).sv_id, si);
       (*sp).store(U64_MAX, AtomicOrdering::Release);
-      *offset_mut((*c).sv_bid, si) = (*b).bb;
-      *offset_mut((*c).sv_ask, si) = (*b).ba;
+      *offset_mut((*c).sv_bid, si) = pb;
+      *offset_mut((*c).sv_ask, si) = pa;
       (*sp).store((*b).ver, AtomicOrdering::Release);
       sst(c, 2i64 * n, Y_SNAP_NOW, (*b).ver);
     }
@@ -2290,6 +2365,103 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
     (*b).next = s + 1u64;
     sst(c, 2i64 * n, 0i64, s);
     st(c, l_step_tail(n), 1i64, s);
+  }
+}
+
+// The best live level of `side` at or beyond `from` toward the far end (book::next_level from
+// `from`): the bids at or below it, the asks at or above it. 0 = none.
+fn level_from(c : *mut Ctx, side : u64, from : u64) -> u64 {
+  let mut best = 0u64;
+  unsafe {
+    let b = (*c).bbo;
+    for i in 0i64..(*b).n_book {
+      let l = (*offset_mut((*b).book_l, i)) as u64;
+      let r = (*offset_mut((*b).book_r, i)) as u64;
+      let o = bord(c, l, r);
+      if (*o).side != side || blive(c, l, r) == 0u64 { continue; }
+      let t = (*o).tick;
+      let ok = if side == 0u64 { t <= from } else { t >= from };
+      if !ok { continue; }
+      if best == 0u64 || (side == 1u64 && t < best) || (side == 0u64 && t > best) { best = t; }
+    }
+  }
+  return best;
+}
+
+// Bbo::exact_bounds at the cut, searching from (from_b, from_a).
+fn exact_bounds(c : *mut Ctx, from_b : u64, from_a : u64) -> void {
+  unsafe {
+    let b = (*c).bbo;
+    (*b).bb = level_from(c, 0u64, from_b);
+    let x = level_from(c, 1u64, from_a);
+    (*b).ba = if x == 0u64 { NO_ASK } else { x };
+  }
+}
+
+// Bbo::exec_rescan in replay (05 §8.6): the logged cut is taken as is. The batch taker is the
+// first in-band New of (prev, cut] in key order. v1 replays a Rescan whose taker trades with
+// nothing: one that would cross the book, or a cut with a Cancel or Reduce (which the taker's
+// key may still see), stops with PBV_E_UNSUPPORTED rather than guess.
+fn exec_rescan(c : *mut Ctx, lo : u64, hi : u64) -> void {
+  unsafe {
+    let b = (*c).bbo;
+    let mut sl = NONE;
+    let mut sq = 0u64;
+    for l in 0i64..(*c).n {
+      let pv = *offset_mut((*b).prev, l);
+      let cl = *offset_mut((*b).cut, l);
+      let mut found = false;
+      for q in (pv + 1u64)..(cl + 1u64) {
+        let e = lop(c, l, q);
+        let k = (*e).kind;
+        if k == OP_CANCEL || k == OP_REDUCE { fail_bbo(c, E_UNSUPPORTED); return; }
+        if found || k != OP_JOIN || (*e).tick < lo || (*e).tick > hi { continue; }
+        found = true;
+        if sl == NONE {
+          sl = l; sq = q;
+        } else {
+          let s = lop(c, sl, sq);
+          let before = (*e).ts < (*s).ts
+            || ((*e).ts == (*s).ts && rank(c, l as u64) < rank(c, sl as u64));
+          if before { sl = l; sq = q; } else { }
+        }
+      }
+    }
+    if sl != NONE {
+      let e = lop(c, sl, sq);
+      let r = (*e).root;
+      let o = bord(c, sl as u64, r);
+      if (*o).state != 1u64 { fail_bbo(c, E_UNSUPPORTED); return; }
+      if best_level(c, 1u64 - (*e).side, (*e).tick) != 0u64 { fail_bbo(c, E_UNSUPPORTED); return; }
+      // RESTED_DONE: the batch taker swept nothing and rests (spec follow-up F10).
+      let open = bopen(c, sl as u64, r);
+      if open > 0u64 {
+        event(c, sl as u64, EV_RESTED, LIQ_TAKER, RESTED_DONE, (*e).vslot, handle(r), (*e).tick, open);
+      } else { }
+    } else { }
+    exact_bounds(c, max((*b).bb, hi), min((*b).ba, lo));
+  }
+}
+
+// Bbo::exec_control for a Control step's command (07 §3.8 Control payload): a Phase event or a
+// Band event to every lane; a return to Continuous makes (B, A) exact at the cut.
+fn exec_control(c : *mut Ctx, p : *mut i8, plen : u64) -> void {
+  unsafe {
+    let b = (*c).bbo;
+    if plen != 10u64 { fail_bbo(c, E_BAD_RECORD); return; }
+    let code = rd8(p, 0i64);
+    let ph = rd8(p, 1i64);
+    let lo = rd32(p, 2i64);
+    let hi = rd32(p, 6i64);
+    if code == 1u64 && ph <= PH_FROZEN {
+      (*b).phase = ph;
+      for l in 0i64..(*c).n { event(c, l as u64, EV_PHASE, 0u64, ph, 0u64, 0u64, lo, hi); }
+      if ph == PH_CONT { exact_bounds(c, NO_ASK - 1u64, 1u64); } else { }
+    } else if code == 2u64 && ph == 0u64 {
+      for l in 0i64..(*c).n { event(c, l as u64, EV_BAND, 0u64, 0u64, 0u64, 0u64, lo, hi); }
+    } else {
+      fail_bbo(c, E_BAD_RECORD);
+    }
   }
 }
 
@@ -2340,7 +2512,28 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
     let src = tx_open(c, s, (*e).sess_id, rs, (*e).pkt_seq, l, ROLE_TAKER);
     let opp = 1u64 - (*e).side;
     let mut ended = false;
-    if !cont {
+    let ph = (*b).phase;
+    if !cont && ph == PH_HALTED {
+      end_taker(c, l, e, src, EV_REJECT, BOOK_HALTED, true, 0u64);
+      ended = true;
+    } else if !cont && ph == PH_FROZEN {
+      end_taker(c, l, e, src, EV_REJECT, AUCTION_PHASE, true, 0u64);
+      ended = true;
+    } else if !cont && ph == PH_AUCTION && (tif == 1u64 || tif == 2u64) {
+      end_taker(c, l, e, src, EV_OUT, OUT_AUCTION, false, 0u64);
+      ended = true;
+    } else if !cont && ph == PH_CONT && tif == 3u64 {
+      end_taker(c, l, e, src, EV_REJECT, AUCTION_PHASE, true, 0u64);
+      ended = true;
+    } else if !cont && ph == PH_AUCTION {
+      // An auction rests the taker without a sweep (Bbo::rest_taker).
+      let open = bopen(c, l, r);
+      book_add(c, l, r);
+      rest_bound(c, (*e).side, (*e).tick);
+      event(c, l, EV_RESTED, LIQ_TAKER, 0u64, (*e).vslot, h, (*e).tick, open);
+      tx_push(c, src, rec_lo(R_ACK, (*e).ix, 0u64, h), rec_hi((*e).tick, (*e).tag));
+      ended = true;
+    } else if !cont {
       // entry_checks (05 §2.5 P1, the post-only test and the FOK dry run).
       // The detail is the best opposite tick it would cross (04 §6), as Bbo::entry_checks.
       let post = ((*e).flags & 8u64) != 0u64;
@@ -2416,7 +2609,7 @@ fn fill_cand(c : *mut Ctx, e : *mut LOp, i : i64) -> bool {
     let ml = (*offset_mut((*b).book_l, i)) as u64;
     let mr = (*offset_mut((*b).book_r, i)) as u64;
     let o = bord(c, ml, mr);
-    if (*o).side != side || bopen(c, ml, mr) == 0u64 { return false; }
+    if (*o).side != side || blive(c, ml, mr) == 0u64 { return false; }
     return if side == 1u64 { (*o).tick <= (*e).tick } else { (*o).tick >= (*e).tick };
   }
 }
@@ -2729,10 +2922,11 @@ pub fn pbv_new(cfg : *const i8, accts : *const i8, n_accts : u32, sp : *const i8
     (*b).vh_ver = zalloc(8i64 * (HIST as i64));
     (*b).vh_b = zalloc(8i64 * (HIST as i64));
     (*b).vh_a = zalloc(8i64 * (HIST as i64));
+    (*b).vh_f = zalloc(8i64 * (HIST as i64));
     (*b).lowver = zalloc(8i64 * n);
     (*b).rapp = zalloc(8i64 * n);
     (*b).rver = zalloc(8i64 * n);
-    if is_null_mut((*b).vh_ver) || is_null_mut((*b).vh_b) || is_null_mut((*b).vh_a)
+    if is_null_mut((*b).vh_ver) || is_null_mut((*b).vh_b) || is_null_mut((*b).vh_a) || is_null_mut((*b).vh_f)
        || is_null_mut((*b).lowver) || is_null_mut((*b).rapp) || is_null_mut((*b).rver)
        || is_null_mut((*c).hist_ver) || is_null_mut((*c).sv_id) || is_null_mut((*c).sv_bid)
        || is_null_mut((*c).sv_ask) {
@@ -2815,6 +3009,7 @@ pub fn pbv_free(c : *mut Ctx) -> void {
     let v0 : *mut i8 = (*b).vh_ver; free(v0);
     let v1 : *mut i8 = (*b).vh_b; free(v1);
     let v2 : *mut i8 = (*b).vh_a; free(v2);
+    let v6 : *mut i8 = (*b).vh_f; free(v6);
     let v3 : *mut i8 = (*b).lowver; free(v3);
     let v4 : *mut i8 = (*b).rapp; free(v4);
     let v5 : *mut i8 = (*b).rver; free(v5);
