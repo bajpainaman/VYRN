@@ -19,6 +19,7 @@ vyrn-engine = { workspace = true }
 vyrn-log = { workspace = true }
 vyrn-replica = { workspace = true }
 vyrn-bench = { workspace = true }
+vyrn-epoch = { workspace = true }
 clap = { workspace = true }
 
 [lints]
