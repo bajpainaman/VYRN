@@ -4,33 +4,38 @@
 //!
 //! ```text
 //! off   size  field
-//!   0      1  0x00          leaf domain
-//!   1      4  account       AccountId, LE
-//!   5      2  n             books, LE
-//!   7  n×194  per book, ascending BookId: book u16 LE, then the account's own stream's four
+//!   0      4  account       AccountId, LE
+//!   4      2  n             books, LE
+//!   6  n×194  per book, ascending BookId: book u16 LE, then the account's own stream's four
 //!             DC_EOD records (ordinal 0–3, 48 B each, 10 §8.1) as sent
 //! ```
 //!
 //! so a client checks its leaf with the `DC_EOD` records it already holds, the last of which
-//! carries its canonical stream's hash (§8.3). The leaf hash is BLAKE3 of those bytes.
+//! carries its canonical stream's hash (§8.3). The leaf hash is
+//! BLAKE3(derive_key([`LEAF_CONTEXT`], leaf bytes)).
 //!
-//! **Tree.** A node is BLAKE3(`0x01` ‖ left ‖ right); a level with an odd count carries its
-//! last node up unchanged; the root of no leaves is BLAKE3 of the empty input. That root is
-//! `ACC_STMT_ROOT`. A [`Proof`] lists, from the leaf up, each sibling with its side.
+//! **Tree.** A node is BLAKE3(derive_key([`NODE_CONTEXT`], left ‖ right)), as the SMT's
+//! (09 §17.3); a level with an odd count carries its last node up unchanged; the root of no
+//! leaves is BLAKE3(derive_key([`NODE_CONTEXT`], empty)). That root is `ACC_STMT_ROOT`. A
+//! [`Proof`] lists, from the leaf up, each sibling with its side.
 //!
 //! Readings (10 §10, recorded there): the leaf carries only what the drop copy derives; the
 //! other §10 fields (allocations, rebates, `MUST_SPLIT`, next tier, class, lane move, router
-//! totals) are not built yet and take a later leaf domain. A master's aggregate stream is not a
-//! leaf: its accounts are.
+//! totals) are not built yet and take a new leaf context, `"vyrn v1 stmt leaf v2"`. A master's
+//! aggregate stream is not a leaf: its accounts are.
 
 use std::collections::BTreeMap;
 
+use vyrn_crypto::derive_key;
+use vyrn_crypto::hash::hash;
 use vyrn_types::{AccountId, BookId, Hash};
 
 use super::record::{DC_REC_BYTES, DcRecord, DcType};
 
-const LEAF: u8 = 0x00;
-const NODE: u8 = 0x01;
+/// The `derive_key` context of a leaf (09 §17.3).
+pub const LEAF_CONTEXT: &str = "vyrn v1 stmt leaf";
+/// The `derive_key` context of an inner node and of the empty tree's root (09 §17.3).
+pub const NODE_CONTEXT: &str = "vyrn v1 stmt node";
 
 /// One account's drop-copy section for one book: its own stream's `DC_EOD` records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,8 +75,7 @@ impl Statement {
     pub fn leaf_bytes(&self) -> Vec<u8> {
         let mut s = self.sections.clone();
         s.sort_unstable_by_key(|x| x.book.0);
-        let mut b = Vec::with_capacity(7 + s.len() * (2 + 4 * DC_REC_BYTES));
-        b.push(LEAF);
+        let mut b = Vec::with_capacity(6 + s.len() * (2 + 4 * DC_REC_BYTES));
         b.extend_from_slice(&self.account.0.to_le_bytes());
         b.extend_from_slice(&u16::try_from(s.len()).unwrap_or(u16::MAX).to_le_bytes());
         for x in &s {
@@ -84,7 +88,7 @@ impl Statement {
     }
 
     pub fn leaf_hash(&self) -> Hash {
-        Hash(*blake3::hash(&self.leaf_bytes()).as_bytes())
+        hash(&derive_key(LEAF_CONTEXT, &self.leaf_bytes()))
     }
 }
 
@@ -106,11 +110,10 @@ impl Proof {
 }
 
 fn node(l: Hash, r: Hash) -> Hash {
-    let mut b = [0u8; 65];
-    b[0] = NODE;
-    b[1..33].copy_from_slice(&l.0);
-    b[33..].copy_from_slice(&r.0);
-    Hash(*blake3::hash(&b).as_bytes())
+    let mut b = [0u8; 64];
+    b[..32].copy_from_slice(&l.0);
+    b[32..].copy_from_slice(&r.0);
+    hash(&derive_key(NODE_CONTEXT, &b))
 }
 
 /// The statement tree over every account's leaf, in `AccountId` order.
@@ -156,7 +159,7 @@ impl StmtTree {
     pub fn root(&self) -> Hash {
         match self.levels.last().and_then(|l| l.first()) {
             Some(h) => *h,
-            None => Hash(*blake3::hash(&[]).as_bytes()),
+            None => hash(&derive_key(NODE_CONTEXT, &[])),
         }
     }
 

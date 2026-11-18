@@ -2004,21 +2004,25 @@ and out, fills (count, base, quote), fees, rebates, message fees, the drop-copy 
 checks its statement with a Merkle path. The ledger credits fees and in-flight totals from it.
 
 **The drop copy's part of the statement** (`vyrn_md::dropcopy::statement`). The rules below are
-readings of this section and §8.3; each carries its label.
+readings of this section and §8.3, ruled or accepted as marked.
 
-1. **Leaf.** `0x00`, `AccountId` u32 LE, the number of books u16 LE, then per book in ascending
+1. **Leaf** (accepted). `AccountId` u32 LE, the number of books u16 LE, then per book in ascending
    `BookId`: the book u16 LE and the account's own stream's four `DC_EOD` records (ordinal 0–3,
-   48 B each, as sent, §8.4 item 6). The leaf hash is BLAKE3 of those bytes. So a client checks
-   its leaf with the `DC_EOD` records it already holds, the last of which is its stream hash
-   (§8.3). \[Likely\]
-2. **Tree.** A node is BLAKE3(`0x01` ‖ left ‖ right). A level with an odd count carries its last
-   node up unchanged, and the root of no leaves is BLAKE3 of the empty input. The root is
-   `ACC_STMT_ROOT`, and a path lists each sibling from the leaf up, with its side. \[Guessing\]
-3. **Masters.** A master's aggregate stream is not a leaf: its accounts, and its own orders'
-   stream, are. \[Likely\]
-4. **Fields not built yet.** The leaf carries only what the drop copy derives. Allocations,
-   rebates, `MUST_SPLIT`, next tier, class, lane move and router totals take a later leaf
-   domain once their inputs exist (open question 14). \[Guessing\]
+   48 B each, as sent, §8.4 item 6). The leaf hash is
+   BLAKE3(derive_key("vyrn v1 stmt leaf", leaf bytes)), so a client checks its leaf with the
+   `DC_EOD` records it already holds, the last of which is its stream hash (§8.3).
+2. **Tree** (ruled). Domains are separated with `derive_key`, as the SMT's (09 §17.3): a node is
+   BLAKE3(derive_key("vyrn v1 stmt node", left ‖ right)). A level with an odd count carries its
+   last node up unchanged, so no node is duplicated, and the root of no leaves is
+   BLAKE3(derive_key("vyrn v1 stmt node", empty input)). The root is `ACC_STMT_ROOT`, and a path
+   lists each sibling from the leaf up, with its side.
+3. **Masters** (accepted). A master's aggregate stream is not a leaf: its accounts, and its own
+   orders' stream, are.
+4. **Fields not built yet** (current scope). The leaf carries only what the drop copy derives.
+   Allocations, rebates, `MUST_SPLIT`, next tier, class, lane move and router totals wait for
+   open question 14; the leaf that carries them hashes under a new context,
+   `"vyrn v1 stmt leaf v2"`, not a version byte, so a v1 leaf and a v2 leaf never collide and the
+   v1 bytes stay exactly the client's `DC_EOD` records.
 
 Not built yet: the quorum-signed epoch report that carries `ACC_STMT_ROOT`, and delivery of a
 client's path (the observer does not end an epoch yet, §8.4).
