@@ -634,9 +634,16 @@ pub fn run(
                 }
             }
             tokio::select! {
-                Some((_, b)) = tail.recv(), if tally.is_some() => {
-                    if let Some(t) = tally.as_mut()
-                        && let Err(e) = t.on_silence(&b)
+                Some((from, b)) = tail.recv(), if tally.is_some() => {
+                    // Codex r4618710697: attributed to the voter whose node_key authenticated
+                    // the connection, never to whoever signed the bytes.
+                    let from = plan
+                        .peers
+                        .iter()
+                        .position(|p| p.node_key == from)
+                        .and_then(|i| u8::try_from(i).ok());
+                    if let (Some(t), Some(from)) = (tally.as_mut(), from)
+                        && let Err(e) = t.on_silence(from, &b)
                     {
                         println!("SILENCE_REFUSED {e}");
                     }

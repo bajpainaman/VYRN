@@ -303,10 +303,19 @@ impl Tally {
     /// A peer's `Silence` from the tail channel. Only this voter's epoch and tenure count (a
     /// signed report of another tenure is refused, never adopted); a standby's report counts
     /// toward the prefix, never toward Q (07 §9.1). A repeat refreshes its arrival time.
-    pub fn on_silence(&mut self, bytes: &[u8]) -> Result<(), String> {
+    /// `from` is the reporter index (voter, or `n + j` for `seq_order[j]`) whose p2p key
+    /// authenticated the connection the report arrived on (Codex r4618710697): a report counts
+    /// only from its own signer, so a peer cannot replay another's old Silence as fresh.
+    pub fn on_silence(&mut self, from: u8, bytes: &[u8]) -> Result<(), String> {
         let s = Silence::decode(bytes).map_err(|e| e.to_string())?;
         s.verify(&self.committee, &self.seq_order)
             .map_err(|e| e.to_string())?;
+        if s.report.reporter != from {
+            return Err(format!(
+                "reporter {} forwarded by peer {from}",
+                s.report.reporter
+            ));
+        }
         if s.report.epoch != self.epoch || s.report.tenure != self.tenure {
             return Err("another epoch or tenure".into());
         }
@@ -489,15 +498,30 @@ mod tests {
     #[allow(clippy::disallowed_methods)]
     fn stale_silence_does_not_add_up_to_a_quorum() {
         let (mut t, sh) = tally(20_000);
-        t.on_silence(&silence(1, 0)).unwrap();
-        t.on_silence(&silence(2, 0)).unwrap();
+        t.on_silence(1, &silence(1, 0)).unwrap();
+        t.on_silence(2, &silence(2, 0)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(40));
-        t.on_silence(&silence(3, 0)).unwrap();
+        t.on_silence(3, &silence(3, 0)).unwrap();
         assert_eq!(t.poll(&sh, 0), None);
         assert_eq!(sh.phase(), Phase::Live);
         // The two repeat theirs (a frozen voter does every 2 ms): now Q are fresh.
-        t.on_silence(&silence(1, 0)).unwrap();
-        t.on_silence(&silence(2, 0)).unwrap();
+        t.on_silence(1, &silence(1, 0)).unwrap();
+        t.on_silence(2, &silence(2, 0)).unwrap();
+        assert!(t.poll(&sh, 0).unwrap().starts_with("DEPOSED"));
+    }
+
+    /// Codex r4618710697: a voter's valid signed Silence that another peer forwards (a replay)
+    /// is refused and does not count toward Q.
+    #[test]
+    fn a_forwarded_silence_does_not_count() {
+        let (mut t, sh) = tally(1_000_000);
+        t.on_silence(1, &silence(1, 0)).unwrap();
+        assert!(t.on_silence(1, &silence(2, 0)).is_err());
+        assert!(t.on_silence(1, &silence(3, 0)).is_err());
+        assert_eq!(t.poll(&sh, 0), None);
+        assert_eq!(sh.phase(), Phase::Live);
+        t.on_silence(2, &silence(2, 0)).unwrap();
+        t.on_silence(3, &silence(3, 0)).unwrap();
         assert!(t.poll(&sh, 0).unwrap().starts_with("DEPOSED"));
     }
 
@@ -506,9 +530,9 @@ mod tests {
     #[test]
     fn a_report_of_another_tenure_pins_nothing() {
         let (mut t, sh) = tally(1_000_000);
-        assert!(t.on_silence(&silence(1, 5)).is_err());
+        assert!(t.on_silence(1, &silence(1, 5)).is_err());
         for v in 1..=3 {
-            t.on_silence(&silence(v, 0)).unwrap();
+            t.on_silence(v, &silence(v, 0)).unwrap();
         }
         assert!(t.poll(&sh, 0).unwrap().starts_with("DEPOSED"));
     }
@@ -519,7 +543,7 @@ mod tests {
     fn a_voter_deposed_by_its_peers_waits_for_its_own_tail() {
         let (mut t, sh) = tally(1_000_000);
         for v in 1..=3 {
-            t.on_silence(&silence(v, 0)).unwrap();
+            t.on_silence(v, &silence(v, 0)).unwrap();
         }
         assert!(t.poll(&sh, u64::MAX).unwrap().starts_with("DEPOSED"));
         assert_eq!(t.poll(&sh, u64::MAX), None);
