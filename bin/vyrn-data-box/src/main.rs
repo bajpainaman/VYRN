@@ -677,7 +677,10 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
                             ex.publish(rx.counters());
                             published = Instant::now();
                         }
-                        if work == 0 {
+                        // A turn with fetch work yields too: under a fetch flood this core never
+                        // idles, and on a shared CPU it would take the sender's turns, so DATA_HB
+                        // would lose its cadence and replicas would mark the box down.
+                        if work == 0 || rx.fetches() > 0 {
                             std::thread::yield_now();
                         }
                     }
@@ -700,6 +703,10 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
                         || shared.aborted() || shared.rx_done.load(Ordering::Acquire),
                         || {
                             let w = core.poll(&mut input, &mut out, store);
+                            // As on the RX core: yield after fetch work (DATA_HB cadence).
+                            if core.fetches() > 0 {
+                                std::thread::yield_now();
+                            }
                             // Never block a shard on stdout: a full queue drops and counts.
                             hand_over(core.drain_events());
                             if published.elapsed() >= PUBLISH {
