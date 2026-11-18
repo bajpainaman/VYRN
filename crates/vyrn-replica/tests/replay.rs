@@ -795,3 +795,75 @@ fn the_vx_client_matches_rust_replay_when_the_band_binds() {
         assert_eq!(h, rust_hashes, "split after {at}");
     }
 }
+
+/// Lanes that take Advance boundaries after their last packet while steps move other lanes'
+/// cuts (found by a search over small scripts). Each step's envelope must start at the
+/// snapshot version each lane's ops read, which the Vx client keeps in its own lane word: a
+/// client that read it from the `fills_applied` word (pbv lane word 3) narrows the envelope
+/// and diverges here, while every other test still passes.
+fn version_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::Day;
+    let p = |l, a, t: u64, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts: t,
+        now: t,
+        msgs,
+    };
+    vec![
+        p(0, 2, 1_000, vec![new(Sell, Day, 400, 1, 1)]),
+        Act::Run,
+        p(1, 3, 2_000, vec![new(Sell, Day, 150, 1, 2)]),
+        Act::Poll,
+        p(0, 3, 3_000, vec![new(Sell, Day, 150, 1, 3)]),
+        Act::Poll,
+        p(1, 2, 4_000, vec![new(Buy, Day, 100, 2, 4)]),
+        Act::Run,
+        p(2, 2, 5_000, vec![new(Sell, Day, 105, 1, 5)]),
+        Act::Step(None),
+        p(2, 4, 6_000, vec![new(Sell, Day, 400, 2, 6)]),
+        Act::Step(None),
+        p(1, 1, 7_000, vec![new(Sell, Day, 400, 1, 7)]),
+        Act::Poll,
+        p(2, 1, 8_000, vec![new(Buy, Day, 400, 1, 8)]),
+        Act::Run,
+        p(2, 3, 9_000, vec![new(Sell, Day, 110, 1, 9)]),
+        Act::Step(None),
+        p(1, 1, 10_000, vec![new(Buy, Day, 300, 2, 10)]),
+        Act::Step(None),
+        p(2, 1, 11_000, vec![new(Sell, Day, 400, 1, 11)]),
+        Act::Poll,
+        Act::Run,
+    ]
+}
+
+#[test]
+fn the_vx_client_keeps_each_lanes_snapshot_version() {
+    let (live_j, store, blocks) = blocks_of(&version_script(), &[]);
+    let (rep, rust_hashes) = replay(&live_j, &store, &blocks).unwrap();
+    check_same(&live_j, &rep);
+    let rejects = live_j
+        .resp
+        .iter()
+        .flat_map(|(_, p)| p.records())
+        .filter(|r| {
+            matches!(
+                r,
+                vyrn_bbo::Record::Reject {
+                    reason: vyrn_types::RejectReason::BadTick,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(rejects, 2, "{:#?}", live_j.resp);
+    let Some(lib) = vx_lib() else { return };
+    let vx = vx_replay(&store, &blocks, &lib).unwrap();
+    let (lanes, tx) = live_bytes(&live_j);
+    for l in 0..N {
+        assert_eq!(vx[0].0[l], lanes[l], "lane {l} responses");
+    }
+    assert_eq!(vx[0].1, tx, "fill TX packets");
+    assert_eq!(vec![vx[0].2], rust_hashes);
+}

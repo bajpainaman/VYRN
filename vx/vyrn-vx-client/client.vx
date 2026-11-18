@@ -361,8 +361,9 @@ fn l_tx_head(n : i64) -> i64 { return 3i64 + 4i64 * n; }
 fn l_tx_tail(n : i64) -> i64 { return 4i64 + 4i64 * n; }
 fn ctl_lines(n : i64) -> i64 { return 1i64 + 4i64 * (n + 1i64); }
 
-// Vx-owned sync words. Lane line 2l: 0 applied, 1 fwd_head, 2 ev_tail, 3 fills_applied.
-// BBO line 2l + 1: 0 ev_head, 1 fwd_tail, 2 cut. BBO line 2n: 0 done_step.
+// Vx-owned sync words. Lane line 2l: 0 applied, 1 fwd_head, 2 ev_tail, 3 fills_applied,
+// 4 snapshot version. BBO line 2l + 1: 0 ev_head, 1 fwd_tail, 2 cut, 3 the cut it waits for.
+// BBO line 2n: 0 done_step.
 const Y_APPLIED : i64 = 0;
 const Y_FWD_HEAD : i64 = 1;
 const Y_EV_TAIL : i64 = 2;
@@ -370,7 +371,8 @@ const Y_EV_HEAD : i64 = 0;
 const Y_FWD_TAIL : i64 = 1;
 const Y_CUT : i64 = 2;
 const Y_WAIT : i64 = 3;
-const Y_SNAP_VER : i64 = 3;       // lane line 2l: the version of the snapshot it last read           // BBO line 2l + 1: the cut it waits for lane l to apply, or 0
+// Lane line 2l word 4: the version of the snapshot it last read (word 3 is fills_applied).
+const Y_SNAP_VER : i64 = 4;
 
 fn stopped(c : *mut Ctx) -> bool { return ld(c, 0i64, 0i64) != 0u64; }
 fn done_step(c : *mut Ctx) -> u64 { unsafe { return sld(c, 2i64 * (*c).n, 0i64); } }
@@ -2646,6 +2648,12 @@ pub fn pbv_free(c : *mut Ctx) -> void {
     let q5 : *mut i8 = (*b).book_l; free(q5);
     let q6 : *mut i8 = (*b).book_r; free(q6);
     free((*b).tx);
+    let v0 : *mut i8 = (*b).vh_ver; free(v0);
+    let v1 : *mut i8 = (*b).vh_b; free(v1);
+    let v2 : *mut i8 = (*b).vh_a; free(v2);
+    let v3 : *mut i8 = (*b).lowver; free(v3);
+    let v4 : *mut i8 = (*b).rapp; free(v4);
+    let v5 : *mut i8 = (*b).rver; free(v5);
     let r0 : *mut i8 = (*c).bbo; free(r0);
     let r1 : *mut i8 = (*c).lanes; free(r1);
     let r2 : *mut i8 = (*c).sync; free(r2);
