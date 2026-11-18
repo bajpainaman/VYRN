@@ -68,6 +68,11 @@ def out(i, cause, h, qty, tag): return rec(0x85, i, cause, h, qty, tag)
 def epoch_notice(e, home, secs): return rec(0x86, 0, 0, e, home, secs)
 
 
+def data_redirect(s, down, to, frm, key):                              # section 7.6
+    body = struct.pack("<HBBB3sII", 0x5244, 1, down, to, bytes(3), s, frm)
+    return body + struct.pack("<Q", siphash24(key, body))
+
+
 def request(s, seq, e16, book, msgs, k_com=None, flags=0):
     body = struct.pack("<IIBBHHH", s, seq, len(msgs), flags, e16, book, 0) + b"".join(msgs)
     tag_com = siphash24(k_com, body) if k_com else 0                    # 0 in BASE mode
@@ -129,6 +134,8 @@ V = [
      response(A, 0, E, 6, [reject(0xFF, 24, 6, 0)]), False),
     ("V18 req A: resend of V16, same pkt_seq and content, bit0 = 1",
      request(A, 6, E, B, [new(of(0, tif=1), 100_000, 2, 0x88888888)], flags=1), True),
+    ("V19 redir A: DataRedirect data[0] down -> data[1], resend_from 5, tag under K_seq",
+     data_redirect(A, 0, 1, 5, K_SEQ), False),
 ]
 for name, pkt, req in V:
     dump(name, pkt, req)
@@ -147,7 +154,9 @@ for what, ok in [("V1 verifies with K_SEQ", verify_request(v1, K_SEQ)),
                   and struct.unpack_from("<H", V[16][1], 18)[0] == 24
                   and struct.unpack_from("<I", V[16][1], 12)[0] == 6),
                  ("V18 has V16's logical content (D3) and verifies", V[17][1][16:32] == V[15][1][16:32]
-                  and V[17][1][:9] == V[15][1][:9] and verify_request(V[17][1], K_SEQ))]:
+                  and V[17][1][:9] == V[15][1][:9] and verify_request(V[17][1], K_SEQ)),
+                 ("V19 tag = SipHash(K_SEQ, bytes 0..16), not K_OUT", struct.unpack_from("<Q", V[18][1], 16)[0]
+                  == siphash24(K_SEQ, V[18][1][:16]) != siphash24(K_OUT, V[18][1][:16]))]:
     if not ok:
         raise SystemExit(f"FAILED: {what}")
     print(f"check OK: {what}")

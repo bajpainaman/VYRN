@@ -22,6 +22,7 @@ This chapter covers the order-entry path between a client and the home that runs
 
 - request packets from a client to the sequencer and to the data tier;
 - response packets from the sequencer (and from the recovery service) to the client;
+- the `DataRedirect` record from the data tier to the client (§7.6);
 - the session life cycle, the keys, the admin channel that opens a BASE-mode session;
 - reliability across loss, failover and epoch handoff;
 - rate limits and the message fee classes.
@@ -159,7 +160,7 @@ Every request packet goes to two places:
 | D2 | Send both copies of **every** transmission, including resends (flags bit0 = 1) and resends to a new sequencer. A resend has a different `PktHash`, because `flags` is hashed, and the replicas need the exact copy that the sequencer accepted. |
 | D3 | Keep the **logical content** of a `pkt_seq` fixed forever. The logical content is (`session`, `pkt_seq`, `count`, `book`, the message bytes). Only `flags` bit0, `epoch16` and the tags may differ between transmissions of one `pkt_seq`. |
 | D4 | Pick the data node from the key bundle's `data` list (§4.4): the first entry that the latest `DataTierStatus` does not mark down. The first entry is the session's **data home**, which is never in the sequencer's facility (01 §14.16, 07); the list is ordered per session by rendezvous hash among the other facilities, so sessions spread evenly over the data nodes. |
-| D5 | Switch data nodes only when a `DataTierStatus` says so (admin channel in BASE, chain state in CHAIN). Data nodes never answer clients, so the client cannot detect a dead data node itself. |
+| D5 | Switch data nodes only when a `DataTierStatus` says so (admin channel in BASE, chain state in CHAIN). Data nodes never answer clients, so the client cannot detect a dead data node itself. The one exception is `DataRedirect` (§7.6): a valid one switches this session's data node as a `DataTierStatus` would. |
 | D6 | A client may send the data copy to two data nodes. The data tier deduplicates by `PktHash`. This costs bandwidth and buys nothing unless a data node is failing. |
 
 **Why D3.** A packet that the sequencer never answered may still have been accepted, and its data
@@ -1328,6 +1329,41 @@ off size field
   in 07 §9.6 cases (d) and (e). A level-2 record's fate is fixed: it is never reverted, and in
   CHAIN it is busted only if its `Bust` verdict was already final with it (01 §14.19 B, 09 §5.9).
 
+### 7.6 `DataRedirect` (data tier → client)
+
+When Q replicas mark a data box down, every live data box sends `DataRedirect` to each affected
+session's address (07 §5.7). It is not a response packet: it has no `resp_seq`, it is not
+retained or resent, and it changes no order state. It is 24 bytes, little-endian, on its own
+datagram, from any data node's address to the source address of the session's latest copy:
+
+| Offset | Size | Field | Value |
+|---|---|---|---|
+| 0 | 2 | `magic` | 0x5244 ("DR") |
+| 2 | 1 | `version` | 1 |
+| 3 | 1 | `down` | the down data node: its position in the session's `KeyBundle.data` list (§4.4), 0 = the data home |
+| 4 | 1 | `to` | the backup data node: its position in the same list |
+| 5 | 3 | reserved | 0 |
+| 8 | 4 | `session` | `SessionId` |
+| 12 | 4 | `resend_from` | the lowest `pkt_seq` no replica has resolved |
+| 16 | 8 | `tag` | SipHash-2-4(K, bytes 0..16), K = the session's `K_seq` of the current epoch in BASE, `K_com` in CHAIN |
+
+The tag uses a key the session already shares with the home, so a redirect proves that a box
+holding the key sent it. The source address proves nothing and is not checked.
+
+Client handling:
+
+| ID | Rule |
+|---|---|
+| DR1 | Drop it, silently, unless it is 24 bytes, `magic`, `version` and reserved match, `session` is the client's, `down` and `to` are < 8 and differ, and `tag` verifies. A bad redirect closes nothing (unlike a bad MAC on a bound source, §3.1). |
+| DR2 | Drop it unless `down` is the position of the data node the client sends copy 2 to now. Every live data box sends the same redirect, and a stale or replayed one names a node the client has already left, so the duplicates are no-ops. |
+| DR3 | Otherwise switch copy 2 to `data[to]` for the rest of the epoch, or until a `DataTierStatus` says otherwise (D5), and resend every retained packet with `pkt_seq` ≥ `resend_from`, bit0 = 1, to `data[to]` only. The sequencer already holds them; dedupe at the data tier drops what is already stored (07 §5.7). |
+| DR4 | A client keeps every sent request packet for at least `REP_CLIENT_RETAIN_MS` = 100 ms (07 §5.7), so that DR3 can resend it. A packet it no longer holds is the `DATA_MISSING` case (§8). |
+
+**Reading (`vyrn-data`, 07 §5.7):** `down` and `to` index the session's `data` list, so the
+client needs no other table, and "next live box in facility order" of 07 §5.7 step 2 is the next
+live entry of that list. The record binds the epoch only through the key: a replay inside one
+epoch is stopped by DR2, and a replay across epochs fails the tag. Vector: V19 (§11).
+
 ## 8. Reject reasons
 
 "In" means in-stream (accepted packet, consumes `pkt_seq`, retained, resendable). "Out" means
@@ -1527,7 +1563,8 @@ V12 also gets an R-ANSWER `EpochNotice` as `resp_seq` 5 (not printed), so V15 is
 V16 reaches lane 3 when test D (§3.5) fails, so the lane sheds it: V17 is the out-of-stream
 `BUSY` (`resp_seq` 0, `echo_pkt` 6, detail = `expected` = 6), and nothing was applied. V18 is the
 client's resend of the same `pkt_seq` with the same logical content and bit0 = 1; the lane
-accepts it as a first acceptance.
+accepts it as a first acceptance. V19 is the `DataRedirect` (§7.6) a live data box sends A when
+its data home (`data[0]`) is down: backup `data[1]`, `resend_from` 5, tag under `K_seq`.
 
 ```python
 #!/usr/bin/env python3
@@ -1600,6 +1637,11 @@ def out(i, cause, h, qty, tag): return rec(0x85, i, cause, h, qty, tag)
 def epoch_notice(e, home, secs): return rec(0x86, 0, 0, e, home, secs)
 
 
+def data_redirect(s, down, to, frm, key):                              # section 7.6
+    body = struct.pack("<HBBB3sII", 0x5244, 1, down, to, bytes(3), s, frm)
+    return body + struct.pack("<Q", siphash24(key, body))
+
+
 def request(s, seq, e16, book, msgs, k_com=None, flags=0):
     body = struct.pack("<IIBBHHH", s, seq, len(msgs), flags, e16, book, 0) + b"".join(msgs)
     tag_com = siphash24(k_com, body) if k_com else 0                    # 0 in BASE mode
@@ -1661,6 +1703,8 @@ V = [
      response(A, 0, E, 6, [reject(0xFF, 24, 6, 0)]), False),
     ("V18 req A: resend of V16, same pkt_seq and content, bit0 = 1",
      request(A, 6, E, B, [new(of(0, tif=1), 100_000, 2, 0x88888888)], flags=1), True),
+    ("V19 redir A: DataRedirect data[0] down -> data[1], resend_from 5, tag under K_seq",
+     data_redirect(A, 0, 1, 5, K_SEQ), False),
 ]
 for name, pkt, req in V:
     dump(name, pkt, req)
@@ -1679,13 +1723,15 @@ for what, ok in [("V1 verifies with K_SEQ", verify_request(v1, K_SEQ)),
                   and struct.unpack_from("<H", V[16][1], 18)[0] == 24
                   and struct.unpack_from("<I", V[16][1], 12)[0] == 6),
                  ("V18 has V16's logical content (D3) and verifies", V[17][1][16:32] == V[15][1][16:32]
-                  and V[17][1][:9] == V[15][1][:9] and verify_request(V[17][1], K_SEQ))]:
+                  and V[17][1][:9] == V[15][1][:9] and verify_request(V[17][1], K_SEQ)),
+                 ("V19 tag = SipHash(K_SEQ, bytes 0..16), not K_OUT", struct.unpack_from("<Q", V[18][1], 16)[0]
+                  == siphash24(K_SEQ, V[18][1][:16]) != siphash24(K_OUT, V[18][1][:16]))]:
     if not ok:
         raise SystemExit(f"FAILED: {what}")
     print(f"check OK: {what}")
 ```
 
-Output of `python3 -I vyrn_proto_vectors.py` on 2026-11-13 (all checks pass):
+Output of `python3 -I vyrn_proto_vectors.py` on 2026-11-18 (all checks pass):
 
 ```
 siphash24(00..0f, 00..0e) = 0xa129ca6149be45e5  reference vector OK (also len 0, 8)
@@ -1806,6 +1852,11 @@ V18 req A: resend of V16, same pkt_seq and content, bit0 = 1 (48 B)
   010: 01 02 00 00 a0 86 01 00 02 00 00 00 88 88 88 88
   020: 37 e2 a3 17 d7 27 2c 64 00 00 00 00 00 00 00 00
   tag_seq=0x642c27d717a3e237  tag_com=0x0000000000000000
+
+V19 redir A: DataRedirect data[0] down -> data[1], resend_from 5, tag under K_seq (24 B)
+  000: 44 52 01 00 01 00 00 00 07 30 10 00 05 00 00 00
+  010: 79 96 aa 52 44 74 04 21
+  tag=0x2104744452aa9679
 check OK: V1 verifies with K_SEQ
 check OK: V1 fails with K_OUT
 check OK: V1 with one tag bit flipped fails (bound source: close session)
@@ -1813,6 +1864,7 @@ check OK: V10 tag_com = SipHash(K_COM, bytes 0..32)
 check OK: V13 tag differs from V2 tag
 check OK: V17 is out of stream (resp_seq 0), reason BUSY 24, echo_pkt 6
 check OK: V18 has V16's logical content (D3) and verifies
+check OK: V19 tag = SipHash(K_SEQ, bytes 0..16), not K_OUT
 ```
 
 Expected lane behaviour for the negative vector: the flipped `tag_seq` comes from A's bound
@@ -1872,7 +1924,7 @@ Planned use of reserved fields (informative; not part of v1):
 | 02 | `REQ-LAT-1`, REQ-LAT-4 (maker fills), REQ-LAT-5 per lane class and its pacing analysis (02 §4.4.1), and the security and epoch requirements that this chapter serves. |
 | 05 | Classification against a versioned snapshot; the BBO-core ring with the reserved `resp_seq`; the BBO → lane fill-event ring; B-packet records and their overflow; slot allocation with `PROTO_HANDLE_REUSE_MIN_S`; `CancelAck` only after the fill events of all earlier steps are applied (R-HANDLE); `Out POST_ONLY` from rescans; CancelAll against orders still at the BBO core; the other-lane SPSC ring on AWS; `TimerTick`; two-pass lanes with the dependency list (01 §14.2); test D for forwarded ops and the `Shed` step with its fill-event answer to the lane; ops that depend on a shed op shed with it; `AcctKill` for `CancelAll`; the later-message count with the first push (§7.1). |
 | 06 | NIC steering by destination port; the lane → NIC-port map that fills the key bundle; RX hardware timestamps; recovery-node NVMe; edge ACLs and policers (E1–E3). |
-| 07 | The `PacketRecord` at acceptance, with `flags` bit 0 `SHED` (bit 1 `ADVANCE` is engine-only, 01 §6.6); the data-home rule (never in the sequencer's facility); R-FIRST for every response (01 §14.5); frame acknowledgements for `DURABLE` (§7.5); payload repair; equivocation detection by logical content (D3); control records `SessionOpen`, `SessionClose`, `Rebind`, `SetCod`, `AdminKill`, `SequencerChange`; `failover_order`. |
+| 07 | The `PacketRecord` at acceptance, with `flags` bit 0 `SHED` (bit 1 `ADVANCE` is engine-only, 01 §6.6); the data-home rule (never in the sequencer's facility); R-FIRST for every response (01 §14.5); frame acknowledgements for `DURABLE` (§7.5); payload repair; equivocation detection by logical content (D3); control records `SessionOpen`, `SessionClose`, `Rebind`, `SetCod`, `AdminKill`, `SequencerChange`; `failover_order`; `DataDown` and the `down`, `to` and `resend_from` of each `DataRedirect` (§7.6, 07 §5.7). |
 | 08 | `boundary_ts`; staging at the new home; the auction phase, its uncross and STP inside it. |
 | 09 | The CHAIN open transaction, key derivation, `K_com(e, s)`, TESLA disclosure, the inclusion port, the bond, close evidence. |
 | 10 | Risk checks and limits, rate tiers, fee amounts, `max_order_qty`, price bands, halts, drop copy, self-trade surveillance, the penalty for late data copies. |
