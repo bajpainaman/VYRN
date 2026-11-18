@@ -3626,6 +3626,7 @@ version = "0.0.0"
 dependencies = [
  "thiserror",
  "vyrn-consensus",
+ "vyrn-crypto",
  "vyrn-types",
 ]
 
