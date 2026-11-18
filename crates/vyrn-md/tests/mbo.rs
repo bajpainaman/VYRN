@@ -208,6 +208,59 @@ fn subscriber_rejects_gaps_and_misplaced_records() {
     assert_eq!(sub.finish(), Err(SubError::Incomplete));
 }
 
+#[test]
+fn finish_waits_for_the_step_channel() {
+    let exec = Event {
+        rx_ts: Nanos(2),
+        kind: EventKind::Exec {
+            aggressor: Side::Sell,
+            ordinal: 0,
+            maker: oid(LaneId(1), 0),
+            tick: Tick(100),
+            qty: Qty(1),
+        },
+    };
+    let mut out: Vec<Vec<u8>> = vec![];
+    MboEncoder::new(BOOK, EPOCH)
+        .run(
+            &mut [add(1, 0, 0), step(1, 1, 1), exec].into_iter(),
+            &mut out,
+        )
+        .unwrap();
+    let (step_pkts, lane_pkts): (Vec<_>, Vec<_>) = out.into_iter().partition(|p| p[0] == 4);
+    let mut sub = MboSubscriber::new(BOOK, EPOCH);
+    for p in &lane_pkts {
+        sub.on_packet(p).unwrap();
+    }
+    // Every lane says W = 1, but step 1 has not arrived.
+    assert_eq!(sub.finish(), Err(SubError::Incomplete));
+    for p in &step_pkts {
+        sub.on_packet(p).unwrap();
+    }
+    sub.finish().unwrap();
+    assert!(sub.book().orders().is_empty());
+}
+
+#[test]
+fn a_rejected_duplicate_add_keeps_the_live_order() {
+    let mut book = vyrn_md::Book::default();
+    let add = |qty| Record::Add {
+        side: Side::Buy,
+        via_bbo: false,
+        auction: false,
+        ts_delta: 0,
+        oid: 7,
+        tick: Tick(100),
+        qty: Qty(qty),
+    };
+    book.apply(&add(10), Nanos(0)).unwrap();
+    assert_eq!(
+        book.apply(&add(99), Nanos(0)),
+        Err(vyrn_md::BookError::DuplicateOid)
+    );
+    assert_eq!(book.orders()[&7].qty, Qty(10));
+}
+
 /// xorshift64*: the test needs no rand dependency.
 struct Rng(u64);
 impl Rng {

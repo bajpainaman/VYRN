@@ -3,6 +3,7 @@
 //! The snapshotter (10 §7.6) and conformance tests use it; a production subscriber may keep a
 //! faster book but must apply records in an order this reader accepts.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, VecDeque};
 
 use vyrn_types::{BookId, Epoch, Nanos, Qty, StepId, Tick};
@@ -69,8 +70,11 @@ impl Book {
                     qty,
                     prio_ts,
                 };
-                if self.orders.insert(oid, o).is_some() {
-                    return Err(BookError::DuplicateOid);
+                match self.orders.entry(oid) {
+                    Entry::Occupied(_) => return Err(BookError::DuplicateOid),
+                    Entry::Vacant(v) => {
+                        v.insert(o);
+                    }
                 }
             }
             Record::Delete { oid, tick, qty, .. } => {
@@ -152,6 +156,8 @@ pub struct MboSubscriber {
     /// Step-channel records not yet applied.
     steps: VecDeque<(Record, Nanos)>,
     last_step: u64,
+    /// `MD_EXEC`s of the last applied step not yet applied.
+    exec_left: u16,
     book: Book,
 }
 
@@ -167,6 +173,7 @@ impl MboSubscriber {
             pending: Default::default(),
             steps: VecDeque::new(),
             last_step: 0,
+            exec_left: 0,
             book: Book::default(),
         }
     }
@@ -247,12 +254,16 @@ impl MboSubscriber {
 
     /// Ends the epoch: applies the lane ops after the last step. Call it once every channel's
     /// final packet arrived; it fails with `Incomplete` otherwise.
+    ///
+    /// Complete means: every lane channel has a watermark, and every step up to the highest
+    /// one is applied with all its `MD_EXEC`s. A step op that
+    /// trails its execs in a later step-channel packet is not detectable here (spec gap 4).
     pub fn finish(&mut self) -> Result<(), SubError> {
-        let done = self
-            .lane_w
-            .iter()
-            .all(|w| w.is_some_and(|w| w >= self.last_step));
-        if !done || !self.steps.is_empty() {
+        let mut final_w = 0;
+        for w in self.lane_w {
+            final_w = final_w.max(w.ok_or(SubError::Incomplete)?);
+        }
+        if self.last_step < final_w || self.exec_left > 0 || !self.steps.is_empty() {
             return Err(SubError::Incomplete);
         }
         self.release(self.last_step + 1)?;
@@ -276,8 +287,15 @@ impl MboSubscriber {
                 }
                 self.release(step.0)?;
                 self.last_step = step.0;
+                self.exec_left = match rec {
+                    Record::Step { n_exec, .. } => n_exec,
+                    _ => 0,
+                };
             } else {
                 self.book.apply(&rec, ts_base)?;
+                if let Record::Exec { .. } = rec {
+                    self.exec_left = self.exec_left.saturating_sub(1);
+                }
             }
             self.steps.pop_front();
         }
