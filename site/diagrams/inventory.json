@@ -294,31 +294,31 @@
   {
    "asciiIndex": 4,
    "heading": "4.4 BASE mode: open over the admin channel",
-   "line": 673,
+   "line": 684,
    "ascii": " client                    vyrn-admin                      sequencer lane      replicas\n   │── TLS 1.3 (mTLS) ───────►│                                   │                 │\n   │── OpenSessionReq ───────►│ pick slot, gen+1, derive keys     │                 │\n   │                          │── SessionOpen control record ────►│ OPENING→ACTIVE  │\n   │                          │                                   │── PacketRecord ►│\n   │                          │◄───────────────── block with the record is final ───│\n   │◄─ OpenSessionResp ───────│ (keys, lane, endpoints)           │                 │\n   │── request pkt_seq 1 (UDP) ──────────────────────────────────►│                 │"
   },
   {
    "asciiIndex": 6,
    "heading": "5.1 Request direction: gapless pkt_seq, go-back-N",
-   "line": 834,
+   "line": 845,
    "ascii": " client                                        lane (expected = 7)\n   │── 7 ──────────────────────────────────────►│ accept, expected = 8\n   │── 8 ────────────────────X (lost)           │\n   │── 9 ──────────────────────────────────────►│ gap: drop, out-of-stream BAD_SEQ(8)\n   │── 10 ─────────────────────────────────────►│ gap: drop (holdoff, counted only)\n   │◄── resp(echo 7) ───────────────────────────│\n   │◄── BAD_SEQ, detail 8 (resp_seq 0) ─────────│\n   │── 8 (bit0) ── 9 (bit0) ── 10 (bit0) ──────►│ accept 8, 9, 10"
   },
   {
    "asciiIndex": 8,
    "heading": "5.7 Epoch handoff",
-   "line": 978,
+   "line": 989,
    "ascii": " old home (epoch e)                      client                        new home (epoch e+1)\n  │── EpochNotice T−600 … T−1 s ────────►│                                  │\n  │   last step S at T; then drops all   │── from T: epoch16 = e+1 ────────►│ stages packets\n  │   packets                            │   new K_seq, new endpoints       │ (08-epochs.md)\n  │── finalize S, cert(e, S), log tail ─────────────────────────────────────►│ state at S\n  │                                      │◄── EpochNotice (epoch start) ────│ starts at S+1\n  │                                      │◄── answers to staged packets ────│ auction phase\n  │                                      │◄── uncross fills (liq 2) ────────│ then continuous"
   },
   {
    "asciiIndex": 9,
    "heading": "7.1 Producers and the resp_seq allocator",
-   "line": 1228,
+   "line": 1239,
    "ascii": " request pkt p:  [0] Cancel h1   [1] New cross   [2] New join\n                      │               │               │\n lane:                │  reserve r ───┼──► BBO ring   │\n                      ▼               │               ▼\n                 L-packet r+1: CancelAck(0), Ack(2)   (after a cut includes them)\n BBO core → TX core:  └────────────► B-packet r: Fill(1) … Ack(1)   (≤ 1 µs path)"
   },
   {
    "asciiIndex": 11,
    "heading": "10.1 Client state machine",
-   "line": 1533,
+   "line": 1544,
    "ascii": "                    send New (pkt_seq p, index i)\n                                │\n                                ▼\n                         ┌─────────────┐ no answer: resend p with bit0 = 1 (§5.1)\n                         │   SENT      │◄──────────────┐\n                         └──────┬──────┘───────────────┘\n        Reject ─────────────────┼────────────────────────────────────► REJECTED\n        Fill… with open = 0 ────┼────────────────────────────────────► FILLED\n        Fill… then Out ─────────┼────────────────────────────────────► OUT\n        Fill… then Ack, or Ack  │\n                                ▼\n                         ┌─────────────┐  maker Fill: open −= qty; open = 0 ──► FILLED\n                         │    LIVE     │  Out (STP, POST_ONLY, EXPIRED, DISCONNECT,\n                         │  (handle h) │       LANE_MOVED, ADMIN, AUCTION_UNFILLED) ──► OUT\n                         └──┬───┬───┬──┘\n              send Cancel   │   │   │ send Replace\n                            ▼   │   ▼\n                 ┌──────────────┐ │ ┌────────────────┐\n                 │CANCEL_PENDING│ │ │REPLACE_PENDING │ Reject (not TOO_LATE): back to LIVE, h kept\n                 └──────┬───────┘ │ └───────┬────────┘ CancelAck(h), no new handle: LIVE (reduced)\n     CancelAck: CANCELED│         │         │          CancelAck(h) + records of h': h ends\n     TOO_LATE: the fills│  send   │         │          (CANCELED), h' starts in SENT-like\n     before it ended it │  Reduce ▼         │          state with its records\n     (FILLED or OUT)    │  REDUCE_PENDING: CancelAck: open −= qty; open = 0 ──► CANCELED\n                        ▼                   otherwise back to LIVE\n             CANCELED / FILLED / OUT (terminal)"
   }
  ],
@@ -402,13 +402,13 @@
   {
    "asciiIndex": 15,
    "heading": "7.6 Catch-up from snapshot plus log",
-   "line": 2019,
+   "line": 2020,
    "ascii": " t0 ── subscribe to live frames + data; verify and vote at once (votes need no history) ──────────►\n  │\n  ├─ fetch the newest snapshot ≤ the newest RootCert (local NVMe, else peers via REPAIR, else archive)\n  ├─ verify it (§7.5)\n  ├─ fetch finalized blocks snapshot.height+1 .. live, striped by height across all peers\n  │     (block record + cert, §8.2), verify certs and roots, write them to the local journal\n  ├─ replay at max speed; buffer live input; live input already counts toward votes\n  └─ replay lag ≤ REP_LIVE_LAG_MS (10 ms): the replica joins root votes and is \"caught up\""
   },
   {
    "asciiIndex": 16,
    "heading": "8.2 Block journal",
-   "line": 2074,
+   "line": 2075,
    "ascii": "REP_BlockRecord   (4 KiB aligned, on drive h mod 12)\n  off size field\n    0   8  magic \"PBBLK001\"         8 8 height        16 4 epoch     20 1 tenure   21 1 kind (0 normal, 1 seal)\n   22   2  reserved                24 190 BlockHeader (§3.10)\n  214   4  order_len              218 4 hash_len       222 4 data_len 226 4 n_unavail  230 26 reserved\n  256   …  order bytes │ pkt_hash list (8 B × records) │ data bytes (O-order; self-delimiting by count)\n           │ unavailable (session, pkt_seq) list │ pad to 4 KiB"
   }
  ],
