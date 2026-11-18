@@ -1168,8 +1168,10 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let replaying: Vec<&Node> = vals
         .iter()
         .filter_map(|&i| nodes.0.get(i))
-        .filter(|n| blocks(n).iter().any(|b| field(b.1, "out").is_some()))
+        .filter(|n| cli.data || blocks(n).iter().any(|b| field(b.1, "out").is_some()))
         .collect();
+    // With --data every validator replays, so this check always runs: a validator with no
+    // out= at all, or a REPLAY_FAULT, fails it rather than skipping it.
     if replaying.is_empty() {
         Report::skip(
             "replica-out",
@@ -1194,6 +1196,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
                         .zip(&ours)
                         .position(|(a, b)| *a != Some(b.as_str()));
                     let short = theirs.len() < ours.len() && !lag;
+                    if let Some(f) = n.lines.iter().find(|l| l.starts_with("REPLAY_FAULT ")) {
+                        return Some(format!("{}: {f}", n.name));
+                    }
                     match first_bad {
                         Some(k) => Some(format!(
                             "{} at block {k} ({} vs tap {})",
