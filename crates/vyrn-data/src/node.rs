@@ -278,7 +278,10 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
             work = self.retry_redirects();
         }
         work = work.saturating_add(self.poll_ingest(now));
-        work = work.saturating_add(self.poll_fetch(now));
+        // Fetches wait in their queue while refused redirects do ([`Pending`]).
+        if self.pending.is_empty() {
+            work = work.saturating_add(self.poll_fetch(now));
+        }
         self.fanout
             .timers(now, &mut self.tx, &mut self.counters, &self.cfg);
         work

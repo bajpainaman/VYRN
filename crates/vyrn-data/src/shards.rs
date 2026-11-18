@@ -215,7 +215,7 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
         sender: &mut SenderTx<'_>,
     ) -> usize {
         let n_shards = shards.len();
-        // Redirects refused last turn go first, paced by the shards' rings (#183 (b)).
+        // Redirects refused last turn go first (#183 (b)).
         let mut retried = 0;
         if !self.pending.is_empty() {
             let c = &mut self.counters;
@@ -245,7 +245,13 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
             }
         }
         self.ingest.release(n);
-        let m = self.fetch.poll(&mut burst);
+        // #183 (b): while redirects wait for a full shard ring, new fetches wait in the NIC's
+        // fetch queue, so the failover burst is paced by the shards' drain, not dropped.
+        let m = if self.pending.is_empty() {
+            self.fetch.poll(&mut burst)
+        } else {
+            0
+        };
         self.fetches = m;
         for p in burst.iter().take(m) {
             let Ok(f) = nic_frame::parse(self.fetch.bytes(p)) else {

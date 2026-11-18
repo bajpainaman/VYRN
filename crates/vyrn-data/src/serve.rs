@@ -585,8 +585,10 @@ impl Responder {
 /// `DataRedirect` is not repaired by any fetch the way a lost `DATA` frame is, so a refused one
 /// waits here and is retried, oldest first, at the start of the core's next turn, before any new
 /// work; a turn stops retrying at the first refusal, so order is kept and a full queue costs one
-/// refusal per turn. At most [`Pending::CAP`] wait, allocated once; past that a redirect is
-/// dropped and counted in `redirect_dropped` (the replicas resend REDIRECT on their own timer).
+/// refusal per turn. While any wait, the core takes no new fetch datagrams: the failover burst
+/// waits in the NIC's fetch queue and is paced by the full queue's drain. One fetch burst
+/// (`RX_BURST` kind-5 batches) therefore always fits, allocated once; a redirect is dropped and
+/// counted in `redirect_dropped` only past that (an operator list longer than [`Pending::CAP`]).
 #[derive(Debug)]
 pub(crate) struct Pending(std::collections::VecDeque<Redirect>);
 
@@ -597,8 +599,8 @@ impl Default for Pending {
 }
 
 impl Pending {
-    /// Two full kind-5 batches.
-    pub(crate) const CAP: usize = 2 * crate::frame::MAX_BATCH;
+    /// One fetch burst of full kind-5 batches (2,896).
+    pub(crate) const CAP: usize = vyrn_wire::RX_BURST * crate::frame::MAX_BATCH;
 
     /// Queues `r` for the next turn (`redirect_retried`), or drops it if full.
     pub(crate) fn push(&mut self, r: Redirect, c: &mut Counters) {
