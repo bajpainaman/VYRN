@@ -42,7 +42,9 @@ Each command prints nothing when its file matches. CI runs them on every pull re
 takes `--json` and print the same vectors as one JSON document, committed beside the `.out` file,
 so an implementation in another language (Vx, for one) needs no parser for the text format. CI
 diffs both forms, and `crates/vyrn-sim/tests/golden_json.rs` reads the proto, reject and session
-JSON and checks it against `vyrn-wire` and `vyrn-lane`:
+JSON and checks it against `vyrn-wire` and `vyrn-lane`; `crates/vyrn-data/tests/golden.rs` and
+`bin/vyrn-admin/tests/admin_vectors.rs` check that the data and admin JSON carry their `.out` vectors
+exactly:
 
 ```sh
 for v in proto log session data admin reject nack; do

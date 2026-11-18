@@ -6,6 +6,9 @@ use vyrn_data::dedupe::{Dedupe, Seen};
 use vyrn_data::frame::{self, DataHdr, Fetch, FrameBuf, Kind};
 use vyrn_types::{BookId, Height, SessionId};
 
+#[path = "../../engine/vyrn-lane/tests/json/mod.rs"]
+mod json;
+
 fn unhex(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)
@@ -24,6 +27,44 @@ fn lines() -> Vec<Vec<String>> {
         .filter(|l| !l.is_empty() && !l.starts_with('#') && l.contains(' '))
         .map(|l| l.split(' ').map(str::to_owned).collect())
         .collect()
+}
+
+/// One `.out` column from a JSON value: an integer in decimal, a string as is, a list joined
+/// by `,` (`-` if empty) with a pair as `a:b`.
+fn column(v: &json::J) -> String {
+    use json::J;
+    match v {
+        J::Int(n) => n.to_string(),
+        J::Str(s) => s.clone(),
+        J::Arr(a) if a.is_empty() => "-".into(),
+        J::Arr(a) => a
+            .iter()
+            .map(|e| match e {
+                J::Arr(p) => p.iter().map(column).collect::<Vec<_>>().join(":"),
+                e => column(e),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        J::Obj(_) => panic!("object column {v:?}"),
+    }
+}
+
+/// The JSON form (`vyrn_data_vectors.json`, README "JSON form") read through the shared
+/// reader: each vector, its fields in order, is its `.out` line, so every check in this file
+/// holds for the JSON too.
+#[test]
+fn the_json_form_is_the_out_form() {
+    let doc = json::load(env!("CARGO_MANIFEST_DIR"), "vyrn_data_vectors.json");
+    let rows: Vec<Vec<String>> = doc
+        .arr("vectors")
+        .iter()
+        .map(|v| match v {
+            json::J::Obj(m) => m.iter().map(|(_, x)| column(x)).collect(),
+            v => panic!("vector {v:?}"),
+        })
+        .collect();
+    assert_eq!(rows.len(), 77);
+    assert_eq!(rows, lines());
 }
 
 fn kind(k: &str) -> Kind {

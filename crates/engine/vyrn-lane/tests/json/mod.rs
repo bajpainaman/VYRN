@@ -1,5 +1,5 @@
 //! A JSON reader for the golden vectors' JSON form (tests/golden/README.md), shared by
-//! `vyrn-lane`'s and `vyrn-sim`'s tests. *Reading:* `serde_json` is not on the 11 §2.2
+//! the tests of `vyrn-lane`, `vyrn-sim`, `vyrn-data` and `vyrn-admin`. *Reading:* `serde_json` is not on the 11 §2.2
 //! allowlist and engine crates take no new dev-dependencies, so this accepts only the subset
 //! the generators print: objects, arrays, ASCII strings (`json.dumps` escapes the rest as
 //! `\uXXXX`) and integers.

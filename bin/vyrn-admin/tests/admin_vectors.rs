@@ -6,6 +6,9 @@ use core::net::{Ipv4Addr, SocketAddrV4};
 use vyrn_admin::codec::{AdminMsg, CtlDone, decode, encode, frame_len};
 use vyrn_types::{AccountId, BookId, HomeCode, LaneId, RejectReason};
 
+#[path = "../../../crates/engine/vyrn-lane/tests/json/mod.rs"]
+mod json;
+
 fn unhex(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)
@@ -27,6 +30,22 @@ fn vectors() -> Vec<(String, String, String, Vec<u8>)> {
             (f[0].into(), f[1].into(), f[2].into(), unhex(f[3]))
         })
         .collect()
+}
+
+/// The JSON form (`vyrn_admin_vectors.json`, README "JSON form") read through the shared
+/// reader carries the `.out` vectors exactly, so every check here holds for it too.
+#[test]
+fn the_json_form_is_the_out_form() {
+    let doc = json::load(env!("CARGO_MANIFEST_DIR"), "vyrn_admin_vectors.json");
+    let got: Vec<(String, String, String, Vec<u8>)> = doc
+        .arr("vectors")
+        .iter()
+        .map(|v| {
+            let s = |k: &str| v.s(k).to_owned();
+            (s("id"), s("message"), s("verdict"), json::unhex(v.s("hex")))
+        })
+        .collect();
+    assert_eq!(got, vectors());
 }
 
 #[test]
