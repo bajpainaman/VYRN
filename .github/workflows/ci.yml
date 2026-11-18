@@ -148,7 +148,7 @@ jobs:
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_session_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_session_vectors.out"
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_data_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_data_vectors.out"
           # The JSON form of the same vectors (tests/golden/README.md).
-          for v in proto log session; do
+          for v in proto log session data admin reject; do
             python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_${v}_vectors.py" --json | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_${v}_vectors.json"
           done
       # gen_dc_vectors.py and gen_feed_vectors.py take BLAKE3 from the b3sum CLI, which the

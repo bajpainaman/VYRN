@@ -1,0 +1,482 @@
+{
+ "source": "tests/golden/vyrn_reject_vectors.py",
+ "vectors": [
+  {
+   "id": "R01",
+   "dir": "req",
+   "what": "V1: count 0",
+   "verdict": "drop",
+   "results": [],
+   "hex": "07301000010000000000e80301000000376dd0d18e259f770000000000000000"
+  },
+  {
+   "id": "R02",
+   "dir": "req",
+   "what": "V1: count 11 > MAX_MSGS_PER_PKT, with 11 messages",
+   "verdict": "drop",
+   "results": [],
+   "hex": "07301000010000000b00e803010000001000000000000000000000000000000010000000000000000000000000000000100000000000000000000000000000001000000000000000000000000000000010000000000000000000000000000000100000000000000000000000000000001000000000000000000000000000000010000000000000000000000000000000100000000000000000000000000000001000000000000000000000000000000010000000000000000000000000000000daddf820dac211500000000000000000"
+  },
+  {
+   "id": "R03",
+   "dir": "req",
+   "what": "V1: count 1 but two messages of payload",
+   "verdict": "drop",
+   "results": [],
+   "hex": "07301000010000000100e803010000001000000000000000000000000000000010000000000000000000000000000000116b0eaeaaa5b5220000000000000000"
+  },
+  {
+   "id": "R04",
+   "dir": "req",
+   "what": "V1: one byte short",
+   "verdict": "drop",
+   "results": [],
+   "hex": "07301000010000000100e8030100000010000000000000000000000000000000a3d19cf0427a12ab00000000000000"
+  },
+  {
+   "id": "R05",
+   "dir": "req",
+   "what": "V1: one byte long",
+   "verdict": "drop",
+   "results": [],
+   "hex": "07301000010000000100e8030100000010000000000000000000000000000000a3d19cf0427a12ab000000000000000000"
+  },
+  {
+   "id": "R06",
+   "dir": "req",
+   "what": "V9: header flags bit 1 (planned v2 extension block)",
+   "verdict": "msgs",
+   "results": [
+    "3/4",
+    "3/4"
+   ],
+   "hex": "07301000010000000202e8030100000001000000a08601000500000011111111020000002a0000010000000022222222de0b8a4320af95f10000000000000000"
+  },
+  {
+   "id": "R07",
+   "dir": "req",
+   "what": "V9: header reserved bytes 14-15 = 1",
+   "verdict": "msgs",
+   "results": [
+    "3/4"
+   ],
+   "hex": "07301000010000000100e8030100010001000000a08601000500000011111111f9bcf8f587036ef60000000000000000"
+  },
+  {
+   "id": "R08",
+   "dir": "req",
+   "what": "V9 before M2: header flags bit 7 and an undefined type",
+   "verdict": "msgs",
+   "results": [
+    "3/4"
+   ],
+   "hex": "07301000010000000180e803010000000500000000000000000000000000000089d0a49301de99820000000000000000"
+  },
+  {
+   "id": "R09",
+   "dir": "req",
+   "what": "M2: type 0x05 (order range, undefined)",
+   "verdict": "msgs",
+   "results": [
+    "3/1"
+   ],
+   "hex": "07301000010000000100e80301000000050000000000000000000000000000003b8eeaad04afe20a0000000000000000"
+  },
+  {
+   "id": "R10",
+   "dir": "req",
+   "what": "M2: type 0x20 (reserved range)",
+   "verdict": "msgs",
+   "results": [
+    "3/1"
+   ],
+   "hex": "07301000010000000100e8030100000020000000000000000000000000000000b29e6c8f914dafac0000000000000000"
+  },
+  {
+   "id": "R11",
+   "dir": "req",
+   "what": "M2: type 0x81 (a response record in a request)",
+   "verdict": "msgs",
+   "results": [
+    "3/1"
+   ],
+   "hex": "07301000010000000100e80301000000810000002a000001a0860100111111118e8dbee92bf525eb0000000000000000"
+  },
+  {
+   "id": "R12",
+   "dir": "req",
+   "what": "M2 before M3: undefined type 0x13 with a nonzero flags byte",
+   "verdict": "msgs",
+   "results": [
+    "3/1"
+   ],
+   "hex": "07301000010000000100e8030100000013ff00000000000000000000000000000ef9df7c3e7e9fde0000000000000000"
+  },
+  {
+   "id": "R13",
+   "dir": "req",
+   "what": "M3: New with order flags bit 6 (planned reduce-only)",
+   "verdict": "msgs",
+   "results": [
+    "3/2"
+   ],
+   "hex": "07301000010000000100e8030100000001400000a08601000500000001000000572cb41f8a4df0690000000000000000"
+  },
+  {
+   "id": "R14",
+   "dir": "req",
+   "what": "M3: New with bytes 2-3 nonzero (planned STP group)",
+   "verdict": "msgs",
+   "results": [
+    "3/2"
+   ],
+   "hex": "07301000010000000100e8030100000001000700a08601000500000001000000afbeee1b9f7c52590000000000000000"
+  },
+  {
+   "id": "R15",
+   "dir": "req",
+   "what": "M3 before the flag combination: post-only IOC with bit 6",
+   "verdict": "msgs",
+   "results": [
+    "3/2"
+   ],
+   "hex": "07301000010000000100e80301000000014a0000a08601000500000001000000d7929455756577220000000000000000"
+  },
+  {
+   "id": "R16",
+   "dir": "req",
+   "what": "M3: Cancel with bytes 8-11 nonzero",
+   "verdict": "msgs",
+   "results": [
+    "3/2"
+   ],
+   "hex": "07301000010000000100e80301000000020000002a00000101000000020000009ee0fe09214db5c50000000000000000"
+  },
+  {
+   "id": "R17",
+   "dir": "req",
+   "what": "M3: Heartbeat with a nonzero flags byte",
+   "verdict": "msgs",
+   "results": [
+    "3/2"
+   ],
+   "hex": "07301000010000000100e8030100000010010000000000000000000000000000e115c7cceb5681dc0000000000000000"
+  },
+  {
+   "id": "R18",
+   "dir": "req",
+   "what": "M3: ResendReq with bytes 12-15 nonzero",
+   "verdict": "msgs",
+   "results": [
+    "3/2"
+   ],
+   "hex": "07301000010000000100e80301000000110000000100000001000000090000004d9f53265e9fb6760000000000000000"
+  },
+  {
+   "id": "R19",
+   "dir": "req",
+   "what": "M3: CancelAll with bytes 4-7 nonzero",
+   "verdict": "msgs",
+   "results": [
+    "3/2"
+   ],
+   "hex": "07301000010000000100e80301000000120000002a0000010000000003000000607b717c7a3b20550000000000000000"
+  },
+  {
+   "id": "R20",
+   "dir": "req",
+   "what": "M3: Replace with order flags bit 7",
+   "verdict": "msgs",
+   "results": [
+    "3/2"
+   ],
+   "hex": "07301000010000000100e80301000000048000002a000001a086010005000000c55d3120fd3b4de80000000000000000"
+  },
+  {
+   "id": "R21",
+   "dir": "req",
+   "what": "04 \u00a76.1: New post-only with IOC",
+   "verdict": "msgs",
+   "results": [
+    "3/3"
+   ],
+   "hex": "07301000010000000100e80301000000010a0000a08601000500000001000000550f5a7666e41d740000000000000000"
+  },
+  {
+   "id": "R22",
+   "dir": "req",
+   "what": "04 \u00a76.1: Replace post-only with FOK",
+   "verdict": "msgs",
+   "results": [
+    "3/3"
+   ],
+   "hex": "07301000010000000100e80301000000040c00002a000001a086010005000000625c2dba19a63e120000000000000000"
+  },
+  {
+   "id": "R23",
+   "dir": "req",
+   "what": "per message: only index 1 is rejected",
+   "verdict": "msgs",
+   "results": [
+    "ok",
+    "3/2",
+    "ok"
+   ],
+   "hex": "07301000010000000300e80301000000020000002a00000100000000222222220180000001000000010000000100000010000000000000000000000000000000d29726c114d0d7f10000000000000000"
+  },
+  {
+   "id": "S01",
+   "dir": "resp",
+   "what": "header: count 0",
+   "verdict": "drop",
+   "results": [],
+   "hex": "07301000010000000000e80301000000d3d0645065dc57e1"
+  },
+  {
+   "id": "S02",
+   "dir": "resp",
+   "what": "header: count 17 > 16, with 17 records",
+   "verdict": "drop",
+   "results": [],
+   "hex": "07301000010000001100e80301000000810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111810000002a000001a086010011111111fc80637ceb5f664a"
+  },
+  {
+   "id": "S03",
+   "dir": "resp",
+   "what": "header: flags bit 1 (planned: more records follow)",
+   "verdict": "drop",
+   "results": [],
+   "hex": "07301000010000000102e80301000000810000002a000001a086010011111111409a4100fad241cd"
+  },
+  {
+   "id": "S04",
+   "dir": "resp",
+   "what": "header: one record short of count",
+   "verdict": "drop",
+   "results": [],
+   "hex": "07301000010000000200e80301000000810000002a000001a0860100111111111406ac414d54ac0a"
+  },
+  {
+   "id": "S05",
+   "dir": "resp",
+   "what": "type 0x89 (undefined)",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e8030100000089000000000000000000000000000000dc4339c41c285ab2"
+  },
+  {
+   "id": "S06",
+   "dir": "resp",
+   "what": "type 0x01 (a request message in a response)",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e8030100000001000000a086010005000000111111112ffe95906d5adfb8"
+  },
+  {
+   "id": "S07",
+   "dir": "resp",
+   "what": "Ack with bytes 2-3 nonzero",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e80301000000810001002a000001a086010001000000caa1271978575322"
+  },
+  {
+   "id": "S08",
+   "dir": "resp",
+   "what": "Ack with index 10 (neither 0-9 nor 0xFF)",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e80301000000810a00002a000001a086010001000000046f8dd5d4737418"
+  },
+  {
+   "id": "S09",
+   "dir": "resp",
+   "what": "Fill with liq 3",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e80301000000820003002a000001a0860100050000002d7881fa96a1bd30"
+  },
+  {
+   "id": "S10",
+   "dir": "resp",
+   "what": "Reject with reason 0",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e8030100000083ff0000000000000000000000000000ac2a4375721a2997"
+  },
+  {
+   "id": "S11",
+   "dir": "resp",
+   "what": "Reject with reason 25 (reserved, not v1)",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e8030100000083ff1900000000000000000000000000537b57bc3888f224"
+  },
+  {
+   "id": "S12",
+   "dir": "resp",
+   "what": "Reject with bytes 8-11 nonzero",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e8030100000083ff0f00e80300000100000000000000604845f17af7f064"
+  },
+  {
+   "id": "S13",
+   "dir": "resp",
+   "what": "CancelAck with bytes 2-3 nonzero",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e80301000000840001002a00000105000000010000009fb46e980c66e5c3"
+  },
+  {
+   "id": "S14",
+   "dir": "resp",
+   "what": "Out with cause 0",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e80301000000850000002a0000010100000001000000359c8a95e3f9233a"
+  },
+  {
+   "id": "S15",
+   "dir": "resp",
+   "what": "Out with cause 9",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e80301000000850009002a0000010100000001000000bdd5872338c072d8"
+  },
+  {
+   "id": "S16",
+   "dir": "resp",
+   "what": "EpochNotice with byte 1 nonzero",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e8030100000086010000e903000002010000100e000042a08ff73a8747e6"
+  },
+  {
+   "id": "S17",
+   "dir": "resp",
+   "what": "EpochNotice with home-word bytes 10-11 nonzero",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e8030100000086000000e903000002010100100e0000737ce28978b4314d"
+  },
+  {
+   "id": "S18",
+   "dir": "resp",
+   "what": "Bust with index 0 (must be 0xFF)",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e80301000000870000002a000001a08601000500000038d14bb01a80df45"
+  },
+  {
+   "id": "S19",
+   "dir": "resp",
+   "what": "Attest with level 0",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e803010000008800000005000000070000000000000041fa3a2caa5bc20b"
+  },
+  {
+   "id": "S20",
+   "dir": "resp",
+   "what": "Attest with level 4",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e80301000000880400000500000007000000000000008ebfea6d675107c2"
+  },
+  {
+   "id": "S21",
+   "dir": "resp",
+   "what": "Attest with bytes 12-15 nonzero",
+   "verdict": "recs",
+   "results": [
+    "bad"
+   ],
+   "hex": "07301000010000000100e8030100000088010000050000000700000001000000357caec9dabfbade"
+  },
+  {
+   "id": "S22",
+   "dir": "resp",
+   "what": "per record: only index 1 is bad",
+   "verdict": "recs",
+   "results": [
+    "ok",
+    "bad",
+    "ok"
+   ],
+   "hex": "07301000010000000300e80301000000810000002a000001a08601001111111189000000000000000000000000000000820001002a000001a086010005000000f80451b2aa100695"
+  },
+  {
+   "id": "S23",
+   "dir": "resp",
+   "what": "Reject RATE_LIMIT detail 8: RSK_BUCKET_NEW, a 10 \u00a73.8 bucket (04 \u00a79.1 ids 8-11)",
+   "verdict": "recs",
+   "results": [
+    "9/8"
+   ],
+   "hex": "07301000010000000100e8030100000083000900080000000000000011111111babfc80e6f04e9a1"
+  },
+  {
+   "id": "S24",
+   "dir": "resp",
+   "what": "Reject RATE_LIMIT detail 9: RSK_BUCKET_CROSS, a 10 \u00a73.8 bucket (04 \u00a79.1 ids 8-11)",
+   "verdict": "recs",
+   "results": [
+    "9/9"
+   ],
+   "hex": "07301000010000000100e803010000008300090009000000000000001111111141ba267a3614d2e0"
+  },
+  {
+   "id": "S25",
+   "dir": "resp",
+   "what": "Reject RATE_LIMIT detail 10: RSK_BUCKET_LANE_CROSS, a 10 \u00a73.8 bucket (04 \u00a79.1 ids 8-11)",
+   "verdict": "recs",
+   "results": [
+    "9/10"
+   ],
+   "hex": "07301000010000000100e80301000000830009000a000000000000001111111199bbb8d0ec385463"
+  },
+  {
+   "id": "S26",
+   "dir": "resp",
+   "what": "Reject RATE_LIMIT detail 11: RSK_BUCKET_LANE_IMPROVE, a 10 \u00a73.8 bucket (04 \u00a79.1 ids 8-11)",
+   "verdict": "recs",
+   "results": [
+    "9/11"
+   ],
+   "hex": "07301000010000000100e80301000000830009000b0000000000000011111111a2bc8fc01637975f"
+  }
+ ]
+}
