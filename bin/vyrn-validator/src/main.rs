@@ -71,7 +71,7 @@ use vyrn_log::Layout;
 use vyrn_nic::frame;
 use vyrn_nic::{BackendKind, KernelUdp, NicBackend, NicConfig, PortConfig, PortId, RxBind};
 use vyrn_replica::{EpochView, FrameErr, OrderCore};
-use vyrn_types::{BookId, Epoch, Height, LaneId, PubKey};
+use vyrn_types::{BookId, Epoch, Height, LaneId, PubKey, SessionId};
 use vyrn_wire::{RX_BURST, RxPkt, RxRing};
 
 #[derive(Parser)]
@@ -320,6 +320,7 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                 boxes: d.boxes.clone(),
                 max_range: d.max_range,
                 fetches: VecDeque::new(),
+                missing: None,
             })
         }
         None => None,
@@ -345,7 +346,12 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
             Some(
                 std::thread::Builder::new()
                     .name("vyrn-validator/voter".into())
-                    .spawn(move || consensus::run(plan, source, &stop))
+                    .spawn(move || {
+                        // However the voter ends, an error or a panic included, the order
+                        // thread stops too, so main joins both and reports the failure.
+                        let _stop = StopOnDrop(&stop);
+                        consensus::run(plan, source, &stop)
+                    })
                     .map_err(|e| e.to_string())?,
             )
         }
@@ -394,6 +400,8 @@ struct DataRx<const N: usize, R, T> {
     /// Gaps not fully fetched yet, with the box to ask: at most `FETCH_BURST` RANGE fetches go
     /// out per poll and a gap's `from` moves past them. One entry per gap, however long.
     fetches: VecDeque<(FrameHdr, Gap)>,
+    /// The payload the front pending block waits for, and when it was last fetched by key.
+    missing: Option<(SessionId, u32, u64)>,
 }
 
 /// RANGE fetches sent per data poll.
@@ -456,12 +464,26 @@ impl<const N: usize, R: RxRing, T: TxRing> DataRx<N, R, T> {
     }
 
     /// Item 3 for the pending blocks, in height order: a block whose payloads are all joined
-    /// passes or contradicts; a missing payload waits.
-    fn check(&mut self, source: &consensus::Source) {
+    /// passes or contradicts; a missing payload waits. A payload still missing
+    /// `REP_DATA_WAIT_US` after it was first seen missing, or after its last KEY fetch, is
+    /// fetched by key (07 §5.5 source 1), so a lost RANGE request or reply does not stall the
+    /// queue.
+    fn check(&mut self, source: &consensus::Source, now: u64) {
         while let Some(b) = self.pending.front() {
             let h = b.header.height;
             match self.join.check(b) {
-                Err(DataErr::Missing { .. }) => return,
+                Err(DataErr::Missing { session, pkt_seq }) => {
+                    match self.missing {
+                        Some((s, q, at)) if (s, q) == (session, pkt_seq) => {
+                            if now.saturating_sub(at) >= REP_DATA_WAIT_NS {
+                                self.fetch_key(session, pkt_seq);
+                                self.missing = Some((session, pkt_seq, now));
+                            }
+                        }
+                        _ => self.missing = Some((session, pkt_seq, now)),
+                    }
+                    return;
+                }
                 Ok(()) => source.valid(h),
                 Err(_) => {
                     source.invalid_from(h);
@@ -474,7 +496,39 @@ impl<const N: usize, R: RxRing, T: TxRing> DataRx<N, R, T> {
             }
         }
     }
+
+    /// A KEY fetch to every configured box: the validator has no session-to-data-home map yet
+    /// (DEV reading, PR body), and a box that lacks the packet does not answer.
+    fn fetch_key(&mut self, session: SessionId, pkt_seq: u32) {
+        let mut wire = [0u8; frame::MAX_FRAME_BYTES];
+        let q = Fetch::encode(&Fetch::Key { session, pkt_seq });
+        for to in &self.boxes {
+            let hdr = FrameHdr {
+                src: self.me,
+                dst: Endpoint {
+                    mac: [0; 6],
+                    ip: *to.ip(),
+                    port: to.port(),
+                },
+            };
+            if let Ok(n) = frame::build(&hdr, &q, &mut wire) {
+                let _ = self.tx.send(wire.get(..n).unwrap_or(&[]));
+            }
+        }
+    }
 }
+
+/// Sets the flag when dropped.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// `REP_DATA_WAIT_US` (07 §5.5): how long a missing payload waits before a KEY fetch.
+const REP_DATA_WAIT_NS: u64 = 300_000;
 
 fn order_thread<const N: usize, R: RxRing, D: RxRing, T: TxRing>(
     mut core: OrderCore<N, View>,
@@ -510,7 +564,7 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing, T: TxRing>(
         rx.release(k);
         let dk = data.as_mut().map_or(0, |d| d.poll(now()));
         if let Some(d) = data.as_mut() {
-            d.check(source);
+            d.check(source, now());
         }
         if k == 0 && dk == 0 {
             let r = core.tick(now());
