@@ -19,7 +19,8 @@
 //! | `[membership] seq_keys = ["<hex>"]` | `REP_Membership`'s `seq_key` per sequencer index (07 §13.1); public keys, so they may sit in the file |
 //! | `[keys] vote, node` | vote key handle; `node` (the p2p identity) defaults to `vote`. Only `env:NAME` (seed hex) resolves, and only with `[consensus]` |
 //! | `[nic] data_port`, `[data] boxes = ["ip:port"], me, max_range` | optional: the data RX queue (07 §5.4); `boxes[i]` is data box `src = i`, `me` this replica's index in their destination lists. Without `[data]` vote-rule item 3 is not checked (DEV) |
-//! | `[replay] tick_min, tick_max, win_center, slot_cap, [[replay.session]] lane, slot, account, k_seq, quote, base` | optional, needs `[data]`: replay of every block that passes item 3 on `vyrn-engine` (`replay.rs`), built from the sequencer's `[engine]` and `[[dev_session]]` (no state snapshot encoding yet) |
+//! | `dev = false` | `true` marks a DEV validator: only then may `[replay] hashlag_us` differ from 1000 |
+//! | `[replay] tick_min, tick_max, win_center, slot_cap, hashlag_us, [[replay.session]] lane, slot, account, k_seq, quote, base` | optional, needs `[data]`: replay of every block that passes item 3 on `vyrn-engine` (`replay.rs`), built from the sequencer's `[engine]` and `[[dev_session]]` (no state snapshot encoding yet). `hashlag_us` (DEV only, default 1000 = the spec's 1 ms, 07 §3.7) is the `REP_E_HASHLAG` bound, for unpinned DEV hosts |
 //! | `[consensus] roster, roster_hash, genesis_hash, home, seq_order, observers, delta_ms, storage` | optional: the Simplex voter (`consensus.rs`); committee and peers from the roster file (08 §9.6), checked against `roster_hash`; `membership.seq_keys[0]` must be the roster's primary `seq_key` |
 //!
 //! **Start sequence** (11 §10.1): load and check config → resolve keys → build the order core
@@ -96,6 +97,8 @@ struct Config {
     #[serde(default)]
     epoch: u32,
     lanes: u8,
+    #[serde(default)]
+    dev: bool,
     nic: Nic,
     #[serde(default)]
     cores: Cores,
@@ -192,6 +195,16 @@ impl Config {
         if c.replay.is_some() && c.data.is_none() {
             return bad("replay", "needs [data]: replay reads the blocks' payloads");
         }
+        match c.replay.as_ref().and_then(|r| r.hashlag_us) {
+            Some(0) => return bad("replay.hashlag_us", "must be at least 1"),
+            Some(us) if us != 1000 && !c.dev => {
+                return bad(
+                    "replay.hashlag_us",
+                    "other than 1000 (07 §3.7) is DEV only: set dev = true on a DEV validator",
+                );
+            }
+            _ => {}
+        }
         Ok(c)
     }
 }
@@ -285,7 +298,12 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
         return Err("config membership.seq_keys[0] is not the roster's primary seq_key".into());
     }
     let layout = Layout::new(cfg.lanes, 1, 0).map_err(|e| e.to_string())?;
-    let core: OrderCore<N, View> = OrderCore::new(layout, view).map_err(|e| e.to_string())?;
+    let mut core: OrderCore<N, View> = OrderCore::new(layout, view).map_err(|e| e.to_string())?;
+    if let Some(us) = cfg.replay.as_ref().and_then(|r| r.hashlag_us) {
+        // DEV only (`Config::load`): a bound past the spec's 1 ms, for unpinned hosts.
+        core.set_hashlag_max(us.saturating_mul(1000));
+        eprintln!("vyrn-validator: DEV REP_E_HASHLAG bound {us} us (spec: 1000)");
+    }
     let ip = cfg.nic.ip;
     let ncfg = NicConfig::new(BackendKind::Kernel, vec![PortConfig { id: PortId(0), ip }]);
     let mut nic = KernelUdp::open(&ncfg).map_err(|e| e.to_string())?;
@@ -727,5 +745,30 @@ mod tests {
         let want = vyrn_crypto::ed25519::public_key(&[0x42; 32]);
         let hex: String = want.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(c.membership.seq_keys, vec![hex]);
+    }
+
+    /// `[replay] hashlag_us` other than the spec's 1000 loads only with `dev = true`.
+    #[test]
+    fn hashlag_us_is_dev_only() {
+        let base =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/dev.toml")).unwrap();
+        let load = |dev: &str, us: u64| {
+            let dir = std::env::temp_dir().join(format!(
+                "vyrn-val-hashlag-{}-{dev}-{us}",
+                std::process::id()
+            ));
+            let text = format!(
+                "{dev}\n{base}\n[data]\nboxes = [\"127.0.0.1:1\"]\nme = 1\n\n[replay]\ntick_min = 1\ntick_max = 2\nwin_center = 1\nhashlag_us = {us}\n"
+            );
+            std::fs::write(&dir, text).unwrap();
+            let r = super::Config::load(&dir);
+            std::fs::remove_file(&dir).unwrap();
+            r
+        };
+        assert!(load("", 1000).is_ok());
+        assert!(load("", 50_000).unwrap_err().contains("DEV only"));
+        assert!(load("", 999).is_err());
+        assert!(load("dev = true", 50_000).is_ok());
+        assert!(load("dev = true", 0).is_err());
     }
 }

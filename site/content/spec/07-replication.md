@@ -348,6 +348,9 @@ to the order hasher on core 50 (§4.6).
 **INV-REP-8:** the HashRun for a record is in a frame sent at most `REP_HASH_LAG_NS` = 4000 ns
 (budget) after the record's ORDER frame, on the same substream. A replica raises `REP_E_HASHLAG` if a record waits more
 than 1 ms. That is a sequencer fault.
+DEV only: `vyrn-validator`'s `[replay] hashlag_us` (with `dev = true`) sets a larger bound for
+unpinned DEV and CI hosts, which do not meet the pinned-core budget of §7.2. A validator without
+`dev = true` refuses any value other than the 1 ms above, so production behaviour is unchanged.
 
 The H-part is not part of `order_root` (§6.1). It is implied by `data_root`, which covers the full
 hashes. The 8-byte `pkt_hash` is used for three things: the lookup key into the data store, an

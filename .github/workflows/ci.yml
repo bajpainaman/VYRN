@@ -103,9 +103,9 @@ jobs:
       # Release: a debug validator can take longer than REP_HASHLAG_MAX_NS (1 ms) on one frame.
       - run: cargo build --locked --release -p vyrn-seq -p vyrn-validator -p vyrn-data -p e2e-smoke
       - name: 4 validators with finality, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --workload tools/e2e-smoke/wl-smoke-nocross.toml
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 50000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: 4 validators with finality, WL-SMOKE seed 1 (tools/e2e-smoke)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 50000 --strict-hashlag
 
   actionlint:
     runs-on: ubuntu-24.04
