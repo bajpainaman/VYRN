@@ -24,6 +24,7 @@
 //! | Verification at the new home | [`accept_cert`], [`LocalView`] | — | `R_{e+1}`, third home | checks 1–5 in order; the first failure decides | [`HandoffErr`] | 08 §5.4 |
 //! | Fencing (`INV-FENCE`) | [`Fence`], [`check_next_vote`] | — | every replica and follower | from the first moment Q signatures on one record are held | [`FenceErr`] | 08 §8.2 F1, F4 |
 //! | The bridge signer table (rotation number → keys) | [`BridgeSignerTable`], [`BridgeSigners`] | governance (`SetParam`, 09 §6.7) | `vyrn-chain` (`Epochs::bridge_signers`), guardians, relayers | a set activates at the first boundary after approval; every activated set stays readable | [`BridgeErr`] | 09 §6.7, 08 §9.5 |
+//! | The opening auction: window answers, reference and band, uncross rule, fills | [`window_answer`], [`reference`], [`Band`], [`uncross`], [`marginal`], [`UncrossRecord`], [`auction_fill`] | the lanes (answers, fills) and the BBO core (`UncrossRecord`) | sessions, every lane, replicas, oracles | after cert(e, S) and Apply; U = (e+1, 1) is the first step of e+1 | `Reject` reasons per §7.2 (IOC per 04 §6.9: spec gap) | 08 §7.2–7.7, 05 §8.8 |
 //! | The membership hand-off | [`Membership`], [`Activation`], [`Membership::hand_off`] | `EpoConfig(e+1)` (roster) | `vyrn-consensus` (the next [`vyrn_consensus::Committee`]), `vyrn-replica`, `vyrn-chain` | only with a verified cert(e, S) | [`MembershipErr`], [`HandoffErr`] | 08 §9, 07 §13.1 |
 //!
 //! # Domain separation
@@ -42,10 +43,12 @@
 //!
 //! # Not in this crate yet
 //!
-//! The opening auction (08 §7), the role state machines (§4) and the tail stream (§5.5) are
-//! follow-ups. The spec gaps this crate had to fill are marked "Spec gap" at the point of use.
+//! The role state machines (§4) and the tail stream (§5.5) are follow-ups. The opening auction's
+//! distributed marginal search and histograms are the engine's (05 §8.8); [`marginal`] is their
+//! sequential reference. The spec gaps this crate had to fill are marked "Spec gap" at the point of use.
 #![forbid(unsafe_code)]
 
+mod auction;
 mod bridge;
 mod fence;
 mod handoff;
@@ -54,6 +57,11 @@ mod notice;
 mod ready;
 mod schedule;
 
+pub use auction::{
+    AtUncross, AuctionOrder, Band, Clearing, EPO_ACK_QUEUED, EPO_HIST_HALF, EPO_HIST_TICKS,
+    IOC_IN_WINDOW, IocRule, PROTO_PHASE_AUCTION, UncrossRecord, WindowAnswer, at_uncross,
+    auction_fill, band_check, marginal, prio_key, reference, uncross, uncross_price, window_answer,
+};
 pub use bridge::{BRIDGE_SIGNERS, BridgeErr, BridgeSignerTable, BridgeSigners, EvmAddress};
 pub use fence::{Fence, FenceErr, check_next_vote};
 pub use handoff::{

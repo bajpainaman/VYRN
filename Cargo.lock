@@ -3639,6 +3639,7 @@ dependencies = [
  "vyrn-consensus",
  "vyrn-crypto",
  "vyrn-types",
+ "vyrn-wire",
 ]
 
 [[package]]
