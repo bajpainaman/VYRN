@@ -59,6 +59,10 @@
 //!   127.0.0.1, and the box refuses two keyed requesters on one IPv4. A relay drops every
 //!   `LOSS_EVERY`-th datagram the box sends validator 0, so its RANGE and KEY fetches must be
 //!   served (`STATS` `fetch_ring_hit + fetch_log_hit + fetch_resent > 0`) for it to keep up.
+//! - R8. `--keyed` also keys the primary `vyrn-seq` box (`SEQ_XCHG`, repl_addr 127.0.0.2) and
+//!   gives its `[repair]` `xchg`: with the box still up, `seq-repair` sends a plain and a sealed
+//!   (`K_fetch(0, 0, SEQ_TARGET)`, validator 0's) KEY fetch of the last packets sent; only the sealed
+//!   one may be answered, with the packet's exact bytes (07 §5.5 source 3, 08 §9.6).
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -121,6 +125,8 @@ const SEQ_SEED: [u8; 32] = [0x42; 32];
 /// `--keyed` (R7): validator 0's X25519 secret and the box's.
 const XCHG_SEED: [u8; 32] = [0x5a; 32];
 const BOX_XCHG: [u8; 32] = [0x6b; 32];
+/// `--keyed` (R8): the primary `vyrn-seq` box's X25519 secret.
+const SEQ_XCHG: [u8; 32] = [0x7c; 32];
 /// `--keyed` (R7): the relay to validator 0 drops every this-many-th datagram.
 const LOSS_EVERY: u64 = 25;
 const LANES: usize = 2;
@@ -634,6 +640,7 @@ fn seq_config(
     order: &[String],
     sessions: &[Sess],
     cons: Option<&Cons>,
+    repair: Option<u16>,
 ) -> Result<PathBuf, String> {
     let mut s = format!(
         r#"schema = 1
@@ -692,6 +699,13 @@ seq = "env:VYRN_E2E_SEQ_SEED"
             hex(&[0; 32])
         ));
     }
+    // --data: `SeqDataReq` (07 §5.5 source 3) on a picked port the validators' configs name.
+    if let Some(port) = repair {
+        s.push_str(&format!("\n[repair]\nport = {port}\n"));
+        if cons.is_some_and(|c| c.seq_fetch_key.is_some()) {
+            s.push_str("xchg = \"env:VYRN_E2E_SEQ_XCHG\"\n");
+        }
+    }
     let p = dir.join("seq.toml");
     std::fs::write(&p, s).map_err(|e| e.to_string())?;
     Ok(p)
@@ -721,20 +735,22 @@ fn data_ports(n: usize) -> Result<Vec<u16>, String> {
     Ok(ports)
 }
 
-/// A validator's config. With `data = Some((fetch, port))` (`--data`): its data RX queue on
-/// `port`, the vyrn-data node at `fetch` as box 0 (it is destination `i + 1` there; the tap is
-/// 0), and `[replay]` with the sequencer's engine and sessions, so it prints `out=` per block.
+/// A validator's config. With `data = Some((fetch, ports, repair))` (`--data`): its data RX
+/// queue on `ports[i]`, the vyrn-data node at `fetch` as box 0 (it is destination `i + 1` there;
+/// the tap is 0), the other validators as `[[data.peer]]` (voter `j`, data port) and the box's `[repair]` port as
+/// `seq_repair` (07 §5.5 sources 2 and 3), and `[replay]` with the sequencer's engine and
+/// sessions, so it prints `out=` per block.
 fn validator_config(
     dir: &Path,
     i: usize,
-    data: Option<(SocketAddrV4, u16)>,
+    data: Option<(SocketAddrV4, &[u16], u16)>,
     sessions: &[Sess],
     cons: Option<&Cons>,
     hashlag_us: Option<u64>,
     keyed: bool,
 ) -> Result<PathBuf, String> {
     let key = hex(&vyrn_crypto::ed25519::public_key(&SEQ_SEED));
-    let data_port = data.map_or(0, |(_, p)| p);
+    let data_port = data.and_then(|(_, ps, _)| ps.get(i).copied()).unwrap_or(0);
     // The vote key resolves only with [consensus]; without it the handle is read and unused.
     let vote = if cons.is_some() {
         "env:VYRN_E2E_VOTE_SEED".to_owned()
@@ -768,9 +784,15 @@ seq_keys = ["{key}"]
 vote = "{vote}"
 "#
     );
-    if let Some((fetch, _)) = data {
+    if let Some((fetch, ports, repair)) = data {
+        let peers = ports
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(j, p)| format!("\n[[data.peer]]\nvoter = {j}\naddr = \"127.0.0.1:{p}\"\n"))
+            .collect::<String>();
         s.push_str(&format!(
-            "\n[data]\nboxes = [\"{fetch}\"]\nme = {}\n{}\n[replay]\ntick_min = {TICK_MIN}\ntick_max = {TICK_MAX}\nwin_center = {WIN_CENTER}\nslot_cap = {SLOT_CAP}\n",
+            "\n[data]\nboxes = [\"{fetch}\"]\nme = {}\n{}seq_repair = \"127.0.0.1:{repair}\"\n{peers}\n[replay]\ntick_min = {TICK_MIN}\ntick_max = {TICK_MAX}\nwin_center = {WIN_CENTER}\nslot_cap = {SLOT_CAP}\n",
             i + 1,
             if keyed {
                 "xchg = \"env:VYRN_E2E_XCHG\"\n"
@@ -906,12 +928,18 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // outside the ephemeral range, so no node's port-0 bind can take it meanwhile.
     // With --finality also each validator's TCP repl port and the box's CTRL port, from the
     // same range in one pick, so no two picks overlap.
-    let want = if cli.data { n_val } else { 0 } + if cli.finality { n_val + 1 } else { 0 };
+    // With --data also the box's `[repair]` port (07 §5.5 source 3), last of the data picks.
+    let want = if cli.data { n_val + 1 } else { 0 } + if cli.finality { n_val + 1 } else { 0 };
     let mut picked = data_ports(want)?;
     let val_data: Vec<u16> = if cli.data {
         picked.drain(..n_val).collect()
     } else {
         Vec::new()
+    };
+    let seq_repair = if cli.data {
+        Some(picked.remove(0))
+    } else {
+        None
     };
     let cons = if cli.finality {
         Some(Cons::new(&dir, &picked, cli.keyed)?)
@@ -971,8 +999,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .map(|i| {
             let data = data_node
                 .as_ref()
-                .zip(val_data.get(i))
-                .map(|((_, _, fetch, _), port)| (*fetch, *port));
+                .zip(seq_repair)
+                .map(|((_, _, fetch, _), r)| (*fetch, &val_data[..], r));
             let keyed = cli.keyed && i == 0;
             let cfg = validator_config(
                 &dir,
@@ -1029,12 +1057,13 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
     let cl_recv = cl_sock.try_clone().map_err(|e| e.to_string())?;
 
-    let cfg = seq_config(&dir, &order, &sessions, cons.as_ref())?;
+    let cfg = seq_config(&dir, &order, &sessions, cons.as_ref(), seq_repair)?;
     let mut c = command(&bin_dir.join("vyrn-seq"), cli.seq_cpus.as_deref());
     c.arg("--config")
         .arg(cfg)
         .arg("--stop-on-stdin-eof")
-        .env("VYRN_E2E_SEQ_SEED", hex(&SEQ_SEED));
+        .env("VYRN_E2E_SEQ_SEED", hex(&SEQ_SEED))
+        .env("VYRN_E2E_SEQ_XCHG", hex(&SEQ_XCHG));
     let seq = nodes.spawn("vyrn-seq", &mut c, &tx)?;
     drop(tx);
     let ready = format!("READY vyrn-seq lanes={LANES} rx=");
@@ -1103,6 +1132,14 @@ fn run(cli: &Cli) -> Result<bool, String> {
         Ok(())
     };
     let fin_target = last(&nodes.0);
+    // R8, with the box still up: its keyed `[repair]` answers a sealed KEY fetch, not a plain one.
+    let seq_repair_probe = cons.as_ref().and_then(|c| c.seq_fetch_key).map(|k| {
+        probe_seq_repair(
+            nodes.0.get(seq).and_then(|n| line(n, "REPAIR addr=")),
+            &k,
+            &pkts,
+        )
+    });
     let seq_ok = nodes.stop(seq, &rx, Instant::now() + wait)?;
     // The data node flushes its open frames on stop.
     let data_ok = data_idx.map(|i| nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
@@ -1207,6 +1244,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
             Ok(stats.clone())
         }
     });
+
+    match seq_repair_probe {
+        Some(r) => rep.check("seq-repair", r),
+        None => Report::skip("seq-repair", "off (enable with --keyed, R8)"),
+    }
 
     rep.check("validators", {
         let mut errs = Vec::new();
@@ -1621,6 +1663,8 @@ fn vote_seed(i: usize) -> [u8; 32] {
 /// ports, this run's `seq_key` as the primary, a dummy standby; and the box's pre-picked CTRL
 /// address, which every validator lists as its observer.
 struct Cons {
+    /// `--keyed` (R8): validator 0's key to the primary `vyrn-seq` box.
+    seq_fetch_key: Option<[u8; 16]>,
     roster: PathBuf,
     roster_hash: String,
     ctrl: SocketAddrV4,
@@ -1658,7 +1702,10 @@ impl Cons {
                 repl_addr: addr(*repl.get(i).ok_or("repl port")?),
             });
         }
-        let seq = [seq_key, [0x77; 32]]
+        // R8: the primary box gets a real key, so its `[repair]` serves only sealed fetches. Its
+        // repl_addr is 127.0.0.2, so the data box, which keys requesters by IPv4, keeps one
+        // keyed requester on 127.0.0.1 (validator 0).
+        let mut seq: Vec<SeqEntry> = [seq_key, [0x77; 32]]
             .iter()
             .zip(1u8..)
             .map(|(k, f)| SeqEntry {
@@ -1670,6 +1717,10 @@ impl Cons {
                 repl_addr: addr(0),
             })
             .collect();
+        if keyed && let Some(s0) = seq.first_mut() {
+            s0.xchg_key = vyrn_crypto::x25519::public_key(&SEQ_XCHG).to_vec();
+            s0.repl_addr.ip[12..].copy_from_slice(&[127, 0, 0, 2]);
+        }
         let home = Home {
             voters,
             seq,
@@ -1696,7 +1747,22 @@ impl Cons {
         };
         let roster = dir.join("roster.hex");
         std::fs::write(&roster, hex(&r.encode())).map_err(|e| e.to_string())?;
+        // Validator 0's `K_fetch(0, 0, SEQ_TARGET)`, which the R8 probe seals with.
+        let seq_fetch_key = keyed
+            .then(|| {
+                r.requester_fetch_key(
+                    vyrn_epoch::FETCH_CONTEXT,
+                    &domain,
+                    Epoch(0),
+                    vyrn_types::HomeCode::Ldn,
+                    0,
+                    vyrn_epoch::SEQ_TARGET,
+                    &XCHG_SEED,
+                )
+            })
+            .flatten();
         Ok(Self {
+            seq_fetch_key,
             roster,
             roster_hash: hex(&r.hash(&domain).0),
             ctrl: SocketAddrV4::new(
@@ -1705,6 +1771,47 @@ impl Cons {
             ),
         })
     }
+}
+
+/// R8: KEY fetches of the last sent packets to the box's keyed `[repair]` at `addr`. The plain
+/// form must get no answer; the form sealed under `key` must return the packet's exact bytes.
+fn probe_seq_repair(addr: Option<&str>, key: &[u8; 16], pkts: &[Pkt]) -> Result<String, String> {
+    use vyrn_data::frame::{Fetch, decode, seal_fetch};
+    let addr: SocketAddrV4 = addr
+        .ok_or("vyrn-seq printed no REPAIR addr=")?
+        .parse()
+        .map_err(|e| format!("REPAIR addr: {e}"))?;
+    let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    sock.set_read_timeout(Some(Duration::from_millis(300)))
+        .map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 2048];
+    // The box retains 50 ms back from its newest packet (05 §6.10): ask for the last ones sent.
+    for p in pkts.iter().rev().take(8) {
+        let q = Fetch::Key {
+            session: p.session,
+            pkt_seq: p.pkt_seq,
+        };
+        sock.send_to(&q.encode(), addr).map_err(|e| e.to_string())?;
+        if sock.recv(&mut buf).is_ok() {
+            return Err(format!(
+                "the keyed box answered a plain fetch of {:?}",
+                (p.session, p.pkt_seq)
+            ));
+        }
+        sock.send_to(&seal_fetch(key, &q), addr)
+            .map_err(|e| e.to_string())?;
+        let n = sock
+            .recv(&mut buf)
+            .map_err(|e| format!("no answer to a sealed fetch: {e}"))?;
+        let f = decode(buf.get(..n).unwrap_or_default()).map_err(|e| format!("{e:?}"))?;
+        if f.packets().any(|b| b == p.bytes.as_slice()) {
+            return Ok(format!(
+                "a plain KEY fetch got no answer; the sealed one returned {:?}'s exact bytes",
+                (p.session.0, p.pkt_seq)
+            ));
+        }
+    }
+    Err("no sealed fetch of the last 8 packets returned their bytes".into())
 }
 
 /// Heights of a validator's `FINAL height=<h>` lines, and of the box's (R4).

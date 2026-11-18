@@ -249,6 +249,16 @@ impl DataJoin {
             .first()
     }
 
+    /// Every held variant of `(session, pkt_seq)`, referenced or not, ordered by `pkt_hash`: what
+    /// a replica answers a peer's KEY fetch with (07 §5.5 source 2).
+    pub fn variants(&self, session: SessionId, pkt_seq: u32) -> impl Iterator<Item = &[u8]> + '_ {
+        self.by_key
+            .get(&(session, pkt_seq))
+            .into_iter()
+            .flat_map(|m| m.values().flatten())
+            .map(|v| v.bytes.as_slice())
+    }
+
     /// The payload and full hash a record names, if held and its `count` fits (07 §5.4).
     pub fn resolve(&self, r: &PacketRecord) -> Result<(&[u8], Hash), DataErr> {
         let v = self.variant(r).ok_or(DataErr::Missing {
