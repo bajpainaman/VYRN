@@ -625,6 +625,14 @@ off size field       type     meaning
 For kinds other than `KeepPrio`, the op's ts is `prio_ts`, so `visible_at` (§5.2) uses `prio_ts`
 as the insertion ts.
 
+**A `NewPrio` after the uncross cut.** The slot has no link to the version it replaces, so the BBO
+reads "auction-only and visible at `C*`" (§8.8 item 6) from the root slot: `replace_ok` (§8.5)
+refuses a `NewPrio` version with `ins_seq > C*` whose root slot (same `gen`) is auction-only with
+`ins_seq ≤ C*`, where `C*` is the newest uncross cut of the lane. The lane has already ended that
+order at `C*` and answers the `Replace` `TOO_LATE` (detail `OUT`), so neither side lets the
+replacement trade. Gap: the lane tests the TIF of the version in effect at `C*`, which differs
+from the root's only if a `Replace` before `C*` changed the TIF to or from auction-only.
+
 **Write-once rule (`INV-ENG-2`).** The lane writes offsets 0–39 and 44–63 before the slot's
 position becomes active (§4.6). It writes `tomb_ts`, then `tomb_seq` with `Release`, at most
 once, and `next_ver` at most once (before `tomb_seq` of the same op). No other write happens
@@ -2306,6 +2314,11 @@ boundaries and of step outputs.
    Maker fills and every record the TX core sent are not emitted again (rule 5).
 5. **Mirroring.** The lane writes the packets of rules 1 and 2 into the retention buffer, from
    the events of B1, with their `resp_seq`.
+
+**Known bound.** The lane stages B3 records in one buffer reserved for 4096 records per boundary.
+A boundary with more (auction-only remainders of one lane, or a `CancelAll` of more than 4096
+orders) reallocates on the sealed engine thread. No swarm or e2e run reaches it; a lane-wide
+bound on records per boundary waits until one does.
 
 Rule 4.1 gives the natural order: a cancel's `CancelAck` follows every fill of the canceled
 version; a join's `Ack` precedes every maker fill on it; a `Replace` shows the old version's fills,

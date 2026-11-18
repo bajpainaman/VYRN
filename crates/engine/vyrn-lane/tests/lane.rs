@@ -1570,3 +1570,135 @@ fn a_reduce_admitted_after_the_freeze_does_not_keep_the_auction_reservation() {
         "the lane-1 sell fills instead"
     );
 }
+
+#[test]
+fn a_replace_admitted_after_the_freeze_does_not_trade_after_the_auction_out() {
+    // 05 §8.8 item 6 with §4.3 (#202 Codex review 2): a Replace admitted after the freeze cut
+    // C* gives the order a NewPrio version with its own position after C*. The lane ends the
+    // order at C* (Out AUCTION 10) and answers the replace TOO_LATE; the BBO refuses the same
+    // replacement, so it never trades in a later auction (on main: the lane faults).
+    use vyrn_bbo::{ControlCmd, OrderFlags, Phase, Stp, Tif};
+    let ao = |side| OrderFlags::new(side, Tif::AuctionOnly, false, Stp::None);
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Auction,
+        lo: Tick(0),
+        hi: Tick(0),
+    });
+    x.settle(&mut bbo);
+    // p* = 105 for 1 on lane 1; the auction-only sell at 110 on lane 0 does not fill.
+    x.send(
+        1,
+        1,
+        1_000,
+        &[
+            new(day(Side::Sell), 104, 1, 1),
+            new(day(Side::Buy), 106, 1, 2),
+        ],
+    );
+    x.send(0, 1, 2_000, &[new(ao(Side::Sell), 110, 10, 4)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 1);
+    assert_eq!(base_resv(&mut x, 0, 1), 10, "the sell reserves its 10");
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Frozen,
+        lo: Tick(1),
+        hi: Tick(u32::MAX - 1),
+    });
+    while x.bbo_step(&mut bbo).is_some() {}
+    // The lane has not applied the freeze: it admits the reduce, after C*.
+    let at = x.lane_cut(0);
+    let none = [Mid {
+        pass: 1,
+        next: LaneSeq(99),
+        at,
+    }];
+    let m = [Msg::Replace {
+        flags: wire_flags(ao(Side::Sell)),
+        handle: h,
+        tick: Tick(111),
+        qty: Qty(6),
+    }];
+    assert_eq!(x.send_at(0, 1, 3_000, 3_000, &m, &none), Rx::Accepted);
+    x.command(&ControlCmd::Uncross {
+        price: Tick(105),
+        qty: 1,
+    });
+    x.settle(&mut bbo);
+    let recs: Vec<_> = x
+        .records(0, 1)
+        .into_iter()
+        .filter(|r| !matches!(r, Record::Ack { .. }))
+        .collect();
+    assert_eq!(
+        recs,
+        vec![
+            Record::Out {
+                index: vyrn_bbo::INDEX_MAKER,
+                cause: vyrn_bbo::OUT_AUCTION,
+                handle: h,
+                qty: Qty(10),
+                client_tag: 4
+            },
+            Record::Reject {
+                index: 0,
+                reason: RejectReason::TooLate,
+                detail: 3,
+                client_tag: 4
+            },
+        ],
+        "{recs:?}"
+    );
+    assert_eq!(base_resv(&mut x, 0, 1), 0, "nothing stays reserved");
+    // The next auction at 111 fills lane 1's own orders, not the refused replacement.
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Auction,
+        lo: Tick(0),
+        hi: Tick(0),
+    });
+    x.settle(&mut bbo);
+    x.send(
+        1,
+        1,
+        4_000,
+        &[
+            new(day(Side::Sell), 111, 6, 8),
+            new(day(Side::Buy), 111, 6, 9),
+        ],
+    );
+    x.settle(&mut bbo);
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Frozen,
+        lo: Tick(1),
+        hi: Tick(u32::MAX - 1),
+    });
+    x.command(&ControlCmd::Uncross {
+        price: Tick(111),
+        qty: 6,
+    });
+    x.settle(&mut bbo);
+    assert!(
+        x.records(0, 1)
+            .iter()
+            .all(|r| !matches!(r, Record::Fill { .. })),
+        "the ended order does not trade"
+    );
+    let at_111: Vec<_> = x
+        .records(1, 1)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Fill {
+                tick: Tick(111),
+                qty,
+                ..
+            } => Some(qty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        at_111,
+        vec![Qty(6), Qty(6)],
+        "the lane-1 sell fills instead"
+    );
+}

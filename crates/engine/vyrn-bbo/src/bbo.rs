@@ -1628,7 +1628,8 @@ impl Bbo {
             _ => {}
         }
         if t.v.kind == SlotKind::NewPrio {
-            if !self.st.replace_ok(t.lane, t.vslot, &t.v) {
+            let root = src.slot(LaneId(lane_u8(t.lane)), t.v.root);
+            if !self.st.replace_ok(t.lane, t.vslot, &t.v, root.as_ref()) {
                 self.reject_taker(t, role, RejectReason::TooLate, 0);
                 return true;
             }
@@ -1758,7 +1759,11 @@ impl Bbo {
                 ev.cause = reason.code();
                 rec = reject(reason);
             } else if d.kind == DEP_JOIN {
-                if v.kind == SlotKind::NewPrio && !self.st.replace_ok(lane, d.slot, &v) {
+                if v.kind == SlotKind::NewPrio
+                    && !self
+                        .st
+                        .replace_ok(lane, d.slot, &v, src.slot(lid, v.root).as_ref())
+                {
                     ev.cause = RejectReason::TooLate.code();
                     rec = reject(RejectReason::TooLate);
                 } else if v.kind == SlotKind::NewPrio && v.total <= r.filled {
