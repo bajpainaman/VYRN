@@ -1,13 +1,9 @@
-//! The two boundaries this crate owns for crates that are not merged yet.
+//! The two boundaries this crate owns toward the engine and the epoch schedule.
 //!
-//! - [`ReplayEngine`] is 11 §5.3's trait. `RustReplay` (over `vyrn-engine` in replay mode) and
-//!   `VxReplay` (over [`crate::vx`]) will implement it. The payload half exists:
-//!   [`crate::DataJoin`] is `vyrn_engine::Payloads`. `RustReplay` does not, because
-//!   `vyrn_engine::Engine::replay` takes the engine's own journal (`OwnedRec::Step` with
-//!   `StepEntry`) and compares every field but `pub_a`/`pub_b`, while 07's wire `StepRecord`
-//!   carries no `n_tx`, `n_fills`, `fill_lanes`, `flags` or band, and 07 fixes no interleaving of
-//!   one block's packet records and steps. [`BlockInputs`] therefore cannot be turned into the
-//!   engine's input [Certain: from both crates' code]; see the spec gap in the PR.
+//! - [`ReplayEngine`] is 11 §5.3's trait. [`crate::RustReplay`] implements it over
+//!   `vyrn_engine::Engine::replay_wire`, which takes 07's fields only (07 §7.1 `REP_MERGE`);
+//!   `VxReplay` (over [`crate::vx`]) is a follow-up. [`crate::DataJoin`] is the payload half
+//!   (`vyrn_engine::Payloads`).
 //! - [`EpochView`] is what the replica reads from the epoch schedule (08, `vyrn-epoch`): the
 //!   epoch and book it serves, the sequencer keys of `REP_Membership` (07 §13.1) and the
 //!   `INV-FENCE` boundary (07 §6.4 item 5).
