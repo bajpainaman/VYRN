@@ -2111,7 +2111,8 @@ fn band_test(b: &Bbo, C: &Cut) -> Band {
   snapshot's spread narrower than the true spread: the safe direction.
 
 `lowver[l]` is updated by `finish_step`: it becomes `P.entry[l].snap_ver` when `C[l] =
-P.entry[l].seq ≥ 1`, it becomes `e.snap_ver` for the source lane, and it is unchanged when the clamp
+P.entry[l].seq ≥ 1` and `C[l] > C_{s−1}[l]` (a lane whose cut did not move keeps its value, which
+is still a valid lower bound, and 07 has no bit for it), it becomes `e.snap_ver` for the source lane, and it is unchanged when the clamp
 held `C[l]` below `P.entry[l].seq` (the older value is still a valid lower bound). Whether
 `P.entry[l]` sat at `C[l]` when the core read it depends on timing, so a step logs each lane whose
 `lowver` that first rule changed (`StepEntry.lowver`, 07 §3.8 `LOWVER`), and replay applies

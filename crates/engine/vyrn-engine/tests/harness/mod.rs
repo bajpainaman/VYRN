@@ -422,6 +422,18 @@ pub fn to_wire(recs: &[OwnedRec]) -> (Vec<PacketRecord>, Vec<vyrn_types::RouteRe
             // `AcctTake`s are a separate input (`takes_of`); the harness box logs none.
             OwnedRec::Take(_) => {}
             OwnedRec::Step(e, d) => {
+                // 07 §3.8: a `LOWVER` bit names a lane whose cut moved, or the encoder refuses
+                // the step (`RepErr::Cut`) and the live stream stops.
+                for l in (0..64).filter(|l| e.lowver >> l & 1 != 0) {
+                    let moved = d[..usize::from(e.n_delta)].iter().any(|x| {
+                        usize::from(x.lane.0) == l && cut.get(l).is_some_and(|c| x.seq > *c)
+                    });
+                    assert!(
+                        moved,
+                        "step {}: LOWVER bit on lane {l}, whose cut did not move",
+                        e.step.0
+                    );
+                }
                 for x in &d[..usize::from(e.n_delta)] {
                     cut[usize::from(x.lane.0)] = x.seq;
                 }

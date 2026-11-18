@@ -203,9 +203,14 @@ fn replay_takes_the_lowver_lanes_the_live_step_logged() {
     // envelope and different bounds. Each step now logs the lanes it updated (07 §3.8
     // `LOWVER`) and replay derives their versions from its own packet records (07 §7.1).
     // Before the fix seeds 7, 9, 10 and 14 replayed other `lowver` lanes than live logged.
+    // Seeds 37 (delay 50) and 197 (delay 150): a lane's cut stayed on its half-cut entry while a
+    // source update moved its `lowver`, and a later step at the same cut took the entry's value
+    // back and logged a bit on a lane whose cut did not move, which the 07 encoder refuses
+    // (`to_wire` asserts it). Only a lane whose cut moves takes its entry's `lowver`.
     let mut taken = 0;
-    for seed in 1..=16 {
-        let (j, store) = interleaved_on_sim(seed, 150);
+    let cases = (1..=16).map(|s| (s, 150)).chain([(37, 50), (197, 150)]);
+    for (seed, delay) in cases {
+        let (j, store) = interleaved_on_sim(seed, delay);
         let (lanes, routes, steps) = to_wire(&j.recs);
         let (r, rep) = replay_wire(&lanes, &routes, &steps, &store, Some(&j));
         assert_eq!(r, Ok(()), "seed {seed}");

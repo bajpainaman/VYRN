@@ -878,9 +878,10 @@ impl Bbo {
         e.pub_a = u32::try_from(self.pair.a.0 & 0xFFFF_FFFF).unwrap_or(0);
         e.pub_b = u32::try_from(self.pair.b.0 & 0xFFFF_FFFF).unwrap_or(0);
         self.out.set_deltas(&prev, &c, self.n);
-        // 05 §8.6: a lane whose cut lands on its half-cut entry takes the entry's `snap_ver`.
+        // 05 §8.6: a lane whose cut moves onto its half-cut entry takes the entry's `snap_ver`.
         // Which entry live saw is physical, so live logs the lanes it updated and replay applies
-        // the logged ones with the versions it derives (07 §3.8 `LOWVER`, §7.1).
+        // the logged ones with the versions it derives (07 §3.8 `LOWVER`, §7.1). A lane whose
+        // cut did not move takes nothing: 07 has no bit for it, so replay could not follow.
         let mut mask = 0u64;
         match self.rlow.take() {
             Some((m, vers)) => {
@@ -897,7 +898,7 @@ impl Bbo {
             None => {
                 for l in 0..self.n {
                     let ent = self.pair.entry(l);
-                    if ent.seq.0 != 0 && c.get(l) == Some(&ent.seq) {
+                    if ent.seq.0 != 0 && c.get(l) == Some(&ent.seq) && c.get(l) > prev.get(l) {
                         let v = self.expand(ent.snap_ver);
                         if let Some(x) = self.lowver.get_mut(l)
                             && *x != v
