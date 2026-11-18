@@ -3,8 +3,11 @@
 //!
 //! **Ring.** Every frame the stream core ships on path A is kept, per substream, in `frame_seq`
 //! order, until the ring holds more than `[replication] rtx_ring_bytes` (default
-//! `REP_RTX_RING_BYTES` = 64 MiB); then the oldest frames go. Buffers are reused, so a full ring
-//! allocates nothing per frame.
+//! `REP_RTX_RING_BYTES` = 64 MiB); then the oldest frames go. The ring counts each buffer's
+//! capacity, not its frame's length, and keeps at most [`SPARE_MAX`] evicted buffers for reuse,
+//! so its retained storage stays within the cap plus `SPARE_MAX` frames whatever the frame sizes
+//! (Codex r4613789579). Buffers are reused, so a full ring of steady frames allocates nothing
+//! per frame.
 //!
 //! **Nacks** come from the finality listener on `REP_UDP_CTRL` (`finality.rs`) through a bounded
 //! queue ([`NACK_QUEUE`]; a full queue drops the Nack and counts it), and the stream core serves
@@ -30,6 +33,8 @@ pub const REP_RTX_MAX_FPS: u64 = 200_000;
 pub const NACK_QUEUE: usize = 1024;
 /// Nacks the stream core serves per turn of its loop.
 pub const NACKS_PER_TURN: usize = 16;
+/// Evicted buffers kept for reuse; the rest are freed.
+pub const SPARE_MAX: usize = 64;
 const FLAGS_AT: usize = 16;
 const BURST_NS: u64 = 10_000_000;
 const SEC: u64 = 1_000_000_000;
@@ -100,7 +105,7 @@ impl Ring {
         let mut b = self.spare.pop().unwrap_or_default();
         b.clear();
         b.extend_from_slice(f);
-        self.bytes = self.bytes.saturating_add(b.len());
+        self.bytes = self.bytes.saturating_add(b.capacity());
         q.push_back(b);
         while self.bytes > self.cap {
             let Some(i) = (0..2).max_by_key(|&i| self.frames[i].len()) else {
@@ -110,8 +115,10 @@ impl Ring {
                 break;
             };
             self.first[i] = self.first[i].saturating_add(1);
-            self.bytes = self.bytes.saturating_sub(old.len());
-            self.spare.push(old);
+            self.bytes = self.bytes.saturating_sub(old.capacity());
+            if self.spare.len() < SPARE_MAX {
+                self.spare.push(old);
+            }
         }
     }
 
@@ -217,6 +224,34 @@ mod tests {
     }
 
     const LO: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+    #[test]
+    fn retained_storage_stays_within_the_cap_for_mixed_frame_sizes() {
+        // Codex's probe: batches of 32 B and 250 B frames under a 64 KiB cap. Counting frame
+        // lengths kept 180,236 B of buffers; capacity is what the ring holds.
+        let cap = 65_536;
+        let mut r = Ring::new(3, 0, cap);
+        let mut q = 0;
+        // Large frames fill the ring, then small ones replace them: a small frame in a reused
+        // large buffer holds 250 B of storage for 32 B of frame.
+        for round in 0..4 {
+            let pad = if round % 2 == 0 { 218 } else { 0 };
+            for _ in 0..4096 {
+                q += 1;
+                let mut f = frame(0, q);
+                f.resize(f.len() + pad, 0);
+                r.push(&f);
+            }
+        }
+        let held: usize = r.frames.iter().flatten().map(Vec::capacity).sum();
+        let spare: usize = r.spare.iter().map(Vec::capacity).sum();
+        assert!(held <= cap, "ring holds {held} B");
+        assert!(
+            r.spare.len() <= SPARE_MAX && spare <= SPARE_MAX * 256,
+            "spare {spare} B"
+        );
+        assert_eq!(r.bytes, held);
+    }
 
     #[test]
     fn serves_from_the_configured_address_with_flags_and_wraps() {
