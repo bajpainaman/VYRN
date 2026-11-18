@@ -153,9 +153,8 @@ fn script() -> Vec<Act> {
     ]
 }
 
-/// [`script`], then a heartbeat-only packet and a join behind a heartbeat. Live only: 07 cannot
-/// frame an accepted packet with a session-only message yet (`SeqWriter` returns `Range`: the
-/// record's `count` is the header's, but session-only messages take no LaneSeq).
+/// [`script`], then a heartbeat-only packet and a join behind a heartbeat (`PacketRecord.count`
+/// counts only LaneSeq-taking messages since #112, so 07 carries both).
 fn script_hb() -> Vec<Act> {
     let pkt = |rx_ts, msgs| Act::Pkt {
         l: 0,
@@ -374,7 +373,7 @@ fn records(pkts: &[Vec<u8>]) -> Vec<Record> {
 
 #[test]
 fn replay_md_equals_live_md_byte_for_byte() {
-    let (j, store, live_md) = live(&script());
+    let (j, store, live_md) = live(&script_hb());
     let live_md = live_md.unwrap();
     let rep_md = replay_md(&j, &store, &blocks(&j, &store, &[])).unwrap();
     assert_eq!(rep_md, live_md);
@@ -382,7 +381,7 @@ fn replay_md_equals_live_md_byte_for_byte() {
 
 #[test]
 fn every_block_split_gives_the_same_md() {
-    let (j, store, live_md) = live(&script());
+    let (j, store, live_md) = live(&script_hb());
     let live_md = live_md.unwrap();
     for at in 0..j.recs.len() - 1 {
         let rep_md = replay_md(&j, &store, &blocks(&j, &store, &[at]))
