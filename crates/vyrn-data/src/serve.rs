@@ -13,7 +13,7 @@ use vyrn_nic::frame::{self as nic_frame, Endpoint, FrameHdr, MAX_FRAME_BYTES};
 use vyrn_types::{BookId, Height, Nanos, SessionId};
 use vyrn_wire::TxRing;
 
-use crate::frame::{DataHdr, Fetch, FrameBuf, FrameErr, Kind, key_seq};
+use crate::frame::{DataHdr, FetchMsg, FrameBuf, FrameErr, Kind, key_seq};
 use crate::node::{Counters, FetchKeysErr, NodeConfig, bump, pkt_key, split_payloads};
 use crate::ring::Ring;
 
@@ -84,23 +84,24 @@ impl Gate {
     }
 
     /// The fetch in `payload` from `src`, if it authenticates and is within `src`'s limit.
-    pub(crate) fn admit(
+    /// A REDIRECT_BATCH costs one token, like any fetch.
+    pub(crate) fn admit<'p>(
         &mut self,
         src: Endpoint,
-        payload: &[u8],
+        payload: &'p [u8],
         now: Nanos,
         c: &mut Counters,
-    ) -> Option<Fetch> {
+    ) -> Option<FetchMsg<'p>> {
         // Authenticate and decode, then charge the source: a forged, unkeyed or malformed
         // fetch costs one SipHash at most and never a token of an honest source's bucket.
         let q = if self.keys.is_empty() {
-            Fetch::decode(payload)
+            FetchMsg::decode(payload)
         } else {
             // Each held epoch's key in turn: at most two SipHashes for a forged fetch.
             let mut q = Err(FrameErr::Tag);
             for (_, m) in &self.keys {
                 if let Some(key) = m.get(&src.ip) {
-                    q = Fetch::open(payload, key);
+                    q = FetchMsg::open(payload, key);
                     if !matches!(q, Err(FrameErr::Tag)) {
                         break;
                     }

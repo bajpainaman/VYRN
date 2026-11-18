@@ -85,6 +85,10 @@
 //!          3 BLOCK  height u64                      the payloads of a logged block
 //!          4 REDIRECT session u32, resend_from u32, down u8, to u8, 14 × 0
 //!                                                    a replica's resend_from (07 §5.7 step 3)
+//!
+//! kind 5 REDIRECT_BATCH (ruled, 07 §5.7), the one variable-length fetch:
+//!   0   8  as above, kind 5      8 1 down u8     9 1 to u8     10 2 count u16   12 4 reserved 0
+//!  16  8n  count × { session u32, resend_from u32 }, sessions strictly ascending
 //! ```
 //!
 //! - KEY: one `FETCH_RESP` with `data_seq = session << 32 | pkt_seq` and every variant of the
@@ -101,11 +105,19 @@
 //!   `down` and `to` must be below 8 and differ (04 DR1), else `FrameErr::Position`. Each
 //!   message costs one token of the requester's bucket, like any fetch. The box acts on every
 //!   admitted one, without a quorum: the client's DR2 makes the replicas' duplicates no-ops.
+//! - REDIRECT_BATCH: kind 4 for 1 ..= [`frame::MAX_BATCH`] (181) sessions of one `down → to`
+//!   move, so a failover is not capped at one session per message. The sealed form (16 + 8n
+//!   bytes, then the tag over all of them) fits one UDP payload of a 1514-byte frame. Decoding
+//!   is strict: `count` equals the entries, the sessions are strictly ascending (*reading*: no
+//!   duplicates, one canonical encoding; [`frame::FrameErr::Order`]), `down` and `to` as for
+//!   kind 4. One token per message; each entry is handled as one kind-4 REDIRECT.
 //!
 //! **Authentication and rate (*reading*, recorded in 07 §5.5).** A box configured with
 //! `K_fetch` keys ([`NodeConfig::fetch_keys`], one 16-byte key per requester address; the `vyrn-data`
 //! binary, `bin/vyrn-data-box`, derives them from the roster, 08 §9.6, `Roster::box_fetch_keys`) serves only
-//! the 40-byte form: the 32 bytes above, then `tag` u64 = SipHash-2-4(`K_fetch`, bytes 0..32).
+//! the authenticated form: the request body, then `tag` u64 = SipHash-2-4(`K_fetch`, the whole
+//! body). The body is 32 bytes for kinds 1 to 4 (40 in all) and 16 + 8 × `count` for kind 5
+//! (32 in all for one entry).
 //! A fetch from an unkeyed address, a plain fetch, or a bad tag is dropped and counted
 //! (`fetch_unauth`). Each keyed address has a token bucket (`fetch_rate` per second, burst
 //! `fetch_burst`, one token per fetch), made at construction; a fetch over it is dropped and

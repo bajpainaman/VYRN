@@ -17,6 +17,10 @@ Line formats (space-separated; '-' for an empty list):
   fetch_auth_err <name> <key hex> <hex> <reason>
   redirect  <name> <key hex> <down> <to> <session> <resend_from> <24-byte hex>
   redirect_err <name> <key hex> <hex> <reason>
+  batch_ok  <name> <down> <to> <session:resend_from,...> <hex>       (REDIRECT_BATCH, kind 5)
+  batch_err <name> <hex> <reason>
+  batch_auth <name> <key hex> <plain hex> <sealed hex>
+  batch_auth_err <name> <key hex> <hex> <reason>
   dedupe    <name> <pkt_seq,...> <verdict,...>   (verdicts: New Repeat Late; one session)
 """
 import struct
@@ -242,6 +246,59 @@ def main():
     ]:
         say(f"redirect_err {name} {hx(kr)} {hx(b)} {why}")
         add("redirect_err", name, key=hx(kr), hex=hx(b), reason=why)
+    # REDIRECT_BATCH (kind 5): magic, version, kind 5, 4 x 0, down u8, to u8, count u16,
+    # 4 x 0, then count x {session u32, resend_from u32}; sealed: + SipHash-2-4 tag u64.
+    max_batch = (1472 - 16 - 8) // 8                 # one UDP payload of a 1514-byte frame
+
+    def batch(down, to, entries, count=None, version=1, kind=5, r1=0, r2=0):
+        n = len(entries) if count is None else count
+        hdr = struct.pack("<HBBIBBHI", FETCH_MAGIC, version, kind, r1, down, to, n, r2)
+        assert len(hdr) == 16
+        return hdr + b"".join(struct.pack("<II", s, f) for s, f in entries)
+
+    def ents(b):
+        return ",".join(f"{s}:{f}" for s, f in b)
+
+    full = [(i * 3 + 1, i) for i in range(max_batch)]
+    for name, down, to, e in [
+        ("one", 0, 1, [(5, 4)]),
+        ("three", 7, 2, [(1, 1), (0x80000000, 0xFFFFFFFF), (0xFFFFFFFF, 0)]),
+        ("max", 1, 3, full),
+    ]:
+        b = batch(down, to, e)
+        say(f"batch_ok {name} {down} {to} {ents(e)} {hx(b)}")
+        add("batch_ok", name, down=down, to=to, entries=[[s, f] for s, f in e], hex=hx(b))
+    for name, b, why in [
+        ("short", batch(0, 1, [])[:15], "Short"),
+        ("empty", batch(0, 1, []), "Count"),
+        ("count_high", batch(0, 1, [(1, 1)], count=2), "Count"),
+        ("count_low", batch(0, 1, [(1, 1), (2, 2)], count=1), "Count"),
+        ("over_max", batch(0, 1, full + [(10 ** 9, 0)]), "Count"),
+        ("trailing", batch(0, 1, [(1, 1)]) + b"\x00", "Count"),
+        ("duplicate", batch(0, 1, [(4, 1), (4, 2)]), "Order"),
+        ("descending", batch(0, 1, [(9, 1), (4, 1)]), "Order"),
+        ("same_pos", batch(3, 3, [(1, 1)]), "Position"),
+        ("to_8", batch(0, 8, [(1, 1)]), "Position"),
+        ("reserved_lo", batch(0, 1, [(1, 1)], r1=1), "Reserved"),
+        ("reserved_hi", batch(0, 1, [(1, 1)], r2=1 << 24), "Reserved"),
+        ("version", batch(0, 1, [(1, 1)], version=2), "Version"),
+    ]:
+        say(f"batch_err {name} {hx(b)} {why}")
+        add("batch_err", name, hex=hx(b), reason=why)
+    good = batch(2, 5, [(3, 7), (11, 0)])
+    for name, b in [("pair", good), ("max", batch(1, 3, full))]:
+        assert name != "max" or len(seal(b, kf)) == 1472
+        say(f"batch_auth {name} {hx(kf)} {hx(b)} {hx(seal(b, kf))}")
+        add("batch_auth", name, key=hx(kf), plain=hx(b), sealed=hx(seal(b, kf)))
+    sealed = seal(good, kf)
+    for name, b, why in [
+        ("bad_tag", sealed[:-1] + bytes([sealed[-1] ^ 1]), "Tag"),
+        ("other_key", seal(good, bytes(16)), "Tag"),
+        ("tagged_bad_body", seal(batch(2, 5, [(11, 0), (3, 7)]), kf), "Order"),
+        ("short", sealed[:23], "Short"),
+    ]:
+        say(f"batch_auth_err {name} {hx(kf)} {hx(b)} {why}")
+        add("batch_auth_err", name, key=hx(kf), hex=hx(b), reason=why)
     cases = [
         ("in_order", [1, 2, 3, 4]),
         ("repeat_and_reorder", [1, 3, 2, 3, 1, 5, 4]),

@@ -60,6 +60,8 @@ pub enum FrameErr {
     Tag,
     #[error("a REDIRECT whose down or to is not below 8, or both are the same position")]
     Position,
+    #[error("REDIRECT_BATCH sessions are not strictly ascending (a duplicate or out of order)")]
+    Order,
 }
 
 fn u16_at(b: &[u8], at: usize) -> u16 {
@@ -420,6 +422,172 @@ impl Fetch {
 /// what every requester sends to a keyed data box or `vyrn-seq` box.
 pub fn seal_fetch(key: &[u8; 16], fetch: &Fetch) -> [u8; FETCH_AUTH_BYTES] {
     fetch.seal(key)
+}
+
+/// The REDIRECT_BATCH kind (crate docs, § Fetch; 07 §5.7 step 3).
+pub const KIND_REDIRECT_BATCH: u8 = 5;
+/// REDIRECT_BATCH: the 16 bytes before the entries.
+pub const BATCH_HDR_BYTES: usize = 16;
+/// REDIRECT_BATCH: one `(session u32, resend_from u32)` entry.
+pub const BATCH_ENTRY_BYTES: usize = 8;
+/// The most entries in one REDIRECT_BATCH: 181, so the sealed form (16 + 8n + 8 bytes, 1,472 at
+/// 181) is one UDP payload of a 1514-byte frame, the bound a data frame has ([`MAX_FRAME`]).
+pub const MAX_BATCH: usize = (MAX_FRAME - BATCH_HDR_BYTES - 8) / BATCH_ENTRY_BYTES;
+
+/// A REDIRECT_BATCH (kind 5): kind 4 for up to [`MAX_BATCH`] sessions of one `down → to` move,
+/// read in place from the datagram. Decoding is strict (crate docs, § Fetch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RedirectBatch<'a> {
+    pub down: u8,
+    pub to: u8,
+    entries: &'a [u8],
+}
+
+impl<'a> RedirectBatch<'a> {
+    /// The number of entries, 1 ..= [`MAX_BATCH`].
+    pub fn len(&self) -> usize {
+        self.entries.len() / BATCH_ENTRY_BYTES
+    }
+
+    /// Never true: a decoded batch has at least one entry.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// `(session, resend_from)` in wire order: sessions strictly ascending.
+    pub fn entries(&self) -> impl Iterator<Item = (SessionId, u32)> + 'a {
+        self.entries
+            .as_chunks::<BATCH_ENTRY_BYTES>()
+            .0
+            .iter()
+            .map(|e| (SessionId(u32_at(e, 0)), u32_at(e, 4)))
+    }
+
+    /// Decodes strictly: the fetch header with kind 5 and zero reserved bytes, `down` and `to`
+    /// as for kind 4 (04 DR1), `count` in 1 ..= [`MAX_BATCH`] and exactly `count` entries after
+    /// the header, sessions strictly ascending (so no duplicates).
+    pub fn decode(b: &'a [u8]) -> Result<Self, FrameErr> {
+        let Some(hdr) = b.get(..BATCH_HDR_BYTES) else {
+            return Err(FrameErr::Short);
+        };
+        if u16_at(hdr, 0) != FETCH_MAGIC {
+            return Err(FrameErr::Magic);
+        }
+        if hdr.get(2) != Some(&VERSION) {
+            return Err(FrameErr::Version);
+        }
+        if hdr.get(3) != Some(&KIND_REDIRECT_BATCH) {
+            return Err(FrameErr::Kind);
+        }
+        let zero =
+            |r: core::ops::Range<usize>| hdr.get(r).is_some_and(|s| s.iter().all(|&x| x == 0));
+        if !zero(4..8) || !zero(12..16) {
+            return Err(FrameErr::Reserved);
+        }
+        let (down, to) = (
+            hdr.get(8).copied().unwrap_or(0),
+            hdr.get(9).copied().unwrap_or(0),
+        );
+        if down >= MAX_DATA_POS || to >= MAX_DATA_POS || down == to {
+            return Err(FrameErr::Position);
+        }
+        let count = usize::from(u16_at(hdr, 10));
+        let entries = b.get(BATCH_HDR_BYTES..).unwrap_or(&[]);
+        if count == 0 || count > MAX_BATCH || entries.len() != count * BATCH_ENTRY_BYTES {
+            return Err(FrameErr::Count);
+        }
+        let batch = Self { down, to, entries };
+        let mut prev = None;
+        for (s, _) in batch.entries() {
+            if prev.is_some_and(|p| p >= s.0) {
+                return Err(FrameErr::Order);
+            }
+            prev = Some(s.0);
+        }
+        Ok(batch)
+    }
+
+    /// Decodes an authenticated batch: the trailing 8-byte tag over everything before it
+    /// first, in constant time, then the bytes as [`RedirectBatch::decode`] does.
+    pub fn open(b: &'a [u8], key: &[u8; 16]) -> Result<Self, FrameErr> {
+        let Some(split) = b.len().checked_sub(8).filter(|&n| n >= BATCH_HDR_BYTES) else {
+            return Err(FrameErr::Short);
+        };
+        let (body, tag) = b.split_at(split);
+        if !vyrn_crypto::siphash::verify(key, body, vyrn_types::Tag(u64_at(tag, 0))) {
+            return Err(FrameErr::Tag);
+        }
+        Self::decode(body)
+    }
+
+    /// The plain bytes of a batch, checked as [`RedirectBatch::decode`] checks them. Senders
+    /// sort `entries` by session first.
+    pub fn encode(down: u8, to: u8, entries: &[(SessionId, u32)]) -> Result<Vec<u8>, FrameErr> {
+        // Positions, then the count, before any buffer is built (the order decode reports).
+        if down >= MAX_DATA_POS || to >= MAX_DATA_POS || down == to {
+            return Err(FrameErr::Position);
+        }
+        if entries.is_empty() || entries.len() > MAX_BATCH {
+            return Err(FrameErr::Count);
+        }
+        let count = u16::try_from(entries.len()).map_err(|_| FrameErr::Count)?;
+        let mut b = Vec::with_capacity(BATCH_HDR_BYTES + entries.len() * BATCH_ENTRY_BYTES + 8);
+        b.extend_from_slice(&FETCH_MAGIC.to_le_bytes());
+        b.extend_from_slice(&[VERSION, KIND_REDIRECT_BATCH, 0, 0, 0, 0, down, to]);
+        b.extend_from_slice(&count.to_le_bytes());
+        b.extend_from_slice(&[0; 4]);
+        for &(s, r) in entries {
+            b.extend_from_slice(&s.0.to_le_bytes());
+            b.extend_from_slice(&r.to_le_bytes());
+        }
+        RedirectBatch::decode(&b)?;
+        Ok(b)
+    }
+
+    /// The authenticated form under `key`, the requester's `K_fetch`: the plain bytes, then
+    /// `tag` u64 = SipHash-2-4(`K_fetch`, the plain bytes).
+    pub fn seal(
+        key: &[u8; 16],
+        down: u8,
+        to: u8,
+        entries: &[(SessionId, u32)],
+    ) -> Result<Vec<u8>, FrameErr> {
+        let mut b = Self::encode(down, to, entries)?;
+        let tag = vyrn_crypto::siphash24(key, &b).0;
+        b.extend_from_slice(&tag.to_le_bytes());
+        Ok(b)
+    }
+}
+
+/// A decoded fetch datagram: one fixed 32-byte [`Fetch`], or a [`RedirectBatch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchMsg<'a> {
+    One(Fetch),
+    Batch(RedirectBatch<'a>),
+}
+
+impl<'a> FetchMsg<'a> {
+    fn is_batch(b: &[u8]) -> bool {
+        b.get(3) == Some(&KIND_REDIRECT_BATCH)
+    }
+
+    /// [`RedirectBatch::decode`] for kind 5, else [`Fetch::decode`].
+    pub fn decode(b: &'a [u8]) -> Result<Self, FrameErr> {
+        if Self::is_batch(b) {
+            RedirectBatch::decode(b).map(Self::Batch)
+        } else {
+            Fetch::decode(b).map(Self::One)
+        }
+    }
+
+    /// [`RedirectBatch::open`] for kind 5, else [`Fetch::open`].
+    pub fn open(b: &'a [u8], key: &[u8; 16]) -> Result<Self, FrameErr> {
+        if Self::is_batch(b) {
+            RedirectBatch::open(b, key).map(Self::Batch)
+        } else {
+            Fetch::open(b, key).map(Self::One)
+        }
+    }
 }
 
 /// `data_seq` of the `FETCH_RESP` that answers a KEY fetch.

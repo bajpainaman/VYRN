@@ -12,7 +12,7 @@ use vyrn_nic::frame::{self as nic_frame, Endpoint};
 use vyrn_types::{BookId, MAX_MSGS_PER_PKT, MSG_BYTES, Nanos, PKT_HDR_BYTES, SessionId, TAG_BYTES};
 use vyrn_wire::{RX_BURST, RxPkt, RxRing, TxRing};
 
-use crate::frame::Fetch;
+use crate::frame::{Fetch, FetchMsg, MAX_BATCH};
 use crate::ingest::{DataHome, Event, HomeConfig, Reject};
 use crate::redirect::Redirect;
 use crate::serve::{Fanout, Gate, Responder, send_to};
@@ -38,9 +38,11 @@ pub struct NodeConfig {
     pub log_scan: u64,
     /// Events kept until drained; more are counted in `events_dropped`.
     pub max_events: usize,
-    /// `K_fetch` per requester address (crate docs, § Fetch). Empty: open mode, plain 32-byte
-    /// fetches from anyone, under one shared rate limit (DEV and tests). Otherwise only these
-    /// sources are served, and only with the 40-byte authenticated form.
+    /// `K_fetch` per requester address (crate docs, § Fetch). Empty: open mode, plain fetches
+    /// from anyone, under one shared rate limit (DEV and tests). Otherwise only these sources are
+    /// served, and only in the authenticated form: the request, then an 8-byte tag over all of
+    /// it (40 bytes for kinds 1 to 4; 16 + 8n + 8 for an n-entry REDIRECT_BATCH,
+    /// [`RedirectBatch`](crate::frame::RedirectBatch)).
     pub fetch_keys: BTreeMap<Ipv4Addr, [u8; 16]>,
     /// The epoch `fetch_keys` are for. [`DataNode::set_fetch_keys`] adds the next one.
     pub fetch_epoch: u32,
@@ -330,8 +332,20 @@ impl<R: RxRing, F: RxRing, T: TxRing, S: BlockStore> DataNode<R, F, T, S> {
                 continue;
             };
             let src = f.hdr.src;
-            if let Some(q) = self.gate.admit(src, f.payload, now, &mut self.counters) {
-                self.serve(src, q);
+            match self.gate.admit(src, f.payload, now, &mut self.counters) {
+                Some(FetchMsg::One(q)) => self.serve(src, q),
+                // Each entry as a kind-4 REDIRECT (07 §5.7 step 3), copied out of the RX
+                // buffer first, on the stack.
+                Some(FetchMsg::Batch(b)) => {
+                    // Up to 181 sends at once: reap completions first, so a busy queue has room
+                    // (a refused send is counted in `tx_full`, as for every send).
+                    self.tx.reap();
+                    let mut e = [(SessionId(0), 0u32); MAX_BATCH];
+                    let n = e.iter_mut().zip(b.entries()).map(|(d, x)| *d = x).count();
+                    let (down, to) = (b.down, b.to);
+                    self.redirect(down, to, e.get(..n).unwrap_or(&[]));
+                }
+                None => {}
             }
         }
         self.fetch.release(n);

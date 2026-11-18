@@ -1124,8 +1124,10 @@ fetch, with these sources in order:
 **Fetch request bytes (reading, `vyrn-data`).** `DataFetch` is a 32-byte request (`magic`
 0x4650 "PF", version 1, kind 1 KEY `{session, pkt_seq}`, 2 RANGE `{dst, from, to}`, 3 BLOCK
 `{height}`, 4 REDIRECT `{session, resend_from, down, to}` of §5.7 step 3; layout and vectors in `crates/vyrn-data` docs and `tests/golden/vyrn_data_vectors`).
-A data box with fetch keys accepts only the 40-byte authenticated form: those 32 bytes, then
-`tag` u64 LE = SipHash-2-4(`K_fetch`, bytes 0..32), with one `K_fetch(e, i, d)` per requester,
+Kind 5 REDIRECT_BATCH (§5.7) is the one variable-length request: 16 + 8 × `count` bytes, at most
+181 entries (ruled).
+A data box with fetch keys accepts only the authenticated form: those bytes (32 for kinds 1 to 4,
+so 40 in all), then `tag` u64 LE = SipHash-2-4(`K_fetch`, every byte before it), with one `K_fetch(e, i, d)` per requester,
 derived per epoch from the roster's X25519 keys (08 §9.6) and keyed by the requester's `repl_addr`
 IPv4, so a requester sends its fetches from that address (*reading*). Across an epoch boundary
 the box holds the keys of both epochs (08 §4.6) and serves a fetch under either; moving to the
@@ -1260,9 +1262,33 @@ box send redirects on its own, and no more than that: each is sealed under the s
 it reaches only that session's client; DR2 lets it move copy 2 only to another entry of the
 client's own `KeyBundle.data` list that the latest `DataTierStatus` does not mark down, and every
 data box fans out to every voter (§5.2), so no packet is lost; and the gate's token bucket caps
-its REDIRECTs at the box's per-requester fetch rate. It is a liveness nuisance inside the
-one-fault model, not a safety fault. A Q-of-replicas rule at the box is deferred. One session per message; a box limits them per replica at its fetch
-rate. The box's operator line (`REDIRECT <down> <to> <session>:<resend_from>,…`, DEV) does the
+its fetch messages at the box's per-requester fetch rate, each of which asks for at most 181
+client redirects (one kind 4, or a kind-5 batch of up to 181 entries), so its client redirects are
+capped at 181 × that rate. It is a liveness nuisance inside the
+one-fault model, not a safety fault. A Q-of-replicas rule at the box is deferred.
+
+**REDIRECT_BATCH (ruled, wire).** One kind-4 message per session caps a failover at about 1,200
+sessions per home box: above that, the last sessions' REDIRECTs arrive after the client's DR4
+retention window (04 §7.6, 100 ms), whatever the box's fetch rate. A replica therefore sends one
+`down → to` move as kind 5:
+
+```text
+off size field
+  0   2  magic 0x4650        2 1 version 1      3 1 kind 5        4 4 reserved 0
+  8   1  down u8             9 1 to u8         10 2 count u16    12 4 reserved 0
+ 16  8n  count × { session u32, resend_from u32 }, sessions strictly ascending
+16+8n 8  tag u64 = SipHash-2-4(K_fetch, bytes 0 .. 16+8n)   (keyed box only)
+```
+
+`count` is 1 to 181, so the sealed form (1,472 B at 181) is one UDP payload of a 1514-byte frame,
+the bound of a data frame. A box decodes it strictly: `count` matches the bytes after the header,
+the sessions are strictly ascending (*reading*: this rules out duplicates in one pass and makes
+the encoding canonical), `down` and `to` follow kind 4's rules (DR1), and the reserved bytes are 0.
+A batch costs one token of the requester's bucket, like any fetch, and the box handles each entry
+exactly as a kind-4 REDIRECT: the owning shard sends that session's `DataRedirect`, or counts
+`redirect_unknown`. Kind 4 is unchanged. A box that supports kind 5 still serves kind 4, so
+batched failover takes effect only once the replicas send kind 5; until then they send kind 4 and
+the per-message limit above still applies. The box's operator line (`REDIRECT <down> <to> <session>:<resend_from>,…`, DEV) does the
 same for a list.
 
 **Replica side (readings, `bin/vyrn-validator` `failover.rs`).** `DataDown{d}` is 24 bytes,
