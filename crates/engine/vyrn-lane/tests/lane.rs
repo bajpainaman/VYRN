@@ -1949,3 +1949,100 @@ fn a_newprio_line_names_its_predecessor_position_in_bytes_20_to_23() {
     // Slot 4 replaces slot 3 (total 7), its own position.
     assert_eq!(line(4).ins_ts, 7 | (3 << 32));
 }
+
+#[test]
+fn a_boundary_that_drains_two_auctions_outs_the_first_before_the_second_fills() {
+    // 05 §8.10 rule 4.2 (#193 review 2): lane 0 is held through two uncrosses. Its auction-only
+    // sell (10 at 110) ends at the first (Out AUCTION 10, step s1); its day buy (3 at 104)
+    // fills in the second (step s2 > s1). One boundary drains both, so the Out comes first.
+    use vyrn_bbo::{ControlCmd, OrderFlags, Phase, Stp, Tif};
+    let ao = |side| OrderFlags::new(side, Tif::AuctionOnly, false, Stp::None);
+    let auction = |x: &mut Rig<'_>| {
+        x.command(&ControlCmd::Phase {
+            phase: Phase::Auction,
+            lo: Tick(0),
+            hi: Tick(0),
+        })
+    };
+    let freeze = |x: &mut Rig<'_>| {
+        x.command(&ControlCmd::Phase {
+            phase: Phase::Frozen,
+            lo: Tick(1),
+            hi: Tick(u32::MAX - 1),
+        })
+    };
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    auction(&mut x);
+    x.settle(&mut bbo);
+    x.send(
+        1,
+        1,
+        1_000,
+        &[
+            new(day(Side::Sell), 104, 1, 1),
+            new(day(Side::Buy), 106, 1, 2),
+        ],
+    );
+    x.send(
+        0,
+        1,
+        2_000,
+        &[
+            new(ao(Side::Sell), 110, 10, 4),
+            new(day(Side::Buy), 104, 3, 5),
+        ],
+    );
+    x.settle(&mut bbo);
+    x.hold(0);
+    freeze(&mut x);
+    x.command(&ControlCmd::Uncross {
+        price: Tick(105),
+        qty: 1,
+    });
+    x.settle(&mut bbo);
+    auction(&mut x);
+    x.settle(&mut bbo);
+    x.send(1, 1, 3_000, &[new(day(Side::Sell), 104, 3, 6)]);
+    x.settle(&mut bbo);
+    freeze(&mut x);
+    x.command(&ControlCmd::Uncross {
+        price: Tick(104),
+        qty: 3,
+    });
+    x.settle(&mut bbo);
+    assert!(
+        x.records(0, 1)
+            .iter()
+            .all(|r| matches!(r, Record::Ack { .. })),
+        "held: nothing drained yet"
+    );
+    x.send(0, 1, 4_000, &[new(day(Side::Buy), 100, 1, 7)]);
+    x.settle(&mut bbo);
+    let recs: Vec<_> = x
+        .records(0, 1)
+        .into_iter()
+        .filter(|r| !matches!(r, Record::Ack { .. }))
+        .collect();
+    assert_eq!(
+        recs,
+        vec![
+            Record::Out {
+                index: vyrn_bbo::INDEX_MAKER,
+                cause: vyrn_bbo::OUT_AUCTION,
+                handle: Handle::new(1, 1).unwrap(),
+                qty: Qty(10),
+                client_tag: 4
+            },
+            Record::Fill {
+                index: vyrn_bbo::INDEX_MAKER,
+                liq: 2,
+                handle: Handle::new(2, 1).unwrap(),
+                tick: Tick(104),
+                qty: Qty(3)
+            },
+        ],
+        "{recs:?}"
+    );
+    assert_eq!(x.lanes[0].multi_auction_drains(), 1, "the drain is counted");
+}

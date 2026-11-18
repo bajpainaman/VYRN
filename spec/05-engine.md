@@ -2333,6 +2333,12 @@ A boundary with more (auction-only remainders of one lane, or a `CancelAll` of m
 orders) reallocates on the sealed engine thread. No swarm or e2e run reaches it; a lane-wide
 bound on records per boundary waits until one does.
 
+**Two auctions at one boundary.** A held lane can apply more than one uncross in one boundary's
+B1. B2 ends each auction's remainders in uncross order, each once the pending ops at or before its
+`C*` have settled, and its `Out`s take the uncross's step, so by rule 4.2 they precede the fills of
+any later step. The lane drains at most `ENG_AUCTION_DRAIN` = 4 uncrosses per boundary; a fifth
+is an engine fault (a known bound, like the B3 one).
+
 Rule 4.1 gives the natural order: a cancel's `CancelAck` follows every fill of the canceled
 version; a join's `Ack` precedes every maker fill on it; a `Replace` shows the old version's fills,
 then its `Ack`, then the new version's fills.

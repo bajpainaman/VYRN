@@ -220,6 +220,8 @@ pub struct Stats {
     pub accepted: u64,
     pub shed: u64,
     pub end_ns: u64,
+    /// Lane boundaries that drained more than one uncross (vyrn-lane 05 §8.10 drain bound).
+    pub multi_auction_drains: u64,
 }
 
 /// The result of one run.
@@ -930,6 +932,10 @@ pub fn run_log(seed: u64, schedule: &Schedule) -> (Report, Out, Store) {
         }
     }
     stats.end_ns = now;
+    stats.multi_auction_drains = (0..cfg.lanes)
+        .filter_map(|l| e.lane(l))
+        .map(|l| l.multi_auction_drains())
+        .sum();
     stats.records = u64::try_from(out.recs.len()).unwrap_or(u64::MAX);
 
     // Liveness: every client finished once the faults healed.
