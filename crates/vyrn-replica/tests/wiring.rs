@@ -372,6 +372,32 @@ fn unreferenced_payloads_expire_after_finality_and_are_capped() {
     j.put(SessionId(1), 1, pa);
     assert!(j.resolve(&a).is_ok() && j.resolve(&b).is_ok() && j.resolve(&d).is_ok());
     assert_eq!(j.evictions().capped, 1);
+
+    // A SHED record and its retry share a key: releasing the SHED block keeps the retry's
+    // reference, so the retry's payload arriving afterwards is not capped.
+    let p = bytes(0xE1);
+    let shed = packet(5, 1, &p, PacketFlags::SHED);
+    let retry = packet(5, 1, &p, 0);
+    let mut j = DataJoin::with_cap(1);
+    j.reference(&block_of(&[shed]));
+    j.reference(&block_of(&[retry]));
+    j.release(Height(1), &[LaneRec::Pkt(shed)]);
+    j.put(SessionId(5), 1, p.clone());
+    j.put(SessionId(6), 1, bytes(0xF1));
+    j.put(SessionId(6), 2, bytes(0xF2));
+    assert!(
+        j.resolve(&retry).is_ok(),
+        "still referenced by the retry's block"
+    );
+
+    // Released without `reference`: the released key leaves the unreferenced set, so it neither
+    // counts toward the cap nor is evicted by it inside its SHED window.
+    let mut j = DataJoin::with_cap(1);
+    j.put(SessionId(5), 1, p.clone());
+    j.release(Height(1), &[LaneRec::Pkt(shed)]);
+    j.put(SessionId(6), 1, bytes(0xF1));
+    assert!(j.resolve(&retry).is_ok(), "the SHED window keeps it");
+    assert_eq!(j.evictions().capped, 0);
 }
 
 #[test]

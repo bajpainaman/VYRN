@@ -22,7 +22,7 @@
 //! substream's packets in O-order, Advance and `SHED` records excluded (07 §6.1). A `SHED`
 //! record is not joined: its responses come from the record alone (05 §18 Q17).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 use vyrn_log::LaneRec;
 use vyrn_log::block::data_root;
@@ -59,8 +59,9 @@ pub struct DataJoin {
     /// Variants kept for a bounded window after a release, `(height released, key, hash)`: a
     /// `SHED` record's variant (for its retry), and the unused variants of an accepted packet.
     shed: VecDeque<(Height, (SessionId, u32), PktHash)>,
-    /// Keys a ready block's record names, until that record is released.
-    refs: BTreeSet<(SessionId, u32)>,
+    /// Records of ready blocks naming each key, not released yet: a SHED record and its retry
+    /// share a key, so one release must not end the other's reference.
+    refs: BTreeMap<(SessionId, u32), u32>,
     /// Unreferenced variants by arrival order: `(final height at arrival, key, hash)`.
     unref: BTreeMap<u64, (u64, (SessionId, u32), PktHash)>,
     /// The arrival numbers of each key's unreferenced variants, to drop them on reference.
@@ -145,7 +146,7 @@ impl DataJoin {
         Self {
             by_key: BTreeMap::new(),
             shed: VecDeque::new(),
-            refs: BTreeSet::new(),
+            refs: BTreeMap::new(),
             unref: BTreeMap::new(),
             unref_keys: BTreeMap::new(),
             next_arrival: 0,
@@ -163,7 +164,7 @@ impl DataJoin {
         let vars = self.by_key.entry(key).or_default();
         if !vars.iter().any(|v| v.full == full) {
             vars.push(Variant { full, bytes });
-            if !self.refs.contains(&key) {
+            if !self.refs.contains_key(&key) {
                 let n = self.next_arrival;
                 self.next_arrival = n.wrapping_add(1);
                 self.unref
@@ -186,10 +187,16 @@ impl DataJoin {
         for r in &b.lanes {
             let LaneRec::Pkt(p) = r else { continue };
             let key = (p.session, p.pkt_seq);
-            self.refs.insert(key);
-            for n in self.unref_keys.remove(&key).unwrap_or_default() {
-                self.unref.remove(&n);
-            }
+            let n = self.refs.entry(key).or_default();
+            *n = n.saturating_add(1);
+            self.unlist(key);
+        }
+    }
+
+    /// Takes `key`'s payloads out of the unreferenced set: a record names them.
+    fn unlist(&mut self, key: (SessionId, u32)) {
+        for n in self.unref_keys.remove(&key).unwrap_or_default() {
+            self.unref.remove(&n);
         }
     }
 
@@ -283,7 +290,15 @@ impl DataJoin {
                 continue;
             }
             let key = (p.session, p.pkt_seq);
-            self.refs.remove(&key);
+            // A released record named its key, referenced or not (a caller may release without
+            // `reference`): its payloads now follow the release rules below, not the cap.
+            self.unlist(key);
+            if let Some(n) = self.refs.get_mut(&key) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.refs.remove(&key);
+                }
+            }
             if p.flags & PacketFlags::SHED != 0 {
                 self.shed.push_back((height, key, p.pkt_hash));
             } else {
