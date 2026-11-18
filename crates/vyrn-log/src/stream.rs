@@ -437,6 +437,14 @@ impl SubstreamState {
         StepId(self.prev_step)
     }
 
+    /// Per lane of this half, `next_lane_seq − 1`: the bounds a `BlockMark` here would carry.
+    pub fn lane_bounds(&self) -> Vec<LaneSeq> {
+        self.lanes
+            .iter()
+            .map(|d| LaneSeq(d.next_lane_seq.saturating_sub(1)))
+            .collect()
+    }
+
     /// This half's current cut, absolute.
     pub fn half_cut(&self) -> Vec<LaneSeq> {
         self.prev_cut.iter().map(|&c| LaneSeq(c)).collect()

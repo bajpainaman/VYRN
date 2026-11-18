@@ -13,6 +13,7 @@
 //! - [`merge`]: whole `StepRecord`s from the two substreams.
 //! - [`block`]: the 190-byte `BlockHeader`, `header_hash`, `seq_sig`, the roots, assembly and
 //!   the chain rules.
+//! - [`writer`]: the sequencer's stream core on one substream, engine records in, frames out.
 //! - [`store`]: `REP_BlockRecord`, the [`BlockStore`] trait, [`MemStore`], [`FileStore`] and
 //!   [`LogReader`].
 //!
@@ -33,6 +34,7 @@ pub mod leb;
 pub mod merge;
 pub mod store;
 pub mod stream;
+pub mod writer;
 
 pub use block::{BlockAssembler, ChainError, check_anchor, check_link, header_hash};
 pub use frame::{
@@ -45,6 +47,7 @@ pub use stream::{
     BlockMark, BodyKind, HalfBlock, Home, LaneBase, LaneRec, Section, SessionBind, StepHalf,
     SubstreamState, TenureStart,
 };
+pub use writer::SeqWriter;
 
 /// Decoder and stream errors. Each is a sequencer fault: the replica stops voting for the block
 /// and records the error with `(epoch, tenure, stream, frame_seq)` (07 §3.12). The first seven
