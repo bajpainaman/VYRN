@@ -25,6 +25,7 @@
 //! | Fencing (`INV-FENCE`) | [`Fence`], [`check_next_vote`] | — | every replica and follower | from the first moment Q signatures on one record are held | [`FenceErr`] | 08 §8.2 F1, F4 |
 //! | The bridge signer table (rotation number → keys) | [`BridgeSignerTable`], [`BridgeSigners`] | governance (`SetParam`, 09 §6.7) | `vyrn-chain` (`Epochs::bridge_signers`), guardians, relayers | a set activates at the first boundary after approval; every activated set stays readable | [`BridgeErr`] | 09 §6.7, 08 §9.5 |
 //! | The opening auction: window answers, reference and band, uncross rule, fills | [`window_answer`], [`reference`], [`Band`], [`uncross`], [`marginal`], [`UncrossRecord`], [`auction_fill`] | the lanes (answers, fills) and the BBO core (`UncrossRecord`) | sessions, every lane, replicas, oracles | after cert(e, S) and Apply; U = (e+1, 1) is the first step of e+1 | `Reject` reasons per §7.2 (IOC per 04 §6.9: spec gap) | 08 §7.2–7.7, 05 §8.8 |
+//! | The role state machines, force seal, halt and reassignment | [`OldSeq`], [`OldReplica`], [`NewReplica`], [`NewSeq`], [`EpoForceSeal`], [`ForceSealPool`], [`EpoReassign`] | each role; voters of `R_e` (force seal); Q operators (reassign) | the role itself; 09 (slashing evidence); the target home | events in log order; timing predicates over logged PTP times | [`RoleErr`], [`SealErr`] | 08 §4.2–4.5, §10.1, §10.3 |
 //! | The membership hand-off | [`Membership`], [`Activation`], [`Membership::hand_off`] | `EpoConfig(e+1)` (roster) | `vyrn-consensus` (the next [`vyrn_consensus::Committee`]), `vyrn-replica`, `vyrn-chain` | only with a verified cert(e, S) | [`MembershipErr`], [`HandoffErr`] | 08 §9, 07 §13.1 |
 //!
 //! # Domain separation
@@ -43,7 +44,7 @@
 //!
 //! # Not in this crate yet
 //!
-//! The role state machines (§4) and the tail stream (§5.5) are follow-ups. The opening auction's
+//! The tail stream (§5.5) is a follow-up. The opening auction's
 //! distributed marginal search and histograms are the engine's (05 §8.8); [`marginal`] is their
 //! sequential reference. The spec gaps this crate had to fill are marked "Spec gap" at the point of use.
 #![forbid(unsafe_code)]
@@ -55,6 +56,7 @@ mod handoff;
 mod membership;
 mod notice;
 mod ready;
+mod roles;
 mod schedule;
 
 pub use auction::{
@@ -72,6 +74,14 @@ pub use handoff::{
 pub use membership::{Activation, Membership, MembershipErr, SeqBox};
 pub use notice::{EpochNotice, NoticeFlags, Notifier};
 pub use ready::{EpoGo, EpoHold, EpoReady, GoErr, READY_CONTEXT, ReadyPool, SEQ_MEMBER};
+pub use roles::{
+    EPO_ACTIVATE_ALARM_MS, EPO_HALT_COLLECT_MS, EPO_REASSIGN_MIN_S, EPO_SEAL_GRACE_MS,
+    EPO_SEAL_GUARD_MS, EPO_SEAL_SLACK_US, EpoForceSeal, EpoReassign, FORCE_SEAL_CONTEXT,
+    FailoverKind, ForceSealPool, HighWater, NewReplica, NewReplicaEv, NewSeq, NewSeqEv, OldReplica,
+    OldReplicaEv, OldSeq, OldSeqEv, REASSIGN_CONTEXT, RoleErr, SealErr, WinHead,
+    activate_alarm_due, failover_kind, force_seal_due, halt_due, idle_lane_seals, lane_seals,
+    may_sign_reassign, reassign_open, respec_result, win_head,
+};
 pub use schedule::{
     Boundary, EpoConfig, ScheduleErr, ScheduleRecord, Timetable, default_home, slot_start,
 };
