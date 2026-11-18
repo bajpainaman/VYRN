@@ -113,6 +113,6 @@ pub mod sink {
         CutDelta, OUT_STP, ROLE_DEPS, ROLE_MAKER, ROLE_TAKER, Record, StepEntry, TxEntry,
     };
     pub use vyrn_engine::{Payloads, Rec, Sink};
-    pub use vyrn_lane::RespPkt;
+    pub use vyrn_lane::{Gate, RespPkt};
     pub use vyrn_log::LaneRec;
 }

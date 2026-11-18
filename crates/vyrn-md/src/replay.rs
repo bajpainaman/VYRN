@@ -51,8 +51,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use vyrn_replica::BlockInputs;
 use vyrn_replica::sink::{
-    CutDelta, LaneRec, OUT_STP, Payloads, ROLE_DEPS, ROLE_MAKER, ROLE_TAKER, Rec, Record as Resp,
-    RespPkt, Sink, StepEntry, TxEntry,
+    CutDelta, Gate, LaneRec, OUT_STP, Payloads, ROLE_DEPS, ROLE_MAKER, ROLE_TAKER, Rec,
+    Record as Resp, RespPkt, Sink, StepEntry, TxEntry,
 };
 use vyrn_types::{
     BookId, Epoch, Handle, LaneId, LaneSeq, Nanos, PacketFlags, PacketRecord, Qty, SessionId,
@@ -141,7 +141,8 @@ pub struct SinkStream<K: PacketSink> {
     msgs: BTreeMap<(SessionId, u32), VecDeque<Msgs>>,
     pkts: BTreeMap<(SessionId, u32), PktOps>,
     /// Lane responses that came before their packet record (immediate rejects).
-    early: Vec<(SessionId, u32, Resp)>,
+    /// With the packet's first LaneSeq when the response's gate names it.
+    early: Vec<(SessionId, u32, Option<u64>, Resp)>,
     /// Per lane: the ops from LaneSeq `base[l]` on, and the lane's priority clock.
     ops: Vec<VecDeque<Op>>,
     base: Vec<u64>,
@@ -264,8 +265,10 @@ impl<K: PacketSink> SinkStream<K> {
         // A session-only message takes a LaneSeq only when the header is rejected (`vyrn-lane`
         // pass 1), and then every message has an immediate reject, which the lane sends before
         // the packet record: a reject naming a session-only index means all are numbered.
-        let all = self.early.iter().any(|&(s, q, r)| {
-            (s, q) == key
+        let first = p.first_lane_seq.0;
+        let mine = |s, q, at: Option<u64>| (s, q) == key && at.is_none_or(|f| f == first);
+        let all = self.early.iter().any(|&(s, q, at, r)| {
+            mine(s, q, at)
                 && matches!(r, Resp::Reject { index, .. }
                     if msgs.get(usize::from(index)).is_some_and(session_only))
         });
@@ -309,11 +312,11 @@ impl<K: PacketSink> SinkStream<K> {
             },
         );
         let early = std::mem::take(&mut self.early);
-        for (s, q, r) in early {
-            if (s, q) == key {
-                self.resolve(s, q, r)?;
+        for (s, q, at, r) in early {
+            if mine(s, q, at) {
+                self.resolve(s, q, at, r)?;
             } else {
-                self.early.push((s, q, r));
+                self.early.push((s, q, at, r));
             }
         }
         Ok(())
@@ -324,8 +327,10 @@ impl<K: PacketSink> SinkStream<K> {
         self.ops.get_mut(l)?.get_mut(i)
     }
 
-    /// One response record of op `(session, pkt_seq, index)`.
-    fn resolve(&mut self, s: SessionId, q: u32, r: Resp) -> Result<(), SinkError> {
+    /// One response record of op `(session, pkt_seq, index)`. `at` is the first LaneSeq of
+    /// the packet the response's gate names (immediate rejects and `BUSY`, 05 §8.10 rule 3):
+    /// a shed packet and its resend share `(session, pkt_seq)`, so `at` picks the attempt.
+    fn resolve(&mut self, s: SessionId, q: u32, at: Option<u64>, r: Resp) -> Result<(), SinkError> {
         let ix = match r {
             Resp::Ack { index, .. }
             | Resp::Fill { index, .. }
@@ -333,8 +338,12 @@ impl<K: PacketSink> SinkStream<K> {
             | Resp::CancelAck { index, .. }
             | Resp::Out { index, .. } => index,
         };
-        let Some(pk) = self.pkts.get(&(s, q)) else {
-            self.early.push((s, q, r));
+        let Some(pk) = self
+            .pkts
+            .get(&(s, q))
+            .filter(|k| at.is_none_or(|f| f == k.first))
+        else {
+            self.early.push((s, q, at, r));
             return Ok(());
         };
         let Some(off) = pk.offset.get(usize::from(ix)).copied().flatten() else {
@@ -356,8 +365,12 @@ impl<K: PacketSink> SinkStream<K> {
         if p.echo_pkt == 0 {
             return Err(SinkError::Unsupported("unsolicited lane record"));
         }
+        let at = match p.gate {
+            Gate::Packet(first) => Some(first.0),
+            _ => None,
+        };
         for r in p.records() {
-            self.resolve(p.session, p.echo_pkt, *r)?;
+            self.resolve(p.session, p.echo_pkt, at, *r)?;
         }
         Ok(())
     }

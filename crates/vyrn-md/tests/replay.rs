@@ -455,7 +455,8 @@ fn the_md_rebuilds_the_book() {
 /// a forwarded improve whose step runs before lane 0's next packet (a `MID` Advance record), a
 /// packet shed at the lane and its resend (its LaneSeqs kept, 07 §3.5), a `Shed` step, a cancel
 /// and an idle poll.
-fn engine_script() -> Vec<Act> {
+/// With `twice`, the shed packet is shed a second time before any cut, then accepted.
+fn engine_script_with(twice: bool) -> Vec<Act> {
     use BSide::{Buy, Sell};
     use Tif::{Day, Ioc};
     let p = |l, a, rx_ts, now, msgs| Act::Pkt {
@@ -483,6 +484,7 @@ fn engine_script() -> Vec<Act> {
         Act::Run,
         // 05 §6.8: one New, age 462 at dequeue is late (path 519 + 462 > 980); then its resend.
         p(0, 3, 10_000, 10_462, vec![new(Sell, Day, 300, 1, 9)]),
+        p(0, 3, 15_000, 15_462, vec![new(Sell, Day, 300, 1, 9)]),
         p(0, 3, 20_000, 20_461, vec![new(Sell, Day, 300, 1, 9)]),
         Act::Run,
         p(
@@ -495,11 +497,22 @@ fn engine_script() -> Vec<Act> {
         Act::Poll,
         Act::Run,
     ]
+    .into_iter()
+    .enumerate()
+    .filter(|&(i, _)| twice || i != 10)
+    .map(|(_, a)| a)
+    .collect()
 }
 
 #[test]
 fn mid_and_shed_resend_replay_to_the_live_md() {
-    let (j, store, live_md) = live(&engine_script());
+    for twice in [false, true] {
+        check_engine_script(twice);
+    }
+}
+
+fn check_engine_script(twice: bool) {
+    let (j, store, live_md) = live(&engine_script_with(twice));
     let flags: Vec<u8> = j
         .recs
         .iter()
@@ -512,7 +525,8 @@ fn mid_and_shed_resend_replay_to_the_live_md() {
         flags.iter().any(|f| f & PacketFlags::MID != 0),
         "a MID record"
     );
-    assert!(flags.contains(&PacketFlags::SHED), "a shed packet");
+    let sheds = flags.iter().filter(|f| **f == PacketFlags::SHED).count();
+    assert_eq!(sheds, 1 + usize::from(twice), "shed packets");
     let live_md = live_md.unwrap();
     // The resend rests: lane 0's sell 300 of 1, the shed copy never does.
     let adds = records(&live_md)
