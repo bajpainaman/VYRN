@@ -38,7 +38,10 @@
 //! **Readings** (the spec does not settle these; PR body):
 //! - R1. The box publishes no output hash. The reference for "replay matches the sequencer" is
 //!   what the box put on the wire: every response the client received, per session, sorted by
-//!   `(resp_seq, bytes)`. The replay side is every `lane_resp` and every fill `tx` with
+//!   `(resp_seq, bytes)`. *Ruled (reading of "equal" for loopback UDP in DEV):* the client's
+//!   responses must be an in-order, byte-identical subsequence of replay's; when vyrn-seq's
+//!   `tx_unsent` = 0, up to 0.1 % of replay's (at least 1) may be missing, printed as
+//!   `udp_resp_lost`. More missing, any byte mismatch, or an extra response fails. The replay side is every `lane_resp` and every fill `tx` with
 //!   `resp_seq ≠ 0` (the box does not send `resp_seq` 0 TX packets yet). Fill TX `step`, `lane`
 //!   and `role`, which `output_hash` covers, are not on the wire, so the per-block output hash
 //!   itself cannot be recomputed from the box's side.
@@ -90,7 +93,8 @@
 //! - R13. `--data-kill` (needs `--keyed`): a backup `vyrn-data` box (`src = 1`, roster data
 //!   box 1 with `BOX1_XCHG`, the same destinations) runs beside the home box, and every validator
 //!   lists both (`[data] boxes`) with a DEV `silence_us` of `KILL_SILENCE_US`. The client sends
-//!   each session's first copy 2 to both (07 §5.7 interim reading) and the rest to the home box,
+//!   copy 2 of each session's first `FIRST_COPIES` (4) packets to both (07 §5.7 interim
+//!   reading, ruled) and the rest to the home box,
 //!   which the harness kills after 2/5 of the packets. `failover` needs every running validator's
 //!   `DATA_DOWN box=0` at quorum, no `DATA_DOWN box=1` while the backup runs, validator 0's
 //!   sealed `REDIRECT_SENT down=0 to=1` (only it holds a `K_fetch`, R7), the backup's
@@ -141,13 +145,22 @@
 //!   50.3 ms, Q DataDowns and every first-round batch sent by 51 ms, all of them at the backup
 //!   by 51–55 ms; the backup then sends its per-entry `DataRedirect`s at about 50 per ms (one
 //!   shard core, 16 per turn, sharing the CPUs), so the last live session's first redirect
-//!   reaches the client at about 82 ms; the client applies each within 2.6 ms. The backup's
+//!   reaches the client at about 82 ms (76.5 ms in CI); the client applies each within 2.6 ms.
+//!   *Ruled:* that this passes DR4's design bound on detection plus fan-out is a DEV figure of
+//!   a 2-vCPU host (50 ms DEV detection, the backup's sending CPU-bound), not a protocol miss;
+//!   07's `REP_DATA_SILENCE_MS` is 1 ms. The backup's
 //!   refused redirects are retried since #194 (`redirect_retried`), and `failover` needs
-//!   `redirect_dropped` = 0. Two losses still fail a run on a 2-vCPU orb, both outside this
-//!   rule: an ingest packet meeting the shard ring the redirect burst fills (`hop_full`), and a
-//!   lost first copy at the backup's socket. Either costs the backup a session's address, since
-//!   it learns it from one first copy (07 §5.7 interim reading), so that session never moves;
-//!   CI runs R15 with `continue-on-error`.
+//!   `redirect_dropped` = 0, and `redirect_unknown` = 0. A backup learned a session's address
+//!   from one first copy, so one lost to a full shard ring (`hop_full`) or the socket left the
+//!   session unmovable. The client now sends four (R13), and since #203 the box holds
+//!   redirects while its shard ring has 2 048 or fewer free slots, so ingest wins it.
+//!   *Ruled (R15 gates):* `redirect_unknown` = 0, `redirect_dropped` = 0, the box's `hop_full`
+//!   = 0 (ingest), every session moves by the deadline, and `replay` (with R1's bounded
+//!   `udp_resp_lost`). DR4 timing does not gate here: CI's R15 step passes `--dr4-dev`, which
+//!   prints the slowest kill-to-redirect and the packets expired at the dead home as a DEV
+//!   figure. A 2-vCPU host holding 2 000 redirects cannot show the 100 ms bound (on a 2-vCPU
+//!   orb on 733ff96: 87–147 ms, the slow runs those with about 2 500 held redirects); 07 §5.7
+//!   treats it as a pinned-core figure. The 4-session `--data-kill` step keeps its DR4 gate.
 //!   The client opens a `DataRedirect` with the key of the session in its bytes 8..12: trying
 //!   every session's key fell behind a burst of 1 600 redirects and moved half the sessions.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
@@ -236,6 +249,9 @@ const SEQ_XCHG: [u8; 32] = [0x7c; 32];
 const BOX1_XCHG: [u8; 32] = [0x8d; 32];
 /// `--data-kill` (R13): the validators' DEV `[data] silence_us`, for an unpinned host.
 const KILL_SILENCE_US: u64 = 50_000;
+/// R13 (07 §5.7 interim reading, ruled): copy 2 of each session's first this many packets also
+/// goes to every backup box, so one lost datagram does not cost a backup the session's address.
+const FIRST_COPIES: usize = 4;
 /// `--data-kill` (R13): the client keeps a sent packet this long (`REP_CLIENT_RETAIN_MS`, 04
 /// DR4), then discards it.
 const CLIENT_RETAIN: Duration = Duration::from_millis(100);
@@ -334,6 +350,11 @@ struct Cli {
     /// does.
     #[arg(long, value_name = "N")]
     tap_loss: Option<u64>,
+    /// With --data-kill, print DR4 timing (slowest kill-to-redirect, packets expired at the
+    /// dead home) as a DEV figure instead of gating on it (R15: a 2-vCPU host holding 2 000
+    /// redirects cannot show the 100 ms bound).
+    #[arg(long)]
+    dr4_dev: bool,
     /// With --drop-path-b, also drop every retransmit to the observer's path B (R14): repair
     /// cannot fill the copy, so the observer must report `ORDER_GAP` and hold the block.
     #[arg(long)]
@@ -1389,6 +1410,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
     if cli.data_shards == 0 || (cli.data_shards > 1 && !cli.data) {
         return Err("--data-shards needs --data and N >= 1".into());
     }
+    if cli.dr4_dev && !cli.data_kill {
+        return Err("--dr4-dev needs --data-kill (R15)".into());
+    }
     if cli.data_kill && !cli.keyed {
         return Err("--data-kill needs --keyed: the REDIRECTs it checks are sealed (R13)".into());
     }
@@ -1740,8 +1764,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
         _ => None,
     };
 
-    // Send, paced by send_ns. R13 (--data-kill): each session's first copy 2 also goes to the
-    // backup box (07 §5.7 interim reading), the home box is killed after `kill_at` packets, and
+    // Send, paced by send_ns. R13 (--data-kill): copy 2 of each session's first
+    // `FIRST_COPIES` packets also goes to the backup box (07 §5.7 interim reading), the home box is killed after `kill_at` packets, and
     // a session's first redirect from it (DR2) moves its copy 2 and resends its retained bytes
     // from `resend_from` (DR3).
     let kill_at = backup.map(|_| pkts.len() * 2 / 5);
@@ -1749,7 +1773,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let mut moved: BTreeMap<SessionId, Redirect> = BTreeMap::new();
     let mut redirects_heard = 0u64;
     let mut resent = 0u64;
-    let mut first_sent = std::collections::BTreeSet::new();
+    let mut first_sent: BTreeMap<SessionId, usize> = BTreeMap::new();
     // R13 (04 DR4): each packet's send time; the client resends only what it still retains.
     let mut sent_at: Vec<Instant> = Vec::with_capacity(pkts.len());
     // Packets a redirect asked for that the client had discarded: `lost` were sent to the dead
@@ -1836,8 +1860,12 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
         }
         if let Some(b) = backup
-            && first_sent.insert(p.session)
             && home != Some(b.ingest)
+            && {
+                let n = first_sent.entry(p.session).or_default();
+                *n += 1;
+                *n <= FIRST_COPIES
+            }
         {
             cl_sock
                 .send_to(&p.bytes, b.ingest)
@@ -2231,7 +2259,24 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
             live.sort();
             replayed.sort();
-            if live != replayed {
+            // R15 (reading of R1's "equal" for loopback UDP in DEV): the client's responses
+            // must be an in-order, byte-identical subsequence of replay's; with vyrn-seq's
+            // tx_unsent = 0, up to 0.1 % of them (at least 1) may be lost on the way.
+            let lost_ok = replayed.len().div_ceil(1000).max(1);
+            let tx_unsent = field(&stats, "tx_unsent");
+            let mut rest = replayed.iter();
+            let subseq = live.iter().all(|a| rest.any(|b| b == a));
+            let udp_resp_lost = replayed.len().saturating_sub(live.len());
+            if subseq
+                && udp_resp_lost > 0
+                && udp_resp_lost <= lost_ok
+                && tx_unsent == Some("0")
+            {
+                println!(
+                    "WARN replay udp_resp_lost={udp_resp_lost} of {} (bound {lost_ok}, R15)",
+                    replayed.len()
+                );
+            } else if live != replayed {
                 let at = live.iter().zip(&replayed).position(|(a, b)| a != b);
                 let show = |v: &[Resp]| {
                     at.and_then(|i| v.get(i)).map(|(s, q, e, rs)| {
@@ -2240,7 +2285,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     })
                 };
                 return Err(format!(
-                    "responses differ: box sent {}, replay produced {}; first difference at {at:?}: box {:?}, replay {:?}",
+                    "responses differ: box sent {}, replay produced {} (subsequence {subseq}, udp_resp_lost={udp_resp_lost}, bound {lost_ok}, tx_unsent {tx_unsent:?}); first difference at {at:?}: box {:?}, replay {:?}",
                     live.len(),
                     replayed.len(),
                     show(&live),
@@ -2258,7 +2303,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 hex(&vyrn_crypto::hash::hash(&b).0)
             };
             Ok(format!(
-                "{} blocks replayed, {} responses equal, responses digest {}, last output_hash {}",
+                "{} blocks replayed, {} responses equal (udp_resp_lost={udp_resp_lost}), responses digest {}, last output_hash {}",
                 ready.len(),
                 live.len(),
                 digest(&live),
@@ -2594,7 +2639,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
             };
             let (worst, worst_late) = (worst_by(true), worst_by(false));
             let n_live = latency.iter().filter(|l| l.1).count();
-            if lost > 0 {
+            if lost > 0 && !cli.dr4_dev {
                 errs.push(format!(
                     "{lost} packets sent to the dead home had expired (DR4, {} ms) before their redirect; slowest kill-to-redirect {worst:?}",
                     CLIENT_RETAIN.as_millis()
@@ -2613,13 +2658,14 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
             if errs.is_empty() {
                 Ok(format!(
-                    "home box killed after {} packets; DATA_DOWN {}; validator-0 sent {} sealed REDIRECTs, the backup admitted and sent {}; the client heard {redirects_heard}, moved {n_moved} sessions (resend_from {}) and resent {resent} packets; DR4 ({} ms): slowest kill-to-redirect {worst:?} over the {n_live} sessions live at the kill ({worst_late:?} for those that started later), 0 lost after the kill, {aged} older ones discarded",
+                    "home box killed after {} packets; DATA_DOWN {}; validator-0 sent {} sealed REDIRECTs, the backup admitted and sent {}; the client heard {redirects_heard}, moved {n_moved} sessions (resend_from {}) and resent {resent} packets; DR4 ({} ms{}): slowest kill-to-redirect {worst:?} over the {n_live} sessions live at the kill ({worst_late:?} for those that started later), {lost} lost after the kill, {aged} older ones discarded",
                     killed.map_or(0, |k| k.0),
                     votes.join(" "),
                     v0_redirects.unwrap_or(0),
                     admitted.unwrap_or(0),
                     from.join(" "),
-                    CLIENT_RETAIN.as_millis()
+                    CLIENT_RETAIN.as_millis(),
+                    if cli.dr4_dev { ", DEV figure, not gating" } else { "" }
                 ))
             } else {
                 Err(errs.join("; "))
