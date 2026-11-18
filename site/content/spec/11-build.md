@@ -1007,10 +1007,11 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   applied seq and snapshot version once the lane has replayed every call due before the step,
   as Rust's cut cores publish them), so a stale bound after a fill empties the last ask rejects
   as in `RustReplay` (`tests/replay.rs`, band test).
-  **Ruling (05/07, #137):** live lanes read the snapshot only at boundaries too, so replay is
-  deterministic from the 07 log with no snapshot version on `PacketRecord`. The live lane and
-  engine change and the 05/07 text belong to the engine work; the Vx client already reads at
-  boundaries only.
+  **Ruling (c), superseding #137's boundary-only rule:** live lanes read the snapshot at accept
+  (05 §6.5) and log `PacketRecord.snap_lag`; Rust replay restores version
+  `base + snap_lag` from its snapshot history (07 §7.1). The Vx client still reads at boundaries
+  only and must follow `snap_lag` next; until it does, it diverges once the band binds, and
+  `engine.client` defaults to `rust`.
 - *Capacity.* The op log (`OPLOG_CAP`) and the forwarded queue (`FWDQ_CAP` = 1024 per lane) are
   fixed. A live lane can have up to `ENG_FWD_RING` + the BBO's lane buffer forwarded ops in
   flight, so more than `FWDQ_CAP` forwarded ops due before one step (or an op log full before

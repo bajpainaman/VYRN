@@ -183,6 +183,7 @@ fn blocks(n: u32) -> Vec<Vec<Vec<u8>>> {
                 pkt_hash: vyrn_crypto::pkt_hash(body.as_bytes()),
                 first_lane_seq: LaneSeq(u64::from(i)),
                 fills_applied: StepId(0),
+                snap_lag: 0,
             };
             let mut f = w
                 .packet(p, Some(vyrn_crypto::hash::hash(body.as_bytes())))

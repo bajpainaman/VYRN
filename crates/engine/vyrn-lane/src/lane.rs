@@ -29,6 +29,15 @@ use crate::out::{Gate, LogRec, Outbox, RespPkt};
 use crate::session::{SessState, SessionSpec, Sessions};
 
 /// `FwdEntry.deadline − rx_ts` (05 §6.8): `970 − 355` ns.
+/// The default `snap_lag` window, `min(u16::MAX, ENG_SNAP_HIST − 1)` = 4095: the largest lag a
+/// lane logs, so the version it names is still in replay's `ENG_SNAP_HIST` ring (05 §6.5,
+/// 07 §3.6). An engine with another ring sets its own ([`Lane::set_snap_lag_max`]).
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+pub const SNAP_LAG_MAX: u16 = if vyrn_bbo::ENG_SNAP_HIST - 1 < u16::MAX as usize {
+    (vyrn_bbo::ENG_SNAP_HIST - 1) as u16
+} else {
+    u16::MAX
+};
 pub const FWD_DEADLINE_NS: u32 = 615;
 /// Messages per packet (01 §6.1).
 const MAX_OPS: usize = 10;
@@ -257,6 +266,13 @@ pub struct Lane<'a, V: Visibility, const NA: usize> {
     pub(crate) phase: Phase,
     pub(crate) band: (Tick, Tick),
     pub(crate) snap: Snapshot,
+    /// The snapshot step `fills_applied` published: its version is the base of `snap_lag`, and
+    /// a packet is never classified against an older one (05 §6.5).
+    pub(crate) f_snap: Snapshot,
+    /// The largest `snap_lag` the lane logs, and the largest gap between a packet's snapshot and
+    /// a `MID` boundary inside it: [`SNAP_LAG_MAX`] unless the engine sets its replay window
+    /// ([`Lane::set_snap_lag_max`], 05 §6.5).
+    pub(crate) lag_max: u64,
     pub(crate) pend: std::collections::VecDeque<PendE>,
     pub(crate) evbuf: std::collections::VecDeque<vyrn_bbo::FillEvent>,
     pub(crate) fwd: std::collections::VecDeque<FwdOut>,
@@ -387,6 +403,11 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                 ask: NO_ASK,
                 ..Snapshot::default()
             },
+            f_snap: Snapshot {
+                ask: NO_ASK,
+                ..Snapshot::default()
+            },
+            lag_max: u64::from(SNAP_LAG_MAX),
             pend: std::collections::VecDeque::with_capacity(n),
             evbuf: std::collections::VecDeque::with_capacity(ENG_FILL_RING),
             fwd: std::collections::VecDeque::with_capacity(ENG_FWD_RING),
@@ -504,13 +525,40 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         self.jpos = self.jpos.wrapping_add(1);
     }
 
-    /// Refreshes the lane's snapshot (05 §6.5: every later op uses this version or newer).
+    /// Refreshes the lane's snapshot (05 §6.5: every later op uses this version or newer),
+    /// unless its `snap_lag` would pass the lane's window (`lag_max`).
     pub(crate) fn refresh_snapshot(&mut self, vis: &V) {
         if let Some(s) = self.io.snapshot.try_read(vis)
             && s.version >= self.snap.version
+            && s.version.saturating_sub(self.f_snap.version) <= self.lag_max
         {
             self.snap = s;
         }
+    }
+
+    /// `snap_lag` of a packet accepted now: `snap.version` minus the version of step
+    /// `fills_applied` (≥ 0: accept never keeps a snapshot older than `f_snap`).
+    fn snap_lag(&self) -> u16 {
+        u16::try_from(self.snap.version.saturating_sub(self.f_snap.version)).unwrap_or(u16::MAX)
+    }
+
+    /// The version step `fills_applied` published, the base of the next packet's `snap_lag`:
+    /// replay classifies that packet against version `snap_base() + snap_lag` (07 §7.1).
+    pub fn snap_base(&self) -> u64 {
+        self.f_snap.version
+    }
+
+    /// Sets the window of [`Self::snap_base`] lags: `min(u16::MAX, REPLAY_SNAP_HIST − 1)`, so
+    /// every lag the lane logs names a version replay still holds (05 §6.5, 07 §3.6). The
+    /// engine calls it once at construction.
+    pub fn set_snap_lag_max(&mut self, n: u16) {
+        self.lag_max = u64::from(n);
+    }
+
+    /// Sets the lane's snapshot: replay restores the one a packet's `snap_lag` names before the
+    /// packet (07 §7.1), and tests pin one. The live path never calls this.
+    pub fn restore_snapshot(&mut self, s: Snapshot) {
+        self.snap = s;
     }
 
     // -----------------------------------------------------------------------------------------
@@ -611,6 +659,18 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             *d = Some(*m);
         }
         self.scripted = !mids.is_empty();
+        // A lane so far behind that the newest snapshot's `snap_lag` would pass its window first
+        // takes a boundary at the newest framed step (an Advance record), so it never saturates.
+        if !self.scripted
+            && self
+                .io
+                .snapshot
+                .try_read(vis)
+                .is_some_and(|s| s.version.saturating_sub(self.f_snap.version) > self.lag_max)
+            && let Some(lc) = self.catch_up_due(vis)
+        {
+            self.boundary(vis, lc, None);
+        }
         let r = self.packet(vis, p, clock);
         self.mids = [None; 20];
         self.scripted = false;
@@ -781,7 +841,13 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         }
         let prio_ts = p.rx_ts.max(self.last_prio_ts);
         self.last_prio_ts = prio_ts;
-        self.refresh_snapshot(vis);
+        // Replay restored the logged snapshot before the packet (07 §7.1).
+        if self.forced.is_none() {
+            self.refresh_snapshot(vis);
+        }
+        if self.snap.version < self.f_snap.version {
+            self.snap = self.f_snap;
+        }
         // V9 (header) and V10 (packet buckets): every message gets the reject.
         let hdr = req.check_header().err().map(|e| rej(e.reason, e.detail));
         let hdr = hdr.or_else(|| (s.book != h.book()).then(|| rej(RejectReason::BadBook, 0)));
@@ -816,6 +882,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             pkt_hash: p.pkt_hash,
             first_lane_seq: LaneSeq(self.seq.0.saturating_add(1)),
             fills_applied: self.fills_applied,
+            snap_lag: self.snap_lag(),
         }));
         self.n_ops = 0;
         self.cur_sess = si;
@@ -939,6 +1006,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             pkt_hash: p.pkt_hash,
             first_lane_seq: first,
             fills_applied: self.fills_applied,
+            snap_lag: 0,
         }));
     }
 
@@ -1026,7 +1094,11 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             if let Some(m) = hit {
                 self.boundary(vis, m.at, Some((pass, next)));
             }
-        } else if let Some(lc) = self.boundary_due(vis) {
+        } else if let Some(lc) = self.boundary_due(vis)
+            // A `MID` raises the packet's due step to `lc.step` (07 §7.1), so replay must still
+            // hold the packet's snapshot then: skip a boundary more than the window past it.
+            && lc.snap.version.saturating_sub(self.snap.version) <= self.lag_max
+        {
             self.boundary(vis, lc, Some((pass, next)));
         }
     }

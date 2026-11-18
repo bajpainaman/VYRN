@@ -51,9 +51,9 @@ use crate::{
 const LEB: usize = 10;
 /// A run's tag and its count.
 const RUN: usize = 1 + LEB;
-/// One lane record: `h`, slot (< 4098, 2 bytes), `rx_ts` ZZ, `fills_applied`, `first_lane_seq`
-/// and `pkt_seq` (5 bytes).
-const REC: usize = 1 + 2 + LEB + LEB + LEB + 5;
+/// One lane record: `h`, slot (< 4098, 2 bytes), `rx_ts` ZZ, `fills_applied`, `first_lane_seq`,
+/// `pkt_seq` (5 bytes) and `snap_lag` (3 bytes).
+const REC: usize = 1 + 2 + LEB + LEB + LEB + 5 + 3;
 /// `SessionBind`: tag, lane, slot (2), session (4), `next_pkt_seq` (5).
 const BIND: usize = 1 + 1 + 2 + 4 + 5;
 /// A `HashRun`'s tag, lane and count, and one entry.

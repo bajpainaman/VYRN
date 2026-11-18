@@ -223,9 +223,13 @@ The logical records are below. On the wire they are delta-encoded with LEB128 va
 PacketRecord  { lane: LaneId, count: u8, flags: u8,   // bit0 SHED, bit1 ADVANCE (count = 0)
                 session: SessionId, pkt_seq: u32,
                 rx_ts: Nanos, pkt_hash: PktHash, first_lane_seq: LaneSeq,
-                fills_applied: StepId }   // the last step whose fill events this lane applied
+                fills_applied: StepId,    // the last step whose fill events this lane applied
                                           // before it processed this packet; this makes balance
                                           // checks that use fill proceeds replayable
+                snap_lag: u16 }           // the BBO snapshot version the lane classified the
+                                          // packet against, minus the version step
+                                          // fills_applied published (05 §6.5); 0 on SHED and
+                                          // ADVANCE records
 StepRecord    { step: StepId, kind: StepKind, src_lane: LaneId, src_lane_seq: LaneSeq,
                 flags: u8,                     // bit1 CROSS: the source's lane route was Cross,
                                                // clear = Improve; 0 without a source (05 §4.15)

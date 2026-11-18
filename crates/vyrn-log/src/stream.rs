@@ -36,6 +36,7 @@
 //! [FA_NZ]  LEB  fills_applied − prev_fills_applied      (≥ 1)
 //! [LSEQ]   LEB  first_lane_seq − next_lane_seq          (≥ 1)
 //! [SEQ]    LEB  pkt_seq (u32), ≠ the slot's next_pkt_seq; never in an Advance record
+//! [PKT]    LEB  snap_lag (u16): a packet record without SHED only (05 §6.5)
 //! ```
 //!
 //! A flag is set exactly when its field differs from the prediction, so a flag with a zero
@@ -797,6 +798,7 @@ impl SubstreamState {
             pkt_hash: PktHash(0),
             first_lane_seq: LaneSeq(first),
             fills_applied: StepId(fa),
+            snap_lag: 0,
         };
         if advance {
             rec.flags = PacketFlags::ADVANCE
@@ -822,6 +824,9 @@ impl SubstreamState {
             };
             rec.session = session;
             rec.pkt_seq = pkt_seq;
+            if h & H_SHED == 0 {
+                rec.snap_lag = u16::try_from(r.leb_u64()?).map_err(|_| RepErr::Range)?;
+            }
         }
         self.apply_pkt(i, slot, &rec)?;
         Ok(LaneRec::Pkt(rec))
@@ -941,6 +946,11 @@ impl SubstreamState {
         // `H_MID` shares bit 4 with `SEQ_EXC`: an Advance record never carries a `pkt_seq`.
         if !advance && h & H_SEQ_EXC != 0 {
             leb::put_u64(out, u64::from(p.pkt_seq));
+        }
+        if !advance && p.flags & PacketFlags::SHED == 0 {
+            leb::put_u64(out, u64::from(p.snap_lag));
+        } else if p.snap_lag != 0 {
+            return Err(RepErr::Range);
         }
         self.apply_pkt(i, slot, p)
     }

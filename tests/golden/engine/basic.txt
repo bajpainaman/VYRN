@@ -20,28 +20,28 @@ I run
 I pkt 0 30000 30000 010010000200000001000000070000000200000001000001000000000c0000007b5fc2cbbb5339410000000000000000
 I poll
 I run
-P lane=0 count=1 flags=0 session=1048577 pkt_seq=1 rx_ts=1000 pkt_hash=ee11debb4d916fbc first=1 fills_applied=0
+P lane=0 count=1 flags=0 session=1048577 pkt_seq=1 rx_ts=1000 pkt_hash=ee11debb4d916fbc first=1 fills_applied=0 snap_lag=0
 R lane=0 lane_seq=1 cross=0
 S step=1 kind=2 src=0:1 n_tx=1 n_fills=0 pub=1/1 band=0..0 fill_lanes=1 flags=0 cut=[]
-P lane=0 count=0 flags=2 session=0 pkt_seq=0 rx_ts=1000 pkt_hash=0000000000000000 first=2 fills_applied=1
+P lane=0 count=0 flags=2 session=0 pkt_seq=0 rx_ts=1000 pkt_hash=0000000000000000 first=2 fills_applied=1 snap_lag=0
 S step=2 kind=5 src=0:0 n_tx=0 n_fills=0 pub=2/2 band=0..0 fill_lanes=0 flags=0 cut=[0:1]
-P lane=1 count=1 flags=0 session=1052673 pkt_seq=1 rx_ts=2000 pkt_hash=28a3827c0c44757f first=1 fills_applied=0
+P lane=1 count=1 flags=0 session=1052673 pkt_seq=1 rx_ts=2000 pkt_hash=28a3827c0c44757f first=1 fills_applied=0 snap_lag=1
 R lane=1 lane_seq=1 cross=1
 S step=3 kind=1 src=1:1 n_tx=2 n_fills=1 pub=4/4 band=0..0 fill_lanes=3 flags=2 cut=[]
-P lane=0 count=2 flags=0 session=1048578 pkt_seq=1 rx_ts=3000 pkt_hash=7ab6365ab9d81fa7 first=2 fills_applied=1
-P lane=0 count=0 flags=6 session=0 pkt_seq=0 rx_ts=3000 pkt_hash=0000000000000000 first=2 fills_applied=3
+P lane=0 count=2 flags=0 session=1048578 pkt_seq=1 rx_ts=3000 pkt_hash=7ab6365ab9d81fa7 first=2 fills_applied=1 snap_lag=0
+P lane=0 count=0 flags=6 session=0 pkt_seq=0 rx_ts=3000 pkt_hash=0000000000000000 first=2 fills_applied=3 snap_lag=0
 S step=4 kind=5 src=0:0 n_tx=0 n_fills=0 pub=5/5 band=0..0 fill_lanes=0 flags=0 cut=[0:3,1:1]
-P lane=0 count=0 flags=2 session=0 pkt_seq=0 rx_ts=3000 pkt_hash=0000000000000000 first=4 fills_applied=4
-P lane=1 count=0 flags=2 session=0 pkt_seq=0 rx_ts=2000 pkt_hash=0000000000000000 first=2 fills_applied=4
-P lane=2 count=1 flags=0 session=1056769 pkt_seq=1 rx_ts=5000 pkt_hash=b0471133922039d2 first=1 fills_applied=0
+P lane=0 count=0 flags=2 session=0 pkt_seq=0 rx_ts=3000 pkt_hash=0000000000000000 first=4 fills_applied=4 snap_lag=0
+P lane=1 count=0 flags=2 session=0 pkt_seq=0 rx_ts=2000 pkt_hash=0000000000000000 first=2 fills_applied=4 snap_lag=0
+P lane=2 count=1 flags=0 session=1056769 pkt_seq=1 rx_ts=5000 pkt_hash=b0471133922039d2 first=1 fills_applied=0 snap_lag=1
 R lane=2 lane_seq=1 cross=1
 S step=5 kind=6 src=2:1 n_tx=1 n_fills=0 pub=7/7 band=0..0 fill_lanes=4 flags=2 cut=[]
 S step=6 kind=5 src=0:0 n_tx=0 n_fills=0 pub=8/8 band=0..0 fill_lanes=0 flags=0 cut=[2:1]
-P lane=2 count=0 flags=2 session=0 pkt_seq=0 rx_ts=5000 pkt_hash=0000000000000000 first=2 fills_applied=6
-P lane=0 count=1 flags=1 session=1048579 pkt_seq=1 rx_ts=10000 pkt_hash=2bde8ce0f4d1587f first=4 fills_applied=4
-P lane=0 count=1 flags=0 session=1048579 pkt_seq=1 rx_ts=20000 pkt_hash=2bde8ce0f4d1587f first=5 fills_applied=4
+P lane=2 count=0 flags=2 session=0 pkt_seq=0 rx_ts=5000 pkt_hash=0000000000000000 first=2 fills_applied=6 snap_lag=0
+P lane=0 count=1 flags=1 session=1048579 pkt_seq=1 rx_ts=10000 pkt_hash=2bde8ce0f4d1587f first=4 fills_applied=4 snap_lag=0
+P lane=0 count=1 flags=0 session=1048579 pkt_seq=1 rx_ts=20000 pkt_hash=2bde8ce0f4d1587f first=5 fills_applied=4 snap_lag=0
 S step=7 kind=5 src=0:0 n_tx=0 n_fills=0 pub=10/10 band=0..0 fill_lanes=0 flags=0 cut=[0:5]
-P lane=0 count=0 flags=2 session=0 pkt_seq=0 rx_ts=20000 pkt_hash=0000000000000000 first=6 fills_applied=7
-P lane=0 count=1 flags=0 session=1048577 pkt_seq=2 rx_ts=30000 pkt_hash=d5446e985ad978fd first=6 fills_applied=7
+P lane=0 count=0 flags=2 session=0 pkt_seq=0 rx_ts=20000 pkt_hash=0000000000000000 first=6 fills_applied=7 snap_lag=0
+P lane=0 count=1 flags=0 session=1048577 pkt_seq=2 rx_ts=30000 pkt_hash=d5446e985ad978fd first=6 fills_applied=7 snap_lag=0
 S step=8 kind=4 src=0:0 n_tx=0 n_fills=0 pub=12/12 band=0..0 fill_lanes=0 flags=0 cut=[0:6]
-P lane=0 count=0 flags=2 session=0 pkt_seq=0 rx_ts=30000 pkt_hash=0000000000000000 first=7 fills_applied=8
+P lane=0 count=0 flags=2 session=0 pkt_seq=0 rx_ts=30000 pkt_hash=0000000000000000 first=7 fills_applied=8 snap_lag=0

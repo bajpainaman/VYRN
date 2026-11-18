@@ -89,6 +89,6 @@ mod settle;
 pub use admit::{Class, DEADLINE_GUARD_NS, PathTable, Point};
 pub use arena::{Arena, ArenaConfig, ArenaView, ArenaWriter};
 pub use book::LaneBook;
-pub use lane::{Config, Lane, Mid, Ports, Rx, RxIn};
+pub use lane::{Config, Lane, Mid, Ports, Rx, RxIn, SNAP_LAG_MAX};
 pub use out::{Gate, LogRec, RespPkt};
 pub use session::{SessState, SessionSpec};

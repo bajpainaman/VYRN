@@ -23,6 +23,21 @@ use vyrn_types::{
 
 /// Steps whose cut replay keeps for `MID` boundaries (`ENG_STEP_LOG`).
 pub(crate) const STEP_HIST: usize = ENG_STEP_LOG;
+/// Snapshot versions replay keeps (07 §7.1): `ENG_SNAP_HIST` = 4096, the BBO core's own version
+/// window; 16 in this crate's unit tests, so they can evict a version.
+pub const REPLAY_SNAP_HIST: usize = if cfg!(test) {
+    16
+} else {
+    vyrn_bbo::ENG_SNAP_HIST
+};
+/// The `snap_lag` window every lane of the engine uses, `min(u16::MAX, REPLAY_SNAP_HIST − 1)`
+/// (05 §6.5, 07 §3.6): a logged lag names a version replay still holds.
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+pub const SNAP_LAG_WINDOW: u16 = if REPLAY_SNAP_HIST - 1 < u16::MAX as usize {
+    (REPLAY_SNAP_HIST - 1) as u16
+} else {
+    u16::MAX
+};
 /// Lane records 07 replay can carry from one block to the next (`ENG_FWD_RING` × 4).
 pub(crate) const CARRY_CAP: usize = 4 * vyrn_cut::ENG_FWD_RING;
 /// Records one fill TX packet can carry (`TxEntry.n_rec` is a `u8`).
@@ -154,6 +169,13 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     /// `hist_id` holds the step each slot is for (step 0, the epoch start, is all zeros).
     hist: Vec<LaneSeq>,
     hist_id: Vec<StepId>,
+    /// The BBO snapshot of each step in `hist` (`done_step = f`), the one `LaneCut` carries.
+    snap_hist: Vec<Snapshot>,
+    /// Replay only, allocated by the first replay call: every published snapshot, keyed by
+    /// `version mod REPLAY_SNAP_HIST` (07 §7.1). Empty on a live engine.
+    snap_vers: Vec<Snapshot>,
+    /// The newest snapshot version the stream role read.
+    pub(crate) snap_now: u64,
     recs: Vec<Record>,
     pub(crate) scratch: Vec<PacketRecord>,
     /// A step the BBO core published whose lines the stream role has not seen yet (a delayed
@@ -227,7 +249,9 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
                 snapshot,
                 lane_cut,
             };
-            lanes.push(mk(*cfg, aw, ports));
+            let mut lane = mk(*cfg, aw, ports);
+            lane.set_snap_lag_max(SNAP_LAG_WINDOW);
+            lanes.push(lane);
             views.push(av);
             fwd_c.push(fc);
             fill_p.push(ip);
@@ -265,6 +289,9 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             deltas: [CutDelta::default(); MAX_LANES],
             hist: vec![LaneSeq(0); n.saturating_mul(STEP_HIST)],
             hist_id: vec![StepId(0); STEP_HIST],
+            snap_hist: vec![Snapshot::default(); STEP_HIST],
+            snap_vers: Vec::new(),
+            snap_now: 0,
             recs: Vec::with_capacity(TX_RECS),
             scratch: Vec::with_capacity(32),
             unread: None,
@@ -599,7 +626,8 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
                 }
             }
         }
-        self.remember_cut(entry.step);
+        self.remember_cut(entry.step, snap);
+        self.note_snapshot(snap);
         let deltas = self.deltas.get(..n_delta).ok_or(Fault::Ring)?;
         sink.record(&Rec::Step(entry, deltas));
         for c in &mut self.tx_c {
@@ -625,6 +653,7 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
                 &LaneCutEntry {
                     step: entry.step,
                     cut: *c,
+                    snap,
                 },
             );
         }
@@ -643,7 +672,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             .unwrap_or(0)
     }
 
-    fn remember_cut(&mut self, f: StepId) {
+    fn remember_cut(&mut self, f: StepId, snap: Snapshot) {
         let n = self.lanes.len();
         let s = Self::slot(f);
         let base = s.saturating_mul(n);
@@ -656,17 +685,59 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         if let Some(id) = self.hist_id.get_mut(s) {
             *id = f;
         }
+        if let Some(x) = self.snap_hist.get_mut(s) {
+            *x = snap;
+        }
     }
 
-    /// `C_f[l]`, if step `f` is still in the history.
-    pub(crate) fn cut_at(&self, f: StepId, l: usize) -> Option<LaneSeq> {
+    /// Starts the version history replay looks `snap_lag` up in, from the current snapshot (the
+    /// initial one on a fresh engine). A no-op once started.
+    pub(crate) fn track_snapshots(&mut self) {
+        if self.snap_vers.is_empty() {
+            self.snap_vers = vec![Snapshot::default(); REPLAY_SNAP_HIST];
+            if let Some(x) = self.snap.try_read(self.vis) {
+                self.note_snapshot(x);
+            }
+        }
+    }
+
+    fn note_snapshot(&mut self, x: Snapshot) {
+        self.snap_now = self.snap_now.max(x.version);
+        let n = u64::try_from(self.snap_vers.len()).unwrap_or(0);
+        let ix = x
+            .version
+            .checked_rem(n)
+            .and_then(|i| usize::try_from(i).ok());
+        if let Some(d) = ix.and_then(|i| self.snap_vers.get_mut(i)) {
+            *d = x;
+        }
+    }
+
+    /// The published snapshot with `version`, if replay still holds it.
+    pub(crate) fn snap_of(&self, version: u64) -> Option<Snapshot> {
+        let n = u64::try_from(self.snap_vers.len()).ok()?;
+        let i = usize::try_from(version.checked_rem(n)?).ok()?;
+        self.snap_vers
+            .get(i)
+            .copied()
+            .filter(|x| x.version == version)
+    }
+
+    /// Lane `l`'s `LaneCut` entry of step `f` (`C_f[l]` and the step's snapshot), if step `f`
+    /// is still in the history.
+    pub(crate) fn cut_at(&self, f: StepId, l: usize) -> Option<LaneCutEntry> {
         let s = Self::slot(f);
         if *self.hist_id.get(s)? != f {
             return None;
         }
-        self.hist
-            .get(s.saturating_mul(self.lanes.len()).saturating_add(l))
-            .copied()
+        let cut = *self
+            .hist
+            .get(s.saturating_mul(self.lanes.len()).saturating_add(l))?;
+        Some(LaneCutEntry {
+            step: f,
+            cut,
+            snap: *self.snap_hist.get(s)?,
+        })
     }
 }
 

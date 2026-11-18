@@ -1264,13 +1264,11 @@ fn scripted_boundaries_stay_scripted_after_the_last_one() {
     ask_105(&mut x, &mut bbo);
     x.send(1, 1, 2_000, &[new(day(Side::Buy), 105, 1, 1)]);
     let a = x.bbo_step(&mut bbo).unwrap();
+    let at = x.lane_cut(0);
+    assert_eq!((at.step, at.cut), (a.entry.step, a.cuts[0]));
     x.send(1, 1, 2_100, &[new(day(Side::Buy), 105, 1, 2)]);
     let b = x.bbo_step(&mut bbo).unwrap();
     assert!(b.entry.step > a.entry.step);
-    let at = vyrn_cut::LaneCutEntry {
-        step: a.entry.step,
-        cut: a.cuts[0],
-    };
     x.publish(); // lane 0's snapshot line now has done_step = b: a live poll would run b
     let n = x.log[0].len();
     let m = [

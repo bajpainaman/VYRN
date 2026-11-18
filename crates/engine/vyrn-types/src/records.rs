@@ -34,6 +34,10 @@ pub struct PacketRecord {
     pub first_lane_seq: LaneSeq,
     /// The last step whose fill events this lane applied before it processed this packet.
     pub fills_applied: StepId,
+    /// The BBO snapshot version the lane classified this packet against, as the number of
+    /// versions after the one published by step `fills_applied` (05 §6.5, 07 §3.6). 0 on an
+    /// Advance or `SHED` record. A lane never lets it pass `u16::MAX`.
+    pub snap_lag: u16,
 }
 
 /// `StepRecord.flags` bits (01 §6.6). They use `StepEntry.flags`' numbering (05 §4.15).

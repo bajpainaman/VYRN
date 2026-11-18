@@ -22,3 +22,11 @@ expect = "pass"
 [[seed]]
 seed = "3"
 expect = "pass"
+
+[[seed]]
+seed = "a"
+# Required: failed INV-UNCROSSED (bid 102 ask 101 at step 280) when lanes read the BBO snapshot
+# only at boundaries (stale snapshots; the 05 §8.5 band_env open item). Guards read-at-accept
+# with a logged snap_lag (05 §6.5).
+faults = "delay 73 15166; dup 65; delay 2 44940"
+expect = "pass"

@@ -126,6 +126,7 @@ fn worked_example_07_3_11() {
                 pkt_hash: PktHash(0),
                 first_lane_seq: LaneSeq(1),
                 fills_applied: StepId(0),
+                snap_lag: 0,
             })],
         },
         Section::StepRun(vec![StepHalf {
@@ -143,7 +144,7 @@ fn worked_example_07_3_11() {
     ];
     let enc = st.encode_sections(&sections, BodyKind::Order).unwrap();
     assert_eq!(enc, bytes(&g, "ex311.sections"));
-    assert_eq!(enc.len(), 20, "07 §3.11: 20 bytes");
+    assert_eq!(enc.len(), 21, "07 §3.11: 21 bytes");
 
     let mut dec = ref_state();
     dec.encode_sections(std::slice::from_ref(&bind), BodyKind::Order)
@@ -168,7 +169,7 @@ fn worked_example_07_3_11() {
     }
     let enc = bound().encode_sections(&cross, BodyKind::Order).unwrap();
     assert_eq!(enc, bytes(&g, "ex311.cross_route.sections"));
-    assert_eq!(enc.len(), 20);
+    assert_eq!(enc.len(), 21);
     assert_eq!(
         bound().decode_sections(&enc, BodyKind::Order).unwrap(),
         cross
@@ -176,6 +177,24 @@ fn worked_example_07_3_11() {
     assert_eq!(
         bound().decode_sections(&bytes(&g, "ex311.bad_src_bit6.sections"), BodyKind::Order),
         Err(RepErr::Cut)
+    );
+    // snap_lag (05 §6.5) is LEB128 after the packet record's other fields; above u16::MAX is
+    // REP_E_RANGE.
+    let mut lagged = sections[..1].to_vec();
+    if let Section::LaneRun { recs, .. } = &mut lagged[0]
+        && let LaneRec::Pkt(p) = &mut recs[0]
+    {
+        p.snap_lag = 300;
+    }
+    let enc = bound().encode_sections(&lagged, BodyKind::Order).unwrap();
+    assert_eq!(enc, bytes(&g, "ex311.snap_lag.sections"));
+    assert_eq!(
+        bound().decode_sections(&enc, BodyKind::Order).unwrap(),
+        lagged
+    );
+    assert_eq!(
+        bound().decode_sections(&bytes(&g, "ex311.bad_snap_lag.sections"), BodyKind::Order),
+        Err(RepErr::Range)
     );
     // G9: a RouteRecord after the packet, 3 bytes; bad back and reserved bits are rejected.
     let pkt = sections[0].clone();
@@ -195,7 +214,7 @@ fn worked_example_07_3_11() {
     }];
     let enc = bound().encode_sections(&route, BodyKind::Order).unwrap();
     assert_eq!(enc, bytes(&g, "ex311.route.sections"));
-    assert_eq!(enc.len(), 10, "a RouteRecord costs 3 bytes");
+    assert_eq!(enc.len(), 11, "a RouteRecord costs 3 bytes");
     assert_eq!(
         bound().decode_sections(&enc, BodyKind::Order).unwrap(),
         route
@@ -245,6 +264,7 @@ fn worked_example_07_3_11() {
                     pkt_hash: PktHash(0),
                     first_lane_seq: LaneSeq(first),
                     fills_applied: StepId(1),
+                    snap_lag: 0,
                 }),
                 // The lane's next LaneSeq stays 11: a route after the MID record still names
                 // an op of the packet.
@@ -333,7 +353,15 @@ fn pkt(lane: u8, count: u8, session: u32, pkt_seq: u32, rx: u64, first: u64, fa:
         pkt_hash: PktHash(0),
         first_lane_seq: LaneSeq(first),
         fills_applied: StepId(fa),
+        snap_lag: 0,
     })
+}
+
+fn lagged(r: LaneRec, snap_lag: u16) -> LaneRec {
+    match r {
+        LaneRec::Pkt(p) => LaneRec::Pkt(PacketRecord { snap_lag, ..p }),
+        x => x,
+    }
 }
 
 fn bodies(g: &BTreeMap<String, String>) -> (Vec<Body>, Vec<Body>, BlockHeader) {
@@ -358,7 +386,7 @@ fn bodies(g: &BTreeMap<String, String>) -> (Vec<Body>, Vec<Body>, BlockHeader) {
                 lane: LaneId(0),
                 recs: vec![
                     pkt(0, 3, 0x0030_1007, 1, 1_000_700, 1, 0),
-                    pkt(0, 1, 0x0030_1007, 5, 1_000_600, 4, 0),
+                    lagged(pkt(0, 1, 0x0030_1007, 5, 1_000_600, 4, 0), 2),
                 ],
             },
             Section::LaneRun {
@@ -644,8 +672,8 @@ fn a_new_tenure_keeps_the_epochs_session_slots() {
     assert_eq!(enc.next_tenure(ident(0)), Err(RepErr::Tenure));
     enc.next_tenure(ident(1)).unwrap();
     let f = enc.encode(&body).unwrap();
-    // The record costs no SEQ_EXC: h = 01, slot 05, zigzag(+100) = c8 01.
-    assert!(f.ends_with(&[0x00, 0x01, 0x01, 0x05, 0xc8, 0x01]));
+    // The record costs no SEQ_EXC: h = 01, slot 05, zigzag(+100) = c8 01, snap_lag 00.
+    assert!(f.ends_with(&[0x00, 0x01, 0x01, 0x05, 0xc8, 0x01, 0x00]));
     let mut fresh = StreamDecoder::new(layout4(), 0).unwrap();
     assert_eq!(
         fresh.decode(&f),

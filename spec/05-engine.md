@@ -928,8 +928,12 @@ TxEntry (64-B header + 16-B records, BBO → the fill TX core of the session's l
 MakerSeq[session] (16 B, lane-written, fill-TX-read; 01 §14.14):
   0 4 base_cur | 4 4 base_next | 8 4 gen | 12 4 rsv      two ranges of 16 numbers each
 
-LaneCut[l] (16 B, 4 per line, stream core of l's half → lane l):  { step: StepId, cut: LaneSeq }
-  one 16-B aligned store; the lane reads it with one 16-B aligned load
+LaneCut[l] (48 B, one per line, stream core of l's half → lane l):
+  { step: StepId, cut: LaneSeq, snap: Snapshot }   snap: the snapshot step `step` published, the
+  base of the lane's next `snap_lag` (§6.5); written and read under the entry's seqlock
+  (ruling, #151: 48 B under vyrn-cut's per-entry seqlock replaces the 16-B atomic entry). A lane
+  keeps its lag within W = min(u16::MAX, REPLAY_SNAP_HIST − 1) = 4095 of `snap.version` (§6.5
+  rule 3, 07 §3.6)
 ```
 
 - **Two stream cores, frame gating (01 §14.15.3, §14.16).** Stream core A (core 4) frames the
@@ -939,7 +943,7 @@ LaneCut[l] (16 B, 4 per line, stream core of l's half → lane l):  { step: Step
   `LaneCut[l] = (s, C_s[l])` for its own lanes only after that. So a lane that reads `LaneCut` for
   `s` knows the gate for its acks is open, and only checks it (~10 ns budget).
 
-- A 16-B aligned SSE/AVX load or store is single-copy atomic on x86-64 CPUs with AVX (vendor:
+- (Before `snap`, the entry was 16 B.) A 16-B aligned SSE/AVX load or store is single-copy atomic on x86-64 CPUs with AVX (vendor:
   Intel SDM vol. 3A §9.1.1; AMD APM vol. 2 §7.3.2). On aarch64 the pair is an `STP`/`LDP` with
   FEAT_LSE2. A target without either uses a per-entry seqlock. `vyrn-cut` uses the seqlock on
   every target, one `LaneCut[l]` per `BLD_SHARED_ALIGN` line, because safe Rust cannot express
@@ -1311,6 +1315,30 @@ because `admit` rejects it with `BOOK_HALTED`.
 
 The lane records `l.snap.version` in `CounterLine.snap_ver` at every refresh. Every later op uses
 that version or a newer one. The BBO core needs only this lower bound (§8.6).
+
+**Which snapshot a packet uses, and `snap_lag` (ruling (c), after #137).** The lane reads the
+snapshot when it accepts a packet (read-at-accept), so its classification and price band use the
+freshest version it can see. Every op of the packet uses that one snapshot; a `MID` boundary inside
+the packet does not change it. Let `base` be the version that step `fills_applied` published,
+which the lane learns from `LaneCut` (§4.15). The rules are:
+
+1. At accept the lane refreshes `snap` (§6.5 above); if `snap.version < base` it uses the step's
+   own snapshot instead, so `snap.version ≥ base` always holds.
+2. `PacketRecord.snap_lag = snap.version − base` (01 §6.6). `SHED` and Advance records classify
+   nothing and log 0.
+3. The lag stays inside the window `W = min(u16::MAX, REPLAY_SNAP_HIST − 1)` = 4095 (§4.15,
+   07 §3.6), so it never saturates and every logged lag names a version replay still holds. A
+   lane whose newest visible snapshot is more than `W` versions past `base` first takes a
+   catch-up boundary at the newest framed step (an Advance record, §6.2), which moves `base`. A
+   refresh that would still exceed `W` is skipped. A `MID` boundary inside the packet whose step
+   published a version more than `W` past the packet's snapshot is not taken (it raises the
+   packet's due step in 07 §7.1); the lane takes it at the next boundary point instead.
+4. Replay classifies the packet against version `base + snap_lag` from its snapshot history
+   (07 §7.1), so it reproduces the live routes and band checks exactly (`INV-DET`).
+
+Reading only at boundaries, the rule #137 first proposed, is rejected: the snapshot goes stale,
+which breaks `INV-UNCROSSED` (sim seed 10) and costs +15.6% steps. A catch-up boundary before
+every packet costs +9.8% records and loses the `MID` coverage.
 
 ### 6.6 Forwarding
 
@@ -2032,6 +2060,17 @@ the taker's lane: one slot-line read per such position. `Pend` leaves are merged
   other source; between them the cut may advance (acks keep flowing, §7.7) and the taker is in
   flight (§2.3). A continuation is never shed: it already traded. The cap is a count, so replay
   splits a sweep at the same fills.
+- **Open item: a Join dependency can rest crossed (latent BBO gap, not fixed).** `band_env`
+  (§8.6) widens the bounds only with the snapshot versions of lanes whose cut moved in the step.
+  A source op's Join dependency was classified by its lane against the lane's snapshot. If that
+  lane's cut did not move, `band_env` never consults its older version, so the dependency can be
+  classified `Join` against a stale ask and rest crossed. Sim seed 10's trace (before the fix in
+  `tests/seeds.toml`, faults `delay 73 15166; dup 65; delay 2 44940`): step 280 is a `Cross` from
+  lane 2 seq 20 (sell 100). Its Join dependency seq 19 (buy 102) was classified against version 81
+  (ask 104) while the true ask was 101. Lane 2's cut stayed at 18, so the step rested bid 102 above
+  ask 101. Read-at-accept (§6.5) keeps snapshots fresh enough that the swarm does not hit it, but
+  the BBO should check a dependency's tick against the current bounds. Putting the source lane
+  into `band_env` livelocks the BBO, so that is not the fix.
 
 ### 8.6 The band test and the `Rescan` step
 

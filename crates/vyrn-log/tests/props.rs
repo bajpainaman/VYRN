@@ -190,6 +190,7 @@ impl Model {
                     pkt_hash: PktHash(0),
                     first_lane_seq: LaneSeq(l.next),
                     fills_applied: StepId(fa),
+                    snap_lag: 0,
                 };
                 (l.rx, l.fa) = (rx, fa);
                 recs.push(LaneRec::Pkt(rec));
@@ -211,6 +212,7 @@ impl Model {
                 pkt_hash: PktHash(0),
                 first_lane_seq: LaneSeq(first),
                 fills_applied: StepId(fa),
+                snap_lag: 0,
             };
             (l.rx, l.fa, l.next) = (rx, fa, first + u64::from(count));
             l.awaiting.push_back(first);
