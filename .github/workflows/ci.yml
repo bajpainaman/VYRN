@@ -141,10 +141,17 @@ jobs:
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_admin_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_admin_vectors.out"
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_session_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_session_vectors.out"
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_data_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_data_vectors.out"
-      - name: the drop-copy Noise generator rewrites its vectors unchanged (10 §8.5 item 5)
+      # gen_dc_vectors.py and gen_feed_vectors.py take BLAKE3 from the b3sum CLI, which the
+      # runner lacks; .agents/setup installs the same tool for orbs.
+      - name: install b3sum
+        working-directory: /tmp
+        run: cargo install b3sum --locked --version 1.8.7
+      - name: the vyrn-md generators rewrite their vectors unchanged (10 §8.5, #92)
         run: |
-          python3 -I crates/vyrn-md/tests/gen_dc_noise_vectors.py crates/vyrn-md/tests
-          git diff --exit-code -- crates/vyrn-md/tests/dc_noise_vectors.txt
+          for gen in gen_feed_vectors gen_dc_vectors gen_dc_noise_vectors; do
+            python3 -I "crates/vyrn-md/tests/$gen.py" crates/vyrn-md/tests
+          done
+          git diff --exit-code -- crates/vyrn-md/tests
       - name: the independent trace decoder rewrites the trace-dump vectors unchanged (11 §8.3)
         run: |
           python3 -I tools/trace-dump/fixtures-src/make.py
