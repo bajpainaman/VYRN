@@ -361,7 +361,12 @@ In `tools/e2e-smoke`, the observer gets its own DEV bound of 200 ms while voters
 (50 ms in CI): it also replays, feeds the drop copy and finalizes on its order thread. The
 bound runs from each frame's `rx_ts`, the kernel's receive time (`SO_TIMESTAMPNS` on Linux
 kernel_udp, 06 §6.6), not from when the order thread gets to the frame, so time a frame waits
-in the socket queue behind a stalled thread does not count. The observer's 200 ms stays until
+in the socket queue behind a stalled thread does not count. Both paths' frames reach the order
+core in receive order, so a late frame on one path does not advance the deadlines past a timely
+HashRun still unread on the other; while a path's burst is full, the time given to the core is
+capped at its last frame read, as its unread frames came later. A frame that fills a gap (§4.9)
+counts as received no later than the earliest frame held behind it, and each held frame keeps
+its own time. The observer's 200 ms stays until
 loaded DEV runs show it within the voters' bound. A stuck HashRun still fails the observer.
 \[DEV only\]
 

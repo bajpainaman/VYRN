@@ -1419,7 +1419,7 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     let mut last_final = 0;
     let t0 = Instant::now();
     let now = || u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let mut burst = [RxPkt::empty(); RX_BURST];
+    let mut bursts = [[RxPkt::empty(); RX_BURST]; 2];
     let mut faulted = false;
     let mut stalled = false;
     // Two paths, or path A alone with `[repair]` (reorder and gap repair, 07 §4.9).
@@ -1439,57 +1439,89 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     while !stop.load(Ordering::Acquire) {
         let mut k = 0;
         let mut delivered = 0usize;
-        for (rx, path) in rxs.iter_mut().zip([RepPath::A, RepPath::B]) {
-            let Some(rx) = rx else { continue };
-            let n = rx.poll(&mut burst);
-            k += n;
-            // `REP_E_HASHLAG` runs from each frame's receive time (07 §3.7): its `rx_ts`
-            // (CLOCK_REALTIME, the kernel's stamp under kernel_udp) moved onto this thread's
-            // monotonic clock by the offset read at this poll, so a frame that waited in the
-            // socket while the thread was descheduled is not counted late.
-            let (mono, real) = (now(), realtime_ns());
-            for p in burst.iter().take(n) {
-                let Ok(f) = frame::parse(rx.bytes(p)) else {
-                    continue;
-                };
-                let at = mono.saturating_sub(real.saturating_sub(p.rx_ts().0));
-                // The sequencer's answer to a Nack for frames its ring no longer holds.
-                if let (Some(t), Some(ps)) = (NackTooOld::decode(f.payload), paths.as_mut()) {
-                    rep_stats[2] = rep_stats[2].saturating_add(1);
-                    ps.too_old(t.path, t.epoch16, t.tenure, t.stream, t.oldest_seq);
-                    continue;
-                }
-                stats.frames.fetch_add(1, Ordering::Relaxed);
-                let mut on = |payload: &[u8]| {
-                    delivered += 1;
-                    let r = core.on_frame(payload, at);
-                    if track
-                        && !matches!(r, Err(FrameErr::OutOfOrder))
-                        && let Some((key, q)) = vyrn_replica::paths::frame_key(payload)
-                    {
-                        frontier.insert(key, q);
-                    }
-                    report(
-                        &mut core,
-                        r,
-                        &mut faulted,
-                        &mut stalled,
-                        stats,
-                        source,
-                        data.as_mut(),
-                    );
-                    if let Some(d) = data.as_mut().filter(|_| track) {
-                        for x in d.pending.iter_mut().filter(|x| x.1.is_none()) {
-                            x.1 = Some(frontier.iter().map(|(k, q)| (*k, *q)).collect());
-                        }
-                    }
-                };
-                match paths.as_mut() {
-                    Some(ps) => ps.rx(path, f.payload, &mut on),
-                    None => on(f.payload),
-                }
+        // `REP_E_HASHLAG` runs from each frame's receive time (07 §3.7): its `rx_ts`
+        // (CLOCK_REALTIME, the kernel's stamp under kernel_udp) moved onto this thread's
+        // monotonic clock by the offset read at this poll, so a frame that waited in the socket
+        // while the thread was descheduled is not counted late. Both paths are polled first and
+        // their frames go to the core in receive order, so a late frame on one path cannot
+        // advance the deadlines past a timely HashRun still unread on the other. A path whose
+        // burst came back full may hold more unread frames, none received before its last one
+        // read: the time given to the core is capped there.
+        let mut n = [0usize; 2];
+        for (rx, (b, n)) in rxs.iter_mut().zip(bursts.iter_mut().zip(&mut n)) {
+            if let Some(rx) = rx {
+                *n = rx.poll(b);
             }
-            rx.release(n);
+        }
+        let (mono, real) = (now(), realtime_ns());
+        let at_of = |p: &RxPkt| mono.saturating_sub(real.saturating_sub(p.rx_ts().0));
+        let cap = (0..2)
+            .filter(|&i| n[i] == RX_BURST)
+            .filter_map(|i| bursts[i].get(RX_BURST - 1).map(at_of))
+            .min()
+            .unwrap_or(u64::MAX);
+        k += n[0] + n[1];
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < n[0] || j < n[1] {
+            let a = bursts[0].get(i).filter(|_| i < n[0]).map(at_of);
+            let b = bursts[1].get(j).filter(|_| j < n[1]).map(at_of);
+            let (pi, p) = match (a, b) {
+                (Some(x), Some(y)) if y < x => (1, &bursts[1][j]),
+                (Some(_), _) => (0, &bursts[0][i]),
+                _ => (1, &bursts[1][j]),
+            };
+            if pi == 0 {
+                i += 1;
+            } else {
+                j += 1;
+            }
+            let (Some(rx), path) = (rxs[pi].as_ref(), [RepPath::A, RepPath::B][pi]) else {
+                continue;
+            };
+            let Ok(f) = frame::parse(rx.bytes(p)) else {
+                continue;
+            };
+            let at = at_of(p).min(cap);
+            // The sequencer's answer to a Nack for frames its ring no longer holds.
+            if let (Some(t), Some(ps)) = (NackTooOld::decode(f.payload), paths.as_mut()) {
+                rep_stats[2] = rep_stats[2].saturating_add(1);
+                ps.too_old(t.path, t.epoch16, t.tenure, t.stream, t.oldest_seq);
+                continue;
+            }
+            stats.frames.fetch_add(1, Ordering::Relaxed);
+            let mut on = |payload: &[u8], at: u64| {
+                delivered += 1;
+                let r = core.on_frame(payload, at);
+                if track
+                    && !matches!(r, Err(FrameErr::OutOfOrder))
+                    && let Some((key, q)) = vyrn_replica::paths::frame_key(payload)
+                {
+                    frontier.insert(key, q);
+                }
+                report(
+                    &mut core,
+                    r,
+                    &mut faulted,
+                    &mut stalled,
+                    stats,
+                    source,
+                    data.as_mut(),
+                );
+                if let Some(d) = data.as_mut().filter(|_| track) {
+                    for x in d.pending.iter_mut().filter(|x| x.1.is_none()) {
+                        x.1 = Some(frontier.iter().map(|(k, q)| (*k, *q)).collect());
+                    }
+                }
+            };
+            match paths.as_mut() {
+                Some(ps) => ps.rx_at(path, f.payload, at, &mut on),
+                None => on(f.payload, at),
+            }
+        }
+        for (rx, n) in rxs.iter_mut().zip(n) {
+            if let Some(rx) = rx {
+                rx.release(n);
+            }
         }
         // The final height first: payloads polled below are stamped with it on arrival, and a
         // stale one would expire them early (07 §5.4 retention).

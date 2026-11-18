@@ -132,7 +132,8 @@ fn due(
 #[derive(Debug)]
 struct Sub {
     next: u64,
-    hold: BTreeMap<u64, Vec<u8>>,
+    /// Each held frame's bytes and receive time.
+    hold: BTreeMap<u64, (Vec<u8>, u64)>,
     both: u64,
     /// Paths each frame above `both` arrived on (bit A = 1, B = 2), and the bytes of its first
     /// copy, which is the one handed on: another copy counts for its path only if it is the
@@ -220,8 +221,22 @@ impl Paths {
     /// One datagram from `path`; `deliver` gets every frame now due, in `frame_seq` order. A
     /// datagram whose header does not parse goes through as is, for the order core to refuse.
     pub fn rx(&mut self, path: Path, frame: &[u8], deliver: &mut impl FnMut(&[u8])) {
+        self.rx_at(path, frame, 0, &mut |f: &[u8], _| deliver(f));
+    }
+
+    /// [`Paths::rx`] for a datagram received at `at`; `deliver` gets each due frame with its
+    /// receive time. A frame that fills a gap counts as received no later than any frame held
+    /// behind it (07 §3.7): it was sent before them, so the time its first copy was lost for
+    /// is not counted against the sequencer, and each held frame keeps its own time.
+    pub fn rx_at(
+        &mut self,
+        path: Path,
+        frame: &[u8],
+        at: u64,
+        deliver: &mut impl FnMut(&[u8], u64),
+    ) {
         let Ok((h, _)) = FrameHeader::parse(frame) else {
-            return deliver(frame);
+            return deliver(frame, at);
         };
         let key = (h.epoch16, h.tenure, h.sender, h.stream);
         let known = self.subs.contains_key(&key);
@@ -260,14 +275,24 @@ impl Paths {
             }
         } else if q > s.next {
             if s.hold.len() < HOLD_MAX {
-                s.hold.insert(q, frame.to_vec());
+                s.hold.insert(q, (frame.to_vec(), at));
             }
         } else {
-            deliver(frame);
             s.next = s.next.saturating_add(1);
+            let mut run = Vec::new();
             while let Some(f) = s.hold.remove(&s.next) {
-                deliver(&f);
+                run.push(f);
                 s.next = s.next.saturating_add(1);
+            }
+            // Each frame's time is the earliest of its own and those after it in the run.
+            let mut t = u64::MAX;
+            for f in run.iter_mut().rev() {
+                t = t.min(f.1);
+                f.1 = t;
+            }
+            deliver(frame, at.min(t));
+            for (f, t) in &run {
+                deliver(f, *t);
             }
         }
         // `both` passes only frames already handed on: until then their first copy's bytes
@@ -425,6 +450,21 @@ mod tests {
         out.iter()
             .map(|f| FrameHeader::parse(f).unwrap().0.frame_seq)
             .collect()
+    }
+
+    /// Vercel #213: frames held behind a gap keep their own receive times, and the frame that
+    /// fills the gap counts as received no later than the earliest frame held behind it.
+    #[test]
+    fn a_gap_fill_keeps_each_held_frames_receive_time() {
+        let mut p = Paths::new(BookId(1), 0, 1).one_path();
+        let mut out = Vec::new();
+        let mut d = |f: &[u8], at: u64| out.push((FrameHeader::parse(f).unwrap().0.frame_seq, at));
+        p.rx_at(Path::A, &frame(0, 1), 10, &mut d);
+        p.rx_at(Path::A, &frame(0, 4), 40, &mut d);
+        p.rx_at(Path::A, &frame(0, 3), 30, &mut d);
+        p.rx_at(Path::A, &frame(0, 2), 900, &mut d);
+        p.rx_at(Path::A, &frame(0, 5), 950, &mut d);
+        assert_eq!(out, [(1, 10), (2, 30), (3, 30), (4, 40), (5, 950)]);
     }
 
     #[test]
