@@ -632,6 +632,14 @@ impl Pending {
         self.0.is_empty()
     }
 
+    /// Drops every queued redirect, counting each in `redirect_dropped`. Returns how many.
+    pub(crate) fn drop_all(&mut self, c: &mut Counters) -> usize {
+        let n = self.0.len();
+        c.redirect_dropped = c.redirect_dropped.saturating_add(n as u64);
+        self.0.clear();
+        n
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
