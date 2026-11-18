@@ -386,7 +386,7 @@ fn one_order_end_to_end() {
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    let block = loop {
+    let mut next_block = || loop {
         assert!(Instant::now() < deadline, "no ready block");
         let Ok(k) = replica.recv(&mut rbuf) else {
             continue;
@@ -399,6 +399,7 @@ fn one_order_end_to_end() {
             break b;
         }
     };
+    let block = next_block();
     assert_eq!(block.header.height, Height(0));
     let signed = &pkt[..n - 2 * vyrn_types::TAG_BYTES];
     let ours = block.lanes.iter().any(|r| {
@@ -424,27 +425,31 @@ fn one_order_end_to_end() {
         "{:?}",
         block.lanes
     );
-    assert!(!block.steps.is_empty(), "block 0 has no step");
     // The resting buy is an improve: its step names our op and its route bit (07 §3.8 src byte
-    // bit 7, StepFlags::CROSS) is clear, end to end through the 07 wire.
-    let ours = block
-        .steps
-        .iter()
-        .find(|m| m.rec.src_lane == LaneId(0) && m.rec.src_lane_seq.0 == 1)
-        .expect("no step names the order");
-    assert_eq!(
-        ours.rec.kind,
-        vyrn_types::StepKind::Improve,
-        "{:?}",
-        ours.rec
-    );
-    assert_eq!(
-        ours.rec.flags & vyrn_types::StepFlags::CROSS,
-        0,
-        "{:?}",
-        ours.rec
-    );
-    assert_eq!(core.verdict(Height(0), Height(0)), Verdict::Valid);
+    // bit 7, StepFlags::CROSS) is clear, end to end through the 07 wire. The step is usually in
+    // block 0 too, but a block can close between the op and its step, so it may be in a later one.
+    let named = |b: &vyrn_replica::BlockInputs<2>| {
+        b.steps
+            .iter()
+            .find(|m| m.rec.src_lane == LaneId(0) && m.rec.src_lane_seq.0 == 1)
+            .map(|m| m.rec)
+    };
+    let mut last = block.header.height;
+    let mut step = named(&block);
+    while step.is_none() {
+        assert!(
+            last.0 < 8,
+            "no step names the order in blocks 0..={}",
+            last.0
+        );
+        let b = next_block();
+        last = b.header.height;
+        step = named(&b);
+    }
+    let ours = step.unwrap();
+    assert_eq!(ours.kind, vyrn_types::StepKind::Improve, "{:?}", ours);
+    assert_eq!(ours.flags & vyrn_types::StepFlags::CROSS, 0, "{:?}", ours);
+    assert_eq!(core.verdict(Height(0), last), Verdict::Valid);
 
     // 3. Clean stop.
     let (stats, ok) = stop(&mut child, out);
