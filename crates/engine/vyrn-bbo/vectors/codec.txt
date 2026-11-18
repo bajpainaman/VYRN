@@ -1,0 +1,106 @@
+# vyrn-bbo conformance vectors: BBO ring entries and response records
+# (spec/05-engine.md §4.12, §4.15; spec/01-conventions.md §6.2, §6.4).
+# Every field value is distinct, so a shifted or swapped field changes the bytes. Expected bytes
+# were written by hand from the spec tables: little-endian, offset order, unused bytes zero.
+# Every line is `key = value`; integers are hex with 0x, `bytes` is lowercase hex, no prefix.
+# `vyrn-bbo/tests/golden.rs` encodes each case from its fields and decodes the bytes back.
+
+case = fwd_entry
+lane_seq = 0x1112131415161718
+prio_ts = 0x2122232425262728
+snap_ver = 0x31323334
+deadline = 0x41424344
+msg = 5152535455565758595a5b5c5d5e5f60
+handle = 0x61626364
+vslot = 0x71727374
+session = 0x81828384
+resp_seq = 0x91929394
+pkt_seq = 0xa1a2a3a4
+acct_ix = 0xb1b2
+applied_back = 0xc1c2
+bytes = 1817161514131211282726252423222134333231444342415152535455565758595a5b5c5d5e5f6064636261747372718483828194939291a4a3a2a1b2b1c2c1
+
+case = fwd_dep_line
+# Two dependencies in slots 0 and 1; slots 2 and 3 are zero.
+# flags 0x2d = sell | FOK (2 << 1) | post-only (8) | STP cancel-oldest (2 << 4).
+dep0 = back 0x01, kind 0x02, flags 0x2d, pos 0x0f, tick 0x11121314, qty 0x21222324, slot 0x31323334
+dep1 = back 0x09, kind 0x01, flags 0x00, pos 0x00, tick 0x41424344, qty 0x51525354, slot 0x61626364
+bytes = 01022d0f141312112423222134333231090100004443424154535251646362610000000000000000000000000000000000000000000000000000000000000000
+
+case = fill_event
+step = 0x0102030405060708
+handle = 0x11121314
+vslot = 0x21222324
+tick = 0x31323334
+qty = 0x41424344
+kind = 0x51
+liq = 0x52
+cause = 0x6162
+ordinal = 0x71727374
+bytes = 0807060504030201141312112423222134333231444342415152626174737271
+
+case = step_entry
+step = 0x0102030405060708
+kind = 0x11
+src_lane = 0x12
+n_delta = 0x13
+n_tx = 0x14
+n_fills = 0x21222324
+src_lane_seq = 0x3132333435363738
+pub_a = 0x41424344
+pub_b = 0x51525354
+band_lo = 0x61626364
+band_hi = 0x71727374
+fill_lanes = 0x8182838485868788
+flags = 0x01
+bytes = 08070605040302011112131424232221383736353433323144434241545352516463626174737271888786858483828101000000000000000000000000000000
+
+case = cut_delta_line
+# Two deltas; slots 2 and 3 are zero. Bytes 1–7 of each slot are reserved.
+d0 = lane 0x05, seq 0x1112131415161718
+d1 = lane 0x30, seq 0x2122232425262728
+bytes = 05000000000000001817161514131211300000000000000028272625242322210000000000000000000000000000000000000000000000000000000000000000
+
+case = tx_entry
+step = 0x0102030405060708
+session = 0x11121314
+resp_seq = 0x21222324
+pkt_seq = 0x31323334
+lane = 0x41
+n_rec = 0x42
+role = 0x02
+bytes = 08070605040302011413121124232221343332314142020000000000000000000000000000000000000000000000000000000000000000000000000000000000
+
+case = record_ack
+fields = index 0x03, handle 0x11121314, tick 0x21222324, client_tag 0x31323334
+bytes = 81030000141312112423222134333231
+
+case = record_fill
+fields = index 0xff, liq 0x00, handle 0x11121314, tick 0x21222324, qty 0x31323334
+bytes = 82ff0000141312112423222134333231
+
+case = record_reject
+# reason 24 = BUSY (01 §14.10); bytes 8–11 are zero.
+fields = index 0x02, reason 0x0018, detail 0x41424344, client_tag 0x51525354
+bytes = 83021800444342410000000054535251
+
+case = record_cancel_ack
+fields = index 0x01, handle 0x11121314, canceled 0x21222324, client_tag 0x31323334
+bytes = 84010000141312112423222134333231
+
+case = record_out
+# cause 2 = STP (01 §14.10).
+fields = index 0x04, cause 0x0002, handle 0x11121314, qty 0x21222324, client_tag 0x31323334
+bytes = 85040200141312112423222134333231
+
+case = order_flags
+# 01 §6.2: bit 0 side, bits 1–2 TIF, bit 3 post-only, bits 4–5 STP.
+fields = side sell, tif fok, post_only true, stp cancel_both
+bytes = 3d
+
+case = rank_e
+# 05 §3.2: rank_e(l) = (l + e) mod N_LANES, without u32 overflow.
+fields = epoch 0x00000032, lane 0x03, n_lanes 0x31
+rank = 0x04
+fields2 = epoch 0xffffffff, lane 0x30, n_lanes 0x31
+rank2 = 0x25
