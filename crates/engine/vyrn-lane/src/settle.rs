@@ -173,7 +173,10 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
             return;
         };
         let root = sp.root;
-        if sp.kind == SKind::Free || ev.handle != self.handle(root) {
+        // A `Shed` step's `Dep(BUSY)` events carry the dependency slot and no handle (vyrn-bbo
+        // `exec_shed`); every other event names its order.
+        let shed_dep = kind == FillKind::Dep && ev.handle == Handle(0);
+        if sp.kind == SKind::Free || (ev.handle != self.handle(root) && !shed_dep) {
             self.fault = true;
             return;
         }
@@ -707,8 +710,19 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
             }
             PendK::ReduceAck => {
                 self.flush_events(Some(p.v));
-                let open = self.open_of(p.root, p.v);
+                // The open quantity at the reduce: fills on the versions before it (05 §2.3).
+                // Fills on its successor `p.w` came later in L, even if they ended the order.
                 let leg = self.slot(p.v).map_or(0, |s| s.leg);
+                let dead = self.slot(leg).is_some_and(|h| h.dead);
+                let r = self.root(p.root).copied().unwrap_or_default();
+                let after = self.slot(p.w).map_or(0, |s| s.filled);
+                let before = r.filled.saturating_sub(after);
+                let ended_early = r.ended && r.end_detail != PROTO_D_FILLED;
+                let open = if dead || ended_early {
+                    0
+                } else {
+                    self.slot(p.v).map_or(0, |s| s.total.saturating_sub(before))
+                };
                 if open == 0 {
                     let d = self.root(p.root).map_or(PROTO_D_FILLED, |r| r.end_detail);
                     self.stage(
@@ -723,10 +737,18 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
                     return;
                 }
                 let canceled = p.r.min(open);
-                if p.r < open {
-                    self.settle_with(leg, |s, o| s.reduce(o, Qty(p.r)));
+                let rem = self
+                    .slot(leg)
+                    .and_then(|h| h.risk)
+                    .filter(|o| !o.closed)
+                    .map_or(0, |o| o.qty.0.saturating_sub(o.settled.0));
+                if canceled < rem {
+                    self.settle_with(leg, |s, o| s.reduce(o, Qty(canceled)));
                 } else {
+                    // Nothing can trade after the reduce (its successor filled, or it was 0).
                     self.release(leg);
+                }
+                if p.r >= open {
                     self.end_root(p.root, PROTO_D_CANCELED);
                 }
                 self.stage(

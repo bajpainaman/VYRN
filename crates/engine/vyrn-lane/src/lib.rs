@@ -40,7 +40,19 @@
 //!   that replace is still at the BBO core. A cancel that pass 2 applies tombstones the current
 //!   version and every pending predecessor in the chain, with one journal entry. When a replace
 //!   takes effect (its first taker event, `Rested`, or a Join dependency resting) the
-//!   predecessor ends there and the new leg's reservation drops by the predecessor's fills.
+//!   predecessor ends there and the new leg's reservation drops by the predecessor's fills. A
+//!   per-session `CancelAll` walks the same chain.
+//! - **D (reduce).** A `ReduceAck` for version `v` reduces `min(r, open)`, where `open` is the
+//!   version's quantity less its fills before `v`'s reduce (fills on a successor leg do not
+//!   count). The order ends there only if its end detail is not `FILLED`.
+//! - **P (pool index).** `FwdEntry.acct_ix`, `OrderSlot.acct_ix` and `AcctKill` carry the index
+//!   set by [`Lane::set_pool_index`], the pool-wide index on a pooled lane (05 §6.9), else the
+//!   lane-local account.
+//! - **Y (replay routing).** [`Lane::replay_packet`] forwards exactly the ops it is given, with
+//!   the route the live lane classified them with, and keeps every other op local (05 §10
+//!   row 7). It never reads the snapshot to route. The route is not the step's kind (a fill-less
+//!   `Cross` steps as `Improve`), and the 05 §10 log does not carry it yet: a spec follow-up.
+//!   [`Lane::process_packet`] is unchanged.
 //!
 //! The arena's ordering protocol is checked by Miri on `arena_tests` and by the lane–BBO
 //! conformance tests, not by a loom model: `loom` is a dev-dependency of `vyrn-cut` only (11 §2.2,

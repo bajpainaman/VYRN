@@ -273,6 +273,14 @@ pub struct Lane<'a, V: Visibility, const NA: usize> {
     pub(crate) cur_ts: Nanos,
     pub(crate) imm: Option<RespPkt>,
     pub(crate) mids: [Option<Mid>; 20],
+    /// The packet's boundaries are the caller's `mids` (replay): no `LaneCut` polls inside it.
+    pub(crate) scripted: bool,
+    /// Replay routes (05 §10): `Some` while a [`Lane::replay_packet`] runs; the listed ops are
+    /// forwarded with their route, every other op is local.
+    pub(crate) forced: Option<[Option<(LaneSeq, Route)>; MAX_OPS]>,
+    /// Account index handed to the BBO core per lane-local account: lane-local by default, the
+    /// pool-wide index on a pooled lane (05 §6.9).
+    pub(crate) acct_ix: Vec<u32>,
     pub(crate) b3: Vec<(u16, u32, Record)>,
     /// Pending explicit cancels forwarded as dependencies: root, op seq, op ts (rule R).
     pub(crate) dep_cancels: Vec<(u32, LaneSeq, Nanos)>,
@@ -391,6 +399,9 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             cur_ts: Nanos(0),
             imm: None,
             mids: [None; 20],
+            scripted: false,
+            forced: None,
+            acct_ix: (0..u32::try_from(NA).unwrap_or(0)).collect(),
             b3: Vec::with_capacity(4096),
             dep_cancels: Vec::with_capacity(64),
             emitq: Vec::with_capacity(64),
@@ -547,7 +558,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             next_ver: 0,
             tick: p.tick,
             total: p.total,
-            acct_ix: acct.0,
+            acct_ix: self.acct_index(acct),
             root,
             flags: p.flags,
             gen_: ROOT_GEN,
@@ -595,9 +606,72 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         for (d, m) in self.mids.iter_mut().zip(mids) {
             *d = Some(*m);
         }
+        self.scripted = !mids.is_empty();
         let r = self.packet(vis, p, clock);
         self.mids = [None; 20];
+        self.scripted = false;
         r
+    }
+
+    /// Replay of one logged packet (05 §10, "snapshot routing in `classify`" row): op `(l, q)`
+    /// is forwarded iff a `StepRecord` has `src = (l, q)`. `routes` lists this packet's
+    /// forwarded ops, each with the route the live lane classified it with (`Cross` or
+    /// `Improve`), because risk charges by that route (10 M8). The step's kind does not give it:
+    /// a `Cross` that STP leaves without fills is logged as an `Improve` step. Every other op is
+    /// local, whatever the lane's snapshot says. Boundaries come from `mids` only, as in
+    /// [`Self::process_packet`] with a nonempty list. The live path never calls this.
+    pub fn replay_packet<C: Clock>(
+        &mut self,
+        vis: &V,
+        p: RxIn<'_>,
+        clock: &C,
+        mids: &[Mid],
+        routes: &[(LaneSeq, Route)],
+    ) -> Rx {
+        let mut f = [None; MAX_OPS];
+        for (d, r) in f.iter_mut().zip(routes) {
+            *d = Some(*r);
+        }
+        self.forced = Some(f);
+        self.mids = [None; 20];
+        for (d, m) in self.mids.iter_mut().zip(mids) {
+            *d = Some(*m);
+        }
+        self.scripted = true;
+        let r = self.packet(vis, p, clock);
+        self.mids = [None; 20];
+        self.scripted = false;
+        self.forced = None;
+        r
+    }
+
+    /// The account index lane-local account `a` hands the BBO core (`FwdEntry.acct_ix`,
+    /// `OrderSlot.acct_ix`, `AcctKill` and its journal entry). On a pooled lane it is the
+    /// pool-wide index, which STP and kills compare across the pool (05 §6.9). Configuration,
+    /// before the first packet. `false` if `a` or `ix` is outside the lane's tables.
+    pub fn set_pool_index(&mut self, a: AcctSlot, ix: u32) -> bool {
+        if ix >= self.a.view().config().accounts {
+            return false;
+        }
+        match self.acct_ix.get_mut(uix(a.0)) {
+            Some(x) => {
+                *x = ix;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn acct_index(&self, a: AcctSlot) -> u32 {
+        self.acct_ix.get(uix(a.0)).copied().unwrap_or(a.0)
+    }
+
+    /// The route of op `seq` (05 §6.5), or the replay's forced route (05 §10).
+    fn route_of(&self, seq: LaneSeq, side: Side, tif: Tif, tick: Tick) -> Option<Route> {
+        match &self.forced {
+            None => classify(&self.snap, side, tif, tick),
+            Some(f) => f.iter().flatten().find(|(q, _)| *q == seq).map(|(_, r)| *r),
+        }
     }
 
     fn packet<C: Clock>(&mut self, vis: &V, p: RxIn<'_>, clock: &C) -> Rx {
@@ -884,8 +958,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
 
     /// The boundary before pass `pass` of op `next` (05 §6.3), if one is due.
     fn maybe_mid(&mut self, vis: &V, pass: u8, next: LaneSeq) {
-        let scripted = self.mids.iter().any(Option::is_some);
-        if scripted {
+        if self.scripted {
             let hit = self
                 .mids
                 .iter_mut()
@@ -979,7 +1052,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                 }
                 let f = bbo_flags(flags);
                 let side = f.side();
-                let route = classify(&self.snap, side, f.tif(), tick);
+                let route = self.route_of(seq, side, f.tif(), tick);
                 let fit = self.slots_free(1) && self.fifo.can_assign(side, tick, ts);
                 let risk = self.check_new(si, f, tick, qty, route, ts, fit)?;
                 let v = self.take_slot();
@@ -1071,7 +1144,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                     return self.reduce_op(base, r, by, rp.tag, ts);
                 }
                 let side = f.side();
-                let route = classify(&self.snap, side, f.tif(), tick);
+                let route = self.route_of(seq, side, f.tif(), tick);
                 let fit = self.slots_free(1) && self.fifo.can_assign(side, tick, ts);
                 let risk = self.check_new(si, f, tick, qty, route, ts, fit)?;
                 let w = self.take_slot();
@@ -1326,6 +1399,12 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             .filter(|o| match o.k {
                 OpK::CancelAll => true,
                 OpK::Reduce => o.side.is_some_and(|s| in_range(j_side, j_tick, s, o.tick)),
+                // A local Replace that moves an order out of j's range: j must not see the old
+                // version, so pass 2 applies and publishes it first (in range: a dependency).
+                OpK::Replace => o.side.is_some_and(|s| {
+                    let old = self.slot(o.v).map_or(o.tick, |p| p.tick);
+                    in_range(j_side, j_tick, s, old) && !in_range(j_side, j_tick, s, o.tick)
+                }),
                 _ => false,
             })
             .map(|o| o.seq)
@@ -1422,7 +1501,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             session: sid,
             resp_seq: rs,
             pkt_seq: self.cur_pkt,
-            acct_ix: u16::try_from(acct.0).unwrap_or(u16::MAX),
+            acct_ix: u16::try_from(self.acct_index(acct)).unwrap_or(u16::MAX),
             applied_back: u16::try_from(op.seq.0.saturating_sub(self.applied.0))
                 .unwrap_or(u16::MAX),
         };
@@ -1560,7 +1639,8 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             return;
         };
         let single = self.acct_sessions.get(uix(s.acct.0)).copied() == Some(1);
-        let prev = self.a.view().acct_kill(s.acct.0);
+        let kix = self.acct_index(s.acct);
+        let prev = self.a.view().acct_kill(kix);
         let (upto, tseq, tts) = if single {
             (LaneSeq(prev.0), LaneSeq(prev.0), Nanos(prev.1))
         } else {
@@ -1575,20 +1655,30 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             // Single session: materialize the previous kill for every root it covered, ended
             // ones included (B2 already released them), before `AcctKill` is overwritten.
             if rp.live && (single || !rp.ended) && cur.ins_seq < upto && !cur.tomb {
-                self.tombstone(rp.cur, tseq, tts);
-                if !single {
-                    self.end_position(rp.cur);
+                // The current version and every pending predecessor (contract rule R): a shed
+                // replace makes its predecessor current again.
+                let mut v = rp.cur;
+                while v != 0 {
+                    self.tombstone(v, tseq, tts);
+                    if !single {
+                        self.end_position(v);
+                    }
+                    let leg = self.slot(v).map_or(0, |p| p.leg);
+                    v = self
+                        .slot(leg)
+                        .filter(|h| h.kind == SKind::NewPrio && h.pred_pending)
+                        .map_or(0, |h| h.pred);
                 }
             }
             r = rp.next;
         }
         if single {
-            self.a.acct_kill(s.acct.0, seq, ts);
+            self.a.acct_kill(kix, seq, ts);
         }
         self.journal(JEnt {
             seq,
             tick: Tick(0),
-            slot: s.acct.0,
+            slot: kix,
             kind: JKind::AcctKill,
         });
     }
