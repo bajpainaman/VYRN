@@ -529,6 +529,13 @@ mod tests {
             later.check_bridge(&pending, Epoch(7)),
             Err(RosterErr::Bridge)
         );
+        // The same answers once epoch 8 has activated the set.
+        pending.activate(Epoch(8));
+        assert_eq!(later.check_bridge(&pending, Epoch(8)), Ok(()));
+        assert_eq!(
+            later.check_bridge(&pending, Epoch(7)),
+            Err(RosterErr::Bridge)
+        );
         assert_eq!(later.check_bridge(&other, Epoch(8)), Err(RosterErr::Bridge));
     }
 }
