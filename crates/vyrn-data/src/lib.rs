@@ -117,6 +117,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod config;
 pub mod dedupe;
 pub mod frame;
 pub mod ingest;

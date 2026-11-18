@@ -1,0 +1,38 @@
+# vyrn-data DEV config. MINIMAL schema 1: a labelled subset of spec/11-build.md §10.1; main.rs
+# documents every field. Not for production boxes: `dev = true` allows open-mode fetches and
+# hex: keys, which a production box refuses.
+schema = 1
+protocol = 1
+role = "data"
+mode = "BASE"
+home = "LDN"
+dev = true
+src = 0
+books = [7]
+dests = ["127.0.0.1:7200"]   # every voter and the standby, in dst order
+
+[nic]
+backend = "kernel_udp"
+ip = "127.0.0.1"
+ingest_port = 19998          # PROTO_DATA_PORT (04)
+fetch_port = 19997
+
+[ring]
+slots = 65536                # rate × retention
+# index_key omitted: 16 bytes from /dev/urandom
+
+[[session]]
+id = 1
+key = "hex:11111111111111111111111111111111"
+
+# No [[fetch_key]]: open mode, DEV only. In production add one per requester:
+# [[fetch_key]]
+# ip = "10.0.0.2"
+# key = "env:VYRN_KFETCH_R2"
+
+[fetch]
+rate = 20000
+burst = 256
+
+[metrics]
+listen = "127.0.0.1:9464"    # BLD_METRICS_PORT (11 §8.4)
