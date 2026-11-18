@@ -39,6 +39,7 @@ pub mod noise;
 mod record;
 pub mod ring;
 pub mod server;
+pub mod statement;
 pub mod wire;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -223,6 +224,7 @@ struct Resting {
 
 /// The drop copy of one book and one epoch (module docs).
 pub struct DropCopy<O: DcOut> {
+    book: BookId,
     tick_size: u64,
     sessions: BTreeMap<SessionId, AccountId>,
     accts: BTreeMap<AccountId, Acct>,
@@ -244,6 +246,8 @@ pub struct DropCopy<O: DcOut> {
     taker_acc: Option<((LaneId, LaneSeq), u32)>,
     /// `DC_EOD` is out: only `DC_SETTLED` may follow.
     ended: bool,
+    /// Each account's own stream's `DC_EOD` records, its statement section (10 §10).
+    eods: BTreeMap<AccountId, [DcRecord; 4]>,
     out: O,
     err: Option<DcError>,
 }
@@ -309,6 +313,7 @@ impl<O: DcOut> DropCopy<O> {
             }
         }
         Self {
+            book: cfg.book,
             tick_size: cfg.tick_size,
             sessions,
             accts,
@@ -323,6 +328,7 @@ impl<O: DcOut> DropCopy<O> {
             undo: VecDeque::new(),
             taker_acc: None,
             ended: false,
+            eods: BTreeMap::new(),
             out,
             err: None,
         }
@@ -480,6 +486,16 @@ impl<O: DcOut> DropCopy<O> {
         Ok(self.out)
     }
 
+    /// Each account's statement section for this book (10 §10), after
+    /// [`DropCopy::end_epoch`]: its own stream's `DC_EOD` records. Masters' aggregate streams
+    /// are not sections; their accounts' are.
+    pub fn statement_sections(&self) -> Vec<statement::Section> {
+        self.eods
+            .values()
+            .filter_map(|e| statement::Section::from_eod(self.book, *e))
+            .collect()
+    }
+
     /// Hands back the output; after [`DropCopy::end_epoch`] and any `DC_SETTLED`.
     pub fn into_out(self) -> Result<O, DcError> {
         match self.err {
@@ -554,11 +570,12 @@ impl<O: DcOut> DropCopy<O> {
             let fees = [s.fees as u64, s.msg_fees, 0, 0, 0];
             let acct = id.account;
             let bal = [b.quote_free, b.quote_resv, b.base_free, b.base_resv, 0];
-            for r in [
+            let words = [
                 DcRecord::eod(acct, EOD_TOTALS, totals),
                 DcRecord::eod(acct, EOD_FEES, fees),
                 DcRecord::eod(acct, EOD_BALANCES, bal),
-            ] {
+            ];
+            for r in words {
                 self.push(id, &r);
                 self.commit_upto(id, u64::MAX)?;
             }
@@ -569,6 +586,9 @@ impl<O: DcOut> DropCopy<O> {
             let r = DcRecord::eod_hash(acct, s.n, &h);
             self.push(id, &r);
             self.commit_upto(id, u64::MAX)?;
+            if !id.master {
+                self.eods.insert(acct, [words[0], words[1], words[2], r]);
+            }
         }
         Ok(())
     }

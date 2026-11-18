@@ -162,7 +162,7 @@ jobs:
         run: cargo install b3sum --locked --version 1.8.7
       - name: the vyrn-md generators rewrite their vectors unchanged (10 §8.5, #92)
         run: |
-          for gen in gen_feed_vectors gen_dc_vectors gen_dc_noise_vectors; do
+          for gen in gen_feed_vectors gen_dc_vectors gen_dc_noise_vectors gen_dc_stmt_vectors; do
             python3 -I "crates/vyrn-md/tests/$gen.py" crates/vyrn-md/tests
           done
           git diff --exit-code -- crates/vyrn-md/tests
