@@ -19,6 +19,7 @@
 //! | `[membership] seq_keys = ["<hex>"]` | `REP_Membership`'s `seq_key` per sequencer index (07 §13.1); public keys, so they may sit in the file |
 //! | `[keys] vote, node` | vote key handle; `node` (the p2p identity) defaults to `vote`. Only `env:NAME` (seed hex) resolves, and only with `[consensus]` |
 //! | `[nic] data_port`, `[data] boxes = ["ip:port"], me, max_range` | optional: the data RX queue (07 §5.4); `boxes[i]` is data box `src = i`, `me` this replica's index in their destination lists. Without `[data]` vote-rule item 3 is not checked (DEV) |
+//! | `[replay] tick_min, tick_max, win_center, slot_cap, [[replay.session]] lane, slot, account, k_seq, quote, base` | optional, needs `[data]`: replay of every block that passes item 3 on `vyrn-engine` (`replay.rs`), built from the sequencer's `[engine]` and `[[dev_session]]` (no state snapshot encoding yet) |
 //! | `[consensus] roster, roster_hash, genesis_hash, home, seq_order, observers, delta_ms, storage` | optional: the Simplex voter (`consensus.rs`); committee and peers from the roster file (08 §9.6), checked against `roster_hash`; `membership.seq_keys[0]` must be the roster's primary `seq_key` |
 //!
 //! **Start sequence** (11 §10.1): load and check config → resolve keys → build the order core
@@ -36,13 +37,14 @@
 //! polls the data RX queue: one `DataFeed::on_frame` per payload into the `DataJoin`, a
 //! `DataFetch` RANGE to the box for every gap, and item 3 (`DataJoin::check`) for each ready
 //! block before the voter may vote for it; a block whose data contradicts its header prints
-//! `DATA_FAULT height=<h>`. `voter` (`consensus.rs`): Simplex, `FINAL ...` per certificate.
+//! `DATA_FAULT height=<h>`. With `[replay]` such a block's `BLOCK` line is printed after it
+//! replays and ends in ` out=<hex>`, its `RustReplay` output hash; the first divergence prints
+//! `REPLAY_FAULT height=<h> <why>` and replay stops (so does a `DATA_FAULT`). `voter` (`consensus.rs`): Simplex, `FINAL ...` per certificate.
 //! main: start, readiness, stop, `STATS frames=<n> blocks=<n> faults=<n>`.
 //!
 //! **Not wired yet** (PR follow-ups): seals in the voter's source (tail reports, Silence), the chain guardian
 //! (`vyrn_chain::bridge::Guardian` needs a `vyrn_chain::Replica` over finalized `StateCommit`s,
-//! which `vyrn-replica` does not produce yet), replay (`RustReplay` over `vyrn-engine`, and with it
-//! `out=<hex>` on `BLOCK` lines), path B dedupe and repair, CHAIN mode.
+//! which `vyrn-replica` does not produce yet), path B dedupe and repair, CHAIN mode.
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
@@ -63,6 +65,7 @@ use vyrn_replica::feed::Gap;
 use vyrn_replica::{BlockInputs, DataErr, DataFeed, DataJoin};
 
 mod consensus;
+mod replay;
 use vyrn_consensus::Verdict;
 use vyrn_log::Layout;
 use vyrn_nic::frame;
@@ -100,6 +103,8 @@ struct Config {
     data: Option<Data>,
     #[serde(default)]
     consensus: Option<consensus::Section>,
+    #[serde(default)]
+    replay: Option<replay::Section>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +186,9 @@ impl Config {
         }
         if c.keys.vote.is_empty() {
             return bad("keys.vote", "is empty");
+        }
+        if c.replay.is_some() && c.data.is_none() {
+            return bad("replay", "needs [data]: replay reads the blocks' payloads");
         }
         Ok(c)
     }
@@ -304,6 +312,8 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
             Some(DataRx {
                 feed: DataFeed::new(BookId(cfg.book), n, d.me),
                 join: DataJoin::default(),
+                replay: None,
+                replay_dead: false,
                 pending: VecDeque::new(),
                 rx: drx,
                 repair,
@@ -315,6 +325,19 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
         }
         None => None,
     };
+    let mut data = data;
+    if let (Some(r), Some(d)) = (&cfg.replay, data.as_mut()) {
+        let n = u8::try_from(N).map_err(|e| e.to_string())?;
+        let join = std::mem::take(&mut d.join);
+        d.replay = Some(Box::new(replay::open(
+            r,
+            n,
+            BookId(cfg.book),
+            Epoch(cfg.epoch),
+            join,
+        )?));
+        println!("REPLAY lanes={n} sessions={}", r.session.len());
+    }
     let source = if plan.is_some() {
         consensus::Source::new()
     } else {
@@ -380,6 +403,10 @@ const IDLE: std::time::Duration = std::time::Duration::from_micros(50);
 struct DataRx<const N: usize, R> {
     feed: DataFeed,
     join: DataJoin,
+    /// With `[replay]`: the engine, which then owns the join ([`DataRx::join`]).
+    replay: Option<Box<replay::Replay>>,
+    /// Replay diverged or a block's data faulted: later blocks are no longer replayed.
+    replay_dead: bool,
     /// Ready blocks whose ORDER part passed, waiting for their payloads (item 3).
     pending: VecDeque<BlockInputs<N>>,
     rx: R,
@@ -400,6 +427,17 @@ struct DataRx<const N: usize, R> {
 const FETCH_BURST: usize = 16;
 
 impl<const N: usize, R: RxRing> DataRx<N, R> {
+    /// The join the feed fills and item 3 reads: the replay's when it runs.
+    fn join<'a>(
+        join: &'a mut DataJoin,
+        rep: &'a mut Option<Box<replay::Replay>>,
+    ) -> &'a mut DataJoin {
+        match rep {
+            Some(r) => r.payloads_mut(),
+            None => join,
+        }
+    }
+
     /// Polls the queue and the repair socket once; sends queued fetches. Returns the datagrams
     /// taken.
     fn poll(&mut self, now: u64) -> usize {
@@ -410,7 +448,9 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             let Ok(f) = frame::parse(self.rx.bytes(p)) else {
                 continue;
             };
-            if let Ok(fed) = self.feed.on_frame(&mut self.join, f.payload, now)
+            if let Ok(fed) =
+                self.feed
+                    .on_frame(Self::join(&mut self.join, &mut self.replay), f.payload, now)
                 && let Some(g) = fed.gap
             {
                 gaps.push(g);
@@ -425,10 +465,11 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             && let Ok(n) = self.repair.recv(&mut buf)
         {
             answers += 1;
-            if let Ok(fed) = self
-                .feed
-                .on_frame(&mut self.join, buf.get(..n).unwrap_or(&[]), now)
-                && let Some(g) = fed.gap
+            if let Ok(fed) = self.feed.on_frame(
+                Self::join(&mut self.join, &mut self.replay),
+                buf.get(..n).unwrap_or(&[]),
+                now,
+            ) && let Some(g) = fed.gap
             {
                 gaps.push(g);
             }
@@ -469,7 +510,7 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
     fn check(&mut self, source: &consensus::Source, now: u64) {
         while let Some(b) = self.pending.front() {
             let h = b.header.height;
-            match self.join.check(b) {
+            match Self::join(&mut self.join, &mut self.replay).check(b) {
                 Err(DataErr::Missing { session, pkt_seq }) => {
                     match self.missing {
                         Some((s, q, at)) if (s, q) == (session, pkt_seq) => {
@@ -486,11 +527,28 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 Err(_) => {
                     source.invalid_from(h);
                     println!("DATA_FAULT height={}", h.0);
+                    self.replay_dead = true;
                 }
             }
-            // Replay is not wired, so nothing else reads these payloads.
-            if let Some(b) = self.pending.pop_front() {
-                self.join.release(h, &b.lanes);
+            let Some(b) = self.pending.pop_front() else {
+                return;
+            };
+            match (&mut self.replay, self.replay_dead) {
+                (Some(r), false) => match replay::block(r, &b) {
+                    Ok(out) => println!("{} out={}", block_line(&b, Verdict::Valid), hex(&out.0)),
+                    Err(e) => {
+                        self.replay_dead = true;
+                        println!("{}", block_line(&b, Verdict::Valid));
+                        println!("REPLAY_FAULT height={} {e}", h.0);
+                        r.payloads_mut().release(h, &b.lanes);
+                    }
+                },
+                (Some(r), true) => {
+                    println!("{}", block_line(&b, Verdict::Valid));
+                    r.payloads_mut().release(h, &b.lanes);
+                }
+                // Without replay nothing else reads these payloads.
+                (None, _) => self.join.release(h, &b.lanes),
             }
         }
     }
@@ -588,14 +646,12 @@ fn report<const N: usize, D: RxRing>(
         let h = b.header.height;
         stats.blocks.fetch_add(1, Ordering::Relaxed);
         let verdict = core.verdict(h, h);
-        println!(
-            "BLOCK height={} first_step={} last_step={} lanes={} steps={} verdict={verdict:?}",
-            h.0,
-            b.header.first_step.0,
-            b.header.last_step.0,
-            b.lanes.len(),
-            b.steps.len(),
-        );
+        // A block that replays prints its line after replay, with `out=` (`DataRx::check`).
+        let replays =
+            verdict == Verdict::Valid && data.as_ref().is_some_and(|d| d.replay.is_some());
+        if !replays {
+            println!("{}", block_line(&b, verdict));
+        }
         source.header(b.header);
         match (verdict, data.as_deref_mut()) {
             (Verdict::Invalid, _) => source.invalid_from(h),
@@ -620,6 +676,22 @@ fn report<const N: usize, D: RxRing>(
         stats.faults.fetch_add(1, Ordering::Relaxed);
         println!("FAULT {} height={}", f.kind.code(), f.height.0);
     }
+}
+
+/// `BLOCK height=<h> first_step=<s> last_step=<s> lanes=<k> steps=<k> verdict=<v>`.
+fn block_line<const N: usize>(b: &BlockInputs<N>, verdict: Verdict) -> String {
+    format!(
+        "BLOCK height={} first_step={} last_step={} lanes={} steps={} verdict={verdict:?}",
+        b.header.height.0,
+        b.header.first_step.0,
+        b.header.last_step.0,
+        b.lanes.len(),
+        b.steps.len(),
+    )
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 #[cfg(test)]

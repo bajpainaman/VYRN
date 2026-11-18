@@ -29,7 +29,7 @@
 //! | `seq` | the box exits 0, `records` equals the packets sent, `seal_violations=0`, at least 2 blocks |
 //! | `validators` | each validator reports heights `0..=H` contiguous with the box's `first_step`/`last_step`, every verdict `Valid`, no `FAULT` (R5 for `REP_E_HASHLAG`) |
 //! | `replay` | the tap's `OrderCore` readies the same blocks, holding every packet sent exactly once, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box |
-//! | `replica-out` | each validator that prints `out=<hex>` on its `BLOCK` lines matches the tap's output hash per block; SKIP while no validator replays |
+//! | `replica-out` | with `--data` every validator replays (`[replay]`) and its `out=<hex>` on each `BLOCK` line equals the tap's output hash of that block; one stopped at `REP_E_HASHLAG` is compared on the blocks it printed (R5); SKIP while no validator replays |
 //! | `finality` | with `--finality`: each validator prints `FINAL height=<h>` up to `H`; SKIP without it |
 //! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed reports no gap or rejected frame, and that join is the one `replay` reads; SKIP without `--data` |
 //!
@@ -44,8 +44,10 @@
 //!   `engine_loop`), copied here. A drift between the two shows as a replay failure.
 //! - R3. With `--data`, the tap's `DataJoin` is filled only from `vyrn-data`'s frames through
 //!   `vyrn_replica::DataFeed` (the tap is destination 0). Without it, the join gets copy 2 from
-//!   the client in process. Validators do not read a data queue yet, so only the tap checks
-//!   `data_root`.
+//!   the client in process. With `--data` the validators are destinations 1..=n: each reads its
+//!   data RX queue, checks `data_root` (vote-rule item 3), fetches gaps from the node, and
+//!   replays (`[replay]`, the box's engine and sessions), so `replica-out` runs. Without it they
+//!   have no data and no replay.
 //! - R4. `FINAL height=<h>` is this harness's guess at a validator's finality line.
 //! - R5. `REP_E_HASHLAG` (07 §3.7 INV-REP-8) is a 1 ms real-time bound that the validator
 //!   measures with user-space receive times and that 07 §7.2 budgets for pinned cores. On an
@@ -614,9 +616,18 @@ seq = "env:VYRN_E2E_SEQ_SEED"
     Ok(p)
 }
 
-fn validator_config(dir: &Path, i: usize) -> Result<PathBuf, String> {
+/// A validator's config. With `data = Some((fetch, port))` (`--data`): its data RX queue on
+/// `port`, the vyrn-data node at `fetch` as box 0 (it is destination `i + 1` there; the tap is
+/// 0), and `[replay]` with the sequencer's engine and sessions, so it prints `out=` per block.
+fn validator_config(
+    dir: &Path,
+    i: usize,
+    data: Option<(SocketAddrV4, u16)>,
+    sessions: &[Sess],
+) -> Result<PathBuf, String> {
     let key = hex(&vyrn_crypto::ed25519::public_key(&SEQ_SEED));
-    let s = format!(
+    let data_port = data.map_or(0, |(_, p)| p);
+    let mut s = format!(
         r#"schema = 1
 protocol = 1
 role = "validator"
@@ -629,6 +640,7 @@ lanes = {LANES}
 backend = "kernel_udp"
 ip = "127.0.0.1"
 order_port = 0
+data_port = {data_port}
 
 [membership]
 seq_keys = ["{key}"]
@@ -637,13 +649,34 @@ seq_keys = ["{key}"]
 vote = "dev:validator-{i}"
 "#
     );
+    if let Some((fetch, _)) = data {
+        s.push_str(&format!(
+            "\n[data]\nboxes = [\"{fetch}\"]\nme = {}\n\n[replay]\ntick_min = {TICK_MIN}\ntick_max = {TICK_MAX}\nwin_center = {WIN_CENTER}\nslot_cap = {SLOT_CAP}\n",
+            i + 1
+        ));
+        for x in sessions {
+            s.push_str(&format!(
+                "\n[[replay.session]]\nlane = {}\nslot = {}\naccount = {}\nk_seq = \"{}\"\nquote = {QUOTE}\nbase = {BASE}\n",
+                x.lane,
+                vyrn_wire::session_slot(x.id),
+                x.acct,
+                hex(&x.k_seq)
+            ));
+        }
+    }
     let p = dir.join(format!("validator-{i}.toml"));
     std::fs::write(&p, s).map_err(|e| e.to_string())?;
     Ok(p)
 }
 
-/// The vyrn-data DEV config: one destination (the tap's data socket), every session's `K_seq`.
-fn data_config(dir: &Path, dest: &str, sessions: &[Sess]) -> Result<PathBuf, String> {
+/// The vyrn-data DEV config: destination 0 the tap's data socket, then the validators', and
+/// every session's `K_seq`.
+fn data_config(dir: &Path, dests: &[String], sessions: &[Sess]) -> Result<PathBuf, String> {
+    let dests = dests
+        .iter()
+        .map(|d| format!("\"{d}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut s = format!(
         r#"schema = 1
 protocol = 1
@@ -653,7 +686,7 @@ home = "LDN"
 dev = true
 src = 0
 books = [{BOOK}]
-dests = ["{dest}"]
+dests = [{dests}]
 
 [nic]
 backend = "kernel_udp"
@@ -707,9 +740,67 @@ fn run(cli: &Cli) -> Result<bool, String> {
 
     let (tx, rx) = channel();
     let mut nodes = Nodes(Vec::new());
+    let timeout = Some(Duration::from_millis(50));
+    let stop_tap = Arc::new(AtomicBool::new(false));
+    // With --data, each validator's data port (07 §5.4), picked before vyrn-data starts.
+    let val_data: Vec<u16> = if cli.data {
+        (0..cli.validators)
+            .map(|_| {
+                UdpSocket::bind("127.0.0.1:0")
+                    .and_then(|s| s.local_addr())
+                    .map(|a| a.port())
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<Result<_, String>>()?
+    } else {
+        Vec::new()
+    };
+    // --data: a vyrn-data node takes copy 2 from the client and fans DATA frames out to the
+    // tap's data socket and every validator's data port (07 §5.1, §5.2). It starts first, so
+    // the validators' configs can name its fetch address; their data ports are picked here.
+    let data_node = if cli.data {
+        let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        sock.set_read_timeout(timeout).map_err(|e| e.to_string())?;
+        let mut dests = vec![sock.local_addr().map_err(|e| e.to_string())?.to_string()];
+        dests.extend(val_data.iter().map(|p| format!("127.0.0.1:{p}")));
+        let cfg = data_config(&dir, &dests, &sessions)?;
+        let mut c = command(&bin_dir.join("vyrn-data"), cli.seq_cpus.as_deref());
+        c.arg("--config").arg(cfg).arg("--stop-on-stdin-eof");
+        let i = nodes.spawn("vyrn-data", &mut c, &tx)?;
+        nodes.wait(&rx, Instant::now() + wait, "vyrn-data READY", |ns| {
+            ns.get(i)
+                .is_some_and(|n| line(n, "READY vyrn-data ").is_some())
+        })?;
+        let ingest: SocketAddrV4 = nodes
+            .0
+            .get(i)
+            .and_then(|n| line(n, "READY vyrn-data "))
+            .and_then(|l| field(l, "ingest"))
+            .ok_or("vyrn-data READY has no ingest=")?
+            .parse()
+            .map_err(|e| format!("vyrn-data ingest address: {e}"))?;
+        let fetch: SocketAddrV4 = nodes
+            .0
+            .get(i)
+            .and_then(|n| line(n, "READY vyrn-data "))
+            .and_then(|l| field(l, "fetch"))
+            .ok_or("vyrn-data READY has no fetch=")?
+            .parse()
+            .map_err(|e| format!("vyrn-data fetch address: {e}"))?;
+        // Read from now on: the node heartbeats every destination while the validators start,
+        // and an unread socket would overflow and drop the first DATA frames.
+        Some((i, ingest, fetch, tap(sock, Arc::clone(&stop_tap))))
+    } else {
+        None
+    };
+
     let vals: Vec<usize> = (0..cli.validators)
         .map(|i| {
-            let cfg = validator_config(&dir, i)?;
+            let data = data_node
+                .as_ref()
+                .zip(val_data.get(i))
+                .map(|((_, _, fetch, _), port)| (*fetch, *port));
+            let cfg = validator_config(&dir, i, data, &sessions)?;
             let mut c = command(
                 &bin_dir.join("vyrn-validator"),
                 cli.validator_cpus.as_deref(),
@@ -736,7 +827,6 @@ fn run(cli: &Cli) -> Result<bool, String> {
         })
         .collect();
 
-    let timeout = Some(Duration::from_millis(50));
     let tap_sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     tap_sock
         .set_read_timeout(timeout)
@@ -752,33 +842,6 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .set_read_timeout(timeout)
         .map_err(|e| e.to_string())?;
     let cl_recv = cl_sock.try_clone().map_err(|e| e.to_string())?;
-
-    // --data: a vyrn-data node takes copy 2 from the client and fans DATA frames out to the
-    // tap's data socket (07 §5.1, §5.2).
-    let data_node = if cli.data {
-        let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-        sock.set_read_timeout(timeout).map_err(|e| e.to_string())?;
-        let dest = sock.local_addr().map_err(|e| e.to_string())?.to_string();
-        let cfg = data_config(&dir, &dest, &sessions)?;
-        let mut c = command(&bin_dir.join("vyrn-data"), cli.seq_cpus.as_deref());
-        c.arg("--config").arg(cfg).arg("--stop-on-stdin-eof");
-        let i = nodes.spawn("vyrn-data", &mut c, &tx)?;
-        nodes.wait(&rx, Instant::now() + wait, "vyrn-data READY", |ns| {
-            ns.get(i)
-                .is_some_and(|n| line(n, "READY vyrn-data ").is_some())
-        })?;
-        let ingest: SocketAddrV4 = nodes
-            .0
-            .get(i)
-            .and_then(|n| line(n, "READY vyrn-data "))
-            .and_then(|l| field(l, "ingest"))
-            .ok_or("vyrn-data READY has no ingest=")?
-            .parse()
-            .map_err(|e| format!("vyrn-data ingest address: {e}"))?;
-        Some((i, ingest, sock))
-    } else {
-        None
-    };
 
     let cfg = seq_config(&dir, &order, &sessions)?;
     let mut c = command(&bin_dir.join("vyrn-seq"), cli.seq_cpus.as_deref());
@@ -801,16 +864,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .map(|a| a.parse().map_err(|e| format!("lane address {a}: {e}")))
         .collect::<Result<_, String>>()?;
 
-    let stop_tap = Arc::new(AtomicBool::new(false));
     let tap_h = tap(tap_sock, Arc::clone(&stop_tap));
     let stop_cl = Arc::new(AtomicBool::new(false));
     let cl_h = client(cl_recv, Arc::clone(&stop_cl));
     let (data_idx, data_ingest, data_h) = match data_node {
-        Some((i, ingest, sock)) => (
-            Some(i),
-            Some(ingest),
-            Some(tap(sock, Arc::clone(&stop_tap))),
-        ),
+        Some((i, ingest, _, h)) => (Some(i), Some(ingest), Some(h)),
         None => (None, None, None),
     };
 
@@ -1115,7 +1173,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     if replaying.is_empty() {
         Report::skip(
             "replica-out",
-            "no validator prints out= (vyrn-validator does not replay on this build)",
+            "no validator prints out= (validators replay only with --data)",
         );
     } else {
         rep.check("replica-out", {
@@ -1125,18 +1183,44 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     let theirs: Vec<Option<&str>> =
                         blocks(n).iter().map(|b| field(b.1, "out")).collect();
                     let ours: Vec<String> = out_hashes.iter().map(|h| hex(&h.0)).collect();
-                    let same = theirs.len() == ours.len()
-                        && theirs
-                            .iter()
-                            .zip(&ours)
-                            .all(|(a, b)| *a == Some(b.as_str()));
-                    (!same).then(|| n.name.clone())
+                    // R5: a validator stopped at REP_E_HASHLAG is compared on the blocks it
+                    // printed; any other validator must print every block.
+                    let lag = n
+                        .lines
+                        .iter()
+                        .any(|l| l.starts_with("FAULT REP_E_HASHLAG "));
+                    let first_bad = theirs
+                        .iter()
+                        .zip(&ours)
+                        .position(|(a, b)| *a != Some(b.as_str()));
+                    let short = theirs.len() < ours.len() && !lag;
+                    match first_bad {
+                        Some(k) => Some(format!(
+                            "{} at block {k} ({} vs tap {})",
+                            n.name,
+                            theirs.get(k).copied().flatten().unwrap_or("-"),
+                            ours.get(k).map_or("-", String::as_str)
+                        )),
+                        None if short || theirs.len() > ours.len() => Some(format!(
+                            "{} printed {} of {} blocks",
+                            n.name,
+                            theirs.len(),
+                            ours.len()
+                        )),
+                        None => None,
+                    }
                 })
                 .collect();
             if bad.is_empty() && replaying.len() == vals.len() {
+                let printed: Vec<String> = replaying
+                    .iter()
+                    .map(|n| format!("{}={}", n.name, blocks(n).len()))
+                    .collect();
                 Ok(format!(
-                    "{} validators match the tap on every block",
-                    vals.len()
+                    "{} validators match the tap on every block they printed of {} (R5): {}",
+                    vals.len(),
+                    out_hashes.len(),
+                    printed.join(" ")
                 ))
             } else {
                 Err(format!(
@@ -1212,7 +1296,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
         }),
         _ => Report::skip(
             "data",
-            "off (enable with --data; vyrn-validator polls no data RX queue yet, so the tap joins copy 2 in process, R3)",
+            "off (enable with --data; without it the tap joins copy 2 in process and validators do not replay, R3)",
         ),
     }
 
