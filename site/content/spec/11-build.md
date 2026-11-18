@@ -992,7 +992,7 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   output hash takes, so the shell hashes without decoding.
 - *Subset.* New (Day, IOC, FOK, post-only, auction-only), Cancel, Reduce, Heartbeat and
   ResendReq (no LaneSeq), `SHED` records (replayed from the record alone, so their slots carry
-  no payload, 05 §18 Q17), and Cross, Improve, Shed, Idle, Depletion, Control and Rescan steps.
+  no payload, 05 §18 Q17), and Cross, Improve, Shed, Idle, Depletion, Control, Rescan, Uncross and Seal steps.
   Anything else stops with `PBV_E_UNSUPPORTED` rather than guess, so a v1 Vx validator halts on
   it instead of diverging silently; the gap list below is the plan that closes it.
 - *Step kinds and payloads (`PBV_ABI_VERSION` 4).* A step slot carries its 07 §3.8 payload:
@@ -1014,8 +1014,23 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   (B, A) exact from `(max(B, band_hi), min(A, band_lo))`. A batch taker that would cross the
   book, or a Rescan cut that holds a Cancel or Reduce, stops with `PBV_E_UNSUPPORTED`, because
   the taker's key visibility and capped CONT sweeps are not in v1.
-- *Gap list (the plan, in order).* What `RustReplay` replays and the Vx client does not yet:
-  1. Uncross and Seal steps (07 §3.8 payloads, #177), checked against the oracle's `uncross`.
+- *Uncross and Seal (1b).* A Frozen phase step records the frozen cut C\*. The Uncross step
+  that opens an uncross takes p\* and Q from its 07 §3.8 payload (#177) and needs a Frozen book
+  at C\*, else `PBV_E_MISMATCH`. Each chunk gives at most `ENG_UNCROSS_CHUNK` = 6 `LIQ_AUCTION`
+  fills at p\*: buys from the highest level down, then sells from the lowest up, each level in
+  key order, visible at C\* (auction-only orders included). No TX packet is made; each lane
+  holds the fill record until its order's version settles, as `vyrn-lane` does (05 §8.9). A book
+  at C\* that cannot fill Q is `PBV_E_MISMATCH`, as `Engine::replay_wire` makes it. While an
+  uncross is open only its chunks run, separated by at most one Idle step each. The chunk that
+  fills Q sends every lane an Uncross event, returns to Continuous and makes (B, A) exact. A
+  chunk step with a payload is `PBV_E_BAD_RECORD`. After a Seal step no step runs (`PBV_E_KIND`).
+  `tests/replay.rs` checks the oracle's price-time allocation by hand. **[Reading, 1b]** A cut
+  past C\* that holds a Cancel or Reduce while an uncross is open stops with
+  `PBV_E_UNSUPPORTED`: the Vx book has already applied it, but at C\* it is not visible.
+  **[Reading, 1b]** Auction-only remainders are not killed at the uncross, as in `vyrn-lane`
+  and `Bbo` today (their follow-up); the oracle's `OUT_AUCTION` for them is not replayed.
+- *Gap list (the plan, in order).* What `RustReplay` replays and the Vx client does not yet
+  (1, Uncross and Seal, is done):
   2. Rescan batch takers that trade: key visibility (05 §5.2), the capped CONT sweep and
      `RESTED_IN_FLIGHT` (rule B), and post-only batch rejects.
   3. Replace (keep and new priority) and CancelAll.
