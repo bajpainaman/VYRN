@@ -38,8 +38,8 @@ use serde::Deserialize;
 use vyrn_md::dropcopy::ring::{RingFrame, RingReader, StoreOut};
 use vyrn_md::dropcopy::server::{DcStore, Keys, Session, Wake, serve};
 use vyrn_md::dropcopy::wire::DC_LOGIN_TIMEOUT_MS;
-use vyrn_md::dropcopy::{DcAccount, DcConfig, DropCopy};
-use vyrn_types::{AccountId, BookId, SessionId};
+use vyrn_md::dropcopy::{DcAccount, DcConfig, DropCopy, MD_DC_REPLAY_EPOCHS};
+use vyrn_types::{AccountId, BookId, Epoch, SessionId};
 
 #[derive(Parser)]
 #[command(about = "Drop-copy server (spec 10 §8)")]
@@ -120,7 +120,10 @@ fn follow(path: &std::path::Path, cfg: &DcConfig, out: &StoreOut) -> String {
             Err(e) => return e.to_string(),
         }
     };
-    let mut dc: Option<DropCopy<StoreOut>> = None;
+    // The current epoch's drop copy and the ended ones still in the replay window, which a late
+    // `Settled` reaches (10 §8.4 item 11).
+    let mut dcs: std::collections::BTreeMap<Epoch, DropCopy<StoreOut>> = Default::default();
+    let mut cur: Option<Epoch> = None;
     let mut err: Option<String> = None;
     loop {
         let r = rd.poll(|f| {
@@ -131,26 +134,45 @@ fn follow(path: &std::path::Path, cfg: &DcConfig, out: &StoreOut) -> String {
                 if let Ok(mut s) = out.store.write() {
                     s.begin_epoch(e);
                 }
-                let d = DropCopy::new(cfg, out.clone());
+                let d = DropCopy::new(
+                    cfg,
+                    StoreOut {
+                        epoch: e,
+                        ..out.clone()
+                    },
+                );
                 // Every configured stream can subscribe from the epoch's start.
                 if let Ok(mut s) = out.store.write() {
                     d.streams().for_each(|id| s.open(id));
                 }
-                dc = Some(d);
+                dcs.insert(e, d);
+                while dcs.len() > MD_DC_REPLAY_EPOCHS {
+                    dcs.pop_first();
+                }
+                cur = Some(e);
             }
-            let Some(d) = dc.as_mut() else {
-                err = Some("ring frame before its epoch's Begin".into());
+            let target = match &f {
+                RingFrame::Settled(e, ..) => Some(*e),
+                _ => cur,
+            };
+            let Some(d) = target.and_then(|e| dcs.get_mut(&e)) else {
+                if matches!(f, RingFrame::Settled(..)) {
+                    // Its epoch left the replay window; sessions rebuild from the statement.
+                    tracing::warn!(?f, "settlement for an epoch outside the window");
+                } else {
+                    err = Some("ring frame before its epoch's Begin".into());
+                }
                 return;
             };
             if let Err(e) = f.apply(d) {
                 err = Some(format!("drop copy: {e:?}"));
             }
-            if matches!(f, RingFrame::End(_)) {
-                if let Ok(mut s) = out.store.write() {
-                    s.end_epoch();
-                }
-                out.wake.bump();
+            if matches!(f, RingFrame::End(_))
+                && let Ok(mut s) = out.store.write()
+            {
+                s.end_epoch();
             }
+            out.wake.bump();
         });
         if let Some(e) = err {
             return e;
@@ -209,6 +231,7 @@ fn run(args: &Args) -> Result<(), String> {
         let out = StoreOut {
             store: Arc::clone(&store),
             wake: Arc::clone(&wake),
+            epoch: Epoch(0),
         };
         let dc = cfg.dc();
         std::thread::spawn(move || {

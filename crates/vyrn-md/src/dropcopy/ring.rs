@@ -36,7 +36,7 @@
 //! item 2).
 
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
@@ -53,6 +53,9 @@ pub const RING_MAGIC: [u8; 8] = *b"VYRNDCR1";
 pub const RING_HEADER: u64 = 64;
 /// Default data region: 64 MiB (\[Guessing\], 10 §8.6 item 3).
 pub const RING_CAP: u64 = 64 << 20;
+/// The ring file's mode: the observer and `vyrn-dropcopy` run as one service user
+/// (\[Guessing\], 10 §8.6 item 1).
+pub const RING_MODE: u32 = 0o600;
 /// Header reads before a reader gives up on a torn header.
 const TORN_RETRIES: u32 = 1_000;
 
@@ -117,8 +120,9 @@ pub enum RingFrame {
     Final(Height, StepId),
     /// [`DropCopy::alloc`].
     Alloc(Alloc),
-    /// [`DropCopy::settled`].
-    Settled(Height, StepId),
+    /// [`DropCopy::settled`] on the drop copy of epoch `.0`, which may have ended (10 §8.4
+    /// item 11).
+    Settled(Epoch, Height, StepId),
     /// [`DropCopy::revert_after`].
     Revert(StepId),
     /// [`DropCopy::route`].
@@ -149,7 +153,7 @@ impl RingFrame {
             }),
             Self::Final(h, s) => dc.final_block(*h, *s),
             Self::Alloc(a) => dc.alloc(*a),
-            Self::Settled(h, s) => dc.settled(*h, *s),
+            Self::Settled(_, h, s) => dc.settled(*h, *s),
             Self::Revert(k) => dc.revert_after(*k),
             Self::Route(r) => dc.route(r),
             Self::Begin(_) => {}
@@ -211,12 +215,14 @@ impl RingFrame {
                     out.extend_from_slice(&r.encode());
                 }
             }
-            Self::Final(h, s) | Self::Settled(h, s) => {
-                out.push(if matches!(self, Self::Final(..)) {
-                    K_FINAL
-                } else {
-                    K_SETTLED
-                });
+            Self::Final(h, s) => {
+                out.push(K_FINAL);
+                out.extend_from_slice(&h.0.to_le_bytes());
+                out.extend_from_slice(&s.0.to_le_bytes());
+            }
+            Self::Settled(e, h, s) => {
+                out.push(K_SETTLED);
+                out.extend_from_slice(&e.0.to_le_bytes());
                 out.extend_from_slice(&h.0.to_le_bytes());
                 out.extend_from_slice(&s.0.to_le_bytes());
             }
@@ -320,7 +326,7 @@ impl RingFrame {
                 }
             }
             K_FINAL => Self::Final(Height(c.u64()?), StepId(c.u64()?)),
-            K_SETTLED => Self::Settled(Height(c.u64()?), StepId(c.u64()?)),
+            K_SETTLED => Self::Settled(Epoch(c.u32()?), Height(c.u64()?), StepId(c.u64()?)),
             K_ALLOC => Self::Alloc(Alloc {
                 step: StepId(c.u64()?),
                 account: AccountId(c.u32()?),
@@ -441,11 +447,17 @@ impl RingTap {
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".new");
         let tmp = std::path::PathBuf::from(tmp);
+        // The ring holds every account's private records (10 §8): owner-only, and never a
+        // leftover `.new` with wider permissions.
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io(e)),
+            _ => {}
+        }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
+            .mode(RING_MODE)
             .open(&tmp)
             .map_err(io)?;
         file.set_len(RING_HEADER + cap).map_err(io)?;
@@ -486,8 +498,9 @@ impl RingTap {
     pub fn alloc(&mut self, a: Alloc) {
         self.send(&RingFrame::Alloc(a));
     }
-    pub fn settled(&mut self, h: Height, last_step: StepId) {
-        self.send(&RingFrame::Settled(h, last_step));
+    /// Block `h` of `epoch`, the current one or an ended one, is settled.
+    pub fn settled(&mut self, epoch: Epoch, h: Height, last_step: StepId) {
+        self.send(&RingFrame::Settled(epoch, h, last_step));
     }
     pub fn revert_after(&mut self, kept: StepId) {
         self.send(&RingFrame::Revert(kept));
@@ -679,12 +692,14 @@ impl RingReader {
 pub struct StoreOut {
     pub store: Arc<RwLock<DcStore>>,
     pub wake: Arc<Wake>,
+    /// The epoch the records belong to: a late `DC_SETTLED` goes to an ended epoch's streams.
+    pub epoch: Epoch,
 }
 
 impl DcOut for StoreOut {
     fn push(&mut self, stream: StreamId, seq: u64, rec: &DcRecord) {
         if let Ok(mut s) = self.store.write() {
-            s.push(stream, seq, rec);
+            s.push_at(self.epoch, stream, seq, rec);
         }
         self.wake.bump();
     }

@@ -98,6 +98,18 @@ impl DcStore {
     }
 }
 
+impl DcStore {
+    /// Appends to `stream` in `epoch`, which may have ended (a late `DC_SETTLED`, 10 §8.4
+    /// item 11). An epoch outside the window takes nothing.
+    pub fn push_at(&mut self, epoch: Epoch, stream: StreamId, seq: u64, rec: &DcRecord) {
+        if let Some(e) = self.epochs.iter_mut().find(|e| e.epoch == epoch) {
+            let v = e.streams.entry(stream).or_default();
+            debug_assert_eq!(v.len() as u64 + 1, seq);
+            v.push(*rec);
+        }
+    }
+}
+
 impl DcOut for DcStore {
     fn push(&mut self, stream: StreamId, seq: u64, rec: &DcRecord) {
         if let Some(e) = self.epochs.back_mut() {

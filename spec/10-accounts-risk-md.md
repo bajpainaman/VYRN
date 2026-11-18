@@ -1802,7 +1802,9 @@ makes, byte for byte. That equality is tested against `RustReplay` at every spli
    or voting. The writer builds a new ring as `<path>.new` and renames it into place once its
    header is written, so a reader that waits for the path never opens a half-made ring.
    An idle reader whose path now names another ring (another file) stops with `Replaced`,
-   so it never goes quiet while it still serves heartbeats.
+   so it never goes quiet while it still serves heartbeats. The ring holds every account's
+   private records, so it is created owner-only (mode 0600, from a fresh `.new`): the observer
+   and `vyrn-dropcopy` run as one service user.
    \[Guessing\]
 2. **Layout.** All fields little-endian. Header (64 bytes): magic `VYRNDCR1`, `cap` (u64),
    `head` (u64, bytes ever written), `!head`, `resv` (u64, `head` once the batch in flight lands),
@@ -1813,7 +1815,7 @@ makes, byte for byte. That equality is tested against `RustReplay` at every spli
      record);
    - 3 `final_block`;
    - 4 `alloc`;
-   - 5 `settled`;
+   - 5 `settled`, with its epoch;
    - 6 `revert_after`;
    - 7 route;
    - 8 epoch begin;
@@ -1834,7 +1836,11 @@ makes, byte for byte. That equality is tested against `RustReplay` at every spli
 5. **Shell inputs.** The observer's shell writes the inputs that no replay output carries:
    finality (`INV-QUORUM`), allocations, settlement, reverts and routes (§8.4 items 9–12), and
    each epoch's begin and end. They go into the ring in the order the shell calls them, so
-   both processes apply them in the same order. \[Likely\]
+   both processes apply them in the same order. `settled` names its epoch and goes to that
+   epoch's drop copy, which `vyrn-dropcopy` keeps for the replay window (§8.3) after its
+   `DC_EOD`, so a settlement that comes after the next epoch begins settles the right records.
+   Its `DC_SETTLED` is appended to the ended epoch's stream after `END`; a session that has
+   moved on reads it by reconnecting to that epoch. \[Guessing\]
 
 ## 9. Surveillance
 

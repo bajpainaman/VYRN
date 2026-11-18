@@ -801,7 +801,7 @@ fn shell_frames_round_trip_through_the_ring() {
             fee: -3,
         }),
         RingFrame::Final(Height(2), StepId(6)),
-        RingFrame::Settled(Height(2), StepId(6)),
+        RingFrame::Settled(Epoch(0x0102_0303), Height(2), StepId(6)),
         RingFrame::End(vec![(
             AccountId(101),
             Balances {
@@ -823,7 +823,7 @@ fn shell_frames_round_trip_through_the_ring() {
             RingFrame::Revert(k) => w.revert_after(*k),
             RingFrame::Route(r) => w.route(r),
             RingFrame::Final(h, s) => w.final_block(*h, *s),
-            RingFrame::Settled(h, s) => w.settled(*h, *s),
+            RingFrame::Settled(e, h, s) => w.settled(*e, *h, *s),
             RingFrame::End(b) => w.end_epoch(b.clone()),
             _ => unreachable!(),
         }
@@ -832,5 +832,8 @@ fn shell_frames_round_trip_through_the_ring() {
     assert_eq!(w.error(), None);
     assert!(w.head() > 64, "wraps");
     assert_eq!(got, frames);
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the ring is owner-only");
     let _ = std::fs::remove_file(&path);
 }
