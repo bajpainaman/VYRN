@@ -100,9 +100,14 @@
 //!   for `CLIENT_RETAIN` (100 ms, 04 DR4) and resends only those; `failover` fails if a packet
 //!   it sent to the dead home after the kill had expired before its redirect arrived, and prints
 //!   the slowest kill-to-redirect time (about 65 ms on a 2-vCPU orb). `KILL_SILENCE_US` (50 ms)
-//!   leaves the rest of the window to gossip and REDIRECT: at 20 ms the backup, busy serving
-//!   every validator's KEY fetches for the lost packets, goes silent long enough to be marked
-//!   down too; at 100 ms redirects arrive after about 114 ms and the check fails. Four sessions sit far below 07 §5.7's ~1 200-session bound, which
+//!   leaves the rest of the window to gossip and REDIRECT: at 100 ms redirects arrive after about
+//!   114 ms and the check fails. At 20 ms, before #189, the backup, busy serving every
+//!   validator's KEY fetches for the lost packets, went silent long enough to be marked down too
+//!   (4 of 4 runs). Since #189 the backup keeps its heartbeat cadence, but 20 ms still fails 3 of
+//!   5 runs on a 2-vCPU orb: every validator marks the live backup down with only about 25 KEY
+//!   misses served, so the false `DataDown` starts on the validators' side (*hypothesis*: a
+//!   validator stamps a frame when it polls it, `RX_BURST` per turn, from a data queue it shares
+//!   with peer fetches and `DataDown` gossip). Passing runs redirect in about 32 ms. Four sessions sit far below 07 §5.7's ~1 200-session bound, which
 //!   `bin/vyrn-validator` `failover.rs` pins in a unit test instead.
 //! - R14. The tap repairs its own data gaps, as a replica does (07 §5.5 source 1): a gap its
 //!   `DataFeed` reports in box `src`'s `data_seq` is asked for by `Fetch::Range{dst: 0}` at
