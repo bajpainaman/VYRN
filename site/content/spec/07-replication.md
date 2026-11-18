@@ -1062,7 +1062,8 @@ sequencer's repair port.
 - **Refused without an answer:** RANGE and BLOCK fetches, which only data boxes serve, and
   malformed requests.
 - **Cost.** An answer takes one `REP_SEQ_DATA_MAX_PPS` token per packet it carries, and a miss
-  takes one. Each packet also takes one `DAV_SESSION_REPAIR_PPS` token of its session. Each bucket
+  takes one. Each packet also takes one `DAV_SESSION_REPAIR_PPS` token of its session; a miss
+  takes no session token, so only sessions with a retained packet hold a bucket. Each bucket
   holds 10 ms of tokens. A request that either bucket cannot cover gets no answer, and the
   replica asks again or moves on in the order above.
 - **At the replica.** A replica takes a `FETCH_RESP` from any `src`, so this answer is stored
