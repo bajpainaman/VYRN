@@ -1,0 +1,4 @@
+/* header */
+#include "shim.h"
+// one
+uint32_t f(void) { return 1u; }

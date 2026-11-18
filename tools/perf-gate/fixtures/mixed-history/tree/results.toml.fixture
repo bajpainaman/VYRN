@@ -1,0 +1,14 @@
+schema = 1
+runner = "ref-1"
+
+[[metric]]
+id = "B2.service_ns"
+stat = "mean"
+value = 1015
+better = "lower"
+
+[[metric]]
+id = "B2.service_ns"
+stat = "p99"
+value = 2000
+better = "lower"

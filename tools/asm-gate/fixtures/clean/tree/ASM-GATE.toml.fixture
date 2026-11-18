@@ -1,0 +1,8 @@
+schema = 1
+
+# helper is allowed; jumps inside the body and to local labels are not calls.
+[[symbol]]
+name = "vyrn_bbo_step"
+forbid_calls = ["__rust_alloc*", "*panic_bounds_check*", "ef_*", "help"]
+forbid_indirect_calls = true
+max_bytes = 64

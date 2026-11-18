@@ -1,0 +1,103 @@
+
+t-x86_64.so:	file format elf64-x86-64
+
+Disassembly of section .text:
+
+0000000000001560 <vyrn_lane_rx_batch>:
+    1560:      	pushq	%rbp
+    1561:      	pushq	%r15
+    1563:      	pushq	%r14
+    1565:      	pushq	%r12
+    1567:      	pushq	%rbx
+    1568:      	movl	%edi, %ebp
+    156a:      	testl	%edi, %edi
+    156c:      	je	 <L3>
+    156e:      	xorl	%r14d, %r14d
+    1571:      	movq	, %r15 <helper+0x2730>
+    1578:      	xorl	%ebx, %ebx
+    157a:      	jmp	 <L1>
+    157c:      	nopl	(%rax)
+<L0>:
+    1580:      	incl	%r14d
+    1583:      	cmpl	%r14d, %ebp
+    1586:      	je	 <L2>
+<L1>:
+    1588:      	movl	%ebx, %r12d
+    158b:      	movl	%r14d, %edi
+    158e:      	callq	 <helper@plt>
+    1593:      	movl	%eax, %ebx
+    1595:      	addl	%r12d, %ebx
+    1598:      	cmpl	$0x65, %ebx
+    159b:      	jl	 <L0>
+    159d:      	movl	%ebx, %edi
+    159f:      	callq	*(%r15)
+    15a2:      	addl	%eax, %ebx
+    15a4:      	jmp	 <L0>
+<L2>:
+    15a6:      	movl	%ebp, %edi
+    15a8:      	cmpl	$0x7, %ebp
+    15ab:      	ja	 <L5>
+    15ad:      	movq	, %rax <helper+0x2738>
+    15b4:      	addl	(%rax,%rdi,4), %ebx
+    15b7:      	cmpl	$0x6, %ebp
+    15ba:      	jb	 <L4>
+    15bc:      	movl	%ebx, %edi
+    15be:      	popq	%rbx
+    15bf:      	popq	%r12
+    15c1:      	popq	%r14
+    15c3:      	popq	%r15
+    15c5:      	popq	%rbp
+    15c6:      	jmp	 <ef_vi_transmit@plt>
+<L3>:
+    15cb:      	movl	%ebp, %eax
+    15cd:      	movq	, %rcx <helper+0x2738>
+    15d4:      	movl	(%rcx,%rax,4), %ebx
+<L4>:
+    15d7:      	movl	$0x8, %edi
+    15dc:      	movl	$0x8, %esi
+    15e1:      	callq	 <__rust_alloc@plt>
+    15e6:      	movl	%ebx, %eax
+    15e8:      	popq	%rbx
+    15e9:      	popq	%r12
+    15eb:      	popq	%r14
+    15ed:      	popq	%r15
+    15ef:      	popq	%rbp
+    15f0:      	retq
+<L5>:
+    15f1:      	movl	$0x8, %esi
+    15f6:      	callq	 <_ZN4core9panicking18panic_bounds_check17h0123456789abcdefE@plt>
+    15fb:      	nopl	(%rax,%rax)
+
+0000000000001600 <vyrn_bbo_step>:
+    1600:      	cmpl	$0x4, %edi
+    1603:      	jge	 <helper@plt>
+    1609:      	incl	%edi
+    160b:      	movl	%edi, %eax
+    160d:      	retq
+
+Disassembly of section .plt:
+
+0000000000001610 <.plt>:
+    1610:      	pushq	 <helper+0x3748>
+    1616:      	jmpq	* <helper+0x3750>
+    161c:      	nopl	(%rax)
+
+0000000000001620 <helper@plt>:
+    1620:      	jmpq	* <helper+0x3758>
+    1626:      	pushq	$0x0
+    162b:      	jmp	 <.plt>
+
+0000000000001630 <ef_vi_transmit@plt>:
+    1630:      	jmpq	* <helper+0x3760>
+    1636:      	pushq	$0x1
+    163b:      	jmp	 <.plt>
+
+0000000000001640 <__rust_alloc@plt>:
+    1640:      	jmpq	* <helper+0x3768>
+    1646:      	pushq	$0x2
+    164b:      	jmp	 <.plt>
+
+0000000000001650 <_ZN4core9panicking18panic_bounds_check17h0123456789abcdefE@plt>:
+    1650:      	jmpq	* <helper+0x3770>
+    1656:      	pushq	$0x3
+    165b:      	jmp	 <.plt>

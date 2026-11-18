@@ -1,4 +1,7 @@
-# Hot symbols and the callees they must not contain (spec/11-build.md §4.4).
+# Hot symbols and the callees they must not contain (spec/11-build.md §4.4). Read by
+# tools/asm-gate (schema 1, see its lib.rs): `*` in a pattern matches any run of characters.
+schema = 1
+
 [[symbol]]
 name = "vyrn_lane_rx_batch"
 forbid_calls = ["vyns_*", "ef_*", "rte_*", "__rust_alloc*", "__rust_dealloc", "__rust_realloc",
@@ -16,5 +19,47 @@ name = "vyrn_bbo_step"
 forbid_calls = ["__rust_alloc*", "*panic_bounds_check*", "*panic_fmt*"]
 forbid_indirect_calls = true
 
-# Still to list (§4.4): vyrn_cut_publish, vyrn_siphash_pkt, vyrn_lane_admit, vyrn_lane_classify,
-# vyrn_order_drain, vyrn_pool_take, vyrn_pool_steal, vyrn_dpdk_rx_burst.
+# The rest of §4.4's list. §4.4 names these symbols but not their forbidden callees, so each gets
+# the no-allocation, no-panic set that every hot wrapper above shares, plus the vendor prefixes for
+# the NIC wrapper. Tighten per symbol when its crate lands.
+[[symbol]]
+name = "vyrn_cut_publish"          # both cut cores
+forbid_calls = ["__rust_alloc*", "__rust_dealloc", "__rust_realloc", "*panic_bounds_check*", "*panic_fmt*"]
+forbid_indirect_calls = true
+
+[[symbol]]
+name = "vyrn_siphash_pkt"
+forbid_calls = ["__rust_alloc*", "__rust_dealloc", "__rust_realloc", "*panic_bounds_check*", "*panic_fmt*"]
+forbid_indirect_calls = true
+
+[[symbol]]
+name = "vyrn_lane_admit"           # the deadline test
+forbid_calls = ["__rust_alloc*", "__rust_dealloc", "__rust_realloc", "*panic_bounds_check*", "*panic_fmt*"]
+forbid_indirect_calls = true
+
+[[symbol]]
+name = "vyrn_lane_classify"
+forbid_calls = ["__rust_alloc*", "__rust_dealloc", "__rust_realloc", "*panic_bounds_check*", "*panic_fmt*"]
+forbid_indirect_calls = true
+
+[[symbol]]
+name = "vyrn_order_drain"          # stream cores 4 and 7
+forbid_calls = ["__rust_alloc*", "__rust_dealloc", "__rust_realloc", "*panic_bounds_check*", "*panic_fmt*"]
+forbid_indirect_calls = true
+
+[[symbol]]
+name = "vyrn_pool_take"            # the token CAS
+forbid_calls = ["__rust_alloc*", "__rust_dealloc", "__rust_realloc", "*panic_bounds_check*", "*panic_fmt*"]
+forbid_indirect_calls = true
+
+[[symbol]]
+name = "vyrn_pool_steal"
+forbid_calls = ["__rust_alloc*", "__rust_dealloc", "__rust_realloc", "*panic_bounds_check*", "*panic_fmt*"]
+forbid_indirect_calls = true
+
+# rte_eth_rx_burst dispatches through the port's ops table, so this one is expected to report an
+# indirect call; §4.4 then allowlists that call by name with its B1 cost, once 06 decides.
+[[symbol]]
+name = "vyrn_dpdk_rx_burst"
+forbid_calls = ["vyns_*", "rte_*", "__rust_alloc*", "*panic_bounds_check*", "*panic_fmt*"]
+forbid_indirect_calls = true

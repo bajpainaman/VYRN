@@ -1,0 +1,20 @@
+schema = 1
+runner = "consumer-1"
+
+[[metric]]
+id = "B7.cut_ns"
+stat = "mean"
+value = 100
+better = "lower"
+
+[[metric]]
+id = "B7.cut_ns"
+stat = "p99"
+value = 200
+better = "lower"
+
+[[metric]]
+id = "B7.cut_ns"
+stat = "p99"
+value = 201
+better = "lower"

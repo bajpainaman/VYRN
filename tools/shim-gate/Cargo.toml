@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish = false
-description = "CI gate tool (spec/11-build.md)."
+description = "Size gate on the C shim (spec/11-build.md §4.5)."
 
 [dependencies]
 
