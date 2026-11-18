@@ -55,7 +55,7 @@ impl BridgeSigners {
 pub enum BridgeErr {
     #[error("rotation {got} is not the next rotation {want}")]
     Rotation { got: u64, want: u64 },
-    #[error("epoch {from:?} is not after the active epoch {active:?}")]
+    #[error("epoch {from:?} is before the active epoch or a pending rotation's ({active:?})")]
     Epoch { from: Epoch, active: Epoch },
     #[error("a key is zero or repeated within its list")]
     Malformed,
@@ -116,10 +116,18 @@ impl BridgeSignerTable {
                 want,
             });
         }
-        if from <= self.active {
+        // Not before the active epoch, nor before a rotation still pending: sets activate in
+        // rotation order, so each accepted schedule activates at its own boundary.
+        let floor = self
+            .pending
+            .last_key_value()
+            .map_or(self.active, |(_, (e, _))| {
+                Epoch(e.0.saturating_sub(1)).max(self.active)
+            });
+        if from <= floor {
             return Err(BridgeErr::Epoch {
                 from,
-                active: self.active,
+                active: floor,
             });
         }
         if !set.well_formed() {
@@ -201,6 +209,15 @@ mod tests {
         let mut zero = set(1, 0x40);
         zero.bridge_keys[2] = [0; 20];
         assert_eq!(t.schedule(zero, Epoch(5)), Err(BridgeErr::Malformed));
+        // A later rotation may not activate before an earlier pending one; the same epoch is fine.
+        assert_eq!(t.schedule(set(1, 0x40), Epoch(7)), Ok(()));
+        assert!(matches!(
+            t.schedule(set(2, 0x80), Epoch(6)),
+            Err(BridgeErr::Epoch { .. })
+        ));
+        assert_eq!(t.schedule(set(2, 0x80), Epoch(7)), Ok(()));
+        t.activate(Epoch(7));
+        assert_eq!(t.current().rotation_no, 2);
         assert!(matches!(
             BridgeSignerTable::genesis(set(1, 1)),
             Err(BridgeErr::Rotation { .. })
