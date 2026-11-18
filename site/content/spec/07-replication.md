@@ -215,10 +215,11 @@ bandwidth on every block and would still need the slot map, which is epoch-scope
 
 ```
 byte h:   bits 0–3  count              (0..10; 11..15 → REP_E_COUNT); numbered messages (05 §3.1)
-          bit 4     SEQ_EXC            pkt_seq ≠ slot_next_pkt_seq[slot]
+          bit 4     SEQ_EXC            pkt_seq ≠ slot_next_pkt_seq[slot]; on an Advance record MID
           bit 5     LSEQ_EXC           first_lane_seq ≠ next_lane_seq
           bit 6     FA_NZ              fills_applied ≠ prev_fills_applied
-          bit 7     SHED               PacketRecord.flags.SHED (01 §14.1): the lane shed the packet
+          bit 7     SHED               PacketRecord.flags.SHED (01 §14.1): the lane shed the packet;
+                                       on an Advance record PASS2 (only with MID)
 slot      LEB128 u16                   lane-local session slot, < MAX_SESSIONS_PER_LANE (pool-wide
                                        on pooled lanes); REP_SLOT_ADVANCE = MAX_SESSIONS_PER_LANE marks
                                        an Advance record, REP_SLOT_TAKE = MAX_SESSIONS_PER_LANE + 1 an
@@ -227,6 +228,7 @@ slot      LEB128 u16                   lane-local session slot, < MAX_SESSIONS_P
 rx_ts     ZigZag LEB128 of (rx_ts − prev_rx_ts) as i64
 [FA_NZ]   LEB128 (fills_applied − prev_fills_applied)          // non-decreasing per lane
 [LSEQ_EXC] LEB128 (first_lane_seq − next_lane_seq)             // > 0; lane ops that are not packets
+[MID]     LEB128 back = next_lane_seq − first_lane_seq          // MID Advance record only; 0 ≤ back ≤ count
 [SEQ_EXC] LEB128 pkt_seq                                       // absolute; never in an Advance record
 ```
 
@@ -251,15 +253,21 @@ fn decode_pkt(l: LaneId, d: &mut LaneDec, r: &mut Reader) -> Rec {   // Rec::Pkt
                                         cross: h & 0x80 != 0 });
     }
     let advance = slot as usize == REP_SLOT_ADVANCE;             // 05 §6.2: a boundary, no packet
-    if advance && (count != 0 || shed || h & 0x30 != 0) { fail(REP_E_COUNT) }
+    let mid = advance && h & 0x10 != 0;                          // 05 §6.2: a boundary inside the packet
+    if advance && (count != 0 || h & 0x20 != 0 || (shed && !mid)) { fail(REP_E_COUNT) }
     let rx_ts = d.prev_rx_ts.checked_add_signed(r.zigzag_i64()).unwrap_or_else(|| fail(REP_E_TS));
     let fills_applied = if h & 0x40 != 0 { d.prev_fills_applied + r.leb_u64() } else { d.prev_fills_applied };
-    let first_lane_seq = if h & 0x20 != 0 { d.next_lane_seq + r.leb_u64() } else { d.next_lane_seq };
+    let first_lane_seq = if mid {                                // an op of the last packet, or its end
+        let back = r.leb_u64();
+        if back > d.last_pkt.1 as u64 { fail(REP_E_COUNT) }
+        d.next_lane_seq - back
+    } else if h & 0x20 != 0 { d.next_lane_seq + r.leb_u64() } else { d.next_lane_seq };
     d.prev_rx_ts = rx_ts; d.prev_fills_applied = fills_applied;
-    d.next_lane_seq = first_lane_seq + count as u64;             // a shed packet keeps its LaneSeqs
+    if !mid { d.next_lane_seq = first_lane_seq + count as u64 }  // a shed packet keeps its LaneSeqs
     if !advance { d.last_pkt = (first_lane_seq, count) }
     if advance {
-        return Rec::Pkt(PacketRecord { lane: l, count: 0, flags: ADVANCE, session: 0, pkt_seq: 0,
+        let flags = ADVANCE | if mid { MID } else { 0 } | if mid && shed { PASS2 } else { 0 };
+        return Rec::Pkt(PacketRecord { lane: l, count: 0, flags, session: 0, pkt_seq: 0,
                               rx_ts, pkt_hash: PktHash(0), first_lane_seq, fills_applied });
     }
     let pkt_seq = if h & 0x10 != 0 { r.leb_u32() } else { d.slot_next_pkt_seq[slot] };
@@ -286,6 +294,17 @@ defines any.
   `pkt_hash = 0`. It carries only `rx_ts` (05: the lane's previous `prio_ts`) and
   `fills_applied`. It has no payload, no HashRun entry and no `data_root` entry. A real packet
   whose messages take no number also has `count = 0`, but it has a real slot and a payload.
+- **`MID` Advance record** (05 §6.2, R11). A `LaneCut` boundary the lane ran inside the packet
+  whose PacketRecord precedes it: `flags = ADVANCE | MID`, plus `PASS2` when it ran before pass 2
+  of its op. `h` bit 4 is `MID` and bit 7 `PASS2` (`PASS2` without `MID` is `REP_E_COUNT`); after
+  `fills_applied` comes one LEB128 `back = next_lane_seq − first_lane_seq`, where
+  `first_lane_seq` is the op before which the boundary ran. `0 ≤ back ≤ count` of the lane's
+  last non-Advance PacketRecord, else `REP_E_COUNT`. `back = 0` is a boundary after the packet's
+  last numbered op: the lane polls `LaneCut` before every message, and a trailing `Heartbeat` or
+  `ResendReq` takes no `LaneSeq` (05 §3.1), so the boundary before it names the next LaneSeq.
+  A `MID` record does not move `next_lane_seq`, so later route records still name the packet's
+  ops. Like a route record it travels with its packet: the sequencer frames a packet's `MID` and
+  route records in the packet's block, because §7.1 replays them in one lane call. `LSEQ_EXC` on any Advance record is `REP_E_COUNT`. Size ~6 B; near zero at peak.
 - **`AcctTake { account, ver, lane }`** (01 §14.17 item 4, 05 R15). A pooled lane logs one each
   time it takes an account's token, in its `LaneRun` just before the first record that uses the
   account: `h` = 0, `slot` = `REP_SLOT_TAKE`, then `account` LEB128 and `ver` LEB128 (the token's
@@ -1440,7 +1459,8 @@ records in O-order (§3.6) and the merged steps in StepId order (§3.8). Every r
 into one sequence by this rule, so the Rust and Vx clients run the same schedule:
 
 1. A lane record `r` of lane `l` is *due at* `f(r)`: its `fills_applied`, raised to the largest
-   `fills_applied` of the `MID` Advance records that follow it in the same lane's O-order, up to
+   `fills_applied` of the `MID` Advance records (§3.6: `h` bit 4 on an Advance record) that
+   follow it in the same lane's O-order, up to
    the lane's next PacketRecord or non-`MID` Advance record (05 §6.2). Those `MID` records, and
    any lane record of the same packet between them (such as a route record), are replayed with
    `r`, as one lane call.

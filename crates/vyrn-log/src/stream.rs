@@ -127,6 +127,10 @@ const H_SEQ_EXC: u8 = 0x10;
 const H_LSEQ_EXC: u8 = 0x20;
 const H_FA_NZ: u8 = 0x40;
 const H_SHED: u8 = 0x80;
+/// On an Advance record: a boundary inside the last packet (`PacketFlags::MID`, 05 §6.2).
+const H_MID: u8 = H_SEQ_EXC;
+/// On a `MID` Advance record: the boundary runs before pass 2 (`PacketFlags::PASS2`).
+const H_PASS2: u8 = H_SHED;
 
 const S_HOME: u8 = 0x10;
 const S_OTHER: u8 = 0x80;
@@ -139,6 +143,16 @@ const SRC_CROSS: u8 = 0x80;
 
 /// The LaneSeq a `RouteRecord` with `back` names: `back` ops before the last op of the lane's
 /// preceding PacketRecord `(first, count)`, which must contain it.
+/// The `first_lane_seq` of a `MID` Advance record with `back` (07 §3.6): `next_lane_seq − back`,
+/// with `back` at most the last packet's `count` (0 when the boundary follows its last numbered
+/// op, such as before a trailing Heartbeat), else `REP_E_COUNT`.
+fn mid_first(d: &LaneDec, back: u64) -> Result<u64, RepErr> {
+    if back > u64::from(d.last_pkt.1) {
+        return Err(RepErr::Count);
+    }
+    d.next_lane_seq.checked_sub(back).ok_or(RepErr::Count)
+}
+
 fn route_seq((first, count): (u64, u8), back: u8) -> Result<u64, RepErr> {
     let k = count.checked_sub(back).and_then(|k| k.checked_sub(1));
     let k = k.ok_or(RepErr::Count)?;
@@ -746,7 +760,7 @@ impl SubstreamState {
             return Err(RepErr::Range);
         }
         let advance = slot == REP_SLOT_ADVANCE;
-        if advance && h & !H_FA_NZ != 0 {
+        if advance && (h & !(H_FA_NZ | H_MID | H_PASS2) != 0 || h & (H_MID | H_PASS2) == H_PASS2) {
             return Err(RepErr::Count);
         }
         let rx_ts = d
@@ -759,7 +773,10 @@ impl SubstreamState {
         } else {
             d.prev_fa
         };
-        let first = if h & H_LSEQ_EXC != 0 {
+        let first = if advance && h & H_MID != 0 {
+            let back = r.leb_u64()?;
+            mid_first(d, back)?
+        } else if h & H_LSEQ_EXC != 0 {
             let delta = nonzero(r.leb_u64()?)?;
             d.next_lane_seq.checked_add(delta).ok_or(RepErr::Range)?
         } else {
@@ -781,7 +798,13 @@ impl SubstreamState {
             fills_applied: StepId(fa),
         };
         if advance {
-            rec.flags = PacketFlags::ADVANCE;
+            rec.flags = PacketFlags::ADVANCE
+                | if h & H_MID != 0 { PacketFlags::MID } else { 0 }
+                | if h & H_PASS2 != 0 {
+                    PacketFlags::PASS2
+                } else {
+                    0
+                };
         } else {
             let t = self.table(i)?;
             let s = usize::from(slot);
@@ -847,14 +870,29 @@ impl SubstreamState {
             return Err(RepErr::Count);
         }
         let mut h = p.count;
+        let mid = p.flags & PacketFlags::MID != 0;
         let slot = if advance {
-            if p.flags != PacketFlags::ADVANCE
+            let extra = p.flags & !PacketFlags::ADVANCE;
+            let back = d.next_lane_seq.checked_sub(p.first_lane_seq.0);
+            if (extra != 0
+                && extra != PacketFlags::MID
+                && extra != PacketFlags::MID | PacketFlags::PASS2)
                 || p.count != 0
                 || p.session.0 != 0
                 || p.pkt_seq != 0
-                || p.first_lane_seq.0 != d.next_lane_seq
+                || if mid {
+                    back.is_none_or(|b| mid_first(d, b).is_err())
+                } else {
+                    p.first_lane_seq.0 != d.next_lane_seq
+                }
             {
                 return Err(RepErr::Count);
+            }
+            if mid {
+                h |= H_MID;
+            }
+            if p.flags & PacketFlags::PASS2 != 0 {
+                h |= H_PASS2;
             }
             REP_SLOT_ADVANCE
         } else {
@@ -884,21 +922,23 @@ impl SubstreamState {
             .0
             .checked_sub(d.prev_fa)
             .ok_or(RepErr::Range)?;
-        let dls = p
-            .first_lane_seq
-            .0
-            .checked_sub(d.next_lane_seq)
-            .ok_or(RepErr::Range)?;
+        let dls = if mid {
+            d.next_lane_seq.checked_sub(p.first_lane_seq.0)
+        } else {
+            p.first_lane_seq.0.checked_sub(d.next_lane_seq)
+        }
+        .ok_or(RepErr::Range)?;
         out.push(h);
         leb::put_u64(out, u64::from(slot));
         leb::put_i64(out, drx);
         if h & H_FA_NZ != 0 {
             leb::put_u64(out, dfa);
         }
-        if h & H_LSEQ_EXC != 0 {
+        if h & H_LSEQ_EXC != 0 || (advance && mid) {
             leb::put_u64(out, dls);
         }
-        if h & H_SEQ_EXC != 0 {
+        // `H_MID` shares bit 4 with `SEQ_EXC`: an Advance record never carries a `pkt_seq`.
+        if !advance && h & H_SEQ_EXC != 0 {
             leb::put_u64(out, u64::from(p.pkt_seq));
         }
         self.apply_pkt(i, slot, p)
@@ -906,13 +946,17 @@ impl SubstreamState {
 
     /// The state transition of one decoded or encoded PacketRecord.
     fn apply_pkt(&mut self, i: usize, slot: u16, p: &PacketRecord) -> Result<(), RepErr> {
-        let next = p
-            .first_lane_seq
-            .0
-            .checked_add(u64::from(p.count))
-            .ok_or(RepErr::Range)?;
         let advance = p.flags & PacketFlags::ADVANCE != 0;
         let d = self.lanes.get(i).ok_or(RepErr::Half)?;
+        // A `MID` boundary names an op of the last packet: the lane's next LaneSeq stays.
+        let next = if p.flags & PacketFlags::MID != 0 {
+            d.next_lane_seq
+        } else {
+            p.first_lane_seq
+                .0
+                .checked_add(u64::from(p.count))
+                .ok_or(RepErr::Range)?
+        };
         if !advance {
             let after = p.pkt_seq.checked_add(1).ok_or(RepErr::Range)?;
             let t = self.tables.get_mut(d.table).ok_or(RepErr::Half)?;

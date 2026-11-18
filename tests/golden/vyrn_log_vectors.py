@@ -141,6 +141,17 @@ out("ex311.route.sections", hx(
 # back 10 >= count 10, and a reserved h bit (0x10): both REP_E_COUNT.
 out("ex311.bad_route_back.sections", hx("07 02 0a ac02 8008 8a 8220"))
 out("ex311.bad_route_bits.sections", hx("07 02 0a ac02 8008 12 8220"))
+# MID Advance record (07 §3.6, 05 §6.2) after lane 7's packet (LaneSeqs 1..10, next 11): a
+# LaneCut boundary before pass 1 of op 8, at step 1. h = FA_NZ | MID (bit 4); slot 4096 = LEB
+# 80 20; rx_ts +0; fills +1; back = 11 - 8 = 3. With PASS2 (bit 7) it runs before pass 2.
+out("ex311.mid.sections", hx("07 02 0a ac02 8008 50 8020 00 01 03"))
+out("ex311.mid_pass2.sections", hx("07 02 0a ac02 8008 d0 8020 00 01 03"))
+# back 0: before a trailing Heartbeat or ResendReq, which takes no LaneSeq (05 §3.1).
+out("ex311.mid_end.sections", hx("07 02 0a ac02 8008 50 8020 00 01 00"))
+# back 11 > count 10, PASS2 without MID, LSEQ_EXC on an Advance record: all REP_E_COUNT.
+out("ex311.bad_mid_back.sections", hx("07 02 0a ac02 8008 50 8020 00 01 0b"))
+out("ex311.bad_mid_pass2.sections", hx("07 02 0a ac02 8008 c0 8020 00 01"))
+out("ex311.bad_mid_lseq.sections", hx("07 02 0a ac02 8008 70 8020 00 01 03"))
 # src byte bit 6 set (0x47): no lane of the half, REP_E_CUT.
 out("ex311.bad_src_bit6.sections", hx("07 01 0a ac02 8008 40 01 51 00 47 00 88100000 02 0a 01"))
 print()

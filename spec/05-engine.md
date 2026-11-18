@@ -352,9 +352,12 @@ the byte encoding. `vyrn-sim` diffs `oracle_state_hash` against the engine after
 - The lane assigns `LaneSeq`s in pass 1, in message index order, before it applies anything.
 - A packet that fails the MAC or sequence checks of `04` takes no `LaneSeq` and produces no
   `PacketRecord`. It never enters the order stream.
-- A packet that deadline admission rejects (§6.8) takes no `LaneSeq`, does not advance the
-  session's `pkt_seq`, and produces a `PacketRecord` with `flags.SHED` and `pkt_hash = 0`. The
-  record is needed because the `BUSY` response consumes a `resp_seq`.
+- A packet that deadline admission rejects (§6.8) keeps its `LaneSeq`s (one per counted
+  message, as an accepted packet), does not advance the session's `pkt_seq`, and produces a
+  `PacketRecord` with `flags.SHED` and its real `pkt_hash`: 07 §3.5 hashes and joins it, so
+  `data_root` covers it. The record is needed because the `BUSY` response consumes a
+  `resp_seq`, which `LaneCut` gates on those `LaneSeq`s. A resend of the same `pkt_seq` takes
+  new `LaneSeq`s.
 - `PacketRecord.first_lane_seq` is the `LaneSeq` of the packet's first message with a number.
   If no message of the packet takes a number, the record carries `count = 0` and
   `first_lane_seq` = the next unused number (`04` decides whether such packets are recorded).

@@ -63,8 +63,8 @@ impl OwnedRec {
     }
 }
 
-/// Packet bytes by record (07's data tier keys them by `pkt_hash`; a `SHED` record has
-/// `pkt_hash` 0, so the store may key on the whole record: spec gap, PR body).
+/// Packet bytes by record (07's data tier keys them by `pkt_hash`, a `SHED` record's included,
+/// 07 §3.5).
 pub trait Payloads {
     fn get(&self, r: &PacketRecord) -> Option<&[u8]>;
 }

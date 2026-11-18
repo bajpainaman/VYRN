@@ -76,6 +76,11 @@ impl LaneState {
         (height, index): (Height, usize),
     ) -> Result<(), LaneErr> {
         let first = rec.first_lane_seq.0;
+        // A `MID` Advance record names an op of the packet before it (07 §3.6; the decoder
+        // checked `back`) and takes no LaneSeq.
+        if rec.flags & PacketFlags::MID != 0 {
+            return Ok(());
+        }
         if first < self.next_lane_seq {
             return Err(LaneErr::Order);
         }
