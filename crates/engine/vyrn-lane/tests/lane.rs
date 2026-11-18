@@ -1702,3 +1702,250 @@ fn a_replace_admitted_after_the_freeze_does_not_trade_after_the_auction_out() {
         "the lane-1 sell fills instead"
     );
 }
+
+#[test]
+fn two_replaces_admitted_after_the_freeze_are_both_refused() {
+    // 05 §8.8 item 6 (#210): two replaces admitted after C*. The lane outs the order once
+    // and answers both TOO_LATE, and neither replacement trades in the next auction.
+    use vyrn_bbo::{ControlCmd, OrderFlags, Phase, Stp, Tif};
+    let ao = |side| OrderFlags::new(side, Tif::AuctionOnly, false, Stp::None);
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Auction,
+        lo: Tick(0),
+        hi: Tick(0),
+    });
+    x.settle(&mut bbo);
+    // p* = 105 for 1 on lane 1; the auction-only sell at 110 on lane 0 does not fill.
+    x.send(
+        1,
+        1,
+        1_000,
+        &[
+            new(day(Side::Sell), 104, 1, 1),
+            new(day(Side::Buy), 106, 1, 2),
+        ],
+    );
+    x.send(0, 1, 2_000, &[new(ao(Side::Sell), 110, 10, 4)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 1);
+    assert_eq!(base_resv(&mut x, 0, 1), 10, "the sell reserves its 10");
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Frozen,
+        lo: Tick(1),
+        hi: Tick(u32::MAX - 1),
+    });
+    while x.bbo_step(&mut bbo).is_some() {}
+    // The lane has not applied the freeze: it admits the reduce, after C*.
+    let at = x.lane_cut(0);
+    let none = [Mid {
+        pass: 1,
+        next: LaneSeq(99),
+        at,
+    }];
+    let rep = |q| Msg::Replace {
+        flags: wire_flags(ao(Side::Sell)),
+        handle: h,
+        tick: Tick(111),
+        qty: Qty(q),
+    };
+    let m = [rep(6), rep(5)];
+    assert_eq!(x.send_at(0, 1, 3_000, 3_000, &m, &none), Rx::Accepted);
+    x.command(&ControlCmd::Uncross {
+        price: Tick(105),
+        qty: 1,
+    });
+    x.settle(&mut bbo);
+    let recs: Vec<_> = x
+        .records(0, 1)
+        .into_iter()
+        .filter(|r| !matches!(r, Record::Ack { .. }))
+        .collect();
+    assert_eq!(
+        recs,
+        vec![
+            Record::Out {
+                index: vyrn_bbo::INDEX_MAKER,
+                cause: vyrn_bbo::OUT_AUCTION,
+                handle: h,
+                qty: Qty(10),
+                client_tag: 4
+            },
+            Record::Reject {
+                index: 0,
+                reason: RejectReason::TooLate,
+                detail: 3,
+                client_tag: 4
+            },
+            Record::Reject {
+                index: 1,
+                reason: RejectReason::TooLate,
+                detail: 3,
+                client_tag: 4
+            },
+        ],
+        "{recs:?}"
+    );
+    assert_eq!(base_resv(&mut x, 0, 1), 0, "nothing stays reserved");
+    // The next auction at 111 fills lane 1's own orders, not the refused replacement.
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Auction,
+        lo: Tick(0),
+        hi: Tick(0),
+    });
+    x.settle(&mut bbo);
+    x.send(
+        1,
+        1,
+        4_000,
+        &[
+            new(day(Side::Sell), 111, 6, 8),
+            new(day(Side::Buy), 111, 6, 9),
+        ],
+    );
+    x.settle(&mut bbo);
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Frozen,
+        lo: Tick(1),
+        hi: Tick(u32::MAX - 1),
+    });
+    x.command(&ControlCmd::Uncross {
+        price: Tick(111),
+        qty: 6,
+    });
+    x.settle(&mut bbo);
+    assert!(
+        x.records(0, 1)
+            .iter()
+            .all(|r| !matches!(r, Record::Fill { .. })),
+        "the ended order does not trade"
+    );
+    let at_111: Vec<_> = x
+        .records(1, 1)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Fill {
+                tick: Tick(111),
+                qty,
+                ..
+            } => Some(qty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        at_111,
+        vec![Qty(6), Qty(6)],
+        "the lane-1 sell fills instead"
+    );
+}
+
+#[test]
+fn a_replace_after_the_auction_of_an_order_that_left_auction_only_is_accepted() {
+    // #210 Codex review 1: an auction-only order replaced by a Day order before the freeze
+    // is not auction-only at C*, so it survives the uncross, and a later replace of it is
+    // accepted although its root slot is still auction-only.
+    use vyrn_bbo::{ControlCmd, OrderFlags, Phase, Stp, Tif};
+    let ao = |side| OrderFlags::new(side, Tif::AuctionOnly, false, Stp::None);
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Auction,
+        lo: Tick(0),
+        hi: Tick(0),
+    });
+    x.settle(&mut bbo);
+    x.send(
+        1,
+        1,
+        1_000,
+        &[
+            new(day(Side::Sell), 104, 1, 1),
+            new(day(Side::Buy), 106, 1, 2),
+        ],
+    );
+    x.send(0, 1, 2_000, &[new(ao(Side::Sell), 110, 10, 4)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 1);
+    x.send(0, 1, 2_500, &[replace(h, Side::Sell, 110, 10)]);
+    x.settle(&mut bbo);
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Frozen,
+        lo: Tick(1),
+        hi: Tick(u32::MAX - 1),
+    });
+    x.command(&ControlCmd::Uncross {
+        price: Tick(105),
+        qty: 1,
+    });
+    x.settle(&mut bbo);
+    // Continuous: a sequential replace to 8 at 112. A second auction at 112 then fills it.
+    x.send(0, 1, 3_000, &[replace(h, Side::Sell, 112, 8)]);
+    x.settle(&mut bbo);
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Auction,
+        lo: Tick(0),
+        hi: Tick(0),
+    });
+    x.settle(&mut bbo);
+    x.send(1, 1, 4_000, &[new(day(Side::Buy), 112, 8, 9)]);
+    x.settle(&mut bbo);
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Frozen,
+        lo: Tick(1),
+        hi: Tick(u32::MAX - 1),
+    });
+    x.command(&ControlCmd::Uncross {
+        price: Tick(112),
+        qty: 8,
+    });
+    x.settle(&mut bbo);
+    let recs = x.records(0, 1);
+    assert!(
+        recs.iter()
+            .all(|r| !matches!(r, Record::Reject { .. } | Record::Out { .. })),
+        "{recs:?}"
+    );
+    let filled: Vec<_> = recs
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Fill {
+                tick: Tick(112),
+                qty,
+                ..
+            } => Some(qty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(filled, vec![Qty(8)], "the replaced Day order trades");
+}
+
+#[test]
+fn a_newprio_line_names_its_predecessor_position_in_bytes_20_to_23() {
+    // 05 §4.3 (#210): a NewPrio line carries `pred_total` in bytes 16–19 and `pred_pos`, the
+    // position (leg) slot of the version it replaces, in bytes 20–23. Through a Reduce, the
+    // position is the chain head, not the KeepPrio version the replace follows.
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    x.send(0, 1, 1_000, &[new(day(Side::Sell), 110, 10, 4)]);
+    x.settle(&mut bbo);
+    let h = x.last_ack(0, 1);
+    let by = Msg::Reduce {
+        handle: h,
+        by: Qty(2),
+        client_tag: 5,
+    };
+    x.send(0, 1, 2_000, &[by]);
+    x.send(0, 1, 3_000, &[replace(h, Side::Sell, 111, 7)]);
+    x.send(0, 1, 4_000, &[replace(h, Side::Sell, 112, 6)]);
+    x.settle(&mut bbo);
+    let lb = vyrn_lane::LaneBook::new(&x.views);
+    let line = |s: u32| lb.slot(lid(0), s).unwrap();
+    assert_eq!(line(2).kind, vyrn_bbo::SlotKind::KeepPrio);
+    // Slot 3 replaces KeepPrio slot 2 (total 8), whose position is slot 1.
+    assert_eq!(line(3).kind, vyrn_bbo::SlotKind::NewPrio);
+    assert_eq!(line(3).ins_ts, 8 | (1 << 32));
+    assert_eq!((line(3).pred_total(), line(3).pred_pos()), (8, 1));
+    // Slot 4 replaces slot 3 (total 7), its own position.
+    assert_eq!(line(4).ins_ts, 7 | (3 << 32));
+}

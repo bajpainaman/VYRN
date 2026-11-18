@@ -44,7 +44,7 @@ pub struct OrderSlot {
     /// Op that created this version.
     pub ins_seq: LaneSeq,
     /// `KeepPrio`: ts of the `Reduce` op. `NewPrio`: low 32 bits = `pred_total` (total of the
-    /// version it replaces). `Original`: 0.
+    /// version it replaces), high 32 bits = `pred_pos` (its position slot). `Original`: 0.
     pub ins_ts: u64,
     /// Op that ended this version; 0 = live.
     pub tomb_seq: LaneSeq,
@@ -77,6 +77,11 @@ impl OrderSlot {
     /// `pred_total` of a `NewPrio` version (05 §4.3 bytes 16–19).
     pub fn pred_total(&self) -> u32 {
         u32::try_from(self.ins_ts & 0xFFFF_FFFF).unwrap_or(0)
+    }
+    /// `pred_pos` of a `NewPrio` version (05 §4.3 bytes 20–23): the position slot of the
+    /// version it replaces; 0 = none.
+    pub fn pred_pos(&self) -> u32 {
+        u32::try_from(self.ins_ts >> 32).unwrap_or(0)
     }
 }
 

@@ -607,8 +607,9 @@ Handle (u32):  bits 0..23 = root slot (1 ..= ENG_SLOT_CAP − 1; 0 is null)
 off size field       type     meaning
   0   8  prio_ts     Nanos    merge key part 1 (§3.2)
   8   8  ins_seq     LaneSeq  op that created this version
- 16   8  ins_ts      Nanos    KeepPrio: ts of the Reduce op. Other kinds: bytes 16–19 =
-                              pred_total (NewPrio: total of the version it replaces), 20–23 = 0
+ 16   8  ins_ts      Nanos    KeepPrio: ts of the Reduce op. NewPrio: bytes 16–19 =
+                              pred_total (total of the version it replaces), 20–23 = pred_pos
+                              (position slot of that version). Original: 0
  24   8  tomb_seq    LaneSeq  op that ended this version; 0 = live. Written once.
  32   8  tomb_ts     Nanos    ts of that op; written before tomb_seq
  40   4  next_ver    u32      the KeepPrio version that follows this one; 0 = none. Written once
@@ -625,13 +626,20 @@ off size field       type     meaning
 For kinds other than `KeepPrio`, the op's ts is `prio_ts`, so `visible_at` (§5.2) uses `prio_ts`
 as the insertion ts.
 
-**A `NewPrio` after the uncross cut.** The slot has no link to the version it replaces, so the BBO
-reads "auction-only and visible at `C*`" (§8.8 item 6) from the root slot: `replace_ok` (§8.5)
-refuses a `NewPrio` version with `ins_seq > C*` whose root slot (same `gen`) is auction-only with
-`ins_seq ≤ C*`, where `C*` is the newest uncross cut of the lane. The lane has already ended that
-order at `C*` and answers the `Replace` `TOO_LATE` (detail `OUT`), so neither side lets the
-replacement trade. Gap: the lane tests the TIF of the version in effect at `C*`, which differs
-from the root's only if a `Replace` before `C*` changed the TIF to or from auction-only.
+**`pred_pos` and a `NewPrio` after the uncross cut.** `pred_pos` is the position (leg) slot of
+the version the `Replace` replaces: that version itself for an `Original` or `NewPrio`, the head
+of its chain for a `KeepPrio`. The lane writes it with the rest of the line, under the write-once
+rule. `replace_ok` (§8.5) uses it to find the TIF in effect at `C*`, the newest uncross cut of the
+lane (§8.8 item 6). For a `NewPrio` version `v` with `ins_seq > C*` it walks back from `v`
+through `pred_pos`: the first position with `ins_seq ≤ C*` gives the TIF (a `Reduce` keeps the
+TIF), and an `Original` with `ins_seq > C*` means the order did not exist at `C*`. If that TIF
+is auction-only, the replace is refused `TOO_LATE`: the lane has ended the order at `C*` and
+gives the same answer (its `version_at`). The walk is bounded by the arena size. A link whose
+slot has another `root` or `gen`, or an `ins_seq` not below its successor's, is an engine fault.
+`pred_pos` is a slot index (< 2^24, §4.9), so it cannot overflow. It needs the predecessor
+position's slot to stay unreused while a successor can still be checked; slots are not reused yet
+(§7.8 reclaim is a follow-up), and a reused slot fails the link check and faults instead of giving
+a wrong answer.
 
 **Write-once rule (`INV-ENG-2`).** The lane writes offsets 0–39 and 44–63 before the slot's
 position becomes active (§4.6). It writes `tomb_ts`, then `tomb_seq` with `Release`, at most

@@ -649,8 +649,10 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         let (kind, ins_ts) = match p.kind {
             SKind::KeepPrio => (SlotKind::KeepPrio, p.ts.0),
             SKind::NewPrio => {
-                let pred = self.slot(p.pred).map_or(0, |v| v.total);
-                (SlotKind::NewPrio, u64::from(pred))
+                // 05 §4.3: bytes 16–19 `pred_total`, bytes 20–23 `pred_pos`, the position
+                // (leg) slot of the version this one replaces.
+                let (pred, pos) = self.slot(p.pred).map_or((0, 0), |v| (v.total, v.leg));
+                (SlotKind::NewPrio, crate::layout::join(pred, pos))
             }
             _ => (SlotKind::Original, 0),
         };

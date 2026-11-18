@@ -395,7 +395,7 @@ impl Bbo {
         src: &S,
         clock: &C,
     ) -> Poll {
-        if self.st.fault {
+        if self.st.fault || self.st.link_fault.get() {
             return Poll::Fault;
         }
         if self.held {
@@ -405,7 +405,7 @@ impl Bbo {
             return Poll::Idle;
         }
         self.intake(vis, p);
-        if self.st.fault {
+        if self.st.fault || self.st.link_fault.get() {
             return Poll::Fault;
         }
         self.decide(src, clock);
@@ -440,7 +440,7 @@ impl Bbo {
     /// After a decision: fault, or publish the decided step (05 §8.2 `finish_step`).
     #[inline(always)]
     fn end_step<V: Visibility>(&mut self, vis: &V, p: &mut Ports<'_, '_, V>) -> Poll {
-        if self.st.fault || self.out.overflow {
+        if self.st.fault || self.st.link_fault.get() || self.out.overflow {
             self.st.fault = true;
             return Poll::Fault;
         }
@@ -470,7 +470,7 @@ impl Bbo {
         src: &S,
         rec: &ReplayStep,
     ) -> Result<Poll, Diverge> {
-        if self.st.fault {
+        if self.st.fault || self.st.link_fault.get() {
             return Ok(Poll::Fault);
         }
         if self.held {
@@ -481,7 +481,7 @@ impl Bbo {
             return Err(Diverge::Kind);
         }
         self.intake(vis, p);
-        if self.st.fault {
+        if self.st.fault || self.st.link_fault.get() {
             return Ok(Poll::Fault);
         }
         if rec.lowver & !lanes_mask(self.n) != 0 {
@@ -598,7 +598,7 @@ impl Bbo {
                 self.exec_control(src, cmd, c);
             }
         }
-        if self.st.fault {
+        if self.st.fault || self.st.link_fault.get() {
             return Ok(()); // reported by end_step as Poll::Fault
         }
         self.replay_check(rec)
@@ -1628,8 +1628,7 @@ impl Bbo {
             _ => {}
         }
         if t.v.kind == SlotKind::NewPrio {
-            let root = src.slot(LaneId(lane_u8(t.lane)), t.v.root);
-            if !self.st.replace_ok(t.lane, t.vslot, &t.v, root.as_ref()) {
+            if !self.st.replace_ok(src, t.lane, t.vslot, &t.v) {
                 self.reject_taker(t, role, RejectReason::TooLate, 0);
                 return true;
             }
@@ -1759,11 +1758,7 @@ impl Bbo {
                 ev.cause = reason.code();
                 rec = reject(reason);
             } else if d.kind == DEP_JOIN {
-                if v.kind == SlotKind::NewPrio
-                    && !self
-                        .st
-                        .replace_ok(lane, d.slot, &v, src.slot(lid, v.root).as_ref())
-                {
+                if v.kind == SlotKind::NewPrio && !self.st.replace_ok(src, lane, d.slot, &v) {
                     ev.cause = RejectReason::TooLate.code();
                     rec = reject(RejectReason::TooLate);
                 } else if v.kind == SlotKind::NewPrio && v.total <= r.filled {

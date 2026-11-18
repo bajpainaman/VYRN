@@ -64,6 +64,8 @@ pub(crate) struct State {
     pub rank: [u8; MAX_LANES],
     /// An engine fault (05 §14.3): an arena index out of range or a full buffer.
     pub fault: bool,
+    /// A broken `pred_pos` chain found by a `&self` check (`replace_ok`); read with `fault`.
+    pub link_fault: Cell<bool>,
     /// `C*` of the last uncross (05 §8.8 item 6): an auction-only order at or below it ended
     /// there (`Out { cause: AUCTION }`, sent by its lane), so no later step sees it, even in a
     /// later auction.
@@ -83,6 +85,7 @@ impl State {
             pend: Vec::with_capacity(ENG_PEND_CAP),
             rank,
             fault: false,
+            link_fault: Cell::new(false),
             adead: [LaneSeq(0); MAX_LANES],
         }
     }
@@ -140,15 +143,15 @@ impl State {
     }
 
     /// 05 §8.5 `replace_ok`: the version a `NewPrio` slot replaces still had open quantity.
-    /// `root` is the order's root (`Original`) slot. A replace created after the last uncross
-    /// cut `C*` of an auction-only order that existed at `C*` is refused: the lane ended the
-    /// order at `C*` (05 §8.8 item 6) and answers the replace `TOO_LATE` (05 §4.3).
-    pub fn replace_ok(
+    /// Also refused (05 §4.3, §8.8 item 6): a replace created after the last uncross cut `C*`
+    /// of an order whose version in effect at `C*` was auction-only. The lane ended that
+    /// order at `C*` and answers the replace `TOO_LATE`.
+    pub fn replace_ok<S: BookSource>(
         &self,
+        src: &S,
         lane: usize,
         slot: u32,
         v: &OrderSlot,
-        root: Option<&OrderSlot>,
     ) -> bool {
         let Some(c) = self.ix(lane, slot).and_then(|i| self.rok.get(i)) else {
             return false;
@@ -160,18 +163,48 @@ impl State {
         let r = self.root(lane, v.root, v.gen_);
         // `fin_seq` covers chains of replaces: the second of two refused replaces would pass
         // `filled < pred_total`, since its predecessor's total is the refused proposal.
-        let ao_ended = self.adead.get(lane).is_some_and(|d| {
-            v.ins_seq > *d
-                && root.is_some_and(|o| {
-                    o.gen_ == v.gen_ && o.flags.tif() == Tif::AuctionOnly && o.ins_seq <= *d
-                })
-        });
+        let ao_ended = self
+            .adead
+            .get(lane)
+            .is_some_and(|d| d.0 != 0 && v.ins_seq > *d && self.ao_at(src, lane, v, *d));
         let ok = !r.killed
             && !ao_ended
             && r.filled < v.pred_total()
             && !(r.fin_seq != 0 && v.ins_seq.0 > r.fin_seq);
         c.set(v.ins_seq.0.wrapping_shl(1) | u64::from(ok));
         ok
+    }
+
+    /// Whether the version in effect at `cut` of the order whose `NewPrio` version is `v`
+    /// (`v.ins_seq > cut`) was auction-only: back through `pred_pos` to the newest position
+    /// at or before `cut`, whose TIF its `KeepPrio` successors keep. The lane's `version_at`
+    /// gives the same answer. An order that did not exist at `cut` was not. A link outside
+    /// the order or not strictly older faults (slots are not reused, 05 §7.8).
+    fn ao_at<S: BookSource>(&self, src: &S, lane: usize, v: &OrderSlot, cut: LaneSeq) -> bool {
+        let lid = LaneId(lane_u8(lane));
+        let mut cur = *v;
+        for _ in 0..self.slot_cap {
+            let p = match src.slot(lid, cur.pred_pos()) {
+                Some(p)
+                    if cur.pred_pos() != 0
+                        && p.root == v.root
+                        && p.gen_ == v.gen_
+                        && p.ins_seq < cur.ins_seq =>
+                {
+                    p
+                }
+                _ => break,
+            };
+            if p.ins_seq <= cut {
+                return p.flags.tif() == Tif::AuctionOnly;
+            }
+            if p.kind != SlotKind::NewPrio {
+                return false; // the order's first version is after `cut`
+            }
+            cur = p;
+        }
+        self.link_fault.set(true);
+        false
     }
 
     /// Adds a fill of `q` to the order whose trading version (`ins_seq`, `total`) is given.
@@ -316,11 +349,6 @@ impl<S: BookSource> Ctx<'_, S> {
         v.total.checked_sub(r.filled).filter(|o| *o > 0)
     }
 
-    /// The root (`Original`) slot of the order whose version is `v`.
-    fn root_slot(&self, l: usize, v: &OrderSlot) -> Option<OrderSlot> {
-        self.src.slot(LaneId(lane_u8(l)), v.root)
-    }
-
     /// 05 §5.1 `live`: visible, not killed, open > 0, and auction-only only in an uncross.
     /// `head` is the `ins_seq` of `v`'s queue position: a `Reduce` keeps the TIF, so the
     /// order was visible at `C*` when its position was, even if a reduce admitted after the
@@ -334,11 +362,7 @@ impl<S: BookSource> Ctx<'_, S> {
         if !self.visible(l, slot, v) {
             return None;
         }
-        if v.kind == SlotKind::NewPrio
-            && !self
-                .st
-                .replace_ok(l, slot, v, self.root_slot(l, v).as_ref())
-        {
+        if v.kind == SlotKind::NewPrio && !self.st.replace_ok(self.src, l, slot, v) {
             return None;
         }
         self.open(l, v)
@@ -351,10 +375,7 @@ impl<S: BookSource> Ctx<'_, S> {
         let lane = LaneId(lane_u8(l));
         let (mut s, mut v) = (slot, self.src.slot(lane, slot)?);
         // A NewPrio position whose replace was refused ends with it, successors included.
-        let refused = v.kind == SlotKind::NewPrio
-            && !self
-                .st
-                .replace_ok(l, slot, &v, self.root_slot(l, &v).as_ref());
+        let refused = v.kind == SlotKind::NewPrio && !self.st.replace_ok(self.src, l, slot, &v);
         for _ in 0..self.st.slot_cap {
             if v.next_ver == 0 || !self.done(v.tomb_seq, v.tomb_ts, usize::from(v.tomb_lane.0)) {
                 break;
@@ -430,9 +451,7 @@ impl<S: BookSource> Ctx<'_, S> {
                 let ps = g.slot.get(i).copied().unwrap_or(0);
                 if pos.kind == SlotKind::NewPrio
                     && (pos.ins_seq.0 <= self.cut(l) || self.st.explicit(l, ps, pos.ins_seq))
-                    && !self
-                        .st
-                        .replace_ok(l, ps, &pos, self.root_slot(l, &pos).as_ref())
+                    && !self.st.replace_ok(self.src, l, ps, &pos)
                 {
                     continue;
                 }
