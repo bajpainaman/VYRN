@@ -4,7 +4,8 @@
 //!
 //! **Invocation.** `e2e-smoke [--bin-dir DIR] [--validators K] [--packets P] [--rate R]
 //! [--seed S] [--wait-s T] [--seq-cpus L] [--validator-cpus L] [--strict-hashlag] [--finality]
-//! [--data] [--dropcopy] [--two-path] [--drop-path-b N] [--keyed] [--data-shards N] [--data-kill]`. `DIR` holds `vyrn-seq`, `vyrn-validator`, (with `--data`) `vyrn-data` and (with
+//! [--data] [--dropcopy] [--two-path] [--drop-path-b N] [--keyed] [--data-shards N] [--data-kill]
+//! [--kill-voter]`. `DIR` holds `vyrn-seq`, `vyrn-validator`, (with `--data`) `vyrn-data` and (with
 //! `--dropcopy`) `vyrn-dropcopy` (default: this binary's directory). Exit 0 when every enabled check passes, 1 when one fails,
 //! 2 when the run could not start. Every wait has a deadline of `T` seconds (default 30): the
 //! harness never blocks on a child, a socket or a pipe without one, and kills every child it
@@ -33,6 +34,7 @@
 //! | `finality` | with `--finality` (default 4 validators, a DEV roster as in `bin/vyrn-validator/tests/committee.rs`, `[consensus]` in every validator and the box): while the box still runs, the box's listener (`FINAL height=<h> ... from=<votes\|cert>`) and every validator that did not stop print `FINAL` through the box's last block. A validator's `OUT_OF_ORDER`, `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT` line fails `validators`; `REP_E_HASHLAG` follows R5 and R6. SKIP without it |
 //! | `dropcopy` | with `--dropcopy` (needs `--data` and `--finality`): an observer (`vyrn-validator`, `role = "observer"`, data destination `n + 1`, in the box's order list on both paths (R12) and every validator's `[consensus] observers`) replays every block into its output ring and finalizes from the validators' certificates; `vyrn-dropcopy` serves the ring over Noise, and one client per session logs in to its account's stream. Each stream's served records, without stage markers, equal an in-process `DropCopy` over the tap's `RustReplay` byte for byte, with gapless seqs, and end in a `DC_FINAL`; every record with a `resp_seq` (acks, cancels, outs, taker fills) names a response packet the client received (10 §8.3). It prints a DEV timing of those records after their response packets (R9); SKIP without it |
 //! | `failover` | with `--data-kill` (R13): the home data box is killed mid-run, the validators reach Q `DataDown`s and REDIRECT, the backup admits a sealed one and redirects every session, and every session moves copy 2; SKIP without it |
+//! | `voter-kill` | with `--kill-voter` (R16): at half the packets, once it has finalized a height, the last validator is killed; its blocks were the box's, and the box finalizes past the kill with the `n − 1` left. `finality` then needs the box and every running validator through the last block, with Q of the whole committee; SKIP without it |
 //! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed has no rejected frame and no gap left unrepaired (R14), and that join is the one `replay` reads; SKIP without `--data` |
 //!
 //! **Readings** (the spec does not settle these; PR body):
@@ -170,6 +172,18 @@
 //!   treats it as a pinned-core figure. The 4-session `--data-kill` step keeps its DR4 gate.
 //!   The client opens a `DataRedirect` with the key of the session in its bytes 8..12: trying
 //!   every session's key fell behind a burst of 1 600 redirects and moved half the sessions.
+//! - R16. `--kill-voter` (needs `--finality`, n ≥ 4): SIGKILL of the last validator after
+//!   half the packets, so the committee runs with `f = 1` voter gone for the rest of the run.
+//!   Every check then covers the `n − 1` running validators, while Q stays that of the whole
+//!   committee (`n − ⌊(n − 1)/3⌋`): with n = 4 every survivor's vote is needed, so any
+//!   REP_E_HASHLAG stop leaves no quorum (R6). *Reading* (harness): the victim is the last
+//!   validator, not validator 0, which `--keyed` and `--drop-path-a` single out; a crash is
+//!   SIGKILL with no stdin EOF, so it prints no `STATS` and is not stopped cleanly. At half the
+//!   packets the client pauses until the victim has finalized a height (deadline `T`), so the
+//!   victim has voted before it dies: consensus can take seconds to finalize its first height on
+//!   a loaded 2-vCPU host, after a 1 500-packet run has ended. The client's schedule then
+//!   shifts by the pause, so no burst follows it. Not with `--data-kill`, whose DR4 timing the
+//!   pause would skew.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -374,6 +388,10 @@ struct Cli {
     /// and REDIRECT, and the client moves copy 2 (R13; needs --keyed).
     #[arg(long)]
     data_kill: bool,
+    /// At half the packets, once it has finalized a height, kill the last validator (f = 1,
+    /// R16; needs --finality and at least 4 validators): the rest must finalize through the end.
+    #[arg(long)]
+    kill_voter: bool,
 }
 
 fn main() -> ExitCode {
@@ -1435,6 +1453,12 @@ fn run(cli: &Cli) -> Result<bool, String> {
     if cli.dr4_dev && !cli.data_kill {
         return Err("--dr4-dev needs --data-kill (R15)".into());
     }
+    if cli.kill_voter && (!cli.finality || n_val < 4 || cli.data_kill) {
+        return Err(
+            "--kill-voter needs --finality, at least 4 validators (f >= 1) and no --data-kill (R16)"
+                .into(),
+        );
+    }
     if cli.data_kill && !cli.keyed {
         return Err("--data-kill needs --keyed: the REDIRECTs it checks are sealed (R13)".into());
     }
@@ -1608,7 +1632,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
         })
     };
 
-    let vals: Vec<usize> = (0..n_val)
+    let mut vals: Vec<usize> = (0..n_val)
         .map(|i| {
             let data = data_node
                 .as_ref()
@@ -1792,6 +1816,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // a session's first redirect from it (DR2) moves its copy 2 and resends its retained bytes
     // from `resend_from` (DR3).
     let kill_at = backup.map(|_| pkts.len() * 2 / 5);
+    // R16 (--kill-voter): at half the packets the client waits for the victim's first FINAL,
+    // kills the last validator and resumes, its schedule shifted by the pause; the killed
+    // validator's node index and what the box had finalized then.
+    let kill_voter_at = cli.kill_voter.then_some(pkts.len() / 2);
+    let mut voter_killed: Option<(usize, Option<u64>)> = None;
     let mut killed = None;
     let mut moved: BTreeMap<SessionId, Redirect> = BTreeMap::new();
     let mut redirects_heard = 0u64;
@@ -1847,7 +1876,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
         }
         n
     };
-    let t0 = Instant::now();
+    let mut t0 = Instant::now();
     for (k, p) in pkts.iter().enumerate() {
         let at = t0 + Duration::from_nanos(p.send_ns);
         while let Some(d) = at.checked_duration_since(Instant::now()) {
@@ -1860,6 +1889,25 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     .map_err(|e| format!("kill vyrn-data-0: {e}"))?;
             }
             killed = Some((k, Instant::now()));
+        }
+        if kill_voter_at == Some(k) {
+            let paused = Instant::now();
+            let victim = vals.last().copied();
+            let up = nodes.wait(&rx, paused + wait, "the victim's first FINAL", |ns| {
+                victim
+                    .and_then(|i| ns.get(i))
+                    .is_some_and(|n| !finals(n).is_empty())
+            });
+            t0 += paused.elapsed();
+            if let (Ok(()), Some(i)) = (up, vals.pop()) {
+                let at = nodes.0.get(seq).and_then(|n| finals(n).last().copied());
+                if let Some(n) = nodes.0.get_mut(i) {
+                    n.child
+                        .kill()
+                        .map_err(|e| format!("kill {}: {e}", n.name))?;
+                }
+                voter_killed = Some((i, at));
+            }
         }
         resent += apply(
             pkts.get(..k).unwrap_or_default(),
@@ -1978,7 +2026,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // --finality: the block the box's stop closed is not in its own FINAL target, so the
     // validators still running finalize through it too, unless HASHLAG stops left no quorum
     // (R6, checked below).
-    let q = vals.len() - (vals.len().saturating_sub(1)) / 3;
+    // Q of the whole committee: R16's killed validator still counts in n.
+    let q = n_val - (n_val - 1) / 3;
     let fin_tail = if cli.finality {
         nodes.wait(
             &rx,
@@ -2435,12 +2484,13 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
             // R6: more than n − Q validators stopped at REP_E_HASHLAG leaves no quorum; the
             // box cannot finalize the rest, which is DEV timing, not a fault.
-            let no_quorum = n - lagged < q;
+            // With R16's victim counted out, it is still only a HASHLAG stop that excuses this.
+            let no_quorum = lagged > 0 && n - lagged < q;
             // R6: quorum held below the (n − Q + 1)-th smallest stop height; when that spans at
             // least two heights, the box must still have finalized from votes, so a broken vote
             // path cannot pass.
             lag_at.sort_unstable();
-            let quorum_until = lag_at.get(n - q).copied().unwrap_or(target);
+            let quorum_until = lag_at.get(n.saturating_sub(q)).copied().unwrap_or(target);
             // R6: without quorum the survivors cannot finalize the rest either.
             if !no_quorum {
                 errs.append(&mut short);
@@ -2468,7 +2518,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 ))
             } else if errs.is_empty() {
                 Ok(format!(
-                    "vyrn-seq through {target} and {} running validators through {val_target} finalized (Q = {q} of {n})",
+                    "vyrn-seq through {target} and {} running validators through {val_target} finalized (Q = {q} of {n_val})",
                     n - lagged
                 ))
             } else {
@@ -2477,6 +2527,41 @@ fn run(cli: &Cli) -> Result<bool, String> {
         });
     } else {
         Report::skip("finality", "off (enable with --finality)");
+    }
+
+    // R16: the killed validator had voted (finalized something) and its blocks were the box's;
+    // the box finalized past the kill with the n - 1 left (`finality` checks it reached the end).
+    match voter_killed {
+        Some((i, at)) => rep.check("voter-kill", {
+            let v = nodes.0.get(i).ok_or("killed validator")?;
+            let ids: Vec<_> = blocks(v).into_iter().map(|b| b.0).collect();
+            let seq_final = nodes.0.get(seq).and_then(|x| finals(x).last().copied());
+            if finals(v).is_empty() {
+                Err(format!(
+                    "{} finalized nothing before the kill ({} blocks, vyrn-seq final {at:?})",
+                    v.name,
+                    ids.len()
+                ))
+            } else if seq_blocks.get(..ids.len()) != Some(&ids[..]) {
+                Err(format!("{}: its {} blocks are not the box's", v.name, ids.len()))
+            } else if seq_final <= at.map(|h| h + 1) {
+                Err(format!(
+                    "vyrn-seq finalized through {seq_final:?} after the kill at {at:?}"
+                ))
+            } else {
+                Ok(format!(
+                    "{} killed with vyrn-seq final at {at:?}, its {} blocks the box's; {} of {n_val} finalized through {seq_final:?} (Q = {q})",
+                    v.name,
+                    ids.len(),
+                    vals.len()
+                ))
+            }
+        }),
+        None if cli.kill_voter => rep.check(
+            "voter-kill",
+            Err("the victim finalized nothing by the deadline at half the packets; not killed".into()),
+        ),
+        None => Report::skip("voter-kill", "off (enable with --kill-voter, R16)"),
     }
     // R14: validator 0 lost one path A frame and repair filled it (`finality` above checks it
     // still finalized through the last block).
