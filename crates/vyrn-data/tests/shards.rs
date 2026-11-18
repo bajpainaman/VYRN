@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 
 use vyrn_cut::Hw;
 use vyrn_data::frame::{self, Fetch, Kind, key_seq};
+use vyrn_data::redirect::Redirect;
 use vyrn_data::shards::{self, SenderRing, ShardRing};
 use vyrn_data::spread::shard_of;
 use vyrn_data::{HomeConfig, Mode, NodeConfig};
@@ -224,4 +225,34 @@ fn shards_forward_one_data_seq_per_dest_and_answer_key_fetches_from_the_owner() 
     assert_eq!(drain(&mut replicas[1]), firsts[1]);
     assert_eq!(sender.counters().fetch_resent, last);
     assert_eq!(rx.counters().hop_full, 0);
+
+    // 07 §5.7 step 3: each session's owner seals its redirect under the session key and sends
+    // it to the client; a session nobody owns is counted, not sent.
+    let mut asked: Vec<(SessionId, u32)> =
+        sessions.iter().map(|&s| (SessionId(s), s + 10)).collect();
+    asked.push((SessionId(99), 1));
+    assert_eq!(rx.redirect(1, 3, &asked, &mut to_shard), asked.len());
+    turn!(30);
+    let mut got: Vec<Redirect> = drain(&mut client_rx)
+        .iter()
+        .map(|b| {
+            let s = u32::from_le_bytes(b[8..12].try_into().unwrap());
+            Redirect::open(b, &key(s)).unwrap()
+        })
+        .collect();
+    got.sort_by_key(|r| r.session.0);
+    let want: Vec<Redirect> = sessions
+        .iter()
+        .map(|&s| Redirect {
+            down: 1,
+            to: 3,
+            session: SessionId(s),
+            resend_from: s + 10,
+        })
+        .collect();
+    assert_eq!(got, want);
+    let sum =
+        |f: fn(&vyrn_data::Counters) -> u64| cores.iter().map(|c| f(c.counters())).sum::<u64>();
+    assert_eq!(sum(|c| c.redirects), sessions.len() as u64);
+    assert_eq!(sum(|c| c.redirect_unknown), 1);
 }

@@ -11,7 +11,8 @@
 //! - **RxCore** parses the frame, reads the session from bytes 0..4 ([`session_of`]) and hands
 //!   the packet to its shard. It also runs the fetch gate ([`Gate`]) for the whole box, so a
 //!   source's rate limit and `K_fetch` are the box's, not a shard's.
-//! - **ShardCore** `i` is a whole [`DataHome`] for its sessions (07 §5.2 steps 1–5). A KEY fetch
+//! - **ShardCore** `i` is a whole [`DataHome`] for its sessions (07 §5.2 steps 1–5), and sends
+//!   their `DataRedirect`s (07 §5.7 step 3, [`RxCore::redirect`]). A KEY fetch
 //!   goes to the shard that owns its session, the only one whose ring can hold the packet, and
 //!   is answered from that ring or the log on the shard's own TX queue.
 //! - **SenderCore** owns every destination (07 §5.2 step 6, §5.3): its open frame, its
@@ -27,13 +28,14 @@
 use vyrn_cut::{Consumer, Hw, Producer, Ring};
 use vyrn_log::BlockStore;
 use vyrn_nic::frame::{self as nic_frame, Endpoint};
-use vyrn_types::{BookId, MAX_REQ_PAYLOAD, Nanos};
+use vyrn_types::{BookId, MAX_REQ_PAYLOAD, Nanos, SessionId};
 use vyrn_wire::{RX_BURST, RxPkt, RxRing, TxRing};
 
 use crate::frame::Fetch;
 use crate::ingest::{DataHome, Event};
 use crate::node::{Counters, FetchKeysErr, NodeConfig, bump};
-use crate::serve::{Fanout, Gate, Responder};
+use crate::redirect::Redirect;
+use crate::serve::{Fanout, Gate, Responder, send_to};
 use crate::spread::{session_of, shard_of};
 
 /// Entries per hop ring.
@@ -72,6 +74,13 @@ pub enum ToShard {
     },
     /// An admitted KEY or BLOCK fetch, answered to `to`.
     Fetch { to: Endpoint, q: Fetch },
+    /// 07 §5.7 step 3 for one session this shard owns.
+    Redirect {
+        down: u8,
+        to: u8,
+        session: SessionId,
+        resend_from: u32,
+    },
 }
 
 /// Shard or RX core → sender.
@@ -131,6 +140,36 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
 
     pub fn fetch_epochs(&self) -> impl Iterator<Item = u32> + '_ {
         self.gate.epochs()
+    }
+
+    /// 07 §5.7 step 3 on a sharded box: hands each `(session, resend_from)` to the shard that
+    /// owns the session, the only one that holds its MAC key and its newest copy's address.
+    /// That shard sends `DataRedirect{down → to, resend_from}` on its own TX queue, as
+    /// [`DataNode::redirect`](crate::DataNode::redirect) does. Returns how many were handed on;
+    /// the rest are counted in `hop_full`.
+    pub fn redirect(
+        &mut self,
+        down: u8,
+        to: u8,
+        sessions: &[(SessionId, u32)],
+        shards: &mut [ShardTx<'_>],
+    ) -> usize {
+        let n = shards.len();
+        let mut sent = 0;
+        for &(session, resend_from) in sessions {
+            let r = ToShard::Redirect {
+                down,
+                to,
+                session,
+                resend_from,
+            };
+            if let Some(q) = shards.get_mut(shard_of(session, n))
+                && hop(q, r, &mut self.counters)
+            {
+                sent += 1;
+            }
+        }
+        sent
     }
 
     /// One turn: an ingest burst to the shards, then a fetch burst to its owners. `shards` are
@@ -279,6 +318,28 @@ impl<T: TxRing> ShardCore<T> {
                         Fetch::Block { height } => self.resp.block(to, height, store, tx, c, cfg),
                         // The RX core sends RANGE fetches to the sender.
                         Fetch::Range { .. } => bump(&mut c.fetch_bad),
+                    }
+                }
+                ToShard::Redirect {
+                    down,
+                    to,
+                    session,
+                    resend_from,
+                } => {
+                    let h = &self.home;
+                    let (Some(dst), Some(key)) = (h.source(session), h.key(session)) else {
+                        bump(&mut self.counters.redirect_unknown);
+                        continue;
+                    };
+                    let r = Redirect {
+                        down,
+                        to,
+                        session,
+                        resend_from,
+                    };
+                    let (tx, c) = (&mut self.tx, &mut self.counters);
+                    if send_to(tx, &mut self.resp.wire, c, self.cfg.me, dst, &r.seal(key)) {
+                        bump(&mut self.counters.redirects);
                     }
                 }
             }

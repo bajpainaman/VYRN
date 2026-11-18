@@ -1212,6 +1212,13 @@ that address, so replayed bytes cannot steer a redirect. A box that never heard 
 sends it nothing and counts it; another live box has its address. Vectors: V19 (04 §11) and
 `tests/golden/vyrn_data_vectors`.
 
+**Redirects on a sharded box (reading, `vyrn-data::shards`).** The shard that owns a session
+(§5.2, RSS by session) holds its MAC key and its newest copy's address, so it seals and sends that
+session's `DataRedirect` on its own TX queue. The RX core takes the `(session, resend_from)` list
+and hands each pair to its owner. Step 3 has the replicas send `resend_from` to the boxes but names
+no message for it; until one exists, the box takes the list on its operator control channel
+(`REDIRECT <down> <to> <session>:<resend_from>,…`, DEV).
+
 Effect: fills and acks are unaffected. Blocks that reference the affected sessions cannot be voted
 until their data arrives. Finality stalls for those blocks for ≤ 1 + 0.5 + 1 + 0.5 = **3 ms**
 (budget) and then catches up (§6.7).
