@@ -318,11 +318,16 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
                 },
                 boxes: d.boxes.clone(),
                 max_range: d.max_range,
+                fetches: VecDeque::new(),
             })
         }
         None => None,
     };
-    let source = consensus::Source::default();
+    let source = if plan.is_some() {
+        consensus::Source::new()
+    } else {
+        consensus::Source::default()
+    };
     let stats = Arc::new(Stats::default());
     let stop = Arc::new(AtomicBool::new(false));
     let order = {
@@ -385,7 +390,12 @@ struct DataRx<const N: usize, R, T> {
     me: Endpoint,
     boxes: Vec<std::net::SocketAddrV4>,
     max_range: u64,
+    /// RANGE fetches not sent yet: at most `FETCH_BURST` go out per poll, the rest wait here.
+    fetches: VecDeque<(FrameHdr, Fetch)>,
 }
+
+/// RANGE fetches sent per data poll.
+const FETCH_BURST: usize = 16;
 
 impl<const N: usize, R: RxRing, T: TxRing> DataRx<N, R, T> {
     /// Polls the queue once; sends a RANGE fetch for every gap. Returns the frames taken.
@@ -417,11 +427,12 @@ impl<const N: usize, R: RxRing, T: TxRing> DataRx<N, R, T> {
                     port: to.port(),
                 },
             };
-            // At most 16 fetches per gap: a longer run is fetched by key when it stays missing.
-            for q in g.fetches(self.max_range).take(16) {
-                if let Ok(n) = frame::build(&hdr, &Fetch::encode(&q), &mut wire) {
-                    let _ = self.tx.send(wire.get(..n).unwrap_or(&[]));
-                }
+            self.fetches
+                .extend(g.fetches(self.max_range).map(|q| (hdr, q)));
+        }
+        for (hdr, q) in self.fetches.drain(..self.fetches.len().min(FETCH_BURST)) {
+            if let Ok(n) = frame::build(&hdr, &Fetch::encode(&q), &mut wire) {
+                let _ = self.tx.send(wire.get(..n).unwrap_or(&[]));
             }
         }
         k

@@ -74,39 +74,63 @@ struct Held {
     invalid_from: Option<u64>,
 }
 
-/// The voter's [`BlockSource`]. The order thread writes it; Simplex reads it.
+/// The voter's [`BlockSource`]. The order thread writes it; Simplex reads it. `default()` is
+/// the source of a box without `[consensus]`: it keeps nothing.
 #[derive(Clone, Default)]
-pub struct Source(Arc<Mutex<Held>>);
+pub struct Source(Option<Arc<Mutex<Held>>>);
 
 impl Source {
-    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    /// A source that keeps blocks for a voter, until [`Source::finalized`] drops them.
+    pub fn new() -> Self {
+        Self(Some(Arc::default()))
+    }
+
+    fn held(&self) -> Option<std::sync::MutexGuard<'_, Held>> {
+        self.0
+            .as_ref()
+            .map(|m| m.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// A header the order core accepted (its `seq_sig`, chain and steps).
     pub fn header(&self, h: BlockHeader) {
-        self.held().headers.insert(h.height.0, h);
+        if let Some(mut held) = self.held() {
+            held.headers.insert(h.height.0, h);
+        }
     }
 
     /// The block's body passed: its ORDER bytes and, when the data tier is wired, its payloads.
     pub fn valid(&self, height: Height) {
-        self.held().valid.insert(height.0);
+        if let Some(mut held) = self.held() {
+            held.valid.insert(height.0);
+        }
+    }
+
+    /// `height` is final: drop what is below it. The final block stays, as the next proposal's
+    /// parent tip.
+    fn finalized(&self, height: Height) {
+        if let Some(mut held) = self.held() {
+            held.headers = held.headers.split_off(&height.0);
+            held.valid = held.valid.split_off(&height.0);
+        }
     }
 
     /// Nothing at or above `height` may be voted for (a fault, or a data root that differs).
     pub fn invalid_from(&self, height: Height) {
-        let mut h = self.held();
-        h.invalid_from = Some(h.invalid_from.map_or(height.0, |f| f.min(height.0)));
+        if let Some(mut h) = self.held() {
+            h.invalid_from = Some(h.invalid_from.map_or(height.0, |f| f.min(height.0)));
+        }
     }
 }
 
 impl BlockSource for Source {
     fn header(&self, height: Height) -> Option<BlockHeader> {
-        self.held().headers.get(&height.0).copied()
+        self.held()?.headers.get(&height.0).copied()
     }
 
     fn check_body(&self, _: Epoch, first: Height, last: Height) -> Verdict {
-        let h = self.held();
+        let Some(h) = self.held() else {
+            return Verdict::Pending;
+        };
         if first > last || h.invalid_from.is_some_and(|f| last.0 >= f) {
             return Verdict::Invalid;
         }
@@ -135,6 +159,8 @@ pub struct Plan {
     pub observers: Vec<SocketAddr>,
     pub timeouts: Timeouts,
     pub storage: PathBuf,
+    /// `storage` is this run's temporary directory, removed at exit; a configured one is kept.
+    pub temp_storage: bool,
 }
 
 fn hex32(s: &str) -> Result<[u8; 32], String> {
@@ -268,6 +294,7 @@ impl Plan {
             observers: s.observers.clone(),
             timeouts,
             storage,
+            temp_storage: s.storage.is_none(),
         })
     }
 
@@ -296,7 +323,7 @@ pub fn run(plan: Plan, source: Source, stop: &AtomicBool) -> Result<(), String> 
     };
     let ctrl = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     let cfg = commonware_runtime::tokio::Config::new().with_storage_directory(&plan.storage);
-    let storage = plan.storage.clone();
+    let storage = plan.temp_storage.then(|| plan.storage.clone());
     let r = commonware_runtime::tokio::Runner::new(cfg).start(|ctx| async move {
         let n = net::start(
             ctx.child("net"),
@@ -314,7 +341,7 @@ pub fn run(plan: Plan, source: Source, stop: &AtomicBool) -> Result<(), String> 
                 seq_key: plan.seq_key,
                 epoch: plan.epoch,
                 genesis,
-                source,
+                source: source.clone(),
                 timeouts: plan.timeouts,
             },
         )
@@ -331,6 +358,7 @@ pub fn run(plan: Plan, source: Source, stop: &AtomicBool) -> Result<(), String> 
             tokio::select! {
                 Some(c) = out.certs.recv() => {
                     send(&ctrl::encode_cert(&c));
+                    source.finalized(c.proposal.last_height);
                     println!(
                         "FINAL height={} view={} first={} kind={} sigs={}",
                         c.proposal.last_height.0,
@@ -350,6 +378,8 @@ pub fn run(plan: Plan, source: Source, stop: &AtomicBool) -> Result<(), String> 
         engine.abort();
         Ok::<(), String>(())
     });
-    let _ = std::fs::remove_dir_all(storage);
+    if let Some(dir) = storage {
+        let _ = std::fs::remove_dir_all(dir);
+    }
     r
 }
