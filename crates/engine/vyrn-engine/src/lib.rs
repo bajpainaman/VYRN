@@ -52,7 +52,13 @@
 //!   derived from its first step's kind, because the log does not carry the live
 //!   classification. A `Cross` that STP stops before any fill is logged as `Improve`, so it
 //!   replays with the `Improve` bucket: a known divergence until the spec logs the route.
-//! - Pooled lanes (`AcctTake`), auction control steps, and the `Sim` visibility backend in tests.
+//! - Pooled lanes (`AcctTake`) and auction control steps.
+//! - On a delayed backend (`Sim`), a step's lines may become visible after `Bbo::poll`
+//!   publishes it. The stream role reads step `s` once the BBO snapshot shows `done_step ≥ s`
+//!   (published after the step's other lines) and polls the BBO core again only after that, so
+//!   a step is never read in part. [`Engine::run`] is quiet when no visible line has work.
+//!   Replay runs a non-`MID` Advance record as the lane's idle poll on the newest `LaneCut`; a
+//!   live poll that read an older `LaneCut` replays as a mismatch (follow-up).
 //!
 //! Determinism (`INV-DET`): the engine's own choices are the call order and nothing else. It
 //! reads no clock, no ring fill level for a decision, no hash-map order and no float.

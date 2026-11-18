@@ -143,6 +143,9 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     hist_id: Vec<StepId>,
     recs: Vec<Record>,
     pub(crate) scratch: Vec<PacketRecord>,
+    /// A step the BBO core published whose lines the stream role has not seen yet (a delayed
+    /// `Visibility`, such as `Sim`): read before the BBO core is polled again.
+    unread: Option<StepId>,
 }
 
 impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
@@ -240,6 +243,7 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             hist_id: vec![StepId(0); STEP_HIST],
             recs: Vec::with_capacity(TX_RECS),
             scratch: Vec::with_capacity(32),
+            unread: None,
         })
     }
 
@@ -319,7 +323,9 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
     }
 
     /// Both cut cores publish, then `decide` runs the BBO core until it publishes a step (or
-    /// [`POLLS_PER_STEP`] passes go by); then the stream and fan-out roles read the step.
+    /// [`POLLS_PER_STEP`] passes go by); then the stream and fan-out roles read the step. A
+    /// step whose lines are not visible yet stays unread: the next call reads it instead of
+    /// polling the BBO core, and returns its id then.
     pub(crate) fn drive<S: Sink>(
         &mut self,
         sink: &mut S,
@@ -330,6 +336,9 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             &LaneBook<'_, 'a>,
         ) -> Result<Poll, Diverge>,
     ) -> Result<Option<StepId>, StepErr> {
+        if let Some(s) = self.unread {
+            return self.read_step(s, sink).map_err(StepErr::Fault);
+        }
         self.publish_cut().map_err(StepErr::Fault)?;
         for _ in 0..POLLS_PER_STEP {
             let r = {
@@ -349,8 +358,8 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             };
             match r {
                 Poll::Step(s) => {
-                    self.read_step(sink).map_err(StepErr::Fault)?;
-                    return Ok(Some(s));
+                    self.unread = Some(s);
+                    return self.read_step(s, sink).map_err(StepErr::Fault);
                 }
                 Poll::Fault => return Err(StepErr::Fault(Fault::Bbo)),
                 Poll::Idle | Poll::Stalled => {}
@@ -389,7 +398,7 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
         for _ in 0..rounds {
             let stepped = self.step(clock, sink)?.is_some();
             let polled = self.poll_lanes(sink)?;
-            if !stepped && polled == 0 {
+            if !stepped && polled == 0 && self.unread.is_none() {
                 return Ok(true);
             }
         }
@@ -453,8 +462,16 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
         out
     }
 
-    /// The stream and fill TX roles read the step just published (05 §4.15, §8.10).
-    fn read_step<S: Sink>(&mut self, sink: &mut S) -> Result<(), Fault> {
+    /// The stream and fill TX roles read step `s` (05 §4.15, §8.10) once it is visible:
+    /// `Some(s)` if read, `None` if not yet. The BBO core publishes its snapshot (with
+    /// `done_step = s`) after the step's log, fill and TX lines, so a snapshot at `s` means
+    /// every line of the step is visible (each ring's lines go out in one `push_all`).
+    fn read_step<S: Sink>(&mut self, s: StepId, sink: &mut S) -> Result<Option<StepId>, Fault> {
+        let snap = match self.snap.try_read(self.vis) {
+            Some(x) if x.done_step >= s => x,
+            _ => return Ok(None),
+        };
+        self.unread = None;
         let entry = StepEntry::decode(&self.pop_log().ok_or(Fault::Ring)?);
         let n_delta = usize::from(entry.n_delta);
         let mut k = 0usize;
@@ -501,11 +518,10 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
                 },
             );
         }
-        let s = self.snap.try_read(self.vis).ok_or(Fault::Torn)?;
         for line in self.lane_snaps {
-            line.publish(self.vis, &s);
+            line.publish(self.vis, &snap);
         }
-        Ok(())
+        Ok(Some(s))
     }
 }
 
