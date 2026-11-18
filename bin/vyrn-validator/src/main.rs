@@ -1021,17 +1021,23 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 self.fetches.pop_front();
             }
         }
-        self.failover(now);
+        // A full burst may leave a box's newest frames queued: judge silence only once the
+        // queue is empty, so a stalled poll does not mark a live box down.
+        self.failover(now, k < RX_BURST);
         k + answers
     }
 
     /// 07 §5.7: gossips this replica's `DataDown`s, and once one is effective for the sessions'
     /// home sends every live box each session's REDIRECT (`failover.rs`).
-    fn failover(&mut self, now: u64) {
+    fn failover(&mut self, now: u64, drained: bool) {
         let Some(fo) = self.failover.as_mut() else {
             return;
         };
-        let silent: Vec<u8> = self.feed.silent_for(now, fo.silence_ns).collect();
+        let silent: Vec<u8> = if drained {
+            self.feed.silent_for(now, fo.silence_ns).collect()
+        } else {
+            Vec::new()
+        };
         for m in fo.silent(&silent, now) {
             for t in self.sources.peers() {
                 let _ = self

@@ -95,7 +95,14 @@
 //!   still holds: the unkeyed validators' plain REDIRECTs are malformed to a keyed box, not
 //!   forged), and `replay` still needs every packet in the tap's join, now fed by both boxes'
 //!   frames. The client paces its DR3 resends (20 µs apart): one burst of every retained packet
-//!   overflows the backup's ingest socket on a 2-vCPU host.
+//!   overflows the backup's ingest socket on a 2-vCPU host. The client keeps each sent packet
+//!   for `CLIENT_RETAIN` (100 ms, 04 DR4) and resends only those; `failover` fails if a packet
+//!   it sent to the dead home after the kill had expired before its redirect arrived, and prints
+//!   the slowest kill-to-redirect time (about 65 ms on a 2-vCPU orb). `KILL_SILENCE_US` (50 ms)
+//!   leaves the rest of the window to gossip and REDIRECT: at 20 ms the backup, busy serving
+//!   every validator's KEY fetches for the lost packets, goes silent long enough to be marked
+//!   down too; at 100 ms redirects arrive after about 114 ms and the check fails. Four sessions sit far below 07 §5.7's ~1 200-session bound, which
+//!   `bin/vyrn-validator` `failover.rs` pins in a unit test instead.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -179,7 +186,10 @@ const SEQ_XCHG: [u8; 32] = [0x7c; 32];
 /// `--data-kill` (R13): the backup data box's X25519 secret.
 const BOX1_XCHG: [u8; 32] = [0x8d; 32];
 /// `--data-kill` (R13): the validators' DEV `[data] silence_us`, for an unpinned host.
-const KILL_SILENCE_US: u64 = 100_000;
+const KILL_SILENCE_US: u64 = 50_000;
+/// `--data-kill` (R13): the client keeps a sent packet this long (`REP_CLIENT_RETAIN_MS`, 04
+/// DR4), then discards it.
+const CLIENT_RETAIN: Duration = Duration::from_millis(100);
 /// `--keyed` (R7): the relay to validator 0 drops every this-many-th datagram.
 const LOSS_EVERY: u64 = 25;
 const LANES: usize = 2;
@@ -1453,7 +1463,18 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let mut redirects_heard = 0u64;
     let mut resent = 0u64;
     let mut first_sent = std::collections::BTreeSet::new();
-    let mut apply = |sent: &[Pkt], moved: &mut BTreeMap<SessionId, Redirect>| -> u64 {
+    // R13 (04 DR4): each packet's send time; the client resends only what it still retains.
+    let mut sent_at: Vec<Instant> = Vec::with_capacity(pkts.len());
+    // Packets a redirect asked for that the client had discarded: `lost` were sent to the dead
+    // home after the kill, so only a resend reaches a live box; `aged` reached the home box
+    // before it died. And each session's kill-to-redirect time.
+    let (mut lost, mut aged) = (0u64, 0u64);
+    let mut latency: Vec<Duration> = Vec::new();
+    let mut apply = |sent: &[Pkt],
+                     at: &[Instant],
+                     kill: Option<(usize, Instant)>,
+                     moved: &mut BTreeMap<SessionId, Redirect>|
+     -> u64 {
         let mut n = 0;
         while let Ok(r) = redir_rx.try_recv() {
             redirects_heard += 1;
@@ -1462,10 +1483,23 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 continue;
             }
             moved.insert(r.session, r);
-            for p in sent
+            let now = Instant::now();
+            latency.extend(kill.map(|(_, t)| now.saturating_duration_since(t)));
+            for (k, p) in sent
                 .iter()
-                .filter(|p| p.session == r.session && p.pkt_seq >= r.resend_from)
+                .enumerate()
+                .filter(|(_, p)| p.session == r.session && p.pkt_seq >= r.resend_from)
             {
+                if at
+                    .get(k)
+                    .is_none_or(|t| now.saturating_duration_since(*t) > CLIENT_RETAIN)
+                {
+                    match kill {
+                        Some((ki, _)) if k >= ki => lost += 1,
+                        _ => aged += 1,
+                    }
+                    continue;
+                }
                 // Paced: an unpaced burst of every retained packet overflows the backup's
                 // ingest socket on a small host (R13).
                 let _ = cl_sock.send_to(&p.bytes, b.ingest);
@@ -1487,11 +1521,17 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     .kill()
                     .map_err(|e| format!("kill vyrn-data-0: {e}"))?;
             }
-            killed = Some(k);
+            killed = Some((k, Instant::now()));
         }
-        resent += apply(pkts.get(..k).unwrap_or_default(), &mut moved);
+        resent += apply(
+            pkts.get(..k).unwrap_or_default(),
+            &sent_at,
+            killed,
+            &mut moved,
+        );
         let dst = lane_addrs.get(usize::from(p.lane)).ok_or("lane address")?;
         cl_sock.send_to(&p.bytes, dst).map_err(|e| e.to_string())?;
+        sent_at.push(Instant::now());
         // Copy 2 (07 §5.1): the client sends the same bytes to the data node.
         let home = match (moved.contains_key(&p.session), backup) {
             (true, Some(b)) => Some(b.ingest),
@@ -1517,7 +1557,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let moved_wait = if backup.is_some() {
         let until = Instant::now() + wait;
         while moved.len() < sessions.len() && Instant::now() < until {
-            resent += apply(&pkts, &mut moved);
+            resent += apply(&pkts, &sent_at, killed, &mut moved);
             std::thread::park_timeout(Duration::from_millis(5));
         }
         Some(moved.len())
@@ -2220,6 +2260,15 @@ fn run(cli: &Cli) -> Result<bool, String> {
             if killed.is_none() {
                 errs.push("the home box was not killed".into());
             }
+            // 04 DR4: a packet sent to the dead home is recovered only by a resend, so its
+            // redirect must arrive while the client still retains it.
+            let worst = latency.iter().max().copied().unwrap_or_default();
+            if lost > 0 {
+                errs.push(format!(
+                    "{lost} packets sent to the dead home had expired (DR4, {} ms) before their redirect; slowest kill-to-redirect {worst:?}",
+                    CLIENT_RETAIN.as_millis()
+                ));
+            }
             if n_moved != sessions.len() {
                 errs.push(format!("{n_moved} of {} sessions moved copy 2", sessions.len()));
             }
@@ -2229,12 +2278,13 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 .collect();
             if errs.is_empty() {
                 Ok(format!(
-                    "home box killed after {} packets; DATA_DOWN {}; validator-0 sent {} sealed REDIRECTs, the backup admitted and sent {}; the client heard {redirects_heard}, moved {n_moved} sessions (resend_from {}) and resent {resent} packets",
-                    killed.unwrap_or(0),
+                    "home box killed after {} packets; DATA_DOWN {}; validator-0 sent {} sealed REDIRECTs, the backup admitted and sent {}; the client heard {redirects_heard}, moved {n_moved} sessions (resend_from {}) and resent {resent} packets; DR4 ({} ms): slowest kill-to-redirect {worst:?}, 0 lost after the kill, {aged} older ones discarded",
+                    killed.map_or(0, |k| k.0),
                     votes.join(" "),
                     v0_redirects.unwrap_or(0),
                     admitted.unwrap_or(0),
-                    from.join(" ")
+                    from.join(" "),
+                    CLIENT_RETAIN.as_millis()
                 ))
             } else {
                 Err(errs.join("; "))
