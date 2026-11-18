@@ -455,7 +455,10 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
                 self.release(old_leg);
             }
             self.end_replaced(v);
-            let d = if kind == FillKind::Out && ev.cause != OUT_FINISHED {
+            // `Reject STP` (04 §6.8) ends an order that was in the matching step, as an `Out`
+            // does: later ops find it ended by the exchange, not canceled.
+            let stp = kind == FillKind::Reject && ev.cause == RejectReason::Stp.code();
+            let d = if (kind == FillKind::Out && ev.cause != OUT_FINISHED) || stp {
                 PROTO_D_OUT
             } else {
                 PROTO_D_CANCELED

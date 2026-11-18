@@ -35,8 +35,10 @@
 //!
 //! **Rejects and outcomes this core decides** (05 §2.3–§2.5, §8.5): `BOOK_HALTED` (P1),
 //! `AUCTION_PHASE` (Frozen), `TOO_LATE` (a `Replace` or dependency `Cancel` whose order had no
-//! open quantity), `POST_ONLY_WOULD_CROSS`, `FOK_UNFILLABLE`, `BUSY` (`Shed`), and `Out` with
-//! causes `IOC_REST`, `STP` and `AUCTION`. Every other reject is the lane's.
+//! open quantity), `POST_ONLY_WOULD_CROSS`, `FOK_UNFILLABLE`, `BUSY` (`Shed`), `STP` (a
+//! forwarded aggressor with no fill yet, detail = the resting handle, 04 §6.8), and `Out` with
+//! causes `IOC_REST`, `STP` (after a fill, and every `Rescan` taker) and `AUCTION`. Every other
+//! reject is the lane's.
 //!
 //! **Not on the pinned path.** [`mem`] is an in-memory [`BookSource`] for tests, `vyrn-sim`
 //! and oracle bindings.

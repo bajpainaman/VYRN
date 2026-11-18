@@ -697,10 +697,158 @@ fn two_refused_replaces_in_a_row_stay_refused() {
 }
 
 #[test]
+fn stp_cancel_newest_rejects_before_a_fill_and_outs_after_one() {
+    // 04 §6.8 mode 1: an aggressor with no fill yet gets `Reject STP`, detail = the resting
+    // handle; after some fills it gets `Out STP` with qty out = remaining. One lane, account 1.
+    // Case A: own ask 1 @ 102, CancelNewest buy 1 @ 102 (msg index 3) → Reject, maker stays.
+    // Case B: account 2's ask 1 @ 101 and own ask 1 @ 102; CancelNewest buy 3 @ 102. Step 1
+    // fills 1 @ 101 (one level per step, D14); the CONT step meets the own ask → Out STP, qty 2.
+    // Case C: account 2's ask 1 @ 102, then own ask 1 @ 102 (same level); CancelNewest buy 3 @
+    // 102. One step, not CONT: Fill 1, then Out STP, qty 2 (a fill came first in this step).
+    let f = OrderFlags::new(Side::Buy, Tif::Day, false, Stp::CancelNewest);
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    let own = rest(&mut x, &mut bbo, 1, 10, Side::Sell, 102, 1, 1);
+    let (q, _) = x.forward(1, 20, f, 102, 1, 1, 3, &[], BIG_DEADLINE);
+    x.publish_cut();
+    let s = step_src(&mut x, &mut bbo, 1);
+    assert!(s.fills().is_empty());
+    let ends: Vec<(usize, u8, u16, u32)> = s
+        .events
+        .iter()
+        .filter(|(_, e)| matches!(e.fill_kind(), Some(FillKind::Out | FillKind::Reject)))
+        .map(|(l, e)| (*l, e.kind, e.cause, e.qty))
+        .collect();
+    assert_eq!(
+        ends,
+        vec![(1, FillKind::Reject.code(), RejectReason::Stp.code(), 1)]
+    );
+    assert_eq!(
+        s.role(ROLE_TAKER),
+        vec![vec![Record::Reject {
+            index: 3,
+            reason: RejectReason::Stp,
+            detail: Handle::new(own, vyrn_bbo::mem::MEM_GEN).unwrap().0,
+            client_tag: u32::try_from(q).unwrap() + 1000,
+        }]]
+    );
+    assert_eq!(bbo.bounds().1, Tick(102), "CancelNewest leaves the maker");
+
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    rest(&mut x, &mut bbo, 1, 10, Side::Sell, 101, 1, 2);
+    rest(&mut x, &mut bbo, 1, 11, Side::Sell, 102, 1, 1);
+    let (q, slot) = x.forward(1, 20, f, 102, 3, 1, 3, &[], BIG_DEADLINE);
+    x.publish_cut();
+    let s1 = step_src(&mut x, &mut bbo, 1);
+    assert_eq!(
+        s1.fills(),
+        vec![(1, LIQ_MAKER, 101, 1), (1, LIQ_TAKER, 101, 1)]
+    );
+    let s2 = x.step(&mut bbo, &CLK);
+    assert_eq!(s2.entry.flags & STEP_CONT, STEP_CONT);
+    assert!(s2.fills().is_empty());
+    assert_eq!(
+        s2.role(ROLE_TAKER),
+        vec![vec![Record::Out {
+            index: 3,
+            cause: OUT_STP,
+            handle: Handle::new(slot, vyrn_bbo::mem::MEM_GEN).unwrap(),
+            qty: Qty(2),
+            client_tag: u32::try_from(q).unwrap() + 1000,
+        }]]
+    );
+
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    rest(&mut x, &mut bbo, 1, 10, Side::Sell, 102, 1, 2);
+    rest(&mut x, &mut bbo, 1, 11, Side::Sell, 102, 1, 1);
+    let (q, slot) = x.forward(1, 20, f, 102, 3, 1, 3, &[], BIG_DEADLINE);
+    x.publish_cut();
+    let s = step_src(&mut x, &mut bbo, 1);
+    assert_eq!(s.entry.flags & STEP_CONT, 0);
+    let h = Handle::new(slot, vyrn_bbo::mem::MEM_GEN).unwrap();
+    assert_eq!(
+        s.role(ROLE_TAKER),
+        vec![vec![
+            Record::Fill {
+                index: 3,
+                liq: LIQ_TAKER,
+                handle: h,
+                tick: Tick(102),
+                qty: Qty(1),
+            },
+            Record::Out {
+                index: 3,
+                cause: OUT_STP,
+                handle: h,
+                qty: Qty(2),
+                client_tag: u32::try_from(q).unwrap() + 1000,
+            }
+        ]]
+    );
+    assert!(!bbo.continuing());
+}
+
+#[test]
+fn continuing_is_true_only_while_a_cont_step_is_pending() {
+    // D14: one level or ENG_STEP_FILLS per step; the rest of the sweep is a CONT step.
+    // Forwarded: account 2's asks 1 @ 101 and 1 @ 102; account 1 buys 2 @ 102. Step 1 fills
+    // 101 and is capped; the CONT step fills 102 and ends the sweep.
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    assert!(!bbo.continuing(), "at rest");
+    rest(&mut x, &mut bbo, 1, 10, Side::Sell, 101, 1, 2);
+    rest(&mut x, &mut bbo, 1, 11, Side::Sell, 102, 1, 2);
+    assert!(!bbo.continuing(), "a resting order leaves no continuation");
+    x.forward(1, 20, day(Side::Buy), 102, 2, 1, 0, &[], BIG_DEADLINE);
+    x.publish_cut();
+    let s1 = step_src(&mut x, &mut bbo, 1);
+    assert_eq!(s1.entry.flags & STEP_CONT, 0);
+    assert!(bbo.continuing(), "capped forwarded sweep");
+    let s2 = x.step(&mut bbo, &CLK);
+    assert_eq!(s2.entry.flags & STEP_CONT, STEP_CONT);
+    assert_eq!(
+        s2.fills(),
+        vec![(1, LIQ_MAKER, 102, 1), (1, LIQ_TAKER, 102, 1)]
+    );
+    assert!(!bbo.continuing(), "the CONT step completed the sweep");
+
+    // Rescan: a stale lane-1 CancelOldest buy of 1 @ 102 meets 8 own asks (8 STP kills fill
+    // the cap), then the CONT step fills lane 0's ask.
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    stale_bid_105(&mut x, &mut bbo);
+    rest(&mut x, &mut bbo, 0, 50, Side::Sell, 102, 1, 2);
+    for i in 0..8u64 {
+        x.join(1, 30 + i, day(Side::Sell), 102, 1, 1);
+    }
+    let f = OrderFlags::new(Side::Buy, Tif::Day, false, Stp::CancelOldest);
+    x.join(1, 40, f, 102, 1, 1);
+    x.publish_cut();
+    assert!(!bbo.continuing());
+    let mut capped = false;
+    for _ in 0..16 {
+        let s = x.step(&mut bbo, &CLK);
+        if s.kind() == StepKind::Rescan && s.of(FillKind::Out).len() == 8 {
+            capped = true;
+            break;
+        }
+        assert!(!bbo.continuing(), "{:?}", s.kind());
+    }
+    assert!(capped, "the capped Rescan ran");
+    assert!(bbo.continuing(), "capped Rescan batch taker");
+    let c = x.step(&mut bbo, &CLK);
+    assert_eq!(c.entry.flags & STEP_CONT, STEP_CONT);
+    assert_eq!(c.kind(), StepKind::Rescan);
+    assert!(!bbo.continuing(), "the batch taker finished");
+}
+
+#[test]
 fn stp_spans_pooled_lanes_only() {
     // Account 1 on lanes 1 and 2 (05 §6.9: a pooled acct_ix is pool-wide). Lane 2's ask of 1 @
-    // 102; lane 1's CancelNewest buy of 1 @ 102 for account 1. Pooled {1, 2}: Out STP, no
-    // fill. Dedicated lanes: acct_ix 1 on lane 1 and on lane 2 are different accounts, so
+    // 102; lane 1's CancelNewest buy of 1 @ 102 for account 1. Pooled {1, 2}: Reject STP
+    // (04 §6.8, no fill yet), no fill. Dedicated lanes: acct_ix 1 on lane 1 and on lane 2 are different accounts, so
     // they trade.
     for (pool, trades) in [(0b110u64, false), (0, true)] {
         let mut c = cfg();
@@ -720,12 +868,16 @@ fn stp_spans_pooled_lanes_only() {
             );
         } else {
             assert!(s.fills().is_empty());
-            let outs: Vec<(usize, u16)> = s
-                .of(FillKind::Out)
+            let ends: Vec<(usize, u8, u16)> = s
+                .events
                 .iter()
-                .map(|(l, e)| (*l, e.cause))
+                .filter(|(_, e)| matches!(e.fill_kind(), Some(FillKind::Out | FillKind::Reject)))
+                .map(|(l, e)| (*l, e.kind, e.cause))
                 .collect();
-            assert_eq!(outs, vec![(1, OUT_STP)]);
+            assert_eq!(
+                ends,
+                vec![(1, FillKind::Reject.code(), RejectReason::Stp.code())]
+            );
             assert_eq!(bbo.bounds().1, Tick(102), "CancelNewest leaves the maker");
         }
     }

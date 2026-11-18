@@ -133,6 +133,9 @@ struct Taker {
     v: OrderSlot,
     vslot: u32,
     seq: LaneSeq,
+    /// A forwarded op's first step (not `CONT`): its fills so far are this sweep's, so STP
+    /// can tell "no fill yet" (04 §6.8). `false` on `CONT` steps and for `Rescan` takers.
+    first: bool,
 }
 
 impl Taker {
@@ -313,6 +316,14 @@ impl Bbo {
             phase: self.phase.code(),
             flags: u8::from(self.phase != Phase::Continuous),
         }
+    }
+
+    /// `true` iff the next step must be a `CONT` step: a capped forwarded sweep or a capped
+    /// `Rescan` batch taker resumes before any other step (D14, 05 §8.6). Replay of a log that
+    /// carries no `CONT` flag (07's `StepRecord`) sets [`ReplayStep::cont`] from this; while it
+    /// is `true`, [`Bbo::replay_step`] refuses any non-`CONT` step.
+    pub fn continuing(&self) -> bool {
+        self.cont.is_some() || self.rcont.is_some()
     }
 
     /// Bounds `(B, A)` (05 §8.6, `INV-ENG-4`).
@@ -1182,12 +1193,12 @@ impl Bbo {
         }
     }
 
-    fn reject_taker(&mut self, t: &Taker, role: Role, reason: RejectReason) {
+    fn reject_taker(&mut self, t: &Taker, role: Role, reason: RejectReason, detail: u32) {
         let rec = match role {
             Role::Fwd { index, tag, .. } => Some(Record::Reject {
                 index,
                 reason,
-                detail: 0,
+                detail,
                 client_tag: tag,
             }),
             Role::Batch => None,
@@ -1275,6 +1286,7 @@ impl Bbo {
         let mut levels = 0u32;
         let mut work = 0u32;
         let mut from = from;
+        let open0 = t.open(&self.st);
         loop {
             if t.open(&self.st) == 0 {
                 return Sweep::Open;
@@ -1311,7 +1323,14 @@ impl Bbo {
                     if level_qty > 0 {
                         self.taker_level(t, role, lvl, level_qty);
                     }
-                    self.out_taker(t, role, OUT_STP);
+                    // 04 §6.8: `Reject STP` with the resting handle before any fill of the
+                    // aggressor, `Out STP` after one. A `Rescan` taker already rests, so
+                    // it always gets `Out` (its record is the lane's).
+                    if t.first && t.open(&self.st) == open0 {
+                        self.reject_taker(t, role, RejectReason::Stp, m.handle().0);
+                    } else {
+                        self.out_taker(t, role, OUT_STP);
+                    }
                     return Sweep::Killed;
                 }
                 let q = open.min(m.open);
@@ -1392,6 +1411,7 @@ impl Bbo {
             v,
             vslot: e.vslot,
             seq: e.lane_seq,
+            first: !cont,
         };
         let tag = if e.msg_type() == MSG_NEW {
             e.client_tag()
@@ -1472,11 +1492,11 @@ impl Bbo {
         let ioc = matches!(t.tif(), Tif::Ioc | Tif::Fok);
         match self.phase {
             Phase::Halted => {
-                self.reject_taker(t, role, RejectReason::BookHalted);
+                self.reject_taker(t, role, RejectReason::BookHalted, 0);
                 return true;
             }
             Phase::Frozen => {
-                self.reject_taker(t, role, RejectReason::AuctionPhase);
+                self.reject_taker(t, role, RejectReason::AuctionPhase, 0);
                 return true;
             }
             Phase::Auction if ioc => {
@@ -1484,14 +1504,14 @@ impl Bbo {
                 return true;
             }
             Phase::Continuous if t.tif() == Tif::AuctionOnly => {
-                self.reject_taker(t, role, RejectReason::AuctionPhase);
+                self.reject_taker(t, role, RejectReason::AuctionPhase, 0);
                 return true;
             }
             _ => {}
         }
         if t.v.kind == SlotKind::NewPrio {
             if !self.st.replace_ok(t.lane, t.vslot, &t.v) {
-                self.reject_taker(t, role, RejectReason::TooLate);
+                self.reject_taker(t, role, RejectReason::TooLate, 0);
                 return true;
             }
             let r = self.st.root(t.lane, t.v.root, t.v.gen_);
@@ -1539,13 +1559,13 @@ impl Bbo {
         }
         let opp = t.side.opposite();
         if t.v.flags.post_only() && self.touch(src, c, opp, t.tick).is_some() {
-            self.reject_taker(t, role, RejectReason::PostOnlyWouldCross);
+            self.reject_taker(t, role, RejectReason::PostOnlyWouldCross, 0);
             return true;
         }
         if t.tif() == Tif::Fok {
             let need = t.open(&self.st);
             if self.fillable(src, t, c, need) < need {
-                self.reject_taker(t, role, RejectReason::FokUnfillable);
+                self.reject_taker(t, role, RejectReason::FokUnfillable, 0);
                 return true;
             }
         }
@@ -1954,6 +1974,7 @@ impl Bbo {
             v,
             vslot: slot,
             seq: v.ins_seq,
+            first: false,
         };
         // Live just after its own key: (ts, rank, seq + 1) orders after it and before every
         // other op (05 §5.2).
@@ -1977,7 +1998,7 @@ impl Bbo {
             && v.flags.post_only()
             && next_level(&self.ctx(src, c, prev, Some(key)), side, from, t.tick).is_some()
         {
-            self.reject_taker(&t, Role::Batch, RejectReason::PostOnlyWouldCross);
+            self.reject_taker(&t, Role::Batch, RejectReason::PostOnlyWouldCross, 0);
             return Sweep::Killed;
         }
         // Capped like a forwarded sweep (D14): one level or ENG_STEP_FILLS per step.
