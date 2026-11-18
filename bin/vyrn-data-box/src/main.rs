@@ -428,9 +428,15 @@ struct Shared {
     rx_done: AtomicBool,
     /// Shards that drained their ring after `rx_done`.
     shards_done: AtomicU64,
-    /// The first core that could not start (pinning), and the start barrier.
+    /// The first core that could not start (pinning).
     failed: std::sync::OnceLock<String>,
-    started: std::sync::Barrier,
+    /// Cores that have pinned and wait for `go`.
+    started: AtomicU64,
+    /// Every core started: run.
+    go: AtomicBool,
+    /// A core thread could not be created: every core returns at once, so the scope's join
+    /// never waits on a core blocked for a peer that does not exist.
+    abort: AtomicBool,
     cpus: Vec<usize>,
 }
 
@@ -440,7 +446,7 @@ impl Shared {
     }
 
     /// Pins core `k` (0 RX, 1 sender, 2 + i shard i) when `[shards] cpus` is set, then waits
-    /// for every core and the main thread.
+    /// for the main thread's `go` (or `abort`).
     fn start(&self, k: usize, name: &str) {
         if let Some(&cpu) = self.cpus.get(k)
             && let Err(e) = vyrn_nic::sys::pin_current_thread(cpu)
@@ -448,7 +454,14 @@ impl Shared {
             let _ = self.failed.set(format!("pin {name} to cpu {cpu}: {e}"));
             self.stop.store(true, Ordering::Release);
         }
-        self.started.wait();
+        self.started.fetch_add(1, Ordering::AcqRel);
+        while !self.go.load(Ordering::Acquire) && !self.aborted() {
+            std::thread::yield_now();
+        }
+    }
+
+    fn aborted(&self) -> bool {
+        self.abort.load(Ordering::Acquire)
     }
 }
 
@@ -544,7 +557,9 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
         rx_done: AtomicBool::new(false),
         shards_done: AtomicU64::new(0),
         failed: std::sync::OnceLock::new(),
-        started: std::sync::Barrier::new(n + 3),
+        started: AtomicU64::new(0),
+        go: AtomicBool::new(false),
+        abort: AtomicBool::new(false),
         cpus: cfg.shards.cpus.clone(),
     };
     // Control input on stdin, one line each (crate docs, Control): `EPOCH <e>` moves the fetch
@@ -607,6 +622,11 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
     let mut total = Counters::default();
     std::thread::scope(|sc| -> Result<(), String> {
         let (shared, store, hand_over) = (&shared, &store, &hand_over);
+        // A spawn error stops every core already started before the scope joins them.
+        let abort = |e: String| {
+            shared.abort.store(true, Ordering::Release);
+            e
+        };
         let spawn = |name: String| std::thread::Builder::new().name(name);
         let rx_core = spawn("vyrn-data/rx".into())
             .spawn_scoped(sc, {
@@ -614,7 +634,7 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
                 move || {
                     shared.start(0, "rx");
                     let mut published = Instant::now();
-                    while !shared.stop.load(Ordering::Acquire) {
+                    while !shared.stop.load(Ordering::Acquire) && !shared.aborted() {
                         let work = rx.poll(shared.now(), &mut to_shard, &mut rx_out);
                         while let Ok(l) = ctl.try_recv() {
                             control(&l, keys, &mut rx, acks);
@@ -632,7 +652,7 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
                     *rx.counters()
                 }
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| abort(e.to_string()))?;
         let mut shard_threads = Vec::with_capacity(n);
         for (i, ((mut core, mut input), mut out)) in
             cores.into_iter().zip(shard_in).zip(to_sender).enumerate()
@@ -643,7 +663,7 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
                     shared.start(2 + i, &format!("shard {i}"));
                     let mut published = Instant::now();
                     drain_loop(
-                        || shared.rx_done.load(Ordering::Acquire),
+                        || shared.aborted() || shared.rx_done.load(Ordering::Acquire),
                         || {
                             let w = core.poll(&mut input, &mut out, store);
                             // Never block a shard on stdout: a full queue drops and counts.
@@ -659,7 +679,7 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
                     ex.publish(core.counters());
                     *core.counters()
                 })
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| abort(e.to_string()))?;
             shard_threads.push(t);
         }
         let sender_core = spawn("vyrn-data/sender".into())
@@ -669,7 +689,10 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
                     shared.start(1, "sender");
                     let mut published = Instant::now();
                     drain_loop(
-                        || shared.shards_done.load(Ordering::Acquire) == n as u64,
+                        || {
+                            shared.aborted()
+                                || shared.shards_done.load(Ordering::Acquire) == n as u64
+                        },
                         || {
                             let w = sender.poll(shared.now(), &mut sender_in);
                             if published.elapsed() >= PUBLISH {
@@ -684,9 +707,12 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
                     *sender.counters()
                 }
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| abort(e.to_string()))?;
 
-        shared.started.wait();
+        while shared.started.load(Ordering::Acquire) < n as u64 + 2 {
+            std::thread::yield_now();
+        }
+        shared.go.store(true, Ordering::Release);
         if shared.failed.get().is_none() {
             println!("READY vyrn-data ingest={in_addr} fetch={fetch_addr} metrics={maddr}");
             let _ = std::io::stdout().flush();
@@ -711,7 +737,7 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
                         eof.store(true, Ordering::Release);
                     }
                 })
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| abort(e.to_string()))?;
             while !eof.load(Ordering::Acquire) && !shared.stop.load(Ordering::Acquire) {
                 std::thread::park_timeout(Duration::from_millis(20));
             }

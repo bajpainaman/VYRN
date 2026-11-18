@@ -347,6 +347,7 @@ pub fn split<R: RxRing, F: RxRing, T: TxRing>(
     tx: T,
 ) -> (RxCore<R, F>, Vec<ShardCore<T>>, SenderCore<T>) {
     let n = shard_tx.len();
+    let lite = lite(cfg);
     let rx = RxCore {
         ingest,
         fetch,
@@ -359,7 +360,7 @@ pub fn split<R: RxRing, F: RxRing, T: TxRing>(
         .map(|(i, tx)| ShardCore {
             home: DataHome::new(cfg.home.shard(i, n)),
             events: Vec::with_capacity(cfg.max_events),
-            cfg: cfg.clone(),
+            cfg: lite.clone(),
             tx,
             resp: Responder::default(),
             counters: Counters::default(),
@@ -367,9 +368,38 @@ pub fn split<R: RxRing, F: RxRing, T: TxRing>(
         .collect();
     let sender = SenderCore {
         fanout: Fanout::new(cfg),
-        cfg: cfg.clone(),
+        cfg: lite,
         tx,
         counters: Counters::default(),
     };
     (rx, shards, sender)
+}
+
+/// `cfg` without its key tables, for the shards and the sender: they read only timers, limits
+/// and addresses, so every session's MAC key and every requester's `K_fetch` stay where they
+/// are used (a shard's own `DataHome`, the RX core's gate), once each.
+fn lite(cfg: &NodeConfig) -> NodeConfig {
+    let h = &cfg.home;
+    NodeConfig {
+        home: crate::HomeConfig {
+            mode: h.mode,
+            books: h.books.clone(),
+            keys: std::collections::BTreeMap::new(),
+            ring_slots: h.ring_slots,
+            index_key: h.index_key,
+        },
+        src: cfg.src,
+        me: cfg.me,
+        dests: cfg.dests.clone(),
+        batch_ns: cfg.batch_ns,
+        hb_ns: cfg.hb_ns,
+        history: cfg.history,
+        max_range: cfg.max_range,
+        log_scan: cfg.log_scan,
+        max_events: cfg.max_events,
+        fetch_keys: std::collections::BTreeMap::new(),
+        fetch_epoch: cfg.fetch_epoch,
+        fetch_rate: cfg.fetch_rate,
+        fetch_burst: cfg.fetch_burst,
+    }
 }
