@@ -297,8 +297,14 @@ fn shards_forward_one_data_seq_per_dest_and_answer_key_fetches_from_the_owner() 
     sorted.sort_unstable();
     let entries: Vec<(SessionId, u32)> = sorted.iter().map(|&s| (SessionId(s), s + 30)).collect();
     let batch = vyrn_data::frame::RedirectBatch::encode(2, 3, &entries).unwrap();
+    let rx_bad = rx.counters().fetch_bad;
     inject(&nic, client, me_fetch, &batch);
     turn!(40);
+    assert_eq!(
+        rx.counters().fetch_bad,
+        rx_bad,
+        "the RX core admits the batch"
+    );
     let mut got: Vec<Redirect> = drain(&mut client_rx)
         .iter()
         .map(|b| {

@@ -286,8 +286,10 @@ def main():
         say(f"batch_err {name} {hx(b)} {why}")
         add("batch_err", name, hex=hx(b), reason=why)
     good = batch(2, 5, [(3, 7), (11, 0)])
-    say(f"batch_auth pair {hx(kf)} {hx(good)} {hx(seal(good, kf))}")
-    add("batch_auth", "pair", key=hx(kf), plain=hx(good), sealed=hx(seal(good, kf)))
+    for name, b in [("pair", good), ("max", batch(1, 3, full))]:
+        assert name != "max" or len(seal(b, kf)) == 1472
+        say(f"batch_auth {name} {hx(kf)} {hx(b)} {hx(seal(b, kf))}")
+        add("batch_auth", name, key=hx(kf), plain=hx(b), sealed=hx(seal(b, kf)))
     sealed = seal(good, kf)
     for name, b, why in [
         ("bad_tag", sealed[:-1] + bytes([sealed[-1] ^ 1]), "Tag"),

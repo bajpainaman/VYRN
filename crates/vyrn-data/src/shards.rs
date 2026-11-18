@@ -112,6 +112,27 @@ fn hop<T: Copy, const N: usize>(p: &mut Producer<'_, T, N, 1, Hw>, v: T, c: &mut
     ok
 }
 
+/// Hands one `(session, resend_from)` of a `down → to` move to the shard that owns the session
+/// (07 §5.7 step 3): the operator line, kind 4 and each kind-5 entry. `false` when its ring is
+/// full (counted in `hop_full`).
+fn redirect_to_owner(
+    shards: &mut [ShardTx<'_>],
+    (down, to): (u8, u8),
+    (session, resend_from): (SessionId, u32),
+    c: &mut Counters,
+) -> bool {
+    let n = shards.len();
+    let r = ToShard::Redirect {
+        down,
+        to,
+        session,
+        resend_from,
+    };
+    shards
+        .get_mut(shard_of(session, n))
+        .is_some_and(|q| hop(q, r, c))
+}
+
 /// The RX core: both RX queues and the fetch gate.
 pub struct RxCore<R: RxRing, F: RxRing> {
     ingest: R,
@@ -154,22 +175,10 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
         sessions: &[(SessionId, u32)],
         shards: &mut [ShardTx<'_>],
     ) -> usize {
-        let n = shards.len();
-        let mut sent = 0;
-        for &(session, resend_from) in sessions {
-            let r = ToShard::Redirect {
-                down,
-                to,
-                session,
-                resend_from,
-            };
-            if let Some(q) = shards.get_mut(shard_of(session, n))
-                && hop(q, r, &mut self.counters)
-            {
-                sent += 1;
-            }
-        }
-        sent
+        sessions
+            .iter()
+            .filter(|&&e| redirect_to_owner(shards, (down, to), e, &mut self.counters))
+            .count()
     }
 
     /// One turn: an ingest burst to the shards, then a fetch burst to its owners. `shards` are
@@ -216,16 +225,8 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
                 Some(FetchMsg::One(q)) => q,
                 // Each entry to its owning shard, exactly as a kind-4 REDIRECT.
                 Some(FetchMsg::Batch(b)) => {
-                    for (session, resend_from) in b.entries() {
-                        let r = ToShard::Redirect {
-                            down: b.down,
-                            to: b.to,
-                            session,
-                            resend_from,
-                        };
-                        if let Some(s) = shards.get_mut(shard_of(session, n_shards)) {
-                            hop(s, r, &mut self.counters);
-                        }
+                    for e in b.entries() {
+                        redirect_to_owner(shards, (b.down, b.to), e, &mut self.counters);
                     }
                     continue;
                 }
@@ -256,15 +257,12 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
                     down,
                     to,
                 } => {
-                    let r = ToShard::Redirect {
-                        down,
-                        to,
-                        session,
-                        resend_from,
-                    };
-                    if let Some(s) = shards.get_mut(shard_of(session, n_shards)) {
-                        hop(s, r, &mut self.counters);
-                    }
+                    redirect_to_owner(
+                        shards,
+                        (down, to),
+                        (session, resend_from),
+                        &mut self.counters,
+                    );
                     continue;
                 }
             };

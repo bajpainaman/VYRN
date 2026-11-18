@@ -523,6 +523,13 @@ impl<'a> RedirectBatch<'a> {
     /// The plain bytes of a batch, checked as [`RedirectBatch::decode`] checks them. Senders
     /// sort `entries` by session first.
     pub fn encode(down: u8, to: u8, entries: &[(SessionId, u32)]) -> Result<Vec<u8>, FrameErr> {
+        // Positions, then the count, before any buffer is built (the order decode reports).
+        if down >= MAX_DATA_POS || to >= MAX_DATA_POS || down == to {
+            return Err(FrameErr::Position);
+        }
+        if entries.is_empty() || entries.len() > MAX_BATCH {
+            return Err(FrameErr::Count);
+        }
         let count = u16::try_from(entries.len()).map_err(|_| FrameErr::Count)?;
         let mut b = Vec::with_capacity(BATCH_HDR_BYTES + entries.len() * BATCH_ENTRY_BYTES + 8);
         b.extend_from_slice(&FETCH_MAGIC.to_le_bytes());

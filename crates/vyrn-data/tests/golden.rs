@@ -293,6 +293,6 @@ fn redirect_batches_match_the_published_vectors() {
             _ => {}
         }
     }
-    assert_eq!((ok, err, auth), (3, 13, 5));
+    assert_eq!((ok, err, auth), (3, 13, 6));
     assert_eq!(MAX_BATCH, 181);
 }

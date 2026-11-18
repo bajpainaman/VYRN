@@ -402,13 +402,13 @@
   {
    "asciiIndex": 14,
    "heading": "7.6 Catch-up from snapshot plus log",
-   "line": 1868,
+   "line": 1872,
    "ascii": " t0 ── subscribe to live frames + data; verify and vote at once (votes need no history) ──────────►\n  │\n  ├─ fetch the newest snapshot ≤ the newest RootCert (local NVMe, else peers via REPAIR, else archive)\n  ├─ verify it (§7.5)\n  ├─ fetch finalized blocks snapshot.height+1 .. live, striped by height across all peers\n  │     (block record + cert, §8.2), verify certs and roots, write them to the local journal\n  ├─ replay at max speed; buffer live input; live input already counts toward votes\n  └─ replay lag ≤ REP_LIVE_LAG_MS (10 ms): the replica joins root votes and is \"caught up\""
   },
   {
    "asciiIndex": 15,
    "heading": "8.2 Block journal",
-   "line": 1923,
+   "line": 1927,
    "ascii": "REP_BlockRecord   (4 KiB aligned, on drive h mod 12)\n  off size field\n    0   8  magic \"PBBLK001\"         8 8 height        16 4 epoch     20 1 tenure   21 1 kind (0 normal, 1 seal)\n   22   2  reserved                24 190 BlockHeader (§3.10)\n  214   4  order_len              218 4 hash_len       222 4 data_len 226 4 n_unavail  230 26 reserved\n  256   …  order bytes │ pkt_hash list (8 B × records) │ data bytes (O-order; self-delimiting by count)\n           │ unavailable (session, pkt_seq) list │ pad to 4 KiB"
   }
  ],

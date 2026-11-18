@@ -115,8 +115,9 @@
 //! **Authentication and rate (*reading*, recorded in 07 §5.5).** A box configured with
 //! `K_fetch` keys ([`NodeConfig::fetch_keys`], one 16-byte key per requester address; the `vyrn-data`
 //! binary, `bin/vyrn-data-box`, derives them from the roster, 08 §9.6, `Roster::box_fetch_keys`) serves only
-//! the 40-byte form: the 32 bytes above, then `tag` u64 = SipHash-2-4(`K_fetch`, bytes 0..32)
-//! (a REDIRECT_BATCH: its bytes, then the tag over all of them).
+//! the authenticated form: the request body, then `tag` u64 = SipHash-2-4(`K_fetch`, the whole
+//! body). The body is 32 bytes for kinds 1 to 4 (40 in all) and 16 + 8 × `count` for kind 5
+//! (32 in all for one entry).
 //! A fetch from an unkeyed address, a plain fetch, or a bad tag is dropped and counted
 //! (`fetch_unauth`). Each keyed address has a token bucket (`fetch_rate` per second, burst
 //! `fetch_burst`, one token per fetch), made at construction; a fetch over it is dropped and
