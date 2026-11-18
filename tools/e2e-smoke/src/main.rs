@@ -34,7 +34,7 @@
 //! | `finality` | with `--finality` (default 4 validators, a DEV roster as in `bin/vyrn-validator/tests/committee.rs`, `[consensus]` in every validator and the box): while the box still runs, the box's listener (`FINAL height=<h> ... from=<votes\|cert>`) and every validator that did not stop print `FINAL` through the box's last block. A validator's `OUT_OF_ORDER`, `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT` line fails `validators`; `REP_E_HASHLAG` follows R5 and R6. SKIP without it |
 //! | `dropcopy` | with `--dropcopy` (needs `--data` and `--finality`): an observer (`vyrn-validator`, `role = "observer"`, data destination `n + 1`, in the box's order list on both paths (R12) and every validator's `[consensus] observers`) replays every block into its output ring and finalizes from the validators' certificates; `vyrn-dropcopy` serves the ring over Noise, and one client per session logs in to its account's stream. Each stream's served records, without stage markers, equal an in-process `DropCopy` over the tap's `RustReplay` byte for byte, with gapless seqs, and end in a `DC_FINAL`; every record with a `resp_seq` (acks, cancels, outs, taker fills) names a response packet the client received (10 §8.3). It prints a DEV timing of those records after their response packets (R9); SKIP without it |
 //! | `failover` | with `--data-kill` (R13): the home data box is killed mid-run, the validators reach Q `DataDown`s and REDIRECT, the backup admits a sealed one and redirects every session, and every session moves copy 2; SKIP without it |
-//! | `voter-kill` | with `--kill-voter` (R16): at half the packets, once it has finalized a height, the last validator is killed; its blocks were the box's, and the box finalizes a height past the victim's last `BLOCK`, one it never accepted, with the `n − 1` left. `finality` then needs the box and every running validator through the last block, with Q of the whole committee; SKIP without it |
+//! | `voter-kill` | with `--kill-voter` (R16): at half the packets, once it has finalized a height, the last validator is killed; its blocks were the box's, and the box finalizes through the block holding the first packet sent after the victim was reaped (cut after it died), with the `n − 1` left. `finality` then needs the box and every running validator through the last block, with Q of the whole committee; SKIP without it |
 //! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed has no rejected frame and no gap left unrepaired (R14), and that join is the one `replay` reads; SKIP without `--data` |
 //!
 //! **Readings** (the spec does not settle these; PR body):
@@ -182,7 +182,12 @@
 //!   packets the client pauses until the victim has finalized a height (deadline `T`), so the
 //!   victim has voted before it dies: consensus can take seconds to finalize its first height on
 //!   a loaded 2-vCPU host, after a 1 500-packet run has ended. The client's schedule then
-//!   shifts by the pause, so no burst follows it. Not with `--data-kill`, whose DR4 timing the
+//!   shifts by the pause, so no burst follows it. Progress after the kill is the barrier block: the harness
+//!   reaps the victim, then sends the next packet, and the block holding that packet was cut
+//!   after the victim died, so the box finalizing through it proves Q without the victim. The
+//!   victim's own `BLOCK` lines cannot bound this (it may vote for a block before printing it),
+//!   and the box's `FINAL` lines are not ordered against the kill (another thread reads them).
+//!   The victim's lines are read through its reader's EOF mark before they are checked. Not with `--data-kill`, whose DR4 timing the
 //!   pause would skew.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
@@ -540,6 +545,8 @@ impl Nodes {
                     break;
                 }
             }
+            // Ordered after the child's last line: its output is complete (R16).
+            let _ = tx.send((idx, EOF_MARK.to_owned()));
         });
         self.0.push(Node {
             name: name.to_owned(),
@@ -606,6 +613,9 @@ impl Nodes {
         }
     }
 }
+
+/// The line a node's reader adds after the child's stdout reaches EOF (no child prints it).
+const EOF_MARK: &str = "\u{0}EOF";
 
 fn line<'a>(n: &'a Node, prefix: &str) -> Option<&'a str> {
     n.lines.iter().find_map(|l| l.strip_prefix(prefix))
@@ -1821,6 +1831,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // validator's node index and what the box had finalized then.
     let kill_voter_at = cli.kill_voter.then_some(pkts.len() / 2);
     let mut voter_killed: Option<(usize, Option<u64>)> = None;
+    let mut barrier_pkt: Option<(u32, u32)> = None;
     let mut killed = None;
     let mut moved: BTreeMap<SessionId, Redirect> = BTreeMap::new();
     let mut redirects_heard = 0u64;
@@ -1904,7 +1915,13 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     n.child
                         .kill()
                         .map_err(|e| format!("kill {}: {e}", n.name))?;
+                    // Reaped: the victim is dead before packet `k` is sent, so the block that
+                    // holds packet `k` was cut after it died (R16's barrier).
+                    n.child
+                        .wait()
+                        .map_err(|e| format!("reap {}: {e}", n.name))?;
                 }
+                barrier_pkt = Some((p.session.0, p.pkt_seq));
                 vals.retain(|&v| v != i);
                 // The baseline: what the box had finalized when the victim died, with every
                 // line queued by then taken.
@@ -2251,6 +2268,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
 
     // The tap: order core, data join, replay.
     let mut out_hashes: Vec<Hash> = Vec::new();
+    // R16: the height of the block holding the first packet sent after the victim was reaped.
+    let mut barrier: Option<u64> = None;
     let mut dc_inproc = Vec::new();
     let mut resp_times = Vec::new();
     rep.check(
@@ -2299,6 +2318,14 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     _ => None,
                 })
                 .collect();
+            barrier = barrier_pkt.and_then(|bp| {
+                ready.iter().find_map(|b| {
+                    b.lanes
+                        .iter()
+                        .any(|r| matches!(r, vyrn_log::LaneRec::Pkt(p) if (p.session.0, p.pkt_seq) == bp))
+                        .then_some(b.header.height.0)
+                })
+            });
             seen.sort_unstable();
             let mut sent: Vec<(u32, u32)> = pkts.iter().map(|p| (p.session.0, p.pkt_seq)).collect();
             sent.sort_unstable();
@@ -2534,10 +2561,16 @@ fn run(cli: &Cli) -> Result<bool, String> {
     }
 
     // R16: the killed validator had voted (finalized something), printed no fault (R5's HASHLAG
-    // WARN aside), and the blocks it printed were the box's, `Valid`, with the tap's `out=`; the
-    // box finalized a height the victim never accepted, so without it (`finality` checks the end).
+    // WARN aside) through its EOF, and the blocks it printed were the box's, `Valid`, with the
+    // tap's `out=`; the box finalized the barrier block, cut after the victim died, so without it
+    // (`finality` checks the end).
     match voter_killed {
         Some((i, at)) => rep.check("voter-kill", {
+            // Every line the victim printed, through its reader's EOF mark.
+            let eof = nodes.wait(&rx, Instant::now() + wait, "the victim's EOF", |ns| {
+                ns.get(i)
+                    .is_some_and(|n| n.lines.last().is_some_and(|l| l == EOF_MARK))
+            });
             let v = nodes.0.get(i).ok_or("killed validator")?;
             let ids: Vec<_> = blocks(v).into_iter().map(|b| b.0).collect();
             let seq_final = nodes.0.get(seq).and_then(|x| finals(x).last().copied());
@@ -2549,7 +2582,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
                         out_hashes.get(*k).is_none_or(|h| hex(&h.0) != o)
                     })
             });
-            if let Some(f) = fault {
+            if let Err(e) = eof {
+                Err(e)
+            } else if let Some(f) = fault {
                 Err(format!("{}: {f} before the kill", v.name))
             } else if let Some((b, k)) = bad_block {
                 Err(format!("{} block {k}: {} (tap out= {:?})", v.name, b.1, out_hashes.get(k).map(|h| hex(&h.0))))
@@ -2561,18 +2596,17 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 ))
             } else if seq_blocks.get(..ids.len()) != Some(&ids[..]) {
                 Err(format!("{}: its {} blocks are not the box's", v.name, ids.len()))
-            } else if seq_final <= ids.last().map(|b| b.0) {
-                // The victim's output is complete (it is dead and its pipe drained), so a height
-                // past its last BLOCK is one it never accepted, voted for, or helped finalize.
-                // The box's own FINAL lines carry no order against the kill (another thread
-                // reads its pipe), so `at` is only reported.
+            } else if barrier.is_none() || seq_final < barrier {
+                // The barrier block holds a packet sent after the victim was reaped, so it was
+                // cut after the victim died: it cannot have voted for it or anything after it.
+                // (Neither its last BLOCK line, printed after it may already have voted, nor the
+                // box's FINAL lines, read on another thread, are ordered against the kill.)
                 Err(format!(
-                    "vyrn-seq finalized through {seq_final:?}, not past the victim's last block {:?}",
-                    ids.last().map(|b| b.0)
+                    "vyrn-seq finalized through {seq_final:?}, not through the barrier block {barrier:?}"
                 ))
             } else {
                 Ok(format!(
-                    "{} killed with vyrn-seq final at {at:?}, no fault, its {} blocks the box's and Valid; {} of {n_val} finalized through {seq_final:?} (Q = {q})",
+                    "{} killed with vyrn-seq final at {at:?}, no fault, its {} blocks the box's and Valid; {} of {n_val} finalized through {seq_final:?}, past the barrier block {barrier:?} cut after the kill (Q = {q})",
                     v.name,
                     ids.len(),
                     vals.len()
