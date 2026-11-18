@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "asm-gate"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "async-trait"
@@ -1909,7 +1909,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "lint-engine"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "serde",
@@ -2276,7 +2276,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "perf-gate"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "pin-project"
@@ -2691,7 +2691,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "repro-build"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2943,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "shim-gate"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "shlex"
@@ -2973,7 +2973,7 @@ dependencies = [
 
 [[package]]
 name = "sim-swarm"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "slab"
@@ -3306,7 +3306,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "trace-dump"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "tracing"
@@ -3435,7 +3435,7 @@ dependencies = [
 
 [[package]]
 name = "unsafe-audit"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "serde",
@@ -3495,11 +3495,11 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vx-friction"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "vyrn-admin"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "serde",
@@ -3510,7 +3510,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-bbo"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "vyrn-cut",
  "vyrn-types",
@@ -3518,7 +3518,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-bench"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "clap",
@@ -3542,7 +3542,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-chain"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "k256",
  "thiserror",
@@ -3554,7 +3554,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-consensus"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "commonware-actor",
  "commonware-codec",
@@ -3585,7 +3585,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-cut"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "loom",
  "proptest",
@@ -3594,7 +3594,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-data"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "commonware-p2p",
@@ -3611,7 +3611,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-engine"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "vyrn-bbo",
  "vyrn-cut",
@@ -3622,7 +3622,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-epoch"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "thiserror",
  "vyrn-consensus",
@@ -3631,7 +3631,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-lane"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "vyrn-bbo",
  "vyrn-cut",
@@ -3642,7 +3642,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-log"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "proptest",
  "thiserror",
@@ -3652,7 +3652,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-md"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "tracing",
@@ -3664,7 +3664,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-nic"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cc",
  "libc",
@@ -3674,7 +3674,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-replica"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "prometheus-client 0.26.0",
@@ -3692,7 +3692,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-risk"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "proptest",
  "vyrn-types",
@@ -3700,7 +3700,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-seq"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "serde",
@@ -3715,7 +3715,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-sim"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "commonware-runtime",
@@ -3747,7 +3747,7 @@ version = "0.1.0"
 
 [[package]]
 name = "vyrn-validator"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "vyrn-chain",
