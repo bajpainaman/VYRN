@@ -1,8 +1,13 @@
 //! The two boundaries this crate owns for crates that are not merged yet.
 //!
 //! - [`ReplayEngine`] is 11 §5.3's trait. `RustReplay` (over `vyrn-engine` in replay mode) and
-//!   `VxReplay` (over [`crate::vx`]) will implement it. Neither exists yet, so the order core
-//!   only produces [`BlockInputs`], and the trait fixes what an engine receives.
+//!   `VxReplay` (over [`crate::vx`]) will implement it. The payload half exists:
+//!   [`crate::DataJoin`] is `vyrn_engine::Payloads`. `RustReplay` does not, because
+//!   `vyrn_engine::Engine::replay` takes the engine's own journal (`OwnedRec::Step` with
+//!   `StepEntry`) and compares every field but `pub_a`/`pub_b`, while 07's wire `StepRecord`
+//!   carries no `n_tx`, `n_fills`, `fill_lanes`, `flags` or band, and 07 fixes no interleaving of
+//!   one block's packet records and steps. [`BlockInputs`] therefore cannot be turned into the
+//!   engine's input [Certain: from both crates' code]; see the spec gap in the PR.
 //! - [`EpochView`] is what the replica reads from the epoch schedule (08, `vyrn-epoch`): the
 //!   epoch and book it serves, the sequencer keys of `REP_Membership` (07 §13.1) and the
 //!   `INV-FENCE` boundary (07 §6.4 item 5).
@@ -21,8 +26,9 @@ pub trait EpochView {
     fn book(&self) -> BookId;
     /// The `seq_key` that `REP_Membership` registers for sequencer index `sender`, if any.
     fn seq_key(&self, sender: u8) -> Option<PubKey>;
-    /// The last height an `INV-FENCE` boundary allows, if one is set (07 §6.4 item 5).
-    fn fence(&self) -> Option<Height>;
+    /// Whether an `INV-FENCE` boundary forbids a block of this epoch at `height` (07 §6.4 item
+    /// 5, 08).
+    fn fenced(&self, height: Height) -> bool;
 }
 
 /// The inputs of one block for replay (07 §7.1), in the order 07 guarantees.
@@ -33,6 +39,8 @@ pub struct BlockInputs<const N: usize> {
     /// Lane records, substream A's then B's, each in O-order. Every PacketRecord has its
     /// `pkt_hash`. Payloads are joined later, by `(session, pkt_seq)` (07 §5.4).
     pub lanes: Vec<LaneRec>,
+    /// `lanes[..split]` are substream A's, the rest B's (`data_root` hashes each half apart).
+    pub split: usize,
     /// Steps `header.first_step ..= header.last_step`, gapless.
     pub steps: Vec<MergedStep<N>>,
 }

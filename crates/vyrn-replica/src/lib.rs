@@ -2,8 +2,8 @@
 //! (spec/07-replication.md, spec/11-build.md §1.3, layer 6 of §1.4).
 //!
 //! This crate is the replica's order core (07 §7.2 core 3). It sits on `vyrn-log`'s decoder and
-//! adds the checks a vote needs that a stateless decoder cannot make. Data join, repair, the
-//! Simplex wiring, replay threads and snapshots are follow-ups (see the PR).
+//! adds the checks a vote needs that a stateless decoder cannot make, the data join and the epoch
+//! handoff state. Repair, the Simplex runtime, replay threads and snapshots are follow-ups.
 //!
 //! # Contract
 //!
@@ -21,8 +21,8 @@
 //! - Replay: [`OrderCore::take_ready`] yields one [`BlockInputs`] per block in height order. Each
 //!   one has passed every check below, and a [`ReplayEngine`] (11 §5.3) consumes it.
 //! - The vote: [`OrderCore::verdict`] answers 07 §6.4 items 2 and 5 for a height range as a
-//!   `vyrn_consensus::Verdict`. Items 3 (payloads, `data_root`) and 4 (CHAIN tags) are not here
-//!   yet, so this verdict is a precondition for a vote, not the whole rule.
+//!   `vyrn_consensus::Verdict`, and [`DataJoin::check`] answers item 3 for a ready block. Item 4
+//!   (CHAIN tags) is not here yet, so these are preconditions for a vote, not the whole rule.
 //!
 //! **Ordering.** Sections are applied in frame order, so a step half-record is checked against
 //! the lane records before it on the same substream. A half-cut covers only its own half's lanes,
@@ -30,6 +30,8 @@
 //! other substream. Steps are merged by StepId (`vyrn_log::StepMerger`). A block becomes ready once
 //! four things hold: both halves are closed by their `BlockMark`, its header is held and checked,
 //! every PacketRecord in it has its `pkt_hash`, and every step through its `last_step` is merged.
+//! Once both halves are closed, a step through `last_step` that the merger lacks is a fault:
+//! `vyrn-log` refuses any step at or below a passed mark, so it can never arrive.
 //!
 //! **Lane-state rules** ([`lane`], 07 §3.5–§3.7). Each lane of each half keeps:
 //! - L1: the *decoded prefix*, `next_lane_seq − 1`, which only lane records advance;
@@ -39,7 +41,7 @@
 //!
 //! **Step rules** ([`check_step`], 07 §3.12). Each step half-record must satisfy:
 //! - S1, `INV-CUT-MONO`: no lane of the half-cut moves back;
-//! - S2: no `cut[l]` above lane `l`'s decoded prefix;
+//! - S2: no `cut[l]` above lane `l`'s decoded prefix, `TenureStart.prev_cut` included;
 //! - S3: `src_lane` and payload follow the kind table of 07 §3.8;
 //! - S4: `src_lane_seq` is a decoded op of `src_lane`, so `1 ≤ src_lane_seq ≤ prefix`;
 //! - S5: no step names an op whose packet carries `SHED`, because a shed packet's ops were never
@@ -59,9 +61,14 @@
 //! [`OrderCore::verdict`] is `Invalid` for every range that reaches the faulted height (07 §3.12,
 //! §10.1).
 //!
-//! **Boundaries owned here** ([`ports`]). The replay engine and the epoch schedule are crates
-//! that are not merged yet. They reach this crate through two traits it owns: [`ReplayEngine`]
-//! (11 §5.3) and [`EpochView`] (08). `vyrn-engine` and `vyrn-epoch` will implement them.
+//! **Boundaries owned here** ([`ports`]). The replay engine and the epoch schedule reach this
+//! crate through two traits it owns: [`ReplayEngine`] (11 §5.3) and [`EpochView`] (08).
+//! [`ActiveEpoch`] implements [`EpochView`] over `vyrn_epoch::Activation` and builds the epoch's
+//! `vyrn_consensus` voter config. [`ReplicaLocal`] is this replica's `vyrn_epoch::LocalView`,
+//! and [`EpochJournal`] makes `SignOnce` admissions and `armed(e+1)` durable before they are
+//! acted on ([`epoch`]). [`DataJoin`] joins payloads, checks `data_root` (07 §6.4 item 3) and
+//! is the engine's `Payloads` ([`data`]). `ReplayEngine` has no Rust implementation yet: see
+//! [`ports`].
 //!
 //! **Conformance.** `tests/golden/vyrn_replica_vectors.txt` at the repository root lists frame
 //! sequences and the verdict a conforming replica reaches on each one. `tests/conformance.rs`
@@ -71,6 +78,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod check;
+pub mod data;
+pub mod epoch;
 pub mod hashlag;
 pub mod lane;
 pub mod order;
@@ -81,6 +90,8 @@ pub mod ports;
 pub mod vx;
 
 pub use check::{StepErr, check_step};
+pub use data::{DataErr, DataJoin, full_hash};
+pub use epoch::{ActiveEpoch, EpochJournal, JournalErr, ReplicaLocal};
 pub use hashlag::{REP_HASHLAG_MAX_NS, check_hashlag};
 pub use lane::{LaneErr, LaneState};
 pub use order::{Fault, FaultKind, FrameErr, HeaderErr, OrderCore};
