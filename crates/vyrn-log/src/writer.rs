@@ -162,7 +162,8 @@ impl SeqWriter {
         Ok(out)
     }
 
-    /// One lane record. `full` is the packet's BLAKE3-256; `None` only for an Advance record.
+    /// One lane record. `full` is the packet's BLAKE3-256; `None` only for an Advance record. A
+    /// `SHED` record's `full` is not in `data_root` (07 §6.1, 05 §18 Q17).
     pub fn packet(&mut self, p: PacketRecord, full: Option<Hash>) -> Result<Frames, RepErr> {
         let lane = usize::from(p.lane.0);
         let advance = p.flags & PacketFlags::ADVANCE != 0;
@@ -195,7 +196,10 @@ impl SeqWriter {
                 .get_mut(lane)
                 .ok_or(RepErr::Half)?
                 .push((p.first_lane_seq, p.pkt_hash));
-            self.full.push(full);
+            // A `SHED` record is outside `data_root` (07 §6.1, 05 §18 Q17).
+            if p.flags & PacketFlags::SHED == 0 {
+                self.full.push(full);
+            }
             *self.pend_lseq.get_mut(lane).ok_or(RepErr::Half)? = Some(p.first_lane_seq);
         }
         let rec = LaneRec::Pkt(PacketRecord {

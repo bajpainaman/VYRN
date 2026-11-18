@@ -274,7 +274,7 @@ fn decode_pkt(l: LaneId, d: &mut LaneDec, r: &mut Reader) -> Rec {   // Rec::Pkt
     d.slot_next_pkt_seq[slot] = pkt_seq + 1;
     let rec = PacketRecord { lane: l, count, flags: if shed { SHED } else { 0 }, session: d.slot_session[slot],
                              pkt_seq, rx_ts, pkt_hash: PktHash::PENDING, first_lane_seq, fills_applied };
-    d.awaiting_hash.push(rec.r#ref());                           // shed packets are hashed and joined too
+    d.awaiting_hash.push(rec.r#ref());                           // shed packets are hashed, not joined
     Rec::Pkt(rec)
 }
 ```
@@ -286,7 +286,10 @@ defines any.
 
 - **SHED** (01 §14.1). Deadline admission answered the whole packet `Reject BUSY`. Its messages
   keep their LaneSeqs, so `LaneCut` gates the answers (§4.11). Replay reads the bit and never
-  recomputes the decision (`INV-DET`). The payload is still joined, so `data_root` covers it.
+  recomputes the decision (`INV-DET`). The record keeps its `pkt_hash` (its HashRun entry), but
+  its payload is not joined and it has no `data_root` entry (§6.1): its `Reject BUSY`s carry
+  `client_tag` 0 and replay rebuilds them from the record alone (05 §6.8, §18 Q17). This holds for
+  both shed points. A dequeue shed skips the MAC check, so its bytes are never trusted or needed.
 - **`flags`** is 01 §6.6's byte: bit 0 `SHED`, bit 1 `ADVANCE`. Neither bit costs a byte on the
   wire: `SHED` is bit 7 of `h`, and `ADVANCE` is the slot value `REP_SLOT_ADVANCE`. Every other
   bit is 0.
@@ -784,7 +787,7 @@ Core 50 (CCD 6, the order hasher of 01 §10) does three jobs:
   `h` (§6.1).
 - It follows `R_step` (its own cursor) and the decoded O-order of each substream. From
   `R_hash32[l]` it appends each packet's full 32-byte hash to that substream's `data_root` hasher,
-  in O-order.
+  in O-order, skipping `SHED` records (§6.1).
 - It keeps the full-hash list of each block for `REP_SEQ_HASHLIST_MS` = 50 ms (~3.2 MB per block
   at peak) and serves `HashListReq` (§5.6).
 
@@ -1141,7 +1144,8 @@ until their data arrives. Finality stalls for those blocks for ≤ 1 + 0.5 + 1 +
   at every replica. With one stream core (CONSUMER, AWS), `order_root_B` is `BLAKE3` of nothing.
 - **`data_root(h)`** = `BLAKE3(data_root_A(h) ‖ data_root_B(h))`, each the `BLAKE3` of the
   concatenated full 32-byte hashes of the packets of every PacketRecord of that substream in
-  block `h`, in O-order. O-order is the order of records in a substream's ORDER bytes.
+  block `h`, in O-order, except Advance and `SHED` records (§3.6; 05 §18 Q17). The data join
+  (§5.4) and DAV fetches (§5.5) skip `SHED` records for the same reason. O-order is the order of records in a substream's ORDER bytes.
 - **`first_step`, `last_step`** are the first and last StepIds in the block. An empty block has
   `last_step = first_step − 1`.
 - **Blocks with no traffic.** Core 4 still asks for their close, so heights advance at 1 kHz and

@@ -13,7 +13,8 @@
 //! **Hashes.** A packet's full hash is BLAKE3 of its signed bytes, `0 .. 16 + 16·count`, the
 //! tags excluded (01 §3, as `vyrn-data` hashes them); `pkt_hash` is its first 8 bytes,
 //! little-endian. `data_root` is `vyrn_log::block::data_root` over the full hashes of each
-//! substream's packets in O-order, Advance records excluded (07 §6.1).
+//! substream's packets in O-order, Advance and `SHED` records excluded (07 §6.1). A `SHED`
+//! record is not joined: its responses come from the record alone (05 §18 Q17).
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -139,7 +140,9 @@ impl DataJoin {
         let mut halves: [Vec<Hash>; 2] = [Vec::new(), Vec::new()];
         for (i, r) in b.lanes.iter().enumerate() {
             let LaneRec::Pkt(p) = r else { continue };
-            if p.flags & PacketFlags::ADVANCE != 0 {
+            // Advance and `SHED` records are outside the join and `data_root` (07 §6.1,
+            // 05 §18 Q17): replay never reads a shed packet's bytes.
+            if p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) != 0 {
                 continue;
             }
             let (_, full) = self.resolve(p)?;

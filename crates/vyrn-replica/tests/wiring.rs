@@ -154,7 +154,10 @@ fn bytes(tag: u8) -> Vec<u8> {
 fn data_join_checks_data_root_per_half() {
     let (pa, pb) = (bytes(0xA0), bytes(0xB0));
     let a = packet(7, 1, &pa, 0);
-    let b = packet(9, 1, &pb, PacketFlags::SHED);
+    let b = packet(9, 1, &pb, 0);
+    // A SHED record (05 §18 Q17): never joined and outside data_root, so its payload is
+    // never put and the block still checks.
+    let shed = packet(11, 4, &bytes(0xC0), PacketFlags::SHED);
     let adv = PacketRecord {
         flags: PacketFlags::ADVANCE,
         count: 0,
@@ -173,8 +176,13 @@ fn data_join_checks_data_root_per_half() {
             data_root: root,
             seq_sig: [0; 64],
         },
-        lanes: vec![LaneRec::Pkt(a), LaneRec::Pkt(adv), LaneRec::Pkt(b)],
-        split: 2,
+        lanes: vec![
+            LaneRec::Pkt(a),
+            LaneRec::Pkt(adv),
+            LaneRec::Pkt(shed),
+            LaneRec::Pkt(b),
+        ],
+        split: 3,
         steps: Vec::new(),
     };
     let mut j = DataJoin::default();
@@ -190,7 +198,19 @@ fn data_join_checks_data_root_per_half() {
     let mut resend = pb.clone();
     resend[40] ^= 0xFF;
     j.put(SessionId(9), 1, resend);
-    assert_eq!(j.check(&blk(root)), Ok(()), "the shed packet is joined too");
+    assert_eq!(
+        j.check(&blk(root)),
+        Ok(()),
+        "the SHED record needs no payload"
+    );
+    // A root that wrongly covers the SHED record's hash does not check.
+    assert_eq!(
+        j.check(&blk(data_root(
+            &[full_hash(&pa), full_hash(&bytes(0xC0))],
+            &[full_hash(&pb)]
+        ))),
+        Err(DataErr::Root)
+    );
     // The halves are hashed apart: the same hashes all in A give another root.
     assert_eq!(
         j.check(&blk(data_root(&[full_hash(&pa), full_hash(&pb)], &[]))),

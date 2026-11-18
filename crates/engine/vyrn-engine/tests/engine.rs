@@ -13,9 +13,11 @@
 mod harness;
 
 use harness::*;
+use vyrn_bbo::Record;
 use vyrn_bbo::{Side, Tif};
 use vyrn_engine::{Diverged, OwnedRec, Why, WireAt, WireDiverged};
 use vyrn_lane::Rx;
+use vyrn_types::RejectReason;
 use vyrn_types::{Handle, LaneSeq, PacketFlags, StepKind};
 
 /// One scenario touching every replay rule: forwarded improve and cross, a cross the maker's
@@ -134,6 +136,44 @@ fn replay_reproduces_every_record_response_and_fill_packet() {
     assert_eq!(logical(&rep.recs), logical(&live_j.recs));
     assert_eq!(rep.resp, live_j.resp);
     assert_eq!(rep.tx, live_j.tx);
+}
+
+#[test]
+fn replay_needs_no_payload_for_a_shed_record() {
+    // 05 §6.8, §18 Q17: a lane-shed packet's `BUSY` responses carry `client_tag` 0 and come
+    // from its `SHED` record alone, so replay matches with the shed copy's bytes gone.
+    let (live_j, mut store, _, _) = live(&script());
+    let shed = *packets(&live_j.recs)
+        .find(|p| p.flags == PacketFlags::SHED)
+        .unwrap();
+    let before = store.0.len();
+    store
+        .0
+        .retain(|(k, _)| *k != (shed.lane, shed.session, shed.pkt_seq, shed.rx_ts.0));
+    assert_eq!(store.0.len(), before - 1, "the shed copy is removed");
+    let (r, rep) = replay(&live_j.recs, &store);
+    assert_eq!(r, Ok(()));
+    assert_eq!(rep.resp, live_j.resp);
+    let busy: Vec<_> = live_j
+        .resp
+        .iter()
+        .flat_map(|(_, p)| p.records())
+        .filter(|r| {
+            matches!(
+                r,
+                Record::Reject {
+                    reason: RejectReason::Busy,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(!busy.is_empty(), "the script sheds at the lane");
+    assert!(
+        busy.iter()
+            .all(|r| matches!(r, Record::Reject { client_tag: 0, .. })),
+        "{busy:?}"
+    );
 }
 
 #[test]

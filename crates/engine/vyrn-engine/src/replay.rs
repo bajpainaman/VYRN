@@ -10,13 +10,15 @@
 //! - a non-`MID` Advance record of lane `l`: lane `l`'s boundary at the `(f, C_f[l])` it logs
 //!   (`f` = its `fills_applied`, `C_f` the replayed step `f`'s cut), as for a `MID` record;
 //! - a packet record (with the `MID` Advance records the lane wrote while processing it): the
-//!   packet, fetched from [`Payloads`], through `vyrn_lane::Lane::replay_packet` with a late
-//!   clock iff `SHED`, its `MID` records as `Mid` boundaries at `(f, C_f[l])` (05 §6.2, §10 row
+//!   packet, fetched from [`Payloads`], through `vyrn_lane::Lane::replay_packet` with an on-time
+//!   clock, its `MID` records as `Mid` boundaries at `(f, C_f[l])` (05 §6.2, §10 row
 //!   3), and its ops' routes taken from its `Route` records (one per op the lane classified,
-//!   forwarded or rejected, 07 §3.6; §10 row 7).
+//!   forwarded or rejected, 07 §3.6; §10 row 7);
+//! - a `SHED` record: `vyrn_lane::Lane::replay_shed`, from the record alone. No payload is
+//!   fetched: a shed packet's `BUSY` responses carry `client_tag` 0 (05 §6.8, §18 Q17).
 //!   A `Route` record is part of its packet's lane call and is compared like the packet's.
 
-use vyrn_bbo::admit::{FixedClock, NeverLate};
+use vyrn_bbo::admit::NeverLate;
 use vyrn_bbo::{Cut, CutDelta, Diverge, MAX_LANES, Record, ReplayStep, StepEntry, TxEntry};
 use vyrn_cut::LaneCutEntry;
 use vyrn_cut::Visibility;
@@ -63,8 +65,8 @@ impl OwnedRec {
     }
 }
 
-/// Packet bytes by record (07's data tier keys them by `pkt_hash`, a `SHED` record's included,
-/// 07 §3.5).
+/// Packet bytes by record (07's data tier keys them by `pkt_hash`, 07 §3.5). Replay never asks
+/// for a `SHED` record's bytes (05 §18 Q17).
 pub trait Payloads {
     fn get(&self, r: &PacketRecord) -> Option<&[u8]>;
 }
@@ -764,6 +766,14 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             let at = LaneCutEntry { step: f, cut };
             return self.replay_advance(l, at, sink).map_err(Why::Fault);
         }
+        if rec.flags & PacketFlags::SHED != 0 {
+            // A shed packet's responses and record come from the record alone (05 §6.8,
+            // §18 Q17): no payload is read, and the data tier need not hold it.
+            return self
+                .replay_shed(l, rec, sink)
+                .map(|_| ())
+                .map_err(Why::Fault);
+        }
         let mut ms = [Mid {
             pass: 0,
             next: LaneSeq(0),
@@ -794,12 +804,9 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         };
         let ms = ms.get(..mids.len()).unwrap_or(&[]);
         let routes = routes.get(..n_route).unwrap_or(&[]);
-        let res = if rec.flags & PacketFlags::SHED != 0 {
-            self.replay_ingest(l, rx, &FixedClock(u64::MAX), ms, routes, sink)
-        } else {
-            self.replay_ingest(l, rx, &NeverLate, ms, routes, sink)
-        };
-        res.map(|_| ()).map_err(Why::Fault)
+        self.replay_ingest(l, rx, &NeverLate, ms, routes, sink)
+            .map(|_| ())
+            .map_err(Why::Fault)
     }
 
     fn replay_in<P: Payloads, S: Sink, R: Responses>(

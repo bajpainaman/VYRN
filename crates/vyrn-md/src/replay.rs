@@ -186,7 +186,8 @@ impl<K: PacketSink> SinkStream<K> {
         self.err
     }
 
-    /// One request payload (its signed bytes and tags), before its packet record arrives.
+    /// One request payload (its signed bytes and tags), before its packet record arrives. A
+    /// `SHED` record needs none; an accepted record uses the newest payload of its key.
     pub fn payload(&mut self, bytes: &[u8]) {
         let Ok(req) = Request::parse(bytes) else {
             return; // V1 rejects it; the lane logs no op for it.
@@ -203,7 +204,7 @@ impl<K: PacketSink> SinkStream<K> {
     pub fn prepare<const N: usize>(&mut self, blk: &BlockInputs<N>, p: &impl Payloads) {
         for r in &blk.lanes {
             if let LaneRec::Pkt(r) = r
-                && r.flags & PacketFlags::ADVANCE == 0
+                && r.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) == 0
                 && let Some(b) = p.get(r)
             {
                 self.payload(b);
@@ -255,11 +256,15 @@ impl<K: PacketSink> SinkStream<K> {
         let shed = p.flags & PacketFlags::SHED != 0;
         let l = usize::from(p.lane.0);
         let key = (p.session, p.pkt_seq);
-        let q = self.msgs.get_mut(&key).ok_or(SinkError::NoPayload)?;
-        let msgs = q.pop_front().ok_or(SinkError::NoPayload)?;
-        if q.is_empty() {
-            self.msgs.remove(&key);
-        }
+        // A shed packet's ops are all numbered and only take `BUSY` (05 §6.8), so it needs no
+        // payload (05 §18 Q17). An accepted packet takes the newest payload of its key: older
+        // ones are shed attempts of the same `pkt_seq`.
+        let msgs = if shed {
+            vec![None; usize::from(p.count)]
+        } else {
+            let q = self.msgs.remove(&key).ok_or(SinkError::NoPayload)?;
+            q.into_iter().next_back().ok_or(SinkError::NoPayload)?
+        };
         let session_only =
             |m: &Option<Msg>| matches!(m, Some(Msg::Heartbeat | Msg::ResendReq { .. }));
         // A session-only message takes a LaneSeq only when the header is rejected (`vyrn-lane`

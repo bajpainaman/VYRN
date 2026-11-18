@@ -311,7 +311,8 @@ pub struct HalfBlock {
     pub last_step: StepId,
     /// The block's ORDER section bytes on this substream, through its `BlockMark`.
     pub order_bytes: Vec<u8>,
-    /// Its PacketRecords other than Advance records, in O-order; `data_root` covers them.
+    /// Its PacketRecords other than Advance and `SHED` records, in O-order; `data_root` covers
+    /// them (07 §6.1, 05 §18 Q17).
     pub packets: Vec<PacketRecord>,
 }
 
@@ -666,7 +667,7 @@ impl SubstreamState {
             Section::LaneRun { recs, .. } => {
                 for r in recs {
                     if let LaneRec::Pkt(p) = r
-                        && p.flags & PacketFlags::ADVANCE == 0
+                        && p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) == 0
                     {
                         self.block_pkts.push(*p);
                     }

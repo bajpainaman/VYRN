@@ -649,6 +649,23 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         r
     }
 
+    /// Replay of one logged `SHED` record (05 §6.8, §10): the same `BUSY` responses and
+    /// record as the live shed, from the record alone (`session`, `pkt_seq`, `count`, `rx_ts`,
+    /// `pkt_hash`), with no payload. `Dropped` if the record's session is not on this lane.
+    /// The live path never calls this.
+    pub fn replay_shed(&mut self, rec: &PacketRecord) -> Rx {
+        let Some(si) = self.sess.find(rec.session) else {
+            return Rx::Dropped;
+        };
+        let p = RxIn {
+            bytes: &[],
+            rx_ts: rec.rx_ts,
+            pkt_hash: rec.pkt_hash,
+        };
+        self.answer_busy(si, rec.pkt_seq, rec.count, p);
+        Rx::Shed
+    }
+
     /// The account index lane-local account `a` hands the BBO core (`FwdEntry.acct_ix`,
     /// `OrderSlot.acct_ix`, `AcctKill` and its journal entry). On a pooled lane it is the
     /// pool-wide index, which STP and kills compare across the pool (05 §6.9). Configuration,
@@ -721,7 +738,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         }
         // Test D at dequeue (05 §6.8): no MAC, nothing applied.
         if admit::late(clock, p.rx_ts, n, cls, Point::Dequeue, &self.cfg.path) {
-            self.answer_busy(vis, si, &req, p);
+            self.answer_busy(si, pkt_seq, n, p);
             return Rx::Shed;
         }
         // V6.
@@ -755,7 +772,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         }
         // Commit-point test: the pre-pass is done, nothing is applied yet.
         if admit::late(clock, p.rx_ts, n, cls, Point::Commit, &self.cfg.path) {
-            self.answer_busy(vis, si, &req, p);
+            self.answer_busy(si, pkt_seq, n, p);
             return Rx::Shed;
         }
         // Accept (04 §3.1): from here every outcome is in stream.
@@ -885,26 +902,25 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
     }
 
     /// 05 §6.8: `Reject BUSY` per message in one packet, a `SHED` record, `pkt_seq` unchanged.
-    /// The packet keeps its LaneSeqs and its `pkt_hash` (07 §3.5, §3.6: it is hashed and joined),
-    /// so a resend of the same `pkt_seq` takes new ones.
-    fn answer_busy(&mut self, vis: &V, si: u16, req: &Request<'_>, p: RxIn<'_>) {
-        let _ = vis;
+    /// The packet keeps its LaneSeqs and its `pkt_hash` in the record, so a resend of the same
+    /// `pkt_seq` takes new ones. Each `BUSY` has `client_tag` 0 (04 §6, 05 §18 Q17): the
+    /// response depends on the record alone, so replay needs no payload and `data_root` leaves
+    /// the record out (07 §6.1). No byte of the packet is read past its header.
+    fn answer_busy(&mut self, si: u16, pkt_seq: u32, count: u8, p: RxIn<'_>) {
         let Some(s) = self.sess.get_mut(si) else {
             return;
         };
         let rs = s.next_resp;
         s.next_resp = s.next_resp.wrapping_add(1);
         let first = LaneSeq(self.seq.0.saturating_add(1));
-        let count = req.header().count;
         self.seq = LaneSeq(self.seq.0.saturating_add(u64::from(count)));
-        let mut r = RespPkt::new(s.id, rs, req.header().pkt_seq.get(), Gate::Packet(first));
-        for (ix, raw) in req.raw_msgs().iter().enumerate() {
-            let tag = tag_of(raw);
+        let mut r = RespPkt::new(s.id, rs, pkt_seq, Gate::Packet(first));
+        for ix in 0..count {
             r.push(Record::Reject {
-                index: u8::try_from(ix).unwrap_or(u8::MAX),
+                index: ix,
                 reason: RejectReason::Busy,
                 detail: 0,
-                client_tag: tag,
+                client_tag: 0,
             });
         }
         let sid = s.id;
@@ -914,7 +930,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             count,
             flags: PacketFlags::SHED,
             session: sid,
-            pkt_seq: req.header().pkt_seq.get(),
+            pkt_seq,
             rx_ts: p.rx_ts,
             pkt_hash: p.pkt_hash,
             first_lane_seq: first,
