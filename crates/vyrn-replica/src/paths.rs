@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 
 use vyrn_log::frame::FrameHeader;
+use vyrn_types::BookId;
 
 /// Path A or B: the port a datagram arrived on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,9 +74,19 @@ pub fn frame_key(frame: &[u8]) -> Option<(Key, u64)> {
 /// What a block needs on both paths: each substream's last frame handed on when it was ready.
 pub type Mark = Vec<(Key, u64)>;
 
-#[derive(Debug, Default)]
+/// Substreams tracked at once: two per tenure and sender; past it a new one is refused.
+const SUBS_MAX: usize = 64;
+
+#[derive(Debug)]
 pub struct Paths {
+    /// The receive context: frames of another book or epoch, of a sender index at or past
+    /// `senders`, or of a stream past B are refused before any state is kept for them.
+    book: BookId,
+    epoch16: u16,
+    senders: u8,
     subs: BTreeMap<Key, Sub>,
+    /// Datagrams refused by the receive context or [`SUBS_MAX`].
+    pub refused: u64,
     /// Copies of frames already handed on, per path.
     pub dups: [u64; 2],
     /// Copies whose bytes (`flags` aside) differ from the first copy of their frame, per path.
@@ -93,25 +104,48 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 }
 
 impl Paths {
+    pub fn new(book: BookId, epoch16: u16, senders: u8) -> Self {
+        Self {
+            book,
+            epoch16,
+            senders,
+            subs: BTreeMap::new(),
+            refused: 0,
+            dups: [0; 2],
+            mismatched: [0; 2],
+        }
+    }
+
     /// One datagram from `path`; `deliver` gets every frame now due, in `frame_seq` order. A
     /// datagram whose header does not parse goes through as is, for the order core to refuse.
     pub fn rx(&mut self, path: Path, frame: &[u8], deliver: &mut impl FnMut(&[u8])) {
         let Ok((h, _)) = FrameHeader::parse(frame) else {
             return deliver(frame);
         };
-        let s = self
-            .subs
-            .entry((h.epoch16, h.tenure, h.sender, h.stream))
-            .or_default();
+        let key = (h.epoch16, h.tenure, h.sender, h.stream);
+        let known = self.subs.contains_key(&key);
+        if h.book != self.book
+            || h.epoch16 != self.epoch16
+            || h.sender >= self.senders
+            || h.stream > 1
+            || (!known && self.subs.len() >= SUBS_MAX)
+        {
+            self.refused = self.refused.saturating_add(1);
+            return;
+        }
+        let s = self.subs.entry(key).or_default();
         let q = h.frame_seq;
         if q > s.both {
             let fresh = s.seen.len() < SEEN_MAX;
             match s.seen.get_mut(&q) {
                 Some((bits, first)) if same(first, frame) => *bits |= path.bit(),
                 Some(_) => {
+                    // Not the frame first seen under this `frame_seq`: it counts for no path
+                    // and is never handed on, so what is delivered is what `both` tracks.
                     if let Some(m) = self.mismatched.get_mut(usize::from(path == Path::B)) {
                         *m = m.saturating_add(1);
                     }
+                    return;
                 }
                 None if fresh => {
                     s.seen.insert(q, (path.bit(), frame.to_vec()));
@@ -167,7 +201,6 @@ impl Paths {
 mod tests {
     use super::*;
     use vyrn_log::frame::{FrameFlags, FrameKind, with_flags};
-    use vyrn_types::BookId;
 
     fn frame(stream: u8, q: u64) -> Vec<u8> {
         let h = FrameHeader {
@@ -182,7 +215,7 @@ mod tests {
             stream,
         };
         let mut v = h.encode().to_vec();
-        v.push(u8::try_from(q).unwrap());
+        v.push(u8::try_from(q % 256).unwrap());
         v
     }
 
@@ -194,7 +227,7 @@ mod tests {
 
     #[test]
     fn each_frame_once_in_order_whichever_path_leads() {
-        let mut p = Paths::default();
+        let mut p = Paths::new(BookId(1), 0, 1);
         let mut out = Vec::new();
         let mut d = |f: &[u8]| out.push(f.to_vec());
         // A loses 2; B lags by one and then catches up past A.
@@ -225,9 +258,56 @@ mod tests {
         assert_eq!(p.dups, [1, 2]);
     }
 
+    /// Codex #167: past the hold buffer, a frame is kept only in `seen`; a conflicting copy at
+    /// `next` is never handed on, and the matching one is.
+    #[test]
+    fn a_conflicting_copy_is_never_handed_on() {
+        let mut p = Paths::new(BookId(1), 0, 1);
+        let out = std::cell::RefCell::new(Vec::new());
+        let mut d = |f: &[u8]| out.borrow_mut().push(f.to_vec());
+        let last = HOLD_MAX as u64 + 2;
+        for q in 2..=last {
+            p.rx(Path::A, &frame(0, q), &mut d);
+        }
+        p.rx(Path::A, &frame(0, 1), &mut d);
+        assert_eq!(out.borrow().len(), HOLD_MAX + 1, "1 and the held frames");
+        let mut forged = with_flags(&frame(0, last), FrameFlags::PATH_B);
+        *forged.last_mut().unwrap() ^= 0xff;
+        p.rx(Path::B, &forged, &mut d);
+        assert_eq!(
+            out.borrow().len(),
+            HOLD_MAX + 1,
+            "the conflicting copy is not handed on"
+        );
+        assert_eq!(p.mismatched, [0, 1]);
+        p.rx(
+            Path::B,
+            &with_flags(&frame(0, last), FrameFlags::PATH_B),
+            &mut d,
+        );
+        assert_eq!(out.borrow().last().unwrap()[24..], frame(0, last)[24..]);
+    }
+
+    #[test]
+    fn foreign_substreams_keep_no_state() {
+        let mut p = Paths::new(BookId(1), 0, 1);
+        let mut d = |_: &[u8]| {};
+        let mut f = frame(0, 2);
+        f[20] = 1; // sender 1: this box has one sequencer
+        p.rx(Path::A, &f, &mut d);
+        assert_eq!((p.refused, p.subs.len()), (1, 0));
+        for t in 0..=255u8 {
+            let mut f = frame(0, 2);
+            f[17] = t; // tenure
+            p.rx(Path::A, &f, &mut d);
+        }
+        assert_eq!(p.subs.len(), SUBS_MAX);
+        assert_eq!(p.refused, 1 + 256 - SUBS_MAX as u64);
+    }
+
     #[test]
     fn durable_waits_for_both_paths_of_every_marked_frame() {
-        let mut p = Paths::default();
+        let mut p = Paths::new(BookId(1), 0, 1);
         let mut d = |_: &[u8]| {};
         for q in 1..=3 {
             p.rx(Path::A, &frame(0, q), &mut d);
@@ -262,6 +342,7 @@ mod tests {
         assert!(p.durable(&m2));
         // A substream the mark does not name is not waited for; one it names but never saw is.
         p.rx(Path::A, &frame(2, 1), &mut d);
+        assert_eq!(p.refused, 1, "stream 2 is outside the receive context");
         assert!(p.durable(&m));
         assert!(!p.durable(&vec![((0, 0, 0, 3), 1)]));
     }

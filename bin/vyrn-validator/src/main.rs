@@ -560,9 +560,23 @@ fn run<const N: usize>(cfg: &Config, stdin_stop: bool) -> Result<(), String> {
     let order = {
         let (stats, stop, source) = (Arc::clone(&stats), Arc::clone(&stop), source.clone());
         let gate = cfg.observer();
+        // Path B's receive context (`vyrn_replica::Paths`): this book, epoch and sequencers.
+        let senders = u8::try_from(cfg.membership.seq_keys.len()).unwrap_or(u8::MAX);
+        let ctx = (BookId(cfg.book), Epoch(cfg.epoch).low16(), senders);
         std::thread::Builder::new()
             .name("vyrn-validator/order".into())
-            .spawn(move || order_thread(core, [Some(rx), rx_b], data, gate, &source, &stop, &stats))
+            .spawn(move || {
+                order_thread(
+                    core,
+                    [Some(rx), rx_b],
+                    data,
+                    gate,
+                    ctx,
+                    &source,
+                    &stop,
+                    &stats,
+                )
+            })
             .map_err(|e| e.to_string())?
     };
     let observer = match observe {
@@ -1127,6 +1141,7 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     mut rxs: [Option<R>; 2],
     mut data: Option<DataRx<N, D>>,
     gate: bool,
+    ctx: (BookId, u16, u8),
     source: &consensus::Source,
     stop: &AtomicBool,
     stats: &Stats,
@@ -1137,7 +1152,7 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     let mut burst = [RxPkt::empty(); RX_BURST];
     let mut faulted = false;
     let mut stalled = false;
-    let mut paths = rxs[1].is_some().then(Paths::default);
+    let mut paths = rxs[1].is_some().then(|| Paths::new(ctx.0, ctx.1, ctx.2));
     // The newest frame handed to the order core per substream: a block's mark is its value
     // when the block becomes ready (`report` queues it), not at the end of the poll.
     let mut frontier: std::collections::BTreeMap<vyrn_replica::paths::Key, u64> =
