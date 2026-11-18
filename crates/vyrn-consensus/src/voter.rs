@@ -220,7 +220,12 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
             let last = run.iter().find(|r| header_hash(r) == h.prev)?;
             (last.height, last.last_step)
         };
-        self.seal_cand(Height(parent.height.0.checked_add(1)?), seal, star, star_step)
+        self.seal_cand(
+            Height(parent.height.0.checked_add(1)?),
+            seal,
+            star,
+            star_step,
+        )
     }
 
     /// The seal range `first ..= seal.header.height` on top of `H*` = `star`, if the seal header
