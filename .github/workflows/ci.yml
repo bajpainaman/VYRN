@@ -94,6 +94,8 @@ jobs:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
       RUSTFLAGS: ""
       VYRN_REQUIRE_VX: "1"
+      # oracle_scenarios reads its own flag (vyrn-sim, 11 §5.2).
+      VYRN_REQUIRE_VX_ORACLE: "1"
     steps:
       - name: base packages
         run: |

@@ -524,37 +524,37 @@
   {
    "asciiIndex": 4,
    "heading": "6. Testing strategy",
-   "line": 1274,
+   "line": 1275,
    "ascii": "   layer                      runs on                 catches\n   ─────────────────────────  ──────────────────────  ─────────────────────────────────────────\n   1 unit + loom + Miri       every PR, all hosts     wrong function, wrong memory ordering, UB\n   2 property (proptest)      every PR, all hosts     engine ≠ oracle on small random books\n   3 differential per msg     every PR + nightly      engine ≠ oracle on 10⁹-message streams\n   4 vyrn-sim                 every PR + swarm        protocol bugs under faults and timing\n   5 fuzzing                  every PR + nightly      panics and wrong verdicts on hostile bytes\n   6 chaos on hardware        nightly staging         what the simulator does not model\n   7 cross-build determinism  nightly + release       compiler, flag and client divergence (B4)"
   },
   {
    "asciiIndex": 5,
    "heading": "6.4 vyrn-sim: the deterministic simulator",
-   "line": 1394,
+   "line": 1395,
    "ascii": "                  vyrn-sim (one thread, virtual time in Nanos, ChaCha8 seeded per component)\n ┌───────────────────────────────────────────────────────────────────────────────────────────┐\n │  event queue (time, seq) ──► scheduler picks the next runnable item, seeded ties          │\n │                                                                                           │\n │  clients ×k ──► sim network (links: latency dist, loss, dup, reorder, partition)          │\n │     (02 workload)        │                                                                │\n │                          ▼                                                                │\n │  box: vyrn-seq  [vyrn-nic::sim queues, PHC model] ─► dedicated lanes + pool ─► cut A, B   │\n │                  ─► BBO ─► TX-A, TX-B, stream-A, stream-B (core map of 01 §10)            │\n │                  each core = Core::poll() step; vyrn-cut Visibility = Sim (seeded delay)  │\n │  box: vyrn-seq standby (F2)  warm, promoted on failover; never votes                      │\n │  box: vyrn-replica ×n      engine = Rust replay, or Vx client through the C ABI           │\n │  box: vyrn-data ×m         payload store and fan-out                                      │\n │  consensus: vyrn-consensus on commonware-runtime::deterministic, same virtual clock       │\n │  disks: in-memory journal with a fault model; clocks: per-box offset, drift, steps        │\n │                                                                                           │\n │  checkers: invariants after every event; oracle diff per message; liveness after heal     │\n └───────────────────────────────────────────────────────────────────────────────────────────┘"
   },
   {
    "asciiIndex": 6,
    "heading": "7.2 Rigs",
-   "line": 1708,
+   "line": 1709,
    "ascii": "  generator boxes                        SUT (vyrn-seq on REF)\n  (vyrn-bench gen, ef_vi TX)\n   G1..G4 ──── fiber ────► [ passive tap ]────────────► port p RX\n                                │ 10% copy\n                                ▼\n                        capture NIC port A ─┐  one NIC, one PHC:\n                                            │  no clock error between A and B\n   G1..G4 ◄─── fiber ───── [ passive tap ]◄─┼──────────── port p TX\n                                │ 10% copy  │\n                                ▼           │\n                        capture NIC port B ─┘ ──► capture host: match request ↔ response\n                                                   by (session, pkt_seq / echo_pkt)"
   },
   {
    "asciiIndex": 7,
    "heading": "8.1 Decision",
-   "line": 2093,
+   "line": 2094,
    "ascii": "  pinned core k (lane, cut, BBO, TX)                     control core\n  ┌───────────────────────────────────┐                 ┌───────────────────────────────┐\n  │ CoreStats   (single writer, 128 B │  Relaxed loads  │ sampler, every 100 ms         │\n  │   lines, Relaxed stores)          │ ──────────────► │  diffs counters + buckets     │\n  │ Histograms  (fixed buckets)       │                 │  → per-window quantiles       │\n  │ TraceRing   (64K × 16 B, shm file)│ ─── on demand ─►│ trace freeze / dump           │\n  └───────────────────────────────────┘                 │ exporter → mgmt NIC (kernel)  │\n                                                        │ tracing logs → journald       │\n  NIC: RX hw timestamp, TX completion timestamp ───────►│ in-box latency of every packet│\n                                                        └───────────────────────────────┘"
   },
   {
    "asciiIndex": 9,
    "heading": "9.1 Stages",
-   "line": 2220,
+   "line": 2221,
    "ascii": " PR opened ─► S1 fast (≤ 15 min) ─► S2 full (≤ 60 min) ─► S3 perf gate (≤ 45 min) ─► merge\n                                                                                     │\n main ─► nightly: S4 long (8 h: fuzz, swarm, B1/B3/B5/B9–B11/B19, chaos) ◄───────────┤\n      ─► weekly:  S5 cluster (B13, B16, B17, B20)                                    │\n tag  ─► S6 release: reproducible builds ×2 ─► compare ─► sign 2-of-3 ─► publish ◄────┘"
   },
   {
    "asciiIndex": 10,
    "heading": "10.3 Rollouts only at epoch boundaries",
-   "line": 2376,
+   "line": 2377,
    "ascii": "  epoch:      TYO active        LDN active        NYC active        TYO active\n  UTC:        00:00 ─────────── 08:00 ─────────── 16:00 ─────────── 00:00\n  LDN boxes:  stage + restart   ◄── runs new ───►\n              as followers      release as home\n              (replay, shadow)\n  NYC boxes:  stage ────────── restart as followers ── runs new as home ──►\n  TYO boxes:  (old release)     stage ──────────── restart as followers ── new as home ──►"
   }
  ],

@@ -1160,7 +1160,8 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   comes with the core map (§10.1), and tests run unpinned. W-03 calls libc `sched_yield`, not
   `vyrn_vx_spin`, because vxc cannot declare a host symbol (W-18 in `vx/FRICTION.md`).
 - *CI.* The `vx` job runs `vx/build.sh`, then `tests/replay.rs`, `oracle_scenarios` and
-  `vx_golden` with `VYRN_REQUIRE_VX=1`, so a missing `libvyrn_vx_client` fails them. The other
+  `vx_golden` with `VYRN_REQUIRE_VX=1` and `VYRN_REQUIRE_VX_ORACLE=1`, so a missing library fails
+  them. The other
   jobs build no Vx, so their Vx halves skip. vxc embeds its source and target directories and
   links the distro's LLVM/MLIR 22 statically, so the job runs in `debian:trixie` with
   `HOME=/home/user`, the host kind `vxc_blake3.x86_64-linux` was pinned on. It builds vxc with
