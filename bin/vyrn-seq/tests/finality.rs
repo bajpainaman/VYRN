@@ -275,16 +275,27 @@ genesis_hash = "{}"
             }
         }
     });
-    let next = |want: &str| -> String {
-        let deadline = Instant::now() + Duration::from_secs(20);
+    // Lines read but not yet asked for: the listener's `GATE` and the stream thread's
+    // `CONTROL` lines may come in either order.
+    let seen = std::cell::RefCell::new(Vec::<String>::new());
+    let take = |want: &str, wait: Duration| -> Option<String> {
+        let mut seen = seen.borrow_mut();
+        if let Some(i) = seen.iter().position(|l| l.starts_with(want)) {
+            return Some(seen.remove(i));
+        }
+        let deadline = Instant::now() + wait;
         while Instant::now() < deadline {
-            if let Ok(l) = rx.recv_timeout(Duration::from_millis(50))
-                && l.starts_with(want)
-            {
-                return l;
+            if let Ok(l) = rx.recv_timeout(Duration::from_millis(1)) {
+                if l.starts_with(want) {
+                    return Some(l);
+                }
+                seen.push(l);
             }
         }
-        panic!("no {want} line");
+        None
+    };
+    let next = |want: &str| {
+        take(want, Duration::from_secs(20)).unwrap_or_else(|| panic!("no {want} line"))
     };
     let ctrl_addr: SocketAddr = next("CONSENSUS ctrl=")["CONSENSUS ctrl=".len()..]
         .parse()
@@ -309,9 +320,7 @@ genesis_hash = "{}"
         let hdr = ReqHeader::new(session, pkt_seq, Epoch(0).low16(), BookId(7), false);
         let n = encode_request(&mut buf, hdr, &[Msg::Heartbeat], &K_SEQ, None).unwrap();
         client.send_to(&buf[..n], lane0).unwrap();
-        if let Ok(l) = rx.recv_timeout(Duration::from_millis(3))
-            && l.starts_with("GATE halt")
-        {
+        if let Some(l) = take("GATE halt", Duration::from_millis(3)) {
             break l;
         }
     };
