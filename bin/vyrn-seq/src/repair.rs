@@ -18,7 +18,9 @@
 //! **Sealed** (07 §5.5, 08 §9.6, *reading*): with [`Server::set_keys`] the box serves only the
 //! 40-byte form under the requester's `K_fetch(e, i, SEQ_TARGET + j)`, keyed by its source IPv4,
 //! like a keyed data box; `j` is this box's place in `home.seq`. A plain or wrongly tagged
-//! fetch counts in `repair_bad`.
+//! fetch counts in `repair_bad`. Like a data box it holds the keys of epochs `e` and `e + 1`
+//! ([`window_keys`]); `EPOCH <e>` on stdin moves both, and the repair thread prints
+//! `FETCH_EPOCHS <e>,<e+1>` once it has installed them (07 §5.5 Epoch boundary).
 //!
 //! **Rate** (07 §5.5, 13 §2, DAV-2): each answer takes one token per packet it carries, and a miss
 //! takes one, from a box bucket of `REP_SEQ_DATA_MAX_PPS` = 50k/s. Each packet also takes one
@@ -128,12 +130,33 @@ pub struct RepairStats {
     pub bad: u64,
 }
 
+/// `K_fetch` per requester address, under every epoch the box holds.
+pub type Keys = BTreeMap<Ipv4Addr, Vec<[u8; 16]>>;
+
+/// [`fetch_keys`] of epochs `e` and `e + 1` (when it exists), merged by requester address: the
+/// window a box serves under, so a requester that moved to `e + 1` first is still served.
+pub fn window_keys(
+    roster: &vyrn_epoch::Roster,
+    domain: &vyrn_epoch::Domain,
+    e: u32,
+    home: vyrn_types::HomeCode,
+    secret: &[u8; 32],
+) -> Result<Keys, String> {
+    let mut out = Keys::new();
+    for ep in [Some(e), e.checked_add(1)].into_iter().flatten() {
+        for (ip, k) in fetch_keys(roster, domain, vyrn_types::Epoch(ep), home, secret)? {
+            out.entry(ip).or_default().push(k);
+        }
+    }
+    Ok(out)
+}
+
 /// The repair service of one box.
 pub struct Server {
     retain: Retain,
     replicas: Vec<Ipv4Addr>,
     /// `K_fetch` per requester address; empty: plain 32-byte fetches (DEV).
-    keys: BTreeMap<Ipv4Addr, [u8; 16]>,
+    keys: Keys,
     box_pps: u64,
     session_pps: u64,
     total: Bucket,
@@ -147,7 +170,7 @@ impl Server {
         Self {
             retain: Retain::new(slots),
             replicas,
-            keys: BTreeMap::new(),
+            keys: Keys::new(),
             box_pps,
             session_pps,
             total: Bucket::full(box_pps, 0),
@@ -157,8 +180,8 @@ impl Server {
         }
     }
 
-    /// Serve only fetches sealed under these keys, by source address.
-    pub fn set_keys(&mut self, keys: BTreeMap<Ipv4Addr, [u8; 16]>) {
+    /// Serve only fetches sealed under one of these keys, by source address.
+    pub fn set_keys(&mut self, keys: Keys) {
         self.keys = keys;
     }
 
@@ -171,7 +194,9 @@ impl Server {
         let q = if self.keys.is_empty() {
             Fetch::decode(req).ok()
         } else {
-            self.keys.get(&from).and_then(|k| Fetch::open(req, k).ok())
+            self.keys
+                .get(&from)
+                .and_then(|ks| ks.iter().find_map(|k| Fetch::open(req, k).ok()))
         };
         let key = match q {
             Some(Fetch::Key { session, pkt_seq }) if self.replicas.contains(&from) => {
@@ -244,10 +269,12 @@ impl Server {
     }
 }
 
-/// The repair thread's loop: copies from the engine into retention, requests answered, until
+/// The repair thread's loop: copies from the engine into retention, requests answered, and
+/// `EPOCH` key sets from `rekey` installed (acked `FETCH_EPOCHS <e>,<e+1>` once in place), until
 /// `stop`. Allocates freely: it is not the sealed engine thread.
 pub fn run<R: vyrn_wire::RxRing, T: vyrn_wire::TxRing>(
     mut server: Server,
+    rekey: Option<std::sync::mpsc::Receiver<(u32, Keys)>>,
     mut copies: Consumer<'_, Kept, RETAIN_HANDOFF, 1, Hw>,
     mut rx: R,
     mut tx: T,
@@ -258,6 +285,13 @@ pub fn run<R: vyrn_wire::RxRing, T: vyrn_wire::TxRing>(
     let mut burst = [vyrn_wire::RxPkt::empty(); vyrn_wire::RX_BURST];
     let mut wire = [0u8; frame::MAX_FRAME_BYTES];
     while !stop.load(std::sync::atomic::Ordering::Acquire) {
+        for (e, keys) in rekey.iter().flat_map(|r| r.try_iter()) {
+            server.set_keys(keys);
+            match e.checked_add(1) {
+                Some(n) => println!("FETCH_EPOCHS {e},{n}"),
+                None => println!("FETCH_EPOCHS {e}"),
+            }
+        }
         // A bounded batch, so requests and `stop` are served under sustained ingest.
         let mut work = 0usize;
         while work < DRAIN_BATCH {
@@ -324,7 +358,7 @@ mod tests {
     fn a_keyed_box_serves_only_sealed_fetches_under_the_sources_key() {
         let mut s = Server::new(64, vec![R], 50_000, 2_000);
         let k = [0x42; 16];
-        s.set_keys(BTreeMap::from([(R, k)]));
+        s.set_keys(Keys::from([(R, vec![[0x41; 16], k])]));
         s.put(kept(5, 1, 0xA));
         let q = Fetch::Key {
             session: SessionId(5),

@@ -61,16 +61,18 @@
 //!   `LOSS_EVERY`-th datagram the box sends validator 0, so its RANGE and KEY fetches must be
 //!   served (`STATS` `fetch_ring_hit + fetch_log_hit + fetch_resent > 0`) for it to keep up.
 //! - R8. `--keyed` also keys the primary `vyrn-seq` box (`SEQ_XCHG`, repl_addr 127.0.0.2) and
-//!   gives its `[repair]` `xchg`: with the box still up, `seq-repair` sends a plain and a sealed
-//!   (`K_fetch(0, 0, SEQ_TARGET)`, validator 0's) KEY fetch of the last packets sent; only the sealed
-//!   one may be answered, with the packet's exact bytes (07 §5.5 source 3, 08 §9.6).
+//!   gives its `[repair]` `xchg`: with the box still up, `seq-repair` sends a plain KEY fetch of
+//!   the last packets sent, one sealed under validator 0's `K_fetch(0, 0, SEQ_TARGET)` and one
+//!   under its `K_fetch(1, 0, SEQ_TARGET)`. After R11 moves the box to epoch 1 only the last may
+//!   be answered, with the packet's exact bytes (07 §5.5 source 3, 08 §9.6).
 //! - R10. `--data-shards N` runs the box on `N` ingest shards (`[shards] n`, 07 §5.2 RSS by
 //!   session): `STATS` must report `shards=N` and `hop_full=0`, with every other `data` check
 //!   unchanged, so the sharded fan-out keeps one `data_seq` per destination (the feed reports no
 //!   gap) and fetches reach the owning shard.
 //! - R11. `--keyed`: before the first packet, validator 0 gets `EPOCH 1` on stdin and re-derives
-//!   its `K_fetch`, then the box gets `EPOCH 1` and drops epoch 0's keys. `data` then needs
-//!   `fetch_unauth = 0`, so every fetch of the run was sealed under an epoch-1 key.
+//!   its `K_fetch`, then the data box and the primary `vyrn-seq` box each get `EPOCH 1` and drop
+//!   epoch 0's keys. `data` then needs `fetch_unauth = 0`, so every fetch of the run was sealed
+//!   under an epoch-1 key, and `seq-repair` (R8) needs the seq box to refuse epoch 0's key.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
 //!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
 //!   still have finalized from votes when quorum held for two heights or more, so a broken vote
@@ -1271,10 +1273,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
         None => (None, None, None),
     };
 
-    // R11, before any packet: validator 0 moves its K_fetch to epoch 1, then the box drops epoch
-    // 0, so every fetch of the run must be sealed under the re-derived keys.
+    // R11, before any packet: validator 0 moves its K_fetch to epoch 1, then the data box and
+    // the vyrn-seq box drop epoch 0, so every fetch of the run must be sealed under the
+    // re-derived keys.
     let epoch_step = match (cli.keyed, data_idx, vals.first()) {
-        (true, Some(b), Some(&v)) => Some(rotate_epoch(&mut nodes, &rx, v, b, 1, wait)),
+        (true, Some(b), Some(&v)) => Some(rotate_epoch(&mut nodes, &rx, v, &[b, seq], 1, wait)),
         _ => None,
     };
 
@@ -1324,13 +1327,18 @@ fn run(cli: &Cli) -> Result<bool, String> {
     };
     let fin_target = last(&nodes.0);
     // R8, with the box still up: its keyed `[repair]` answers a sealed KEY fetch, not a plain one.
-    let seq_repair_probe = cons.as_ref().and_then(|c| c.seq_fetch_key).map(|k| {
-        probe_seq_repair(
-            nodes.0.get(seq).and_then(|n| line(n, "REPAIR addr=")),
-            &k,
-            &pkts,
-        )
-    });
+    // R11: it has moved to epoch 1, so the epoch-0 key is refused too.
+    let seq_repair_probe = cons
+        .as_ref()
+        .and_then(|c| c.seq_fetch_key)
+        .map(|(old, new)| {
+            probe_seq_repair(
+                nodes.0.get(seq).and_then(|n| line(n, "REPAIR addr=")),
+                &old,
+                &new,
+                &pkts,
+            )
+        });
     let seq_ok = nodes.stop(seq, &rx, Instant::now() + wait)?;
     // The data node flushes its open frames on stop.
     let data_ok = data_idx.map(|i| nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
@@ -1942,7 +1950,7 @@ fn vote_seed(i: usize) -> [u8; 32] {
 /// address, which every validator lists as its observer.
 struct Cons {
     /// `--keyed` (R8): validator 0's key to the primary `vyrn-seq` box.
-    seq_fetch_key: Option<[u8; 16]>,
+    seq_fetch_key: Option<([u8; 16], [u8; 16])>,
     roster: PathBuf,
     roster_hash: String,
     ctrl: SocketAddrV4,
@@ -2027,20 +2035,20 @@ impl Cons {
         };
         let roster = dir.join("roster.hex");
         std::fs::write(&roster, hex(&r.encode())).map_err(|e| e.to_string())?;
-        // Validator 0's `K_fetch(0, 0, SEQ_TARGET)`, which the R8 probe seals with.
-        let seq_fetch_key = keyed
-            .then(|| {
-                r.requester_fetch_key(
-                    vyrn_epoch::FETCH_CONTEXT,
-                    &domain,
-                    Epoch(0),
-                    vyrn_types::HomeCode::Ldn,
-                    0,
-                    vyrn_epoch::SEQ_TARGET,
-                    &XCHG_SEED,
-                )
-            })
-            .flatten();
+        // Validator 0's `K_fetch(e, 0, SEQ_TARGET)` of epochs 0 and 1, which the R8 probe seals
+        // with: after R11 moves the box to epoch 1, only the second may be answered.
+        let seq_key = |e| {
+            r.requester_fetch_key(
+                vyrn_epoch::FETCH_CONTEXT,
+                &domain,
+                Epoch(e),
+                vyrn_types::HomeCode::Ldn,
+                0,
+                vyrn_epoch::SEQ_TARGET,
+                &XCHG_SEED,
+            )
+        };
+        let seq_fetch_key = keyed.then(|| Some((seq_key(0)?, seq_key(1)?))).flatten();
         Ok(Self {
             seq_fetch_key,
             roster,
@@ -2056,20 +2064,22 @@ impl Cons {
 
 /// R8: KEY fetches of the last sent packets to the box's keyed `[repair]` at `addr`. The plain
 /// form must get no answer; the form sealed under `key` must return the packet's exact bytes.
-/// R11: `EPOCH e` to validator `v` (acked `FETCH_EPOCH e`), then to box `b` (acked
-/// `FETCH_EPOCHS e,e+1`), so the box never drops a key the validator still uses.
+/// R11: `EPOCH e` to validator `v` (acked `FETCH_EPOCH e`), then to each of `boxes` (acked
+/// `FETCH_EPOCHS e,e+1`), so no box drops a key the validator still uses.
 fn rotate_epoch(
     nodes: &mut Nodes,
     rx: &Lines,
     v: usize,
-    b: usize,
+    boxes: &[usize],
     e: u32,
     wait: Duration,
 ) -> Result<String, String> {
-    for (i, ack) in [
-        (v, format!("FETCH_EPOCH {e}")),
-        (b, format!("FETCH_EPOCHS {e},{}", e + 1)),
-    ] {
+    let acks = std::iter::once((v, format!("FETCH_EPOCH {e}"))).chain(
+        boxes
+            .iter()
+            .map(|&b| (b, format!("FETCH_EPOCHS {e},{}", e + 1))),
+    );
+    for (i, ack) in acks {
         let n = nodes.0.get_mut(i).ok_or("node")?;
         let name = n.name.clone();
         let stdin = n.child.stdin.as_mut().ok_or("stdin")?;
@@ -2081,12 +2091,17 @@ fn rotate_epoch(
         })?;
     }
     Ok(format!(
-        "validator-0 acked FETCH_EPOCH {e}, then the box FETCH_EPOCHS {e},{}; the run's fetches use epoch {e}",
+        "validator-0 acked FETCH_EPOCH {e}, then vyrn-data and vyrn-seq FETCH_EPOCHS {e},{}; the run's fetches use epoch {e}",
         e + 1
     ))
 }
 
-fn probe_seq_repair(addr: Option<&str>, key: &[u8; 16], pkts: &[Pkt]) -> Result<String, String> {
+fn probe_seq_repair(
+    addr: Option<&str>,
+    old: &[u8; 16],
+    key: &[u8; 16],
+    pkts: &[Pkt],
+) -> Result<String, String> {
     use vyrn_data::frame::{Fetch, decode, seal_fetch};
     let addr: SocketAddrV4 = addr
         .ok_or("vyrn-seq printed no REPAIR addr=")?
@@ -2109,6 +2124,14 @@ fn probe_seq_repair(addr: Option<&str>, key: &[u8; 16], pkts: &[Pkt]) -> Result<
                 (p.session, p.pkt_seq)
             ));
         }
+        sock.send_to(&seal_fetch(old, &q), addr)
+            .map_err(|e| e.to_string())?;
+        if sock.recv(&mut buf).is_ok() {
+            return Err(format!(
+                "the box answered a fetch of {:?} sealed under epoch 0's key after EPOCH 1 (R11)",
+                (p.session, p.pkt_seq)
+            ));
+        }
         sock.send_to(&seal_fetch(key, &q), addr)
             .map_err(|e| e.to_string())?;
         let n = sock
@@ -2117,7 +2140,7 @@ fn probe_seq_repair(addr: Option<&str>, key: &[u8; 16], pkts: &[Pkt]) -> Result<
         let f = decode(buf.get(..n).unwrap_or_default()).map_err(|e| format!("{e:?}"))?;
         if f.packets().any(|b| b == p.bytes.as_slice()) {
             return Ok(format!(
-                "a plain KEY fetch got no answer; the sealed one returned {:?}'s exact bytes",
+                "a plain and an epoch-0 sealed KEY fetch got no answer; the epoch-1 sealed one returned {:?}'s exact bytes",
                 (p.session.0, p.pkt_seq)
             ));
         }

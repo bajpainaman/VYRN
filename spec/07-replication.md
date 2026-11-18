@@ -1156,6 +1156,12 @@ epoch transitions are wired, the transition is the control line `EPOCH <e>` on t
 stdin, like the data box's, acked `FETCH_EPOCH <e>` once the order thread has installed the new
 keys (ruled for now; 07 and 08 name no transport for it).
 
+**Epoch boundary (`vyrn-seq` repair).** A keyed `vyrn-seq` `[repair]` serves source 3 like a
+data box: it holds `K_fetch(e, i, SEQ_TARGET + j)` of epochs `e` and `e + 1`, and the same
+`EPOCH <e>` stdin line moves both and drops older keys, acked `FETCH_EPOCHS <e>,<e+1>` once the
+repair thread serves under them (reading, as for the data box). Its requesters move first, as
+above, so it keeps no `e − 1`.
+
 **`SeqDataReq` bytes (source 3).** The request is the data tier's 32-byte KEY fetch
 (`vyrn-data` frame docs: magic `PF`, kind 1, `session u32, pkt_seq u32`), sent to the
 sequencer's repair port.

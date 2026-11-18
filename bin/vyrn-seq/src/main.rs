@@ -61,6 +61,12 @@
 //! seal_violations=<n> handoff_full=<n>`, then with `[repair]` `REPAIR_STATS retain_dropped=<n>
 //! served=<n> missed=<n> limited=<n> bad=<n>`.
 //!
+//! **Control** (stdin, one line each; *reading*, like `vyrn-data`'s: 07 and 08 name no
+//! transport for it yet). `EPOCH <e>` re-derives a keyed `[repair]`'s `K_fetch` for epochs `e`
+//! and `e + 1` and drops older ones (07 §5.5 Epoch boundary); the repair thread prints
+//! `FETCH_EPOCHS <e>,<e+1>` once it serves under them. A refused or unknown line prints
+//! `CONTROL_ERR <why>` on stderr and changes nothing.
+//!
 //! **Stop.** With `--stop-on-stdin-eof`, closing stdin stops both threads, flushes the stream
 //! and prints `STATS`. Otherwise the process runs until killed (06 §4.8: never restarted).
 //!
@@ -73,7 +79,6 @@ mod config;
 mod finality;
 mod repair;
 
-use std::io::Read as _;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -193,6 +198,33 @@ fn main() -> ExitCode {
     }
 }
 
+/// What `EPOCH <e>` derives the repair keys from, and the repair thread's sender.
+type Control = (
+    vyrn_epoch::Roster,
+    vyrn_epoch::Domain,
+    vyrn_types::HomeCode,
+    [u8; 32],
+    std::sync::mpsc::Sender<(u32, repair::Keys)>,
+);
+
+/// One stdin control line (cold path): `EPOCH <e>` hands the repair thread epoch `e`'s key
+/// window, which it acks once installed; empty lines are ignored.
+fn control_line(line: &str, control: Option<&Control>) -> Result<(), String> {
+    let mut w = line.split_whitespace();
+    match (w.next(), w.next().map(str::parse::<u32>), w.next()) {
+        (None, ..) => Ok(()),
+        (Some("EPOCH"), Some(Ok(e)), None) => {
+            let Some((roster, domain, home, secret, tx)) = control else {
+                return Err("EPOCH needs a keyed [repair] (repair.xchg)".into());
+            };
+            let keys = repair::window_keys(roster, domain, e, *home, secret)?;
+            tx.send((e, keys))
+                .map_err(|_| "the repair thread has stopped".into())
+        }
+        _ => Err(format!("unknown control line {:?}", line.trim())),
+    }
+}
+
 fn run<B: NicBackend>(cfg: &Config, seed: [u8; 32], stdin_stop: bool) -> Result<(), String>
 where
     B::Rx: LocalAddr + 'static,
@@ -244,6 +276,9 @@ where
     // 07 §5.5 source 3: its queues, ring and server are allocated before any thread starts.
     let mut retain_ring = cfg.repair.as_ref().map(|_| repair::RetainRing::new(&Hw));
     let mut repair_q = None;
+    // Keyed `[repair]`: what `EPOCH <e>` derives keys from, and the repair thread's receiver.
+    let mut control = None;
+    let mut rekey = None;
     if let Some(r) = &cfg.repair {
         let bind = RxBind {
             lane: LaneId(0),
@@ -275,15 +310,15 @@ where
             let roster =
                 vyrn_epoch::Roster::decode(mode, &bytes).map_err(|e| format!("roster: {e}"))?;
             let home = home_code(&cfg.home).ok_or("config home is not TYO, LDN or NYC")?;
-            server.set_keys(repair::fetch_keys(
-                &roster,
-                &domain,
-                Epoch(cfg.epoch),
-                home,
-                &config::resolve::<32>(h)?,
+            let secret = config::resolve::<32>(h)?;
+            server.set_keys(repair::window_keys(
+                &roster, &domain, cfg.epoch, home, &secret,
             )?);
+            let (tx, rx) = std::sync::mpsc::channel();
+            rekey = Some(rx);
+            control = Some((roster, domain, home, secret, tx));
         }
-        repair_q = Some((server, rrx, rtx));
+        repair_q = Some((server, rekey.take(), rrx, rtx));
     }
     let (retain_tx, retain_rx) = match retain_ring.as_mut().and_then(|r| r.split()) {
         Some((p, [c])) => (Some(p), Some(c)),
@@ -321,7 +356,7 @@ where
         // `println!` panic), both threads are told to finish, so the scope's join cannot hang.
         let _stop = Done([&*stop, &engine_done]);
         let repair = match (repair_q, retain_rx) {
-            (Some((server, rrx, rtx)), Some(copies)) => {
+            (Some((server, rekey, rrx, rtx)), Some(copies)) => {
                 let me = Endpoint {
                     mac: [0; 6],
                     ip,
@@ -331,7 +366,9 @@ where
                 let stop = Arc::clone(&stop);
                 let t = std::thread::Builder::new()
                     .name("vyrn-seq/repair".into())
-                    .spawn_scoped(sc, move || repair::run(server, copies, rrx, rtx, me, &stop))
+                    .spawn_scoped(sc, move || {
+                        repair::run(server, rekey, copies, rrx, rtx, me, &stop)
+                    })
                     .map_err(|e| e.to_string())?;
                 Some(t)
             }
@@ -415,9 +452,14 @@ where
         }
         if failed.is_none() {
             start_line(cfg, n, &addrs);
+            // Control lines on stdin until EOF (crate docs, Control).
+            for line in std::io::stdin().lines() {
+                let Ok(line) = line else { break };
+                if let Err(e) = control_line(&line, control.as_ref()) {
+                    eprintln!("CONTROL_ERR {e}");
+                }
+            }
             if stdin_stop {
-                let mut sink = Vec::new();
-                let _ = std::io::stdin().read_to_end(&mut sink);
                 stop.store(true, Ordering::Release);
             }
         } else {
