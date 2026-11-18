@@ -160,8 +160,31 @@ const EVENT_QUEUE: usize = 4096;
 /// How long a stop waits for the output thread to print what is queued.
 const DRAIN: Duration = Duration::from_secs(1);
 
-fn print_events(rx: &std::sync::mpsc::Receiver<Event>, printed: &AtomicU64) {
+/// Set in [`Drain::claimed`] by a stop: from then on the output thread prints nothing.
+const CLOSED: u64 = 1 << 63;
+
+/// The output thread's progress, shared with the stop.
+#[derive(Default)]
+struct Drain {
+    /// Events the output thread has taken to print, with [`CLOSED`] set once the stop has
+    /// counted what is left. Claiming and closing are one atomic word, so an event is either
+    /// claimed (printed, or the one line being written when the process exits) or abandoned,
+    /// never both.
+    claimed: AtomicU64,
+    /// Events fully written.
+    printed: AtomicU64,
+}
+
+fn print_events(rx: &std::sync::mpsc::Receiver<Event>, d: &Drain) {
     while let Ok(e) = rx.recv() {
+        let claim = d
+            .claimed
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                (v & CLOSED == 0).then_some(v.wrapping_add(1))
+            });
+        if claim.is_err() {
+            return;
+        }
         let mut out = std::io::stdout().lock();
         let _ = match e {
             Event::BadMac { session, pkt_seq } => {
@@ -177,7 +200,7 @@ fn print_events(rx: &std::sync::mpsc::Receiver<Event>, printed: &AtomicU64) {
         };
         let _ = out.flush();
         drop(out);
-        printed.fetch_add(1, Ordering::Release);
+        d.printed.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -289,12 +312,12 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
     // reader of stdout (or a bad-MAC flood) never blocks ingest.
     let (events, events_rx) = std::sync::mpsc::sync_channel::<Event>(EVENT_QUEUE);
     let (mut unprinted, mut queued) = (0u64, 0u64);
-    let printed = Arc::new(AtomicU64::new(0));
+    let drain = Arc::new(Drain::default());
     {
-        let printed = Arc::clone(&printed);
+        let drain = Arc::clone(&drain);
         std::thread::Builder::new()
             .name("vyrn-data/events".into())
-            .spawn(move || print_events(&events_rx, &printed))
+            .spawn(move || print_events(&events_rx, &drain))
             .map_err(|e| e.to_string())?;
     }
     let mut hand_over = |node_events: std::vec::Drain<'_, Event>, unprinted: &mut u64| {
@@ -327,13 +350,16 @@ fn run<S: BlockStore>(cfg: &Config, store: S, stdin_stop: bool) -> Result<(), St
     node.flush(now(t0));
     hand_over(node.drain_events(), &mut unprinted);
     drop(hand_over);
-    // Give the output thread `DRAIN` to print what is queued; whatever it has not printed by
-    // then is counted, so every event is either an EVENT line or in `events_unprinted`.
+    // Give the output thread `DRAIN` to print what is queued, then close it: whatever it has not
+    // claimed by then is counted and never printed, so every event is either an EVENT line or in
+    // `events_unprinted` (at most one line, the one being written as the process exits, may be
+    // cut short).
     let deadline = Instant::now() + DRAIN;
-    while printed.load(Ordering::Acquire) < queued && Instant::now() < deadline {
+    while drain.printed.load(Ordering::Acquire) < queued && Instant::now() < deadline {
         std::thread::yield_now();
     }
-    let abandoned = queued.saturating_sub(printed.load(Ordering::Acquire));
+    let claimed = drain.claimed.fetch_or(CLOSED, Ordering::AcqRel) & !CLOSED;
+    let abandoned = queued.saturating_sub(claimed);
     unprinted = unprinted.wrapping_add(abandoned);
     unprinted_metric.inc_by(abandoned);
     let c = *node.counters();

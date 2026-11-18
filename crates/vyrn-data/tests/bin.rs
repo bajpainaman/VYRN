@@ -194,8 +194,12 @@ fn a_stop_accounts_for_every_event() {
         let n = encode_request(&mut pkt, h, &[Msg::Heartbeat], &[9; 16], None).unwrap();
         client.send_to(&pkt[..n], &ingest).unwrap();
     }
+    // Stop while the flood is still being ingested, but only once the box has raised an event.
+    let mut first = String::new();
+    out.read_line(&mut first).unwrap();
+    assert!(first.starts_with("EVENT bad_mac "), "{first}");
     drop(child.stdin.take());
-    let mut rest = String::new();
+    let mut rest = first;
     out.read_to_string(&mut rest).unwrap();
     assert!(child.wait().unwrap().success());
     let printed = rest
