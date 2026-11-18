@@ -13,6 +13,7 @@
 //! | [`eip712`] | `Post`, `Unpause`, `SignerSet` digests; 65-byte `r‖s‖v` bridge-key signatures, 4 of 5 | 09 §6.2, §6.5, §6.7; contracts/README §Typed data | the validators' bridge keys (HSM) | `VyrnBridge._countSigs` on L1, guardians, relayers |
 //! | [`wdtree`] | keccak256 sorted-pair Merkle tree of `Withdrawal` (OpenZeppelin `StandardMerkleTree`) | 09 §6.2 | the post builder, [`bridge::build_post`] | `VyrnBridge.claim`, wallets |
 //! | [`smt`] | BLAKE3 sparse Merkle tree, depth 256; `AccountLeaf`, `BalanceLeaf` | 09 §9.3; contracts/README §Leaf encoding | the commit box | `VyrnBridge.escapeClaim`, light clients (09 §10.4) |
+//! | [`smtinc`] | the same tree, updated in place from a batch of dirty leaves | 09 §9.3 net diff, B-CHN-2 | the commit box | [`smt::Proof`] readers |
 //! | [`bridge`] | [`bridge::Checkpoint`] → `Post`; the guardian's veto decision | 09 §6.4, §6.5 | validators (build), guardians (review) | relayers, L1 |
 //! | [`session`] | `SessionOpen` (item 0x01), checks 2–4 | 09 §5.2 | wallets | every validator |
 //! | [`tesla`] | `K_seq`, `K_out`, `K_com` chain and anchor; `KeyDisclosure` (45 B) | 09 §5.3, §5.4, §5.10 | clients, sequencer node, committee members | validators' `tag_com` check, third-party auditors |
@@ -72,6 +73,7 @@ pub mod lthash;
 pub mod session;
 pub mod signer;
 pub mod smt;
+pub mod smtinc;
 pub mod tesla;
 pub mod tx;
 pub mod wdtree;
@@ -89,6 +91,7 @@ pub use lthash::{LtHash, OrderElem};
 pub use session::{OpenReject, SessionOpen, SessionState};
 pub use signer::{BridgeSigner, Ed25519Signer, SignerError};
 pub use smt::{AccountLeaf, BalanceLeaf, Proof, Smt};
+pub use smtinc::IncSmt;
 pub use tesla::{ClientKeys, KcomWindow, KeyDisclosure, Traversal};
 pub use tx::{SignerRef, TxEnvelope};
 pub use wdtree::Withdrawal;
