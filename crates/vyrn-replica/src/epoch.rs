@@ -21,7 +21,8 @@
 //! after its fact is durable (08 §5.3 rule 4, F4). On open, a last line without its `\n` is a
 //! write that never completed and is dropped; any other malformed line fails the open. The file
 //! holds an exclusive lock while open, so only one guard can admit records, and a newly created
-//! journal's parent directory is fsynced before `open` returns.
+//! journal's parent directory is fsynced before `open` returns. `open` also fsyncs the file it
+//! read before exposing its state, so a line seen only in the page cache is never trusted.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -236,6 +237,10 @@ impl EpochJournal {
             // Drop the torn tail so the next append starts on a fresh line.
             file.set_len(u64::try_from(keep).unwrap_or(0))?;
         }
+        // A line read back may sit only in the page cache: a crash between write and fsync, or
+        // a failed fsync. Make what was read durable before any of it is trusted, so `admit`
+        // never returns `Repeat` for an admission that a host crash could still lose.
+        file.sync_all()?;
         Ok(Self {
             file,
             once: SignOnce::from_persisted(signed),

@@ -15,11 +15,11 @@
 //! little-endian. `data_root` is `vyrn_log::block::data_root` over the full hashes of each
 //! substream's packets in O-order, Advance records excluded (07 §6.1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use vyrn_log::LaneRec;
 use vyrn_log::block::data_root;
-use vyrn_types::{Hash, PacketFlags, PacketRecord, PktHash, SessionId};
+use vyrn_types::{Hash, Height, PacketFlags, PacketRecord, PktHash, SessionId};
 
 use crate::ports::BlockInputs;
 
@@ -49,7 +49,15 @@ pub enum DataErr {
 #[derive(Clone, Debug, Default)]
 pub struct DataJoin {
     by_key: BTreeMap<(SessionId, u32), Vec<Variant>>,
+    /// Variants kept for a bounded window after a release, `(height released, key, hash)`: a
+    /// `SHED` record's variant (for its retry), and the unused variants of an accepted packet.
+    shed: VecDeque<(Height, (SessionId, u32), PktHash)>,
 }
+
+/// Blocks a released `SHED` record's payload is kept for its retry, which reuses the packet's
+/// `pkt_seq` (05 §6.8, `vyrn-lane` `answer_busy`) and may have the same bytes. 128 blocks
+/// (≈ 128 ms) covers `REP_CLIENT_RETAIN_MS` = 100 (07 §5.6) [Guessing: spec gap, PR body].
+pub const REP_SHED_KEEP_BLOCKS: u64 = 128;
 
 /// The signed bytes of a request packet: its 16-byte header and `count` 16-byte messages.
 fn signed(bytes: &[u8]) -> &[u8] {
@@ -139,11 +147,55 @@ impl DataJoin {
         }
     }
 
-    /// Forgets every payload of the given records, once their block is replayed and stored.
-    pub fn release<'a>(&mut self, recs: impl IntoIterator<Item = &'a LaneRec>) {
+    /// Releases the payloads of block `height`'s records once that block is replayed and
+    /// stored. Only the variant each record names (by `pkt_hash`) goes, so other variants of its
+    /// `(session, pkt_seq)` stay. A `SHED` record's variant stays [`REP_SHED_KEEP_BLOCKS`] more
+    /// blocks, for the retry that reuses its `pkt_seq`; a retry released in a later block frees
+    /// it at once, and a later `SHED` record of the same variant extends the window. The other
+    /// variants of an accepted packet expire after the same window. Calls come in non-decreasing
+    /// `height`.
+    pub fn release<'a>(&mut self, height: Height, recs: impl IntoIterator<Item = &'a LaneRec>) {
         for r in recs {
-            if let LaneRec::Pkt(p) = r {
-                self.by_key.remove(&(p.session, p.pkt_seq));
+            let LaneRec::Pkt(p) = r else { continue };
+            if p.flags & PacketFlags::ADVANCE != 0 {
+                continue;
+            }
+            let key = (p.session, p.pkt_seq);
+            if p.flags & PacketFlags::SHED != 0 {
+                self.shed.push_back((height, key, p.pkt_hash));
+            } else {
+                self.evict(key, p.pkt_hash);
+                // Other variants of an accepted packet (resends the sequencer did not take) have
+                // no record left to release them: they expire after the same window.
+                let rest: Vec<PktHash> = self
+                    .by_key
+                    .get(&key)
+                    .map(|vs| vs.iter().map(|v| prefix(&v.full)).collect())
+                    .unwrap_or_default();
+                for h in rest {
+                    if !self.shed.iter().any(|&(_, k, x)| k == key && x == h) {
+                        self.shed.push_back((height, key, h));
+                    }
+                }
+            }
+        }
+        while let Some(&(h, key, hash)) = self.shed.front() {
+            if h.0.saturating_add(REP_SHED_KEEP_BLOCKS) > height.0 {
+                break;
+            }
+            self.shed.pop_front();
+            // A later SHED record of the same variant (the retry was shed again) keeps it.
+            if !self.shed.iter().any(|&(_, k, x)| k == key && x == hash) {
+                self.evict(key, hash);
+            }
+        }
+    }
+
+    fn evict(&mut self, key: (SessionId, u32), hash: PktHash) {
+        if let Some(vars) = self.by_key.get_mut(&key) {
+            vars.retain(|v| prefix(&v.full) != hash);
+            if vars.is_empty() {
+                self.by_key.remove(&key);
             }
         }
     }
