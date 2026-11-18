@@ -67,7 +67,8 @@
 //! reach the RX core through a queue of `CONTROL_QUEUE`; while
 //! it is full the stdin reader waits, never a core.
 //!
-//! **Stop.** With `--stop-on-stdin-eof`, closing stdin stops the RX core; each shard drains its
+//! **Stop.** With `--stop-on-stdin-eof`, closing stdin stops the RX core taking packets; it
+//! hands on the redirects its retry queue still holds, then each shard drains its
 //! ring, then the sender drains its rings and flushes open frames, then `STATS` is printed.
 #![forbid(unsafe_code)]
 
@@ -686,6 +687,11 @@ fn run<S: BlockStore + Sync>(cfg: &Config, store: S, stdin_stop: bool) -> Result
                         if work == 0 || rx.fetches() > 0 {
                             std::thread::yield_now();
                         }
+                    }
+                    // Redirects a full shard ring held back still go out: the shards keep
+                    // draining until `rx_done`, so this ends.
+                    while !shared.aborted() && rx.drain_redirects(&mut to_shard) > 0 {
+                        std::thread::yield_now();
                     }
                     shared.rx_done.store(true, Ordering::Release);
                     ex.publish(rx.counters());

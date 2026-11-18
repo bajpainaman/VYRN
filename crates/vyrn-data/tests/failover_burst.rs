@@ -222,4 +222,23 @@ fn a_failover_burst_twice_the_hop_ring_is_paced_not_dropped() {
     assert!(k.redirect_retried > 0, "the burst overran the ring: {k:?}");
     assert_eq!(k.redirect_dropped, 0);
     assert_eq!(cores[0].counters().redirects, 4 * u64::from(SESSIONS));
+
+    // A stop right after an operator burst of twice the ring's headroom: the RX core takes no
+    // more packets, but hands on every redirect its retry queue holds while the shard drains.
+    rx.redirect(0, 1, &sessions, &mut to_shard);
+    rx.redirect(0, 1, &sessions, &mut to_shard);
+    assert!(rx.pending() > 0, "the burst must leave redirects queued");
+    let base = got;
+    for _ in 0..2000 {
+        let left = rx.drain_redirects(&mut to_shard);
+        cores[0].poll(&mut shard_in[0], &mut shard_out[0], &store);
+        sender.poll(Nanos(9000), &mut sender_in);
+        got += count(&mut client_rx);
+        if left == 0 && got - base == 2 * SESSIONS as usize {
+            break;
+        }
+    }
+    assert_eq!(rx.pending(), 0);
+    assert_eq!(got - base, 2 * SESSIONS as usize, "{:?}", rx.counters());
+    assert_eq!(rx.counters().redirect_dropped, 0);
 }

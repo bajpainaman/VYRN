@@ -214,6 +214,21 @@ impl<R: RxRing, F: RxRing> RxCore<R, F> {
             .count()
     }
 
+    /// Redirects waiting in the retry queue ([`Pending`]).
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The stop path: retries queued redirects (as the start of [`RxCore::poll`] does) without
+    /// taking new packets, and returns how many still wait. A stopping box calls it, while the
+    /// shards keep draining, until it returns 0, so a stop loses no `DataRedirect` a full ring
+    /// held back.
+    pub fn drain_redirects(&mut self, shards: &mut [ShardTx<'_>]) -> usize {
+        let c = &mut self.counters;
+        self.pending.retry(|r| redirect_to_owner(shards, r, c));
+        self.pending.len()
+    }
+
     /// One turn: an ingest burst to the shards, then a fetch burst to its owners. `shards` are
     /// the producers of every shard's ring, in shard order. Returns the frames handled.
     pub fn poll(
