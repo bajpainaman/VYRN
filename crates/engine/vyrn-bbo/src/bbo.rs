@@ -1622,8 +1622,11 @@ impl Bbo {
             return true;
         }
         let opp = t.side.opposite();
-        if t.v.flags.post_only() && self.touch(src, c, opp, t.tick).is_some() {
-            self.reject_taker(t, role, RejectReason::PostOnlyWouldCross, 0);
+        // The detail is the best opposite tick it would cross (04 §6), from the live book.
+        if t.v.flags.post_only()
+            && let Some(at) = self.touch(src, c, opp, t.tick)
+        {
+            self.reject_taker(t, role, RejectReason::PostOnlyWouldCross, at.0);
             return true;
         }
         if t.tif() == Tif::Fok {
@@ -1802,16 +1805,21 @@ impl Bbo {
             g,
         };
         let opp = t.side.opposite();
-        let crosses = resume
-            || self.phase == Phase::Continuous && {
-                let from = self.bound(opp);
-                let empty = if opp == Side::Buy { NO_BID } else { NO_ASK };
-                from != empty && next_level(&self.ctx(src, c, c, None), opp, from, t.tick).is_some()
-            };
+        let at = if self.phase == Phase::Continuous {
+            let from = self.bound(opp);
+            let empty = if opp == Side::Buy { NO_BID } else { NO_ASK };
+            (from != empty)
+                .then(|| next_level(&self.ctx(src, c, c, None), opp, from, t.tick))
+                .flatten()
+        } else {
+            None
+        };
+        let crosses = resume || at.is_some();
         let n_ev = self.out.events().len();
         if crosses {
             if !resume && v.flags.post_only() {
-                self.reject_taker(&t, role, RejectReason::PostOnlyWouldCross, 0);
+                let d = at.map_or(0, |x| x.0);
+                self.reject_taker(&t, role, RejectReason::PostOnlyWouldCross, d);
                 return Some(false);
             }
             let from = self.bound(opp);
@@ -2156,9 +2164,9 @@ impl Bbo {
         };
         if !cont
             && v.flags.post_only()
-            && next_level(&self.ctx(src, c, prev, Some(key)), side, from, t.tick).is_some()
+            && let Some(at) = next_level(&self.ctx(src, c, prev, Some(key)), side, from, t.tick)
         {
-            self.reject_taker(&t, Role::Batch, RejectReason::PostOnlyWouldCross, 0);
+            self.reject_taker(&t, Role::Batch, RejectReason::PostOnlyWouldCross, at.0);
             return Sweep::Killed;
         }
         // Capped like a forwarded sweep (D14): one level or ENG_STEP_FILLS per step.

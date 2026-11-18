@@ -473,20 +473,18 @@ fn m7_runs_count_before_credit() {
 // ---------------------------------------------------------------- M8: post-only, BBO buckets
 
 #[test]
-fn m8_post_only_cross_rejects_with_the_opposite_best() {
+fn m8_post_only_cross_is_forwarded_to_the_bbo_core() {
+    // 03 ARC-D6, 05 §2.4: whether a post-only order crosses is the BBO core's decision against
+    // the live book, so lane risk passes it on its charged route (a Cross takes the cross
+    // buckets) instead of rejecting it against the snapshot.
     let mut f = Fx::new();
     let mut m = buy(100_000, 1);
     m.post_only = true;
-    assert_eq!(
-        reason(f.new_order(m, Route::Cross)),
-        Some((R::PostOnlyWouldCross, 100_000))
-    );
+    let r = f.new_order(m, Route::Cross).unwrap();
+    assert_eq!(r.route, Route::Cross);
     let mut s = sell(99_000, 1);
     s.post_only = true;
-    assert_eq!(
-        reason(f.new_order(s, Route::Cross)),
-        Some((R::PostOnlyWouldCross, 99_000))
-    );
+    assert!(f.new_order(s, Route::Cross).is_ok());
     m.tick = Tick(99_999);
     assert!(f.new_order(m, Route::Improve).is_ok());
 }

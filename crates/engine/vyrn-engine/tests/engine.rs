@@ -424,11 +424,11 @@ fn replay_from_07_carries_unsettled_records_across_blocks() {
 }
 
 #[test]
-fn replay_routes_a_locally_rejected_cross_from_its_route_record() {
-    // G9 (07 §3.6): a post-only buy @ 105 against ask 105 is a Cross that lane risk rejects
-    // (POST_ONLY_WOULD_CROSS), so no step names it and only its RouteRecord carries the route.
-    // Both entry points must replay it from that record; without it the op replays as a Join,
-    // which the lane accepts: the divergence must be detected, not pass silently.
+fn replay_routes_a_post_only_cross_from_its_route_record() {
+    // G12 (07 §3.6): a post-only buy @ 105 against ask 105 is a Cross. The lane forwards it and
+    // the BBO core kills it (POST_ONLY_WOULD_CROSS, detail the live ask: 03 ARC-D6, 05 §2.4).
+    // Both entry points must replay its route from the RouteRecord; without it the op replays
+    // as a Join, which the lane applies itself: the divergence must be detected, not pass.
     use Side::{Buy, Sell};
     use Tif::Day;
     let po = vyrn_wire::Msg::New {
@@ -484,6 +484,25 @@ fn replay_routes_a_locally_rejected_cross_from_its_route_record() {
     // G12: every classified op has a route record; the two post-only crosses are the rejects.
     let cross: Vec<_> = routes.iter().filter(|x| x.cross).copied().collect();
     assert_eq!(cross, [route(2), route(4)]);
+    let killed =
+        j.tx.iter()
+            .flat_map(|(_, r)| r)
+            .filter(|r| {
+                matches!(
+                    r,
+                    vyrn_bbo::Record::Reject {
+                        reason: vyrn_types::RejectReason::PostOnlyWouldCross,
+                        detail: 105,
+                        ..
+                    }
+                )
+            })
+            .count();
+    assert_eq!(
+        killed, 2,
+        "the BBO core kills both at the live ask: {:?}",
+        j.tx
+    );
     // Journal replay reproduces it, route record included.
     let (r, rep) = replay(&j.recs, &store);
     assert_eq!(r, Ok(()));
@@ -494,13 +513,13 @@ fn replay_routes_a_locally_rejected_cross_from_its_route_record() {
         .filter(|r| !matches!(r, OwnedRec::Route(x) if x.cross))
         .copied()
         .collect();
-    // Without it the op replays as a Join: the lane accepts it, so its responses differ.
+    // Without it the op replays as a Join: the step that names it finds no forwarded source.
     let r = replay_checked(&no_route, &store, &j).0;
     assert!(
         matches!(
             r,
             Err(Diverged {
-                why: Why::Response,
+                why: Why::Step(_) | Why::Response,
                 ..
             })
         ),

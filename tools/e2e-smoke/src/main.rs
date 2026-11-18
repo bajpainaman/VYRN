@@ -54,12 +54,9 @@
 //!   keep the box's two polling threads off the validators' cores. Without them all validators
 //!   can stop at one height when the box is preempted between an ORDER frame and its HASH frame.
 //!
-//! **Known gap.** `vyrn-risk` (`check.rs`, the post-only check) rejects a post-only `New` that
-//! crosses the lane's snapshot in the lane, with the snapshot's opposite tick as the detail.
-//! 03 ARC-D6 routes that order to the BBO core, because the snapshot version a lane read is not
-//! in the order stream. So when a lane's snapshot lags, replay's `POST_ONLY_WOULD_CROSS` detail
-//! differs from live and `replay` fails on `wl-smoke.toml` for some seeds and timings.
-//! `wl-smoke-nocross.toml` sends no post-only orders and gates CI.
+//! **Post-only.** A post-only `New` that crosses the lane's snapshot is forwarded, and the BBO
+//! core decides it against the true book (03 ARC-D6), so `wl-smoke.toml`, which sends them,
+//! replays byte for byte and gates CI alongside `wl-smoke-nocross.toml`.
 //!
 //! **Build.** Run release binaries: a debug `vyrn-validator` spends more than
 //! `REP_HASHLAG_MAX_NS` (1 ms) on ORDER frames often enough to raise `REP_E_HASHLAG` in most
