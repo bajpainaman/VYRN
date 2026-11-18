@@ -380,14 +380,19 @@ pub fn to_wire(recs: &[OwnedRec]) -> (Vec<PacketRecord>, Vec<vyrn_types::RouteRe
     (lanes, routes, steps)
 }
 
-/// The `AcctTake`s of `recs`, in order: `Engine::replay_wire`'s `takes` input.
-pub fn takes_of(recs: &[OwnedRec]) -> Vec<vyrn_types::AcctTake> {
-    recs.iter()
-        .filter_map(|r| match r {
-            OwnedRec::Take(t) => Some(*t),
-            _ => None,
-        })
-        .collect()
+/// The `AcctTake`s of `recs`, each with the index in `to_wire`'s packet records of the packet
+/// right after it (05 §6.9): `Engine::replay_wire`'s `takes` input.
+pub fn takes_of(recs: &[OwnedRec]) -> Vec<(usize, vyrn_types::AcctTake)> {
+    let mut n = 0;
+    let mut out = Vec::new();
+    for r in recs {
+        match r {
+            OwnedRec::Packet(_) => n += 1,
+            OwnedRec::Take(t) => out.push((n, *t)),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// One step as `to_wire` gives it: step, kind, source, `CROSS`, cut, payload.

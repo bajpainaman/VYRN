@@ -1592,16 +1592,18 @@ into one sequence by this rule, so the Rust and Vx clients run the same schedule
    records with `f(r) < s`. Then step `s` is replayed. A pooled record whose `AcctTake` (§3.6)
    has `ver = v` is due only once every take of the same account with a lower `ver` in the
    block's (and the carried) inputs has been reproduced; the lane passes repeat in lane id order
-   until no lane replays another record, so the pool's take order is replayed exactly. Each take
-   the replayed lane call emits must equal the input's lowest-`ver` unreproduced take of its
-   `(lane, lane_seq)` (`Why::Mismatch` otherwise).
+   until no lane replays another record, so the pool's take order is replayed exactly. A take is
+   bound to the packet record right after it in its `LaneRun`, not looked up by `lane_seq`: a
+   heartbeat-only packet takes no LaneSeq, so two packets of different pooled accounts can share
+   one. The replayed lane call must emit exactly that record's take (`Why::Mismatch`
+   otherwise). A take not followed by a non-Advance record of its lane at its `lane_seq`, two
+   takes of one record, or two takes of one `(account, ver)` is `Why::BadRecord`.
 3. After the block's last step, every lane in increasing lane id replays its remaining records
    with `f(r)` at most the last step, in O-order, and stops at the first record with `f(r)`
    greater than the last step. That record and every later record of its lane, with their route
    records, **carry** into the next block, where they come before the next block's records. A
    packet's routes are its route records (§3.6), and its `AcctTake` sits right before it, so
-   both travel with it and no record waits for a later block's steps. A take that no replayed
-   or carried record of its block owns is `Why::Mismatch` at the block end. A record carried past a cut that covers one of its ops is
+   both travel with it and no record waits for a later block's steps. A record carried past a cut that covers one of its ops is
    `REP_E_ORDER`.
 
 `REP_MERGE` respects both dependencies above: a lane reads a step's fill events only after the

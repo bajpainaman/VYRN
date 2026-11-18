@@ -27,8 +27,8 @@ use vyrn_cut::Visibility;
 use vyrn_lane::{Mid, RespPkt, RxIn};
 use vyrn_risk::Route;
 use vyrn_types::{
-    AcctTake, LaneId, LaneSeq, PacketFlags, PacketRecord, RouteRecord, StepFlags, StepId, StepKind,
-    StepRecord, Tick,
+    AccountId, AcctTake, LaneId, LaneSeq, PacketFlags, PacketRecord, RouteRecord, StepFlags,
+    StepId, StepKind, StepRecord, Tick,
 };
 
 use crate::engine::{CARRY_CAP, Engine, Fault, Rec, Sink, StepErr};
@@ -462,9 +462,10 @@ struct Recs<'a> {
     /// The carried route records, then this block's.
     ra: &'a [RouteRecord],
     rb: &'a [RouteRecord],
-    /// The carried `AcctTake`s, then this block's.
-    ta: &'a [AcctTake],
-    tb: &'a [AcctTake],
+    /// The carried `AcctTake`s, then this block's, each with the index of its packet record
+    /// in `a` and `b` respectively.
+    ta: &'a [(usize, AcctTake)],
+    tb: &'a [(usize, AcctTake)],
 }
 
 impl Recs<'_> {
@@ -480,8 +481,14 @@ impl Recs<'_> {
     fn routes(&self) -> impl Iterator<Item = RouteRecord> + '_ {
         self.ra.iter().chain(self.rb).copied()
     }
-    fn takes(&self) -> impl Iterator<Item = AcctTake> + '_ {
-        self.ta.iter().chain(self.tb).copied()
+    /// Every take with its packet record's index in this sequence.
+    fn takes(&self) -> impl Iterator<Item = (usize, AcctTake)> + '_ {
+        let off = self.a.len();
+        self.ta.iter().copied().chain(
+            self.tb
+                .iter()
+                .map(move |&(i, t)| (i.saturating_add(off), t)),
+        )
     }
 }
 
@@ -556,7 +563,8 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
     /// O-order (other lanes' records may sit between them, as in a decoded block), `routes` the
     /// block's route records (07 §3.6, any order: each joins the lane call of the packet that
     /// holds its `(lane, lane_seq)`, and must equal the route record that call emits), `takes`
-    /// the block's `AcctTake`s (any order; matched by `(lane, lane_seq)` and `ver`, 05 §6.9), and
+    /// the block's `AcctTake`s, each with the index in `lanes` of the packet record it covers
+    /// (any order, 05 §6.9), and
     /// `steps` the merged steps in StepId order. The two are merged by `REP_MERGE`. Steps
     /// compare only what 07 carries (kind, source, `CROSS`, cut, checked by `Bbo::replay_step`);
     /// packet records compare byte for byte; responses compare against `log`. A route record
@@ -572,7 +580,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         &mut self,
         lanes: &[PacketRecord],
         routes: &[RouteRecord],
-        takes: &[AcctTake],
+        takes: &[(usize, AcctTake)],
         steps: &[WireStep<'_>],
         payloads: &P,
         log: &mut R,
@@ -583,8 +591,6 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         let mut next_t = core::mem::take(&mut self.carry_takes_next);
         next_t.clear();
         next_t.reserve(CARRY_CAP);
-        // Grows with the block's takes (replay only; the live path never touches it).
-        self.taken.clear();
         let mut buf = core::mem::take(&mut self.scratch);
         let carry = core::mem::take(&mut self.carry);
         let mut next = core::mem::take(&mut self.carry_next);
@@ -636,7 +642,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         (carry, carry_r, carry_t): (
             &mut Vec<PacketRecord>,
             &mut Vec<RouteRecord>,
-            &mut Vec<AcctTake>,
+            &mut Vec<(usize, AcctTake)>,
         ),
     ) -> Result<(), WireDiverged> {
         let n = self.lanes.len();
@@ -646,6 +652,10 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 why: Why::BadRecord,
             });
         }
+        self.index_takes(lanes).map_err(|why| WireDiverged {
+            at: WireAt::End,
+            why,
+        })?;
         // cur[l]: index of lane l's next record.
         let mut cur = [0usize; MAX_LANES];
         let (lo, hi) = self.tick_range().ok_or(WireDiverged {
@@ -736,11 +746,15 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 .copied()
                 .unwrap_or(usize::MAX)
             {
-                if carry.len() >= CARRY_CAP {
+                if carry.len() >= CARRY_CAP || carry_t.len() >= CARRY_CAP {
                     return Err(WireDiverged {
                         at: WireAt::Lane(i),
                         why: Why::Order,
                     });
+                }
+                // Its take carries with it, at the record's index in the carry.
+                if let Some(t) = self.take_at.get(i).copied().flatten() {
+                    carry_t.push((carry.len(), t));
                 }
                 carry.push(*r);
             }
@@ -769,24 +783,6 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 }
                 carry_r.push(x);
             }
-        }
-        // An `AcctTake` the block did not reproduce carries with its packet: a carried
-        // non-Advance record of its lane at its `lane_seq` (05 §6.9). Any other is a take no
-        // replayed record emitted.
-        for t in lanes.takes() {
-            if self.taken.contains(&t) {
-                continue;
-            }
-            let owned = carry
-                .iter()
-                .any(|p| p.lane == t.lane && !is_advance(p) && p.first_lane_seq == t.lane_seq);
-            if !owned || carry_t.len() >= CARRY_CAP {
-                return Err(WireDiverged {
-                    at: WireAt::End,
-                    why: if owned { Why::Order } else { Why::Mismatch },
-                });
-            }
-            carry_t.push(t);
         }
         Ok(())
     }
@@ -837,7 +833,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     // with `Why::NoSnapshot`.
                     if c.f >= s
                         || self.snap_want(l, &c.rec).is_some_and(|v| v > self.snap_now)
-                        || self.take_waits(lanes, &c.rec)
+                        || self.take_waits(i)
                     {
                         break;
                     }
@@ -873,22 +869,16 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     if !same_r {
                         return Err(at(Why::Mismatch));
                     }
-                    // Each `AcctTake` the call emitted is the lowest-`ver` input take of its
-                    // `(lane, lane_seq)` not yet reproduced: a take of another `ver`, account or
-                    // record, or one the input lacks, diverges here (05 §6.9).
-                    for g in tee.takes.iter().flatten() {
-                        let next = lanes
-                            .takes()
-                            .filter(|t| {
-                                t.lane == g.lane
-                                    && t.lane_seq == g.lane_seq
-                                    && !self.taken.contains(t)
-                            })
-                            .min_by_key(|t| t.ver);
-                        if next != Some(*g) {
-                            return Err(at(Why::Mismatch));
-                        }
-                        self.taken.push(*g);
+                    // The call's `AcctTake`s are exactly the input's take of this record: one
+                    // of another `ver` or account, a missing one or an extra one diverges here
+                    // (05 §6.9).
+                    let want_t = self.take_at.get(i).copied().flatten();
+                    let mut got_t = tee.takes.iter().flatten();
+                    if got_t.next().copied() != want_t || got_t.next().is_some() {
+                        return Err(at(Why::Mismatch));
+                    }
+                    if let Some(t) = want_t {
+                        self.take_done(t.account);
                     }
                     let want = core::iter::once(&c.rec).chain(mids.iter());
                     if buf.len() != c.n_mid.saturating_add(1)
@@ -909,23 +899,57 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         Ok(())
     }
 
-    /// Whether `rec`'s `AcctTake` must wait: the input holds an unreproduced take of the same
-    /// account with a lower `ver`, so the pool's take order would change (07 §3.6, §7.1).
-    fn take_waits(&self, lanes: Recs<'_>, rec: &PacketRecord) -> bool {
-        if is_advance(rec) {
-            return false;
+    /// Binds each input take to its packet record (05 §6.9) and orders them per account. A
+    /// take whose index names no packet record of its lane at its `lane_seq`, or a second take
+    /// of one record or of one `(account, ver)`, is [`Why::BadRecord`].
+    fn index_takes(&mut self, lanes: Recs<'_>) -> Result<(), Why> {
+        self.take_at.clear();
+        self.take_at.resize(lanes.len(), None);
+        self.take_order.clear();
+        self.take_pos.clear();
+        for (i, t) in lanes.takes() {
+            let rec = lanes.get(i).ok_or(Why::BadRecord)?;
+            let slot = self.take_at.get_mut(i).ok_or(Why::BadRecord)?;
+            if is_advance(rec)
+                || rec.lane != t.lane
+                || rec.first_lane_seq != t.lane_seq
+                || slot.is_some()
+            {
+                return Err(Why::BadRecord);
+            }
+            *slot = Some(t);
+            self.take_order.push((t.account, t.ver));
         }
-        let open = |t: &AcctTake| !self.taken.contains(t);
-        let Some(mine) = lanes
-            .takes()
-            .filter(|t| t.lane == rec.lane && t.lane_seq == rec.first_lane_seq && open(t))
-            .min_by_key(|t| t.ver)
-        else {
+        self.take_order.sort_unstable();
+        if self.take_order.windows(2).any(|w| w.first() == w.last()) {
+            return Err(Why::BadRecord);
+        }
+        for (k, (a, _)) in self.take_order.iter().enumerate() {
+            if self.take_pos.last().is_none_or(|(b, _)| b != a) {
+                self.take_pos.push((*a, k));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the lane record at index `i` must wait: its take has a lower-`ver` take of the
+    /// same account still unreproduced, so the pool's take order would change (07 §7.1).
+    fn take_waits(&self, i: usize) -> bool {
+        let Some(t) = self.take_at.get(i).copied().flatten() else {
             return false;
         };
-        lanes
-            .takes()
-            .any(|t| t.account == mine.account && t.ver < mine.ver && open(&t))
+        self.take_pos
+            .iter()
+            .find(|(a, _)| *a == t.account)
+            .and_then(|(_, k)| self.take_order.get(*k))
+            .is_some_and(|(b, v)| *b == t.account && *v < t.ver)
+    }
+
+    /// Account `a`'s next take is reproduced.
+    fn take_done(&mut self, a: AccountId) {
+        if let Some((_, k)) = self.take_pos.iter_mut().find(|(b, _)| *b == a) {
+            *k = k.saturating_add(1);
+        }
     }
 
     /// The snapshot version packet record `rec` of lane `l` names, `snap_base + snap_lag`;

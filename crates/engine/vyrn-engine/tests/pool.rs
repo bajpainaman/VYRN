@@ -449,11 +449,11 @@ fn an_auction_runs_through_control_steps_and_replays() {
 }
 
 /// Replays 07-only blocks (`Engine::replay_wire`) on a fresh box, pooled as `pool` says; each
-/// block is `(packet records, route records, AcctTakes, steps)`.
+/// block is `(packet records, route records, AcctTakes with their packet's index, steps)`.
 type PoolBlock<'a> = (
     &'a [vyrn_types::PacketRecord],
     &'a [vyrn_types::RouteRecord],
-    &'a [AcctTake],
+    &'a [(usize, AcctTake)],
     &'a [Wire],
 );
 
@@ -516,28 +516,31 @@ fn replay_wire_reproduces_each_take_and_carries_it_with_its_packet() {
     let (lanes, routes, steps) = to_wire(&s.j.recs);
     let takes = takes_of(&s.j.recs);
     assert_eq!(takes.len(), 3);
-    let one = |t: &[AcctTake]| replay_wire_pooled(&[(&lanes, &routes, t, &steps)], &store, true);
+    let one =
+        |t: &[(usize, AcctTake)]| replay_wire_pooled(&[(&lanes, &routes, t, &steps)], &store, true);
     let why = |r: Result<(), vyrn_engine::WireDiverged>| r.map_err(|d| (d.at, d.why));
     assert_eq!(why(one(&takes)), Ok(()));
-    // Any order in the input: each take matches its packet by `(lane, lane_seq)` and `ver`.
+    // Any order in the input: each take is bound to its packet by index.
     let mut rev = takes.clone();
     rev.reverse();
     assert_eq!(why(one(&rev)), Ok(()));
 
     // Where the first take's packet sits among the packet records.
-    let t0 = takes[0];
-    let at0 = lanes
-        .iter()
-        .position(|p| p.lane == t0.lane && p.count > 0 && p.first_lane_seq == t0.lane_seq)
-        .unwrap();
+    let (at0, t0) = takes[0];
+    assert_eq!(
+        (lanes[at0].lane, lanes[at0].first_lane_seq),
+        (t0.lane, t0.lane_seq)
+    );
+    // The last take's `ver` changed (no reordering: it stays the account's highest).
+    let (atl, _) = *takes.last().unwrap();
     let mut bad_ver = takes.clone();
-    bad_ver[0].ver += 1;
+    bad_ver.last_mut().unwrap().1.ver += 10;
     assert_eq!(
         why(one(&bad_ver)),
-        Err((vyrn_engine::WireAt::Lane(at0), Why::Mismatch))
+        Err((vyrn_engine::WireAt::Lane(atl), Why::Mismatch))
     );
     let mut bad_acct = takes.clone();
-    bad_acct[0].account = AccountId(78);
+    bad_acct[0].1.account = AccountId(78);
     assert_eq!(
         why(one(&bad_acct)),
         Err((vyrn_engine::WireAt::Lane(at0), Why::Mismatch))
@@ -547,30 +550,35 @@ fn replay_wire_reproduces_each_take_and_carries_it_with_its_packet() {
         why(one(&takes[1..])),
         Err((vyrn_engine::WireAt::Lane(at0), Why::Mismatch))
     );
-    // An extra take no replayed or carried record emits.
-    let mut extra = takes.clone();
-    extra.push(AcctTake {
-        ver: 99,
-        lane_seq: vyrn_types::LaneSeq(50),
-        ..t0
-    });
+    // Review 1: a duplicate of a valid take, a second take on one record, or a take bound to
+    // a record that is not its packet (another lane_seq, an Advance record) is malformed.
+    let bad = |t: Vec<(usize, AcctTake)>| why(one(&t));
+    let end = Err((vyrn_engine::WireAt::End, Why::BadRecord));
+    let mut dup = takes.clone();
+    dup.push(takes[0]);
+    assert_eq!(bad(dup), end);
+    let mut second = takes.clone();
+    second.push((at0, AcctTake { ver: 99, ..t0 }));
+    assert_eq!(bad(second), end);
+    let adv = lanes
+        .iter()
+        .position(|p| p.lane == t0.lane && p.count == 0)
+        .unwrap();
+    let mut wrong = takes.clone();
+    wrong[0].0 = adv;
+    assert_eq!(bad(wrong), end);
+    // A box without the pool emits no take where the input holds one.
     assert_eq!(
-        why(one(&extra)),
-        Err((vyrn_engine::WireAt::End, Why::Mismatch))
-    );
-    // A box without the pool reproduces no take, so the take of `ver` 2 waits on `ver` 1
-    // forever and the step whose cut covers its op cannot be ordered (`REP_E_ORDER`).
-    assert!(matches!(
         why(replay_wire_pooled(
             &[(&lanes, &routes, &takes, &steps)],
             &store,
             false
         )),
-        Err((vyrn_engine::WireAt::Step(_), Why::Order))
-    ));
+        Err((vyrn_engine::WireAt::Lane(at0), Why::Mismatch))
+    );
 
     // Split before the last take's step: its packet and take carry into the second block.
-    let last = *takes.last().unwrap();
+    let (_, last) = *takes.last().unwrap();
     let cut_at = steps
         .iter()
         .position(|w| {
@@ -584,6 +592,8 @@ fn replay_wire_reproduces_each_take_and_carries_it_with_its_packet() {
     let (la, lb) = lanes.split_at(split);
     let (sa, sb) = steps.split_at(cut_at);
     let (ta, tb) = takes.split_at(2);
+    // Block 2's takes index into block 2's records.
+    let tb: Vec<_> = tb.iter().map(|&(i, t)| (i - split, t)).collect();
     // Each route record goes in the block of its packet.
     let in_b = |x: &vyrn_types::RouteRecord| x.lane == last.lane && x.lane_seq >= last.lane_seq;
     let ra: Vec<_> = routes.iter().copied().filter(|x| !in_b(x)).collect();
@@ -593,7 +603,7 @@ fn replay_wire_reproduces_each_take_and_carries_it_with_its_packet() {
     assert_eq!(lb.len(), lanes.len() - split);
     assert_eq!(
         why(replay_wire_pooled(
-            &[(la, &ra, ta, sa), (lb, &rb, tb, sb)],
+            &[(la, &ra, ta, sa), (lb, &rb, &tb, sb)],
             &store,
             true
         )),
@@ -611,13 +621,13 @@ fn replay_wire_reproduces_each_take_and_carries_it_with_its_packet() {
         Ok(())
     );
     // A take in an earlier block than its packet is malformed (on the wire it sits right
-    // before its packet): no replayed or carried record of that block owns it.
+    // before its packet): its index names no packet record of that block.
     assert_eq!(
         why(replay_wire_pooled(
             &[(la, &ra, &takes, sa), (lb, &rb, &[], sb)],
             &store,
             true
         )),
-        Err((vyrn_engine::WireAt::End, Why::Mismatch))
+        Err((vyrn_engine::WireAt::End, Why::BadRecord))
     );
 }

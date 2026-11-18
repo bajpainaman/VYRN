@@ -67,7 +67,7 @@ pub struct RustReplay<'a, V: Visibility, const NA: usize, P, R, S> {
     /// Per-block scratch, reused: packet and route records, per-lane and TX output bytes.
     pkts: Vec<PacketRecord>,
     routes: Vec<RouteRecord>,
-    takes: Vec<AcctTake>,
+    takes: Vec<(usize, AcctTake)>,
     lane_out: Vec<Vec<u8>>,
     tx_out: Vec<u8>,
     /// The records the last `replay_block` settled: those carried into it and its own, minus
@@ -165,26 +165,19 @@ impl<V: Visibility, const NA: usize, P: Payloads, R: Responses, S: Sink, const N
                 LaneRec::Pkt(p) => self.pkts.push(*p),
                 LaneRec::Route(x) => self.routes.push(*x),
                 LaneRec::Take(t) => {
-                    // 05 §6.9: the take sits right before its packet's group, so the next record
-                    // of its lane is that packet (on the wire its routes follow the packet).
-                    let next = blk
-                        .lanes
-                        .iter()
-                        .skip(k.saturating_add(1))
-                        .find(|x| match x {
-                            LaneRec::Pkt(p) => p.lane == t.lane,
-                            LaneRec::Route(q) => q.lane == t.lane,
-                            LaneRec::Take(q) => q.lane == t.lane,
-                        });
-                    let placed = matches!(next, Some(LaneRec::Pkt(p))
-                        if p.flags & PacketFlags::ADVANCE == 0 && p.first_lane_seq == t.lane_seq);
+                    // 05 §6.9: the take sits right before its packet's group, so the block's
+                    // next record, of any lane, is that packet record.
+                    let placed = matches!(blk.lanes.get(k.saturating_add(1)), Some(LaneRec::Pkt(p))
+                        if p.lane == t.lane
+                            && p.flags & PacketFlags::ADVANCE == 0
+                            && p.first_lane_seq == t.lane_seq);
                     if !placed {
                         return Err(ReplayError(format!(
                             "height {}: AcctTake {t:?} is not right before its packet record",
                             blk.header.height.0
                         )));
                     }
-                    self.takes.push(*t);
+                    self.takes.push((self.pkts.len(), *t));
                 }
             }
         }
