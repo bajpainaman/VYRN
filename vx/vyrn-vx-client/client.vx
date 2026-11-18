@@ -17,8 +17,8 @@
 //
 // Every C struct and ring slot is read and written by byte offset (as in the oracle), so the ABI
 // never depends on how vxc lays out a struct. Anything outside the supported subset of v1 stops
-// with PBV_E_UNSUPPORTED rather than guess: Replace, CancelAll, STP that would trigger,
-// in-packet dependencies, trading Rescan batch takers (pbv.h lists the subset).
+// with PBV_E_UNSUPPORTED rather than guess: Replace, STP that would trigger and in-packet
+// dependencies (pbv.h lists the subset).
 
 import core::ptr;
 import core::num;
@@ -185,15 +185,22 @@ const OP_JOIN : u64 = 1;
 const OP_FWD : u64 = 2;
 const OP_CANCEL : u64 = 3;
 const OP_REDUCE : u64 = 4;
+// CancelAll (04 §6.6): every order of session sess_id on the lane ends (05 §4.7).
+const OP_KILLALL : u64 = 5;
 
 // Lane op kinds (pass 1 -> pass 2) and pending settles (05 §7.6).
 const OK_REJECT : u64 = 0;
 const OK_JOIN : u64 = 1;
 const OK_CANCEL : u64 = 2;
 const OK_REDUCE : u64 = 3;
+const OK_CANCEL_ALL : u64 = 4;
 const PK_ACK : u64 = 1;
 const PK_CXL : u64 = 2;
 const PK_REDUCE : u64 = 3;
+const PK_CANCEL_ALL : u64 = 4;
+// CancelAck.handle of a CancelAll summary (04 §6.6, PROTO_HANDLE_ALL).
+const HANDLE_ALL : u64 = 4294967295;
+const CANCELALL_TOKENS : u64 = 16; // PROTO_CANCELALL_TOKENS
 
 // Version kinds.
 const SK_FREE : u64 = 0;
@@ -222,6 +229,8 @@ struct Acct {
 struct Sess {
   id : u64, acct : u64, book : u64, k0 : u64, k1 : u64,
   expected : u64, next_resp : u64, g : i64, pidx : i64,
+  // The newest CancelAll: orders whose current version precedes it are TOO_LATE (04 §6.6).
+  cancel_all : u64,
 }
 
 struct Slot {
@@ -1378,7 +1387,8 @@ fn resolve(ln : *mut Lane, h : u64, detail : *mut u64) -> u64 {
     if r == 0u64 || r >= (*ln).next_slot || (h >> 24u64) != 1u64 { return UNKNOWN_HANDLE; }
     let rp = root(ln, r);
     if (*rp).live == 0u64 || (*rp).sess != (*ln).cur_sess { return UNKNOWN_HANDLE; }
-    if (*rp).ended != 0u64 || (*rp).local_end != 0u64 {
+    let cur_seq = (*slot(ln, (*rp).cur)).ins_seq;
+    if (*rp).ended != 0u64 || (*rp).local_end != 0u64 || cur_seq < (*sess(ln, (*ln).cur_sess)).cancel_all {
       *detail = if (*rp).ended != 0u64 { (*rp).end_detail } else { D_CANCELED };
       return TOO_LATE;
     }
@@ -1386,12 +1396,12 @@ fn resolve(ln : *mut Lane, h : u64, detail : *mut u64) -> u64 {
   return 0u64;
 }
 
-fn check_cancel(ln : *mut Lane, now : u64) -> u64 {
+fn check_cancel(ln : *mut Lane, now : u64, cost : u64) -> u64 {
   unsafe {
     let s = sess(ln, (*ln).cur_sess);
     if !acct_ok(ln, (*s).acct) { return UNKNOWN_HANDLE; }
     let ac = acct(ln, (*s).acct);
-    return take_pair(ln, now, (*s).g + 1i64, BK_MSG, (*ac).g + 1i64, BK_MSG_A, 1u64, false);
+    return take_pair(ln, now, (*s).g + 1i64, BK_MSG, (*ac).g + 1i64, BK_MSG_A, cost, false);
   }
 }
 
@@ -1445,7 +1455,7 @@ fn pass1(c : *mut Ctx, l : i64, ix : u64, m : *mut i8, op : *mut Op, detail : *m
       return 0u64;
     }
     if typ == 2u64 || typ == 3u64 {
-      let cr = check_cancel(ln, ts);
+      let cr = check_cancel(ln, ts, 1u64);
       if cr == UNKNOWN_HANDLE { *detail = 0u64; return UNKNOWN_HANDLE; }
       if cr != 0u64 { *detail = cr; return RATE_LIMIT; }
       let by = rd32(m, 8i64);
@@ -1480,7 +1490,16 @@ fn pass1(c : *mut Ctx, l : i64, ix : u64, m : *mut i8, op : *mut Op, detail : *m
       if typ == 3u64 { (*op).r = by; }
       return 0u64;
     }
-    // Replace (04 §6.5) and CancelAll (04 §6.6) are outside the supported subset.
+    if typ == 18u64 {
+      // CancelAll (04 §6.6): PROTO_CANCELALL_TOKENS from the MSG buckets.
+      let cr = check_cancel(ln, ts, CANCELALL_TOKENS);
+      if cr == UNKNOWN_HANDLE { *detail = 0u64; return UNKNOWN_HANDLE; }
+      if cr != 0u64 { *detail = cr; return RATE_LIMIT; }
+      (*s).cancel_all = (*op).seq;
+      (*op).k = OK_CANCEL_ALL; (*op).tag = rd32(m, 12i64);
+      return 0u64;
+    }
+    // Replace (04 §6.5) is outside the supported subset.
     fail_lane(ln, E_UNSUPPORTED);
     return 0u64;
   }
@@ -1492,15 +1511,27 @@ fn forward(c : *mut Ctx, l : i64, m : *mut i8, op : *mut Op, cross : bool) -> vo
   unsafe {
     let jt = (*op).tick;
     let js = (*op).side;
-    // Earlier unapplied local Joins and Cancels in range would be dependencies (05 §3.7); a
-    // Reduce in range would be a pass barrier. Neither is in the supported subset.
+    // Pass barriers (05 §3.7): a CancelAll, or a Reduce of an opposite-side order in range, is
+    // applied before the push, so the forwarded op sees it through the cut.
+    let mut bar = 0u64;
+    for i in 0i64..((*ln).n_ops - 1i64) {
+      let o = opk(ln, i);
+      if (*o).applied != 0u64 || (*o).explicit != 0u64 { continue; }
+      let in_rng = (*o).has_side != 0u64 && (*o).side != js
+        && ((js == 0u64 && (*o).tick <= jt) || (js == 1u64 && (*o).tick >= jt));
+      if (*o).k == OK_CANCEL_ALL || ((*o).k == OK_REDUCE && in_rng) { bar = max(bar, (*o).seq); }
+    }
+    if bar != 0u64 { pass2_through(c, l, bar); }
+    if (*ln).err != 0u64 { return; }
+    // Earlier unapplied local Joins and Cancels in range would be dependencies, which are not in
+    // the supported subset.
     for i in 0i64..((*ln).n_ops - 1i64) {
       let o = opk(ln, i);
       if (*o).applied != 0u64 || (*o).explicit != 0u64 || (*o).has_side == 0u64 { continue; }
       if (*o).root == (*op).root { continue; }
       let opp_side = (*o).side != js;
       let in_rng = opp_side && ((js == 0u64 && (*o).tick <= jt) || (js == 1u64 && (*o).tick >= jt));
-      if in_rng && ((*o).k == OK_JOIN || (*o).k == OK_CANCEL || (*o).k == OK_REDUCE) {
+      if in_rng && ((*o).k == OK_JOIN || (*o).k == OK_CANCEL) {
         fail_lane(ln, E_UNSUPPORTED);
         return;
       }
@@ -1586,6 +1617,12 @@ fn pass2_apply(c : *mut Ctx, l : i64, op : *mut Op) -> void {
       let e = put_op(c, l, (*op).seq, OP_CANCEL);
       (*e).root = (*op).root; (*e).ts = (*ln).cur_ts;
       pend_push(ln, op, PK_CXL);
+      return;
+    }
+    if k == OK_CANCEL_ALL {
+      let e = put_op(c, l, (*op).seq, OP_KILLALL);
+      (*e).ts = (*ln).cur_ts; (*e).sess_id = (*sess(ln, (*ln).cur_sess)).id;
+      pend_push(ln, op, PK_CANCEL_ALL);
       return;
     }
     // Reduce: a keep-priority version with the smaller total.
@@ -1803,6 +1840,26 @@ fn settle(c : *mut Ctx, ln : *mut Lane, p : *mut Pend) -> void {
         (*rp).end_detail = D_CANCELED;
         stage(ln, p, rec_lo(R_CXL, (*p).ix, 0u64, h), rec_hi(open, (*p).tag));
       }
+      return;
+    }
+    if k == PK_CANCEL_ALL {
+      // 04 §6.6: a CancelAck per canceled order in ascending handle order, then the summary.
+      let mut count = 0u64;
+      for r in 1u64..(*ln).next_slot {
+        let xp = root(ln, r);
+        if (*xp).live == 0u64 || (*xp).sess != (*p).sess || (*xp).ended != 0u64 { continue; }
+        let cur = (*xp).cur;
+        if (*slot(ln, cur)).ins_seq >= (*p).seq { continue; }
+        let open = open_of(ln, r, cur);
+        if open == 0u64 { continue; }
+        flush_held(ln, cur);
+        release(c, ln, (*slot(ln, cur)).leg);
+        (*xp).ended = 1u64;
+        (*xp).end_detail = D_CANCELED;
+        stage(ln, p, rec_lo(R_CXL, (*p).ix, 0u64, handle(r)), rec_hi(open, (*p).tag));
+        count = count + 1u64;
+      }
+      stage(ln, p, rec_lo(R_CXL, (*p).ix, 0u64, HANDLE_ALL), rec_hi(count, (*p).tag));
       return;
     }
     // ReduceAck: the open quantity at the reduce (vyrn-lane settle.rs).
@@ -2189,6 +2246,34 @@ fn fail_bbo(c : *mut Ctx, e : u64) -> void {
 }
 
 // The ops of lane l in (prev, cut] enter the book (05 §5.1: visibility at the cut).
+// CancelAll at LaneSeq q (05 §4.7, an AcctKill or per-order tombstones): every order of the
+// session on lane l ends. A forwarded op of the lane still queued before q would join the book
+// after it, already dead at the cut, which v1 does not model (PBV_E_UNSUPPORTED).
+fn kill_session(c : *mut Ctx, l : u64, q : u64, sid : u64) -> void {
+  unsafe {
+    let b = (*c).bbo;
+    let li = l as i64;
+    let head = sld(c, 2i64 * li, Y_FWD_HEAD);
+    for t in (*offset_mut((*b).fwd_tail, li))..head {
+      if *offset_mut((*c).fwdq, li * (FWDQ_CAP as i64) + ((t % FWDQ_CAP) as i64)) < q {
+        fail_bbo(c, E_UNSUPPORTED);
+        return;
+      }
+    }
+    if (*b).has_cont != 0u64 && (*b).cont_lane == l { fail_bbo(c, E_UNSUPPORTED); return; }
+    let mut i = 0i64;
+    while i < (*b).n_book {
+      let ml = (*offset_mut((*b).book_l, i)) as u64;
+      let mr = (*offset_mut((*b).book_r, i)) as u64;
+      if ml == l && (*bord(c, ml, mr)).sess_id == sid {
+        book_drop(c, ml, mr);
+      } else {
+        i = i + 1i64;
+      }
+    }
+  }
+}
+
 fn ingest(c : *mut Ctx, l : u64, from : u64, to : u64) -> void {
   for q in (from + 1u64)..(to + 1u64) {
     let e = lop(c, l as i64, q);
@@ -2205,6 +2290,9 @@ fn ingest(c : *mut Ctx, l : u64, from : u64, to : u64) -> void {
         book_add(c, l, (*e).root);
       } else if k == OP_CANCEL {
         book_drop(c, l, (*e).root);
+      } else if k == OP_KILLALL {
+        kill_session(c, l, q, (*e).sess_id);
+        if (*(*c).bbo).err != 0u64 { return; }
       } else if k == OP_REDUCE {
         let o = bord(c, l, (*e).root);
         (*o).total = (*e).total;
@@ -2611,7 +2699,7 @@ fn exec_rescan(c : *mut Ctx, lo : u64, hi : u64) -> void {
     for l in 0i64..(*c).n {
       for q in (*offset_mut((*b).prev, l) + 1u64)..(*offset_mut((*b).cut, l) + 1u64) {
         let k = (*lop(c, l, q)).kind;
-        if (k == OP_CANCEL || k == OP_REDUCE) && after_key(c, l, q) {
+        if (k == OP_CANCEL || k == OP_REDUCE || k == OP_KILLALL) && after_key(c, l, q) {
           fail_bbo(c, E_UNSUPPORTED);
           return;
         }
@@ -2715,7 +2803,7 @@ fn uncross_chunk(c : *mut Ctx) -> void {
       let fz = *offset_mut((*b).fz, l);
       for q in (fz + 1u64)..(*offset_mut((*b).cut, l) + 1u64) {
         let k = (*lop(c, l, q)).kind;
-        if k == OP_CANCEL || k == OP_REDUCE { fail_bbo(c, E_UNSUPPORTED); return; }
+        if k == OP_CANCEL || k == OP_REDUCE || k == OP_KILLALL { fail_bbo(c, E_UNSUPPORTED); return; }
       }
     }
     let p = (*b).unc_p;
