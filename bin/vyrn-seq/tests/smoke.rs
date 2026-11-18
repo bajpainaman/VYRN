@@ -254,7 +254,9 @@ fn orders(
 
 /// Closes stdin, reads stdout to EOF and returns the `STATS` line and whether the box exited 0.
 /// `[cores] pin = true`: pinned to a CPU this test may use, the box starts and stops cleanly;
-/// pinned past `CPU_SETSIZE`, it fail-stops before `READY` with the reason on stderr.
+/// pinned past `CPU_SETSIZE`, it fail-stops before `READY` with the reason on stderr. Linux
+/// only: `pin_current_thread` is `Unsupported` elsewhere, so a pinned box never starts there.
+#[cfg(target_os = "linux")]
 #[test]
 fn pinned_cores_start_and_a_bad_pin_fail_stops() {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
