@@ -200,11 +200,13 @@ pub fn check(
     got: &[Got],
     responses: &[(Instant, u32, u32)],
     inproc: &[(StreamId, u64, DcRecord)],
+    lost: &[(u32, u32)],
 ) -> Result<String, String> {
     let mut canonical = 0usize;
     let mut finals = 0usize;
     let mut lat_us: Vec<i64> = Vec::new();
     let mut fills = 0usize;
+    let mut unseen = 0usize;
     for (i, g) in got.iter().enumerate() {
         let own = StreamId {
             account: account(i),
@@ -259,6 +261,11 @@ pub fn check(
                 .iter()
                 .find(|(_, s, q)| (SessionId(*s), *q) == key)
             else {
+                // R1: replay produced this response and the client's socket dropped it.
+                if lost.contains(&(key.0.0, key.1)) {
+                    unseen += 1;
+                    continue;
+                }
                 return Err(format!(
                     "{own:?}: {:?} {key:?} has no response packet",
                     r.kind()
@@ -281,7 +288,8 @@ pub fn check(
     let pct = |p: usize| lat_us[(lat_us.len() - 1) * p / 100];
     Ok(format!(
         "{} streams, {canonical} canonical records equal the in-process DropCopy, {finals} DC_FINALs cover them; \
-         each record with a resp_seq names a response packet the client got; \
+         each record with a resp_seq names a response packet the client got, or one replay produced \
+         that the client's socket dropped (R1: {unseen}); \
          DEV (shared host, unpinned, per-block replay; not a latency result): record after its response packet \
          p50={}us p99={}us max={}us over {} records ({fills} DC_FILL) (REQ-LAT-12 on REF: p99 <= 50us)",
         got.len(),
