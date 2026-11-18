@@ -132,6 +132,9 @@ pub struct Sources {
     scan_at: (u64, usize),
     /// When the last round began (`None`: none yet).
     round_at: Option<u64>,
+    /// The live data boxes, one bit per box index (07 §5.7): a dead box answers no fetch, so
+    /// only the live ones' misses make a key [`Sources::stuck`].
+    live: u64,
     pub counts: Counts,
 }
 
@@ -146,6 +149,7 @@ impl Sources {
             round: 0,
             scan_at: (0, 0),
             round_at: None,
+            live: u64::MAX,
             counts: Counts::default(),
         }
     }
@@ -204,16 +208,21 @@ impl Sources {
         }
     }
 
-    /// Whether every data box said it lacks `(session, pkt_seq)` (a box that is not the
-    /// session's home lacks it anyway, Codex r4618616259): then it was lost at its box, and so
-    /// may the packets after it be, so every missing key is escalated at once (reading (j)).
-    /// A replica catching up, whose data is in flight, never gets a box's miss, so it keeps
-    /// asking for one key: a timer here (2 × `REP_DATA_WAIT_US`) fired for a restarted voter
-    /// catching up and stopped it at `REP_E_HASHLAG` in 8 of 40 loaded runs.
+    /// The live data boxes, one bit per box index ([`Sources::stuck`]).
+    pub fn set_live(&mut self, live: u64) {
+        self.live = live;
+    }
+
+    /// Whether every live data box said it lacks `(session, pkt_seq)` (a box that is not the
+    /// session's home lacks it anyway, Codex r4618616259; a dead one answers nothing): then it
+    /// was lost at its box, and so may the packets after it be, so every missing key is
+    /// escalated at once (reading (j)).
     pub fn stuck(&self, session: SessionId, pkt_seq: u32) -> bool {
         self.missing.get(&(session, pkt_seq)).is_some_and(|x| {
             let n = u32::try_from(self.boxes.len()).unwrap_or(u32::MAX).min(64);
-            n > 0 && x.box_missed.count_ones() >= n
+            let all = 1u64.checked_shl(n).map_or(u64::MAX, |b| b.wrapping_sub(1));
+            let live = self.live & all;
+            live != 0 && x.box_missed & live == live
         })
     }
 
@@ -635,6 +644,12 @@ mod tests {
         assert!(!s.stuck(k, 9), "box 0, its home, has not said");
         s.box_missed(k, 9, 0);
         assert!(s.stuck(k, 9));
+        // Box 0 dead: box 1's miss alone is every live box's.
+        let _ = s.due(k, 10, 7 * w);
+        s.box_missed(k, 10, 1);
+        assert!(!s.stuck(k, 10));
+        s.set_live(0b10);
+        assert!(s.stuck(k, 10));
         // Rounds are at least ROUND_NS apart.
         assert!(!s.begin_round(5 * w + ROUND_NS - 1));
         assert!(s.begin_round(5 * w + ROUND_NS));
