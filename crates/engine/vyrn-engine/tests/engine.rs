@@ -137,8 +137,9 @@ fn replay_reproduces_every_record_response_and_fill_packet() {
 }
 
 #[test]
-fn replay_takes_shed_deadlines_from_lane_ops_and_prio_ts() {
-    // Two BBO Shed steps whose deadlines replay must rebuild as the lane did (05 §6.3, §6.8):
+fn replay_reproduces_shed_steps_after_a_heartbeat_and_a_backward_rx_ts() {
+    // Two BBO Shed steps whose live deadlines depend on lane state (05 §6.3, §6.8); replay
+    // takes the kind from the record, so it needs no deadline at all (05 §10):
     // - lane 2: a Heartbeat-only packet (no LaneSeq) at rx 1000, then an IOC (LaneSeq 1) at
     //   rx 3000. The IOC's deadline is 3000 + 615, not the heartbeat's 1000 + 615.
     // - lane 1: a join at rx 8000, then an IOC at rx 7000. prio_ts = max(7000, 8000) = 8000,
@@ -171,6 +172,42 @@ fn replay_takes_shed_deadlines_from_lane_ops_and_prio_ts() {
         .collect();
     assert_eq!(shed, vec![(2, LaneSeq(1)), (1, LaneSeq(2))]);
     assert_eq!(replay(&j.recs, &store).0, Ok(()));
+}
+
+#[test]
+fn replay_takes_kind_and_source_from_the_record() {
+    // 05 §10 rows 4–5: replay executes the logged step, so the BBO core refuses a record that
+    // cannot be its next step instead of re-deciding it.
+    let (j, store, _, _) = live(&script());
+    let shed = j
+        .recs
+        .iter()
+        .position(|r| matches!(r, OwnedRec::Step(e, _) if e.kind == StepKind::Shed.code()))
+        .unwrap();
+    // The logged source of the Shed step is lane 2's LaneSeq 1; name LaneSeq 2 instead.
+    let mut recs = j.recs.clone();
+    if let OwnedRec::Step(e, _) = &mut recs[shed] {
+        e.src_lane_seq = LaneSeq(2);
+    }
+    assert_eq!(
+        replay(&recs, &store).0,
+        Err(Diverged {
+            index: shed,
+            why: Why::Step(vyrn_bbo::Diverge::Source)
+        })
+    );
+    // An unknown kind code does not decode.
+    let mut recs = j.recs.clone();
+    if let OwnedRec::Step(e, _) = &mut recs[shed] {
+        e.kind = 0xEE;
+    }
+    assert_eq!(
+        replay(&recs, &store).0,
+        Err(Diverged {
+            index: shed,
+            why: Why::BadStep
+        })
+    );
 }
 
 #[test]

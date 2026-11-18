@@ -24,30 +24,31 @@
 //!   only clock reads (11 §3.1).
 //! - **Replay.** [`Engine::replay`] takes the order stream and a [`Payloads`] store and re-runs
 //!   every lane call and every step. No clock is read: a `SHED` record is replayed with a late
-//!   clock, every other packet with an on-time clock, and each step's source deadline test is
-//!   given the instant that reproduces its logged kind (`Shed` or not). Because the replayed
+//!   clock and every other packet with an on-time clock. Each step runs through
+//!   `vyrn_bbo::Bbo::replay_step` with its cut (`C_{s−1}` plus the record's deltas), source,
+//!   kind (incl. `Shed`, `CONT`) and `Rescan` band taken from the record (05 §10 rows 4–5); the
+//!   cut cores still publish before it, since it reads the half-cuts. Because the replayed
 //!   steps write the same `LaneCut` values in the same record order, a non-`MID` Advance record
 //!   is replayed as the lane's idle poll, and the `MID` Advance records of a packet are
 //!   reproduced by the lane's own polls inside it; both are then checked against the log (05
 //!   §10 table rows 1–3 and 6).
 //!
 //! **Replay rejects** ([`Diverged`]): a record the replayed engine does not reproduce byte for
-//! byte ([`Why::Mismatch`]), a packet record without payload ([`Why::NoPayload`]), a step whose
-//! source op is older than the packet history ([`Why::SourceTooOld`]), a record with no lane
-//! work behind it ([`Why::BadRecord`]), a step the BBO core does not take ([`Why::NoStep`]),
-//! and any lane or BBO fault ([`Why::Fault`]).
+//! byte ([`Why::Mismatch`]), a packet record without payload ([`Why::NoPayload`]), a step
+//! record that does not decode ([`Why::BadStep`]), a step the BBO core refuses as its next one
+//! ([`Why::Step`] with `vyrn_bbo::Diverge`), a record with no lane work behind it
+//! ([`Why::BadRecord`]), a step the BBO core does not publish ([`Why::NoStep`]), and any lane
+//! or BBO fault ([`Why::Fault`]).
 //!
 //! **Scope of this version** (each is a PR follow-up):
 //!
 //! - Live mode is the single-threaded schedule of 11 §6.4 (`vyrn-sim` order). The engine
 //!   crates may not spawn threads (11 §3.3), so pinned cores are the binary's: it runs the same
 //!   roles from [`role`] on its own threads.
-//! - Replay re-derives each step's cut and source by running the BBO core on the same inputs and
-//!   checks them against the logged `StepEntry`, and the lane routes by its snapshot. Spec 05
-//!   §10 rows 4, 5 and 7 (take `StepRecord.cut`, `src` and kind from the log, route iff a
-//!   `StepRecord` names the op) need a `vyrn-bbo` step-replay entry point and a forced-route
-//!   input in `vyrn-lane`. Until then, replay reproduces only logs that this engine's own
-//!   schedule produced.
+//! - In replay the lane still routes by its snapshot. 05 §10 row 7 (forward op `(l, q)` iff a
+//!   `StepRecord` names it) needs `vyrn-lane`'s forced-route input. Until then a lane replays
+//!   correctly only where its snapshot routes as the live lane's did, which holds for logs of
+//!   this engine's schedule (the fan-out writes the same snapshots in the same record order).
 //! - Pooled lanes (`AcctTake`), auction control steps, and the `Sim` visibility backend in tests.
 //!
 //! Determinism (`INV-DET`): the engine's own choices are the call order and nothing else. It

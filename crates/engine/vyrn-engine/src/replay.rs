@@ -3,20 +3,22 @@
 //! Each record is replayed by the call that produced it live, and the call's output records
 //! must equal the input records byte for byte:
 //!
-//! - a `Rec::Step`: one BBO step ([`Engine::step`]), its clock set so the source's deadline test
-//!   gives the logged kind (`Shed` iff late);
+//! - a `Rec::Step`: [`vyrn_bbo::Bbo::replay_step`] with the step's cut (`C_{s−1}` plus its
+//!   deltas), source, kind (incl. `Shed`, `CONT`) and `Rescan` band from the record (05 §10 rows
+//!   4–5). No clock is read; the cut cores still publish, because `replay_step` reads the
+//!   half-cuts for `Pend` retirement;
 //! - a non-`MID` Advance record of lane `l`: lane `l`'s idle poll, which reads the `LaneCut`
 //!   that the replayed steps wrote;
 //! - a packet record (with the `MID` Advance records the lane wrote while processing it): the
 //!   packet, fetched from [`Payloads`], with a late clock iff `SHED`.
 
 use vyrn_bbo::admit::{FixedClock, NeverLate};
-use vyrn_bbo::{CutDelta, MAX_LANES, StepEntry};
+use vyrn_bbo::{CutDelta, Diverge, MAX_LANES, ReplayStep, StepEntry};
 use vyrn_cut::Visibility;
 use vyrn_lane::RxIn;
-use vyrn_types::{LaneSeq, PacketFlags, PacketRecord, StepKind};
+use vyrn_types::{PacketFlags, PacketRecord};
 
-use crate::engine::{Engine, Fault, PKT_HIST, Rec, Sink};
+use crate::engine::{Engine, Fault, Rec, Sink, StepErr};
 
 /// One order-stream element, owned (for logs and journals).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,8 +67,10 @@ pub enum Why {
     NoPayload,
     /// The BBO core took no step where the log has one.
     NoStep,
-    /// A step's source op is not in the packet history (`ENG_FWD_RING` packets per lane).
-    SourceTooOld,
+    /// A step record does not decode (`StepKind`, delta count or lane out of range).
+    BadStep,
+    /// The BBO core refused the logged step: it cannot be this core's next step.
+    Step(Diverge),
     /// A record names a lane the box does not have, or an Advance record with no lane work.
     BadRecord,
     Fault(Fault),
@@ -165,17 +169,20 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                 step: None,
             };
             let used = match r {
-                OwnedRec::Step(e, _) => {
-                    let late = e.kind == StepKind::Shed.code();
-                    let got = match self.src_deadline(e) {
-                        Some(None) => self.step(&NeverLate, &mut tee),
-                        Some(Some(d)) => {
-                            let now = if late { d.wrapping_add(1) } else { d };
-                            self.step(&FixedClock(u64::from(now)), &mut tee)
-                        }
-                        None => return Err(at(Why::SourceTooOld)),
-                    };
-                    if got.map_err(|f| at(Why::Fault(f)))?.is_none() {
+                OwnedRec::Step(e, d) => {
+                    let deltas = d.get(..usize::from(e.n_delta)).unwrap_or(&[]);
+                    let rs = ReplayStep::from_log(&self.cut, e, deltas).ok_or(at(Why::BadStep))?;
+                    let got = self
+                        .drive(&mut tee, |bbo, vis, ports, book| {
+                            bbo.replay_step(vis, ports, book, &rs)
+                        })
+                        .map_err(|x| {
+                            at(match x {
+                                StepErr::Fault(f) => Why::Fault(f),
+                                StepErr::Diverge(v) => Why::Step(v),
+                            })
+                        })?;
+                    if got.is_none() {
                         return Err(at(Why::NoStep));
                     }
                     if !tee.step.as_ref().is_some_and(|g| same_step(g, r)) {
@@ -209,17 +216,12 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                         pkt_hash: pk.pkt_hash,
                     };
                     let shed = pk.flags & PacketFlags::SHED != 0;
-                    let before = self.lanes.get(l).map_or(LaneSeq(0), |x| x.seq());
                     let res = if shed {
                         self.ingest(l, rx, &FixedClock(u64::MAX), &mut tee)
                     } else {
                         self.ingest(l, rx, &NeverLate, &mut tee)
                     };
                     res.map_err(|f| at(Why::Fault(f)))?;
-                    if !shed {
-                        let after = self.lanes.get(l).map_or(LaneSeq(0), |x| x.seq());
-                        self.remember(l, before, after, pk.rx_ts.0);
-                    }
                     tee.pkts.len()
                 }
             };
@@ -238,49 +240,5 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             i = i.saturating_add(used);
         }
         Ok(())
-    }
-
-    /// Lane `l` accepted a packet received at `rx_ts` and gave its ops the `LaneSeq`s
-    /// `before + 1 ..= after` (Heartbeat and ResendReq take none, so the message count is not
-    /// the range). The lane keys the packet at `prio_ts = max(rx_ts, previous prio_ts)` (05
-    /// §6.3), and its forwarded ops' deadlines are built from that, so that is what is kept.
-    fn remember(&mut self, l: usize, before: LaneSeq, after: LaneSeq, rx_ts: u64) {
-        let Some(prio) = self.prio.get_mut(l) else {
-            return;
-        };
-        *prio = rx_ts.max(*prio);
-        let ts = *prio;
-        if after <= before {
-            return;
-        }
-        let Some(n) = self.pkt_next.get_mut(l) else {
-            return;
-        };
-        let slot = l.saturating_mul(PKT_HIST).saturating_add(*n);
-        if let Some(x) = self.pkts.get_mut(slot) {
-            *x = (before.0.saturating_add(1), after.0, ts);
-        }
-        *n = n.saturating_add(1).checked_rem(PKT_HIST).unwrap_or(0);
-    }
-
-    /// The deadline (`FwdEntry.deadline`, low 32 bits of `rx_ts + fwd_deadline_ns`, 05 §6.8) of
-    /// step `e`'s source: `Some(None)` if the step has no source, `None` if it is unknown.
-    fn src_deadline(&self, e: &StepEntry) -> Option<Option<u32>> {
-        if e.src_lane_seq.0 == 0 {
-            return Some(None);
-        }
-        let l = usize::from(e.src_lane.0);
-        let cfg = self.cfgs.get(l)?;
-        let ring = self
-            .pkts
-            .get(l.saturating_mul(PKT_HIST)..l.saturating_add(1).saturating_mul(PKT_HIST))?;
-        let q = e.src_lane_seq.0;
-        let rx = ring
-            .iter()
-            .find_map(|(lo, hi, ts)| (*lo != 0 && *lo <= q && q <= *hi).then_some(*ts))?;
-        let [a, b, c, d, ..] = rx
-            .wrapping_add(u64::from(cfg.fwd_deadline_ns))
-            .to_le_bytes();
-        Some(Some(u32::from_le_bytes([a, b, c, d])))
     }
 }
