@@ -31,6 +31,7 @@ pub fn cfg() -> Config {
         band_half: 0,
         band_hyst: 0,
         band_ref: Tick(100),
+        pool: 0,
     }
 }
 

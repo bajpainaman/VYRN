@@ -25,6 +25,10 @@ pub(crate) struct RootSt {
     pub killed: bool,
     pub filled: u32,
     pub np_seq: u64,
+    /// `ins_seq` of the newest version whose fills brought `filled` to its total: the order
+    /// finished there, so every later version of it (a `Replace` or `Reduce` the lane wrote
+    /// before it learned of those fills) is dead (05 §2.3 `TOO_LATE`). 0 = not finished.
+    pub fin_seq: u64,
 }
 
 /// One `Pend` entry (05 §8.5): an explicit op that rested and that its lane has not yet written.
@@ -140,9 +144,30 @@ impl State {
             return x & 1 == 1;
         }
         let r = self.root(lane, v.root, v.gen_);
-        let ok = !r.killed && r.filled < v.pred_total();
+        // `fin_seq` covers chains of replaces: the second of two refused replaces would pass
+        // `filled < pred_total`, since its predecessor's total is the refused proposal.
+        let ok =
+            !r.killed && r.filled < v.pred_total() && !(r.fin_seq != 0 && v.ins_seq.0 > r.fin_seq);
         c.set(v.ins_seq.0.wrapping_shl(1) | u64::from(ok));
         ok
+    }
+
+    /// Adds a fill of `q` to the order whose trading version (`ins_seq`, `total`) is given.
+    pub fn add_fill(
+        &mut self,
+        lane: usize,
+        root: u32,
+        gen_: u8,
+        ins_seq: LaneSeq,
+        total: u32,
+        q: u32,
+    ) {
+        if let Some(r) = self.root_mut(lane, root, gen_) {
+            r.filled = r.filled.saturating_add(q);
+            if r.filled >= total {
+                r.fin_seq = r.fin_seq.max(ins_seq.0);
+            }
+        }
     }
 
     pub fn pend_insert(&mut self, p: PendEnt) {

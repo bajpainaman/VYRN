@@ -632,3 +632,78 @@ fn a_batch_taker_that_rests_after_two_cont_steps_reports_in_flight_twice_then_do
     );
     assert_eq!(bbo.bounds(), (Tick(103), NO_ASK));
 }
+
+#[test]
+fn two_refused_replaces_in_a_row_stay_refused() {
+    // Lane 0's ask of 10 @ 102 is fully filled before lane 0 learns it. Lane 0 then replaces it
+    // to 20 and that version to 30 (both new priority). In L the first replace sees open 0
+    // (TOO_LATE), so the order is over and the second is TOO_LATE too (05 §2.3). The second
+    // replace's pred_total is 20 > filled 10, so a check on pred_total alone lets 30 trade.
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    let old = rest(&mut x, &mut bbo, 0, 1, Side::Sell, 102, 10, 1);
+    x.forward(1, 2, day(Side::Buy), 102, 10, 1, 0, &[], BIG_DEADLINE);
+    x.publish_cut();
+    assert_eq!(step_src(&mut x, &mut bbo, 1).fills().len(), 2);
+    let mut prev = old;
+    for (i, qty) in [(3u64, 20u32), (4, 30)] {
+        x.seq[0] += 1;
+        let q = LaneSeq(x.seq[0]);
+        let nv = x
+            .book
+            .replace_slot(lid(0), prev, q, Nanos(i), Tick(102), qty);
+        x.book.tombstone(lid(0), prev, q, Nanos(i));
+        x.book.place(lid(0), nv);
+        x.book.push_journal(
+            lid(0),
+            JEnt {
+                seq: q,
+                tick: Tick(102),
+                slot: nv,
+                kind: JKind::NewPrio,
+            },
+        );
+        prev = nv;
+    }
+    x.publish_cut();
+    x.forward(1, 9, day(Side::Buy), 102, 30, 1, 0, &[], BIG_DEADLINE);
+    x.publish_cut();
+    let s = step_src(&mut x, &mut bbo, 1);
+    assert!(s.fills().is_empty(), "{:?}", s.fills());
+    assert_eq!(s.kind(), StepKind::Improve);
+}
+
+#[test]
+fn stp_spans_pooled_lanes_only() {
+    // Account 1 on lanes 1 and 2 (05 §6.9: a pooled acct_ix is pool-wide). Lane 2's ask of 1 @
+    // 102; lane 1's CancelNewest buy of 1 @ 102 for account 1. Pooled {1, 2}: Out STP, no
+    // fill. Dedicated lanes: acct_ix 1 on lane 1 and on lane 2 are different accounts, so
+    // they trade.
+    for (pool, trades) in [(0b110u64, false), (0, true)] {
+        let mut c = cfg();
+        c.pool = pool;
+        let mut bbo = Bbo::new(c);
+        let mut w = World::new(&bbo.initial_snapshot());
+        let mut x = w.lanes();
+        rest(&mut x, &mut bbo, 2, 1, Side::Sell, 102, 1, 1);
+        let f = OrderFlags::new(Side::Buy, Tif::Day, false, Stp::CancelNewest);
+        x.forward(1, 5, f, 102, 1, 1, 0, &[], BIG_DEADLINE);
+        x.publish_cut();
+        let s = step_src(&mut x, &mut bbo, 1);
+        if trades {
+            assert_eq!(
+                s.fills(),
+                vec![(2, LIQ_MAKER, 102, 1), (1, LIQ_TAKER, 102, 1)]
+            );
+        } else {
+            assert!(s.fills().is_empty());
+            let outs: Vec<(usize, u16)> = s
+                .of(FillKind::Out)
+                .iter()
+                .map(|(l, e)| (*l, e.cause))
+                .collect();
+            assert_eq!(outs, vec![(1, OUT_STP)]);
+            assert_eq!(bbo.bounds().1, Tick(102), "CancelNewest leaves the maker");
+        }
+    }
+}

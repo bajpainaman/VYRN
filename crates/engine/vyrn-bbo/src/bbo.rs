@@ -54,6 +54,9 @@ pub struct Config {
     pub band_hyst: u32,
     /// The band reference at epoch start.
     pub band_ref: Tick,
+    /// Pooled lanes (bit `l`, 01 §14.15). Their `acct_ix` is pool-wide, so STP compares
+    /// accounts across them (05 §6.9); a dedicated lane's `acct_ix` is lane-local.
+    pub pool: u64,
 }
 
 /// A forwarded op with its dependency lines and its lane.
@@ -828,9 +831,8 @@ impl Bbo {
         liq: u8,
         record: bool,
     ) {
-        if let Some(r) = self.st.root_mut(m.lane, m.v.root, m.v.gen_) {
-            r.filled = r.filled.saturating_add(q);
-        }
+        self.st
+            .add_fill(m.lane, m.v.root, m.v.gen_, m.v.ins_seq, m.v.total, q);
         let ord = self.out.next_ordinal();
         self.out.event(
             LaneId(lane_u8(m.lane)),
@@ -1066,7 +1068,7 @@ impl Bbo {
                 let Some(m) = level.next(&self.ctx(src, c, prev, key)) else {
                     break;
                 };
-                if m.lane == t.lane && t.stp() != Stp::None && m.v.acct_ix == t.v.acct_ix {
+                if t.stp() != Stp::None && self.same_acct(&m, t) {
                     match t.stp() {
                         Stp::CancelOldest => {
                             self.kill_maker(src, &m);
@@ -1084,9 +1086,8 @@ impl Bbo {
                 }
                 let q = open.min(m.open);
                 self.fill_maker(src, &m, q, lvl, LIQ_MAKER, true);
-                if let Some(r) = self.st.root_mut(t.lane, t.v.root, t.v.gen_) {
-                    r.filled = r.filled.saturating_add(q);
-                }
+                self.st
+                    .add_fill(t.lane, t.v.root, t.v.gen_, t.seq, t.total, q);
                 level_qty = level_qty.saturating_add(q);
                 work = work.saturating_add(1);
             }
@@ -1096,6 +1097,13 @@ impl Bbo {
             levels = levels.saturating_add(1);
             from = lvl;
         }
+    }
+
+    /// STP's account test (05 §2.4, §6.9): same `acct_ix` on the same lane, or on two pooled
+    /// lanes.
+    fn same_acct(&self, m: &Maker, t: &Taker) -> bool {
+        let pooled = |l: usize| self.cfg.pool & crate::book::bit(l) != 0;
+        m.v.acct_ix == t.v.acct_ix && (m.lane == t.lane || (pooled(m.lane) && pooled(t.lane)))
     }
 
     /// 05 §8.5 `dry_run_fillable`: what the sweep would fill, with the STP skip and stop rules,
@@ -1111,7 +1119,7 @@ impl Bbo {
             };
             let mut level = Level::new(&ctx, side, lvl);
             while let Some(m) = level.next(&ctx) {
-                if m.lane == t.lane && t.stp() != Stp::None && m.v.acct_ix == t.v.acct_ix {
+                if t.stp() != Stp::None && self.same_acct(&m, t) {
                     if t.stp() == Stp::CancelOldest {
                         continue;
                     }
