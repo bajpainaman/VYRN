@@ -25,7 +25,7 @@ pub mod source;
 pub mod voter;
 
 pub use cert::{CertErr, FinalityCert, NAMESPACE, verify_finality_cert};
-pub use membership::{Committee, CommitteeErr};
+pub use membership::{Committee, CommitteeErr, VoterOrder};
 pub use proposal::{Proposal, ProposalErr, ProposalKind};
 pub use source::{BlockSource, Genesis, LogSource, Verdict};
 
