@@ -903,6 +903,57 @@ fn a_replayed_log_reproduces_the_original_forwarding() {
 }
 
 #[test]
+fn replay_charges_the_lane_route_not_the_step_kind() {
+    // 10 M8: a Cross takes the account and lane cross buckets; an Improve takes the lane
+    // improve bucket. Lane 0 rests sell 1 @ 105 (session 1, account 1); session 30 on the same
+    // account sends a CancelNewest buy 1 @ 105. Lane classifies it Cross (105 ≥ ask 105, 05
+    // §6.5), but STP leaves no fill, so the BBO logs an Improve step. A replay given the step
+    // kind would charge Improve; given the lane's route it reproduces the account state.
+    let f = vyrn_bbo::OrderFlags::new(
+        Side::Buy,
+        vyrn_bbo::Tif::Day,
+        false,
+        vyrn_bbo::Stp::CancelNewest,
+    );
+    let run = |route: Option<vyrn_risk::Route>| {
+        let (mut bbo, mut w) = setup();
+        let mut x = w.rig();
+        x.open(0, 30, 1, vyrn_risk::SessionBuckets::default());
+        x.send(0, 1, 1_000, &[new(day(Side::Sell), 105, 1, 11)]);
+        x.settle(&mut bbo);
+        let m = [new(f, 105, 1, 22)];
+        let rx = match route {
+            None => x.send(0, 30, 2_000, &m),
+            Some(r) => x.replay(0, 30, 2_000, &m, &[], &[(LaneSeq(2), r)]),
+        };
+        assert_eq!(rx, Rx::Accepted);
+        x.settle(&mut bbo);
+        let step = x.steps.iter().find(|s| s.entry.src_lane_seq == LaneSeq(2));
+        let kind = step.unwrap().entry.kind;
+        let cross = x.lanes[0]
+            .account_mut(vyrn_risk::AcctSlot(1))
+            .unwrap()
+            .0
+            .buckets
+            .cross
+            .tat;
+        (kind, cross, x.records(0, 30))
+    };
+    let original = run(None);
+    assert_eq!(
+        original.0,
+        StepKind::Improve.code(),
+        "no fill: Improve step"
+    );
+    let from_kind = run(Some(vyrn_risk::Route::Improve));
+    assert_ne!(
+        from_kind.1, original.1,
+        "the step kind loses the Cross charge"
+    );
+    assert_eq!(run(Some(vyrn_risk::Route::Cross)), original);
+}
+
+#[test]
 fn a_reduce_settles_even_when_its_successor_filled_first() {
     // Codex review 2: sell 10 @ 106, then reduce by 4 (LaneSeq 2, local), then lane 1 buys 6
     // @ 106. In L the reduce comes first: CancelAck 4, then the 6 remaining lots fill

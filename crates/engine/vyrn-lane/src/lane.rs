@@ -615,8 +615,10 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
 
     /// Replay of one logged packet (05 §10, "snapshot routing in `classify`" row): op `(l, q)`
     /// is forwarded iff a `StepRecord` has `src = (l, q)`. `routes` lists this packet's
-    /// forwarded ops with the route their step's kind gives (`Cross`, `Improve`); every other op
-    /// is local, whatever the lane's snapshot says. Boundaries come from `mids` only, as in
+    /// forwarded ops, each with the route the live lane classified it with (`Cross` or
+    /// `Improve`), because risk charges by that route (10 M8). The step's kind does not give it:
+    /// a `Cross` that STP leaves without fills is logged as an `Improve` step. Every other op is
+    /// local, whatever the lane's snapshot says. Boundaries come from `mids` only, as in
     /// [`Self::process_packet`] with a nonempty list. The live path never calls this.
     pub fn replay_packet<C: Clock>(
         &mut self,

@@ -49,8 +49,10 @@
 //!   set by [`Lane::set_pool_index`], the pool-wide index on a pooled lane (05 §6.9), else the
 //!   lane-local account.
 //! - **Y (replay routing).** [`Lane::replay_packet`] forwards exactly the ops it is given, with
-//!   their logged route, and keeps every other op local (05 §10 row 7). It never reads the
-//!   snapshot to route. [`Lane::process_packet`] is unchanged.
+//!   the route the live lane classified them with, and keeps every other op local (05 §10
+//!   row 7). It never reads the snapshot to route. The route is not the step's kind (a fill-less
+//!   `Cross` steps as `Improve`), and the 05 §10 log does not carry it yet: a spec follow-up.
+//!   [`Lane::process_packet`] is unchanged.
 //!
 //! The arena's ordering protocol is checked by Miri on `arena_tests` and by the lane–BBO
 //! conformance tests, not by a loom model: `loom` is a dev-dependency of `vyrn-cut` only (11 §2.2,
