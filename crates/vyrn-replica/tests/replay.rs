@@ -2247,15 +2247,10 @@ fn post(side: Side, tick: u32, qty: u32, tag: u32) -> vyrn_wire::Msg {
 /// stale snapshot and is the batch taker of a Rescan whose book it crosses, so it ends with a
 /// batch `Reject POST_ONLY_WOULD_CROSS`, its record the lane's. Otherwise lane 2's buy at 102
 /// is a batch taker whose sweep is capped at one level: a `RESTED_IN_FLIGHT` step, its fill
-/// record held by the lane, its Ack held until a CONT Rescan ends the sweep (rule B).
-fn batch_script(post_only: bool) -> Vec<Act> {
-    batch_script_on(post_only, false)
-}
-
-/// [`batch_script`] where lane 2's sell at 104 is a local new-priority Replace of a resting sell
-/// at 110 (gap item 3b): the batch taker is the Replace's version, as `JKind::NewPrio` is in
-/// `Bbo::rescan`.
-fn batch_script_on(post_only: bool, rep: bool) -> Vec<Act> {
+/// record held by the lane, its Ack held until a CONT Rescan ends the sweep (rule B). `rep`
+/// makes lane 2's sell at 104 a local new-priority Replace of a resting sell at 110 (gap item
+/// 3b): the batch taker is then the Replace's version, as `JKind::NewPrio` is in `Bbo::rescan`.
+fn batch_script(post_only: bool, rep: bool) -> Vec<Act> {
     use Side::{Buy, Sell};
     use Tif::{Day, Ioc};
     let p = |l, a, t: u64, m| Act::Pkt {
@@ -2314,7 +2309,7 @@ fn batch_script_on(post_only: bool, rep: bool) -> Vec<Act> {
 #[test]
 fn the_vx_client_replays_rescan_batch_takers_that_trade() {
     for (post_only, by_replace) in [(false, false), (true, false), (false, true)] {
-        let script = batch_script_on(post_only, by_replace);
+        let script = batch_script(post_only, by_replace);
         let (live_j, store, blocks) = blocks_of(&script, &[]);
         let (rep, _) = replay(&live_j, &store, &blocks).unwrap();
         check_same(&live_j, &rep);
