@@ -2327,7 +2327,7 @@ Resolved by 01 and removed: `PacketRecord.flags` (§6.6: `SHED`, `ADVANCE`), INV
    does not halve with the lanes (§4.7). The gate bound does not depend on it.
 10. **§14.2:** the cross fill at index 9 with the 15 ns step is 947 ns, not 880: the gate opens
     ≤ 142 ns after the step starts for a step that spans both halves (§4.7).
-11. **§5:** `N_LANES_REF` = 50 disagrees with the core map's 49 lanes; 07 uses 49 (§3.4).
+11. **§5:** *Resolved by 01:* §5 has `N_LANES_REF` = 49, which 07 uses (§3.4).
 
 ## Open questions
 

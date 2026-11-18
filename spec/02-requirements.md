@@ -14,7 +14,7 @@ REQ-PLT-4 (§10).
 The hard requirements of 01 §14.0 are not negotiable: 1 µs as a maximum for every accepted packet,
 every message type and every index 0–9; 1B msgs/s on one book; 10 ms finality for every accepted
 order; the 8 h move; CHAIN mode with 5 validators. No requirement below exempts a packet size, a
-message index or a message type, or replaces a bound with a percentile. Two physical facts are
+message index or a message type, or replaces a bound with a percentile. Three facts are
 stated as facts (§3.5): on AWS the wire belongs to Nitro, light sets the handoff window, and
 finality needs a network that meets its delay bound.
 
@@ -1347,8 +1347,8 @@ Resolved: the ack sum (§14.17.1), `FINALITY_P99_MS` (§14.9), the REQ-LAT-5 gap
 
 1. Add `LANE_MAX_LOAD = 0.60` (11 §7.23 asks the same); this chapter uses `REQ_LANE_MAX_LOAD`.
    Add a resend-redirect record (e.g. `Reject` 25 `RESEND_RECOVERY`) for REQ-LAT-10.
-2. **Lane count.** `N_LANES_REF` = 50 (§5), but the §10 map has 49 lanes; §14.3 still puts cut B
-   on lanes 25–49 and the hasher on core 7. Set 49 and align §14.3 with §10.
+2. **Lane count.** *Resolved by 01:* §5 has `N_LANES_REF` = 49, and §14.3 puts cut B on lanes 25–48 with
+   the hasher on core 50, as the §10 map does.
 3. **§14.1's last bullet** still says `BUSY` ≤ 1e-6 of all packets at 1B msgs/s. Replace it with
    §14.17.2's per-class bounds, which REQ-LAT-5 uses.
 4. **§14.17.5:** ~40 makers at index 9 needs ≤ 7.5 ns per maker packet per TX core; at 04's

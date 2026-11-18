@@ -25,17 +25,17 @@ requirements at the same time:
 | # | File | Contents | Lines (draft 0.2) |
 |---|---|---|---|
 | 00 | `00-index.md` | This page: constraints, map, master diagram | — |
-| 01 | [`01-conventions.md`](01-conventions.md) | **The contract every chapter follows**: glossary, types, constants, byte layouts, invariants, IDs, and the binding draft 0.2 decisions (§14) | 607 |
-| 02 | [`02-requirements.md`](02-requirements.md) | Requirements, measurement points, SLOs, budgets, acceptance | 1,360 |
-| 03 | [`03-architecture.md`](03-architecture.md) | System, region, box and core diagrams; data flows; sequence diagrams; component catalog | 1,722 |
-| 04 | [`04-protocol.md`](04-protocol.md) | Client protocol: sessions, packets, messages, responses, reliability, rate limits | 1,922 |
-| 05 | [`05-engine.md`](05-engine.md) | Matching engine: lanes, cut, BBO core, data structures, algorithms, proofs | 2,973 |
-| 06 | [`06-platform.md`](06-platform.md) | Unix host platform: hardware, BIOS, kernel, NIC backends, C shim, PTP, AWS, consumer, macOS | 1,886 |
-| 07 | [`07-replication.md`](07-replication.md) | Log, ordering frames, data tier, Simplex, finality, storage, failover, replay | 2,162 |
-| 08 | [`08-epochs.md`](08-epochs.md) | Follow the sun: schedule, handoff, certificate, opening auction, fencing, failures | 1,498 |
-| 09 | [`09-chain.md`](09-chain.md) | On-chain mode: validators, custody, bridge, authentication, commitments, slashing | 2,026 |
-| 10 | [`10-accounts-risk-md.md`](10-accounts-risk-md.md) | Accounts, risk, positions, fees, market data, drop copy, surveillance | 1,738 |
-| 11 | [`11-build.md`](11-build.md) | Repo, crates, coding rules, Vx client, tests, benchmarks, observability, ops, milestones | 2,381 |
+| 01 | [`01-conventions.md`](01-conventions.md) | **The contract every chapter follows**: glossary, types, constants, byte layouts, invariants, IDs, and the binding draft 0.2 decisions (§14) | 876 |
+| 02 | [`02-requirements.md`](02-requirements.md) | Requirements, measurement points, SLOs, budgets, acceptance | 1,380 |
+| 03 | [`03-architecture.md`](03-architecture.md) | System, region, box and core diagrams; data flows; sequence diagrams; component catalog | 1,723 |
+| 04 | [`04-protocol.md`](04-protocol.md) | Client protocol: sessions, packets, messages, responses, reliability, rate limits | 1,993 |
+| 05 | [`05-engine.md`](05-engine.md) | Matching engine: lanes, cut, BBO core, data structures, algorithms, proofs | 3,044 |
+| 06 | [`06-platform.md`](06-platform.md) | Unix host platform: hardware, BIOS, kernel, NIC backends, C shim, PTP, AWS, consumer, macOS | 1,890 |
+| 07 | [`07-replication.md`](07-replication.md) | Log, ordering frames, data tier, Simplex, finality, storage, failover, replay | 2,279 |
+| 08 | [`08-epochs.md`](08-epochs.md) | Follow the sun: schedule, handoff, certificate, opening auction, fencing, failures | 1,536 |
+| 09 | [`09-chain.md`](09-chain.md) | On-chain mode: validators, custody, bridge, authentication, commitments, slashing | 2,101 |
+| 10 | [`10-accounts-risk-md.md`](10-accounts-risk-md.md) | Accounts, risk, positions, fees, market data, drop copy, surveillance | 1,814 |
+| 11 | [`11-build.md`](11-build.md) | Repo, crates, coding rules, Vx client, tests, benchmarks, observability, ops, milestones | 2,442 |
 | 12 | [`12-commitment.md`](12-commitment.md) | Draft 0.3: execution lifecycle, what can undo a fill at each stage, evidence and who pays | — |
 | 13 | [`13-availability.md`](13-availability.md) | Draft 0.3: data-availability and fault model, the repair-capacity gap, proposed rules DAV-1 to DAV-4 | — |
 | 14 | [`14-envelope.md`](14-envelope.md) | Draft 0.3: throughput envelope, five reported rates, packet-fill ceiling, regimes R1–R6 | — |
@@ -76,7 +76,7 @@ compensated; withheld data copies are attributed and contained by DAV-1 to DAV-4
 Every number in this specification is one of three kinds, and the text says which:
 
 - **Budget:** a target the design commits to. A benchmark in `11-build.md` checks it.
-- **Measured:** a result of one of our benchmarks, with its ID. Draft 0.1 has none.
+- **Measured:** a result of one of our benchmarks, with its ID. Draft 0.2 has none.
 - **Vendor:** a figure published by a vendor. It is taken as given until our own benchmark
   replaces it.
 

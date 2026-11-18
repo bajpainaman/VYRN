@@ -1518,7 +1518,7 @@ epochs (§14.8). These remain:
     step's record for its half. §14.5 still names a single core 4.
 13. §14.15: state that a pool core steals nothing and logs no `AcctTake` from T until its lane
     is live (§7.1), so the window path is the same for both lane classes.
-14. §5: `N_LANES_REF` = 50 against the §10 map's 49 lanes; this chapter's lane sums use 49.
+14. §5: *Resolved by 01:* `N_LANES_REF` = 49, which this chapter's lane sums use.
 
 ## Open questions
 

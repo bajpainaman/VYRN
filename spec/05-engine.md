@@ -3026,7 +3026,7 @@ flag half of R11 (§6.6 now has `flags`), and R14's step part (15 ns steps, §14
 | R13 | Promote `INV-ENG-7` and `INV-ENG-8`. | 07 and 11 test positions and explicit ops. |
 | R14 | Add the 20 ns "lane notices `LaneCut`" term to 01 §14.2's ack path (935 → 955 typical, 965 worst). | A lane inside another packet polls `LaneCut` every `ENG_UNIT_NS` (§6.1). |
 | R15 | *Resolved by 01* (§14.17.4): `AcctTake { account, ver, lane }` in the lane record stream (01 §6.6, 07). | 01 §14.15's "each core's `LaneSeq` logs the token order" does not order one account's work across two pool cores; `ver` does (Lemma 6.1). |
-| R16 | Reconcile `N_LANES_REF` = 50 with the core map's 49 lanes (42 + 7), and `BBO_CROSS_NS` = 40 in §5 with 15 in §14.15.2. | Two definitions of one name. |
+| R16 | *Resolved by 01:* §5 has `N_LANES_REF` = 49 (42 + 7) and `BBO_CROSS_NS` = 15, matching §14.15.2. | — |
 
 ## 18. Open questions
 
