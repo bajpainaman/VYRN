@@ -30,7 +30,6 @@ vyrn-consensus = { path = "crates/vyrn-consensus" }
 vyrn-epoch = { path = "crates/vyrn-epoch" }
 vyrn-replica = { path = "crates/vyrn-replica" }
 vyrn-chain = { path = "crates/vyrn-chain" }
-vyrn-md = { path = "crates/vyrn-md" }
 # Test-only (§1.4): tools/sim-swarm drives it.
 vyrn-sim = { path = "crates/vyrn-sim" }
 # Tier T: tools/e2e-smoke drives its generator.
