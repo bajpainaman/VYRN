@@ -3553,8 +3553,10 @@ name = "vyrn-chain"
 version = "0.1.0"
 dependencies = [
  "k256",
+ "sha3",
  "thiserror",
  "vyrn-crypto",
+ "vyrn-epoch",
  "vyrn-types",
 ]
 

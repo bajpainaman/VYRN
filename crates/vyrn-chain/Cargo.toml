@@ -7,12 +7,14 @@ license-file.workspace = true
 publish = false
 description = "Chain mode: wallet session open, key registration, TESLA disclosure, lattice commitment, bridge."
 
-# vyrn-replica and vyrn-epoch (spec/11-build.md §1.4, layer 7) are not dependencies yet: this crate
-# reads them through its own traits, `Replica` and `Epochs` in src/lib.rs, until they land.
+# Layer 7 (spec/11-build.md §1.4). vyrn-replica is not a dependency yet: this crate reads it through
+# its own `Replica` trait in src/lib.rs until it lands. vyrn-epoch owns the bridge signer table.
 [dependencies]
 vyrn-types = { workspace = true }
 vyrn-crypto = { workspace = true }
+vyrn-epoch = { workspace = true }
 k256 = { workspace = true }
+sha3 = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]

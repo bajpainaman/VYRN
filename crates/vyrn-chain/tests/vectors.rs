@@ -212,10 +212,7 @@ fn eip712_domain_type_hashes_digests() {
         ("SignerSet", eip712::SIGNER_SET_TYPE),
     ] {
         assert_eq!(v.get("typeStrings").get(name).s(), s);
-        assert_eq!(
-            vyrn_chain::keccak::keccak256(s.as_bytes()),
-            th.get(name).b32()
-        );
+        assert_eq!(vyrn_chain::keccak256(s.as_bytes()), th.get(name).b32());
     }
     let vs = v.get("vectors").arr();
     assert_eq!(vs.len(), 4);
@@ -533,12 +530,6 @@ impl Replica for FakeReplica {
         self.posts.get(&post_no).copied()
     }
 }
-struct FakeEpochs(SignerSet);
-impl Epochs for FakeEpochs {
-    fn bridge_signers(&self, rotation_no: u64) -> Option<SignerSet> {
-        (rotation_no == self.0.rotation_no).then_some(self.0)
-    }
-}
 
 #[test]
 fn post1_rebuilds_from_its_checkpoint_and_guardian_accepts() {
@@ -575,11 +566,14 @@ fn post1_rebuilds_from_its_checkpoint_and_guardian_accepts() {
         checkpoints: vec![cp.clone(), cp2.clone()],
         posts: canonical.clone(),
     };
-    let epochs = FakeEpochs(SignerSet {
+    // The real table from vyrn-epoch, with the vectors' keys as the genesis set.
+    let epochs = vyrn_epoch::BridgeSignerTable::genesis(vyrn_epoch::BridgeSigners {
         rotation_no: 0,
         bridge_keys: keys5(e.get("bridgeKeys")),
         guardian_keys: keys5(e.get("guardianKeys")),
-    });
+    })
+    .unwrap();
+    assert_eq!(epochs.bridge_signers(1), None);
     let guardian = |replica| Guardian {
         replica,
         epochs: &epochs,

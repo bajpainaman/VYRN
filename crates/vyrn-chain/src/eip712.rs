@@ -15,7 +15,7 @@
 
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 
-use crate::keccak::{keccak256, keccak256_parts};
+use crate::{keccak256, keccak256_parts};
 
 /// A 20-byte EVM address.
 pub type Address = [u8; 20];

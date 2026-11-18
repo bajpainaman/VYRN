@@ -18,8 +18,8 @@ use crate::Domain;
 use crate::fence::Fence;
 use crate::handoff::{HandoffCert, HandoffErr, LocalView, accept_cert};
 use thiserror::Error;
-use vyrn_consensus::{Committee, CommitteeErr};
-use vyrn_types::{Epoch, HomeCode, Mode, PubKey};
+use vyrn_consensus::{Committee, CommitteeErr, Genesis};
+use vyrn_types::{Epoch, HomeCode, Mode, PubKey, StepId};
 
 /// One `vyrn-seq` box of a home.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +64,11 @@ pub struct Activation {
     pub standby_key: PubKey,
     /// `INV-FENCE` for epoch e.
     pub fence: Fence,
+    /// What the first block of e+1 extends, for `vyrn_consensus::voter::VoterConfig::genesis`:
+    /// the certified last block of e (`last_height`, `log_hash`). Steps restart at 1 each epoch, so
+    /// `last_step` is 0. Assumes `log_hash` is `vyrn-log`'s `header_hash` (08 Requests to 01 item 3)
+    /// [Likely].
+    pub genesis: Genesis,
 }
 
 impl Membership {
@@ -132,6 +137,11 @@ impl Membership {
             seq_key: next.seq[0].seq_key,
             standby_key: next.seq[1].seq_key,
             fence: Fence::from_record(&cert.record),
+            genesis: Genesis {
+                height: cert.record.last_height,
+                hash: cert.record.log_hash,
+                last_step: StepId(0),
+            },
         })
     }
 }
@@ -155,6 +165,10 @@ mod tests {
         assert_eq!(a.committee.voter(0), next.committee().voter(0));
         assert_eq!(a.seq_key, next.seq()[0].seq_key);
         assert_eq!(a.fence.epoch(), Epoch(7));
+        assert_eq!(
+            (a.genesis.height, a.genesis.hash),
+            (cert.record.last_height, cert.record.log_hash)
+        );
         // The certificate must be checked against R_e, not R_{e+1}.
         assert_eq!(
             next.hand_off(&next, &cert, &domain, &local).err(),

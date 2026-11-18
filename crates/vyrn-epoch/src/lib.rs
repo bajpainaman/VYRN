@@ -23,6 +23,7 @@
 //! | The handoff certificate | [`encode_record`], [`HandoffSig`], [`HandoffCert`], [`CertBuilder`] | each voter of `R_e`, once per (book, e) ([`SignOnce`]) | `R_{e+1}`, both new `vyrn-seq` boxes, the third home, light clients | sign only after the block with S is final; persist before send | [`HandoffErr`] with an [`Action`] | 08 §5 |
 //! | Verification at the new home | [`accept_cert`], [`LocalView`] | — | `R_{e+1}`, third home | checks 1–5 in order; the first failure decides | [`HandoffErr`] | 08 §5.4 |
 //! | Fencing (`INV-FENCE`) | [`Fence`], [`check_next_vote`] | — | every replica and follower | from the first moment Q signatures on one record are held | [`FenceErr`] | 08 §8.2 F1, F4 |
+//! | The bridge signer table (rotation number → keys) | [`BridgeSignerTable`], [`BridgeSigners`] | governance (`SetParam`, 09 §6.7) | `vyrn-chain` (`Epochs::bridge_signers`), guardians, relayers | a set activates at the first boundary after approval; every activated set stays readable | [`BridgeErr`] | 09 §6.7, 08 §9.5 |
 //! | The membership hand-off | [`Membership`], [`Activation`], [`Membership::hand_off`] | `EpoConfig(e+1)` (roster) | `vyrn-consensus` (the next [`vyrn_consensus::Committee`]), `vyrn-replica`, `vyrn-chain` | only with a verified cert(e, S) | [`MembershipErr`], [`HandoffErr`] | 08 §9, 07 §13.1 |
 //!
 //! # Domain separation
@@ -45,6 +46,7 @@
 //! follow-ups. The spec gaps this crate had to fill are marked "Spec gap" at the point of use.
 #![forbid(unsafe_code)]
 
+mod bridge;
 mod fence;
 mod handoff;
 mod membership;
@@ -52,6 +54,7 @@ mod notice;
 mod ready;
 mod schedule;
 
+pub use bridge::{BRIDGE_SIGNERS, BridgeErr, BridgeSignerTable, BridgeSigners, EvmAddress};
 pub use fence::{Fence, FenceErr, check_next_vote};
 pub use handoff::{
     Action, CertBuilder, HANDOFF_CONTEXT, HandoffCert, HandoffErr, HandoffSig, LocalView,
