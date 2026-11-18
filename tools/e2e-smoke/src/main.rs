@@ -41,7 +41,7 @@
 //!   itself cannot be recomputed from the box's side.
 //! - R2. The tap's engine is built the way `vyrn-seq` builds its DEV engine (`EnginePlan`,
 //!   `engine_loop`), copied here. A drift between the two shows as a replay failure.
-//! - R3. Until `vyrn-data` and the replica's data path are wired, the tap's `DataJoin` gets copy 2
+//! - R3. Until `vyrn-data` runs and `vyrn-validator` feeds `vyrn_replica::DataFeed` from it, the tap's `DataJoin` gets copy 2
 //!   of each packet from the client in process, standing in for 07 §5.1.
 //! - R4. `FINAL height=<h>` is this harness's guess at a validator's finality line.
 //!
@@ -609,7 +609,7 @@ vote = "dev:validator-{i}"
 fn run(cli: &Cli) -> Result<bool, String> {
     if cli.data {
         return Err(
-            "--data: vyrn-data and the replica's data path are not wired on this build".into(),
+            "--data: vyrn-data is an empty binary and vyrn-validator polls no data RX queue on this build".into(),
         );
     }
     let wait = Duration::from_secs(cli.wait_s);
@@ -968,7 +968,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     }
     Report::skip(
         "data",
-        "off (vyrn-data and the replica data path are not wired; the tap joins copy 2 in process, R3)",
+        "off (vyrn-data is an empty binary and vyrn-validator polls no data RX queue yet; the tap joins copy 2 in process, R3)",
     );
 
     let _ = std::io::stdout().flush();
