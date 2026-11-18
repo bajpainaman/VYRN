@@ -16,7 +16,8 @@ use vyrn_bbo::{OrderFlags, Record as Resp, Side as BSide, Stp, Tif, TxEntry};
 use vyrn_md::dropcopy::server::{DcStore, Keys, Session};
 use vyrn_md::dropcopy::wire::{FRAME_BYTES, Frame, LOGIN_BYTES, Login};
 use vyrn_md::dropcopy::{
-    Balances, DC_REC_BYTES, DcAccount, DcConfig, DcOut, DcRecord, DropCopy, StreamId,
+    Alloc, AllocAsset, Balances, DC_REC_BYTES, DcAccount, DcConfig, DcOut, DcRecord, DcRoute,
+    DropCopy, StreamId,
 };
 use vyrn_md::{Tap, TapOp, TapSrc, TapStep};
 use vyrn_types::{
@@ -224,7 +225,34 @@ fn run_case(lines: &[&str]) -> Recs {
                     },
                 );
             }
-            "end" => {}
+            "alloc" => dc.alloc(Alloc {
+                step: StepId(num(h[1])),
+                account: AccountId(n32(h[2])),
+                asset: if num(h[3]) == 0 {
+                    AllocAsset::Quote
+                } else {
+                    AllocAsset::Base
+                },
+                debit: h[4] == "1",
+                amount: num(h[5]),
+            }),
+            "revert" => dc.revert_after(StepId(num(h[1]))),
+            "route" => dc.route(&DcRoute {
+                account: AccountId(n32(h[1])),
+                lane_seq: num(h[2]),
+                index: u8::try_from(num(h[3])).unwrap(),
+                session: SessionId(n32(h[4])),
+                resp_seq: n32(h[5]),
+                asset: u8::try_from(num(h[6])).unwrap(),
+                to_book: BookId(u16::try_from(num(h[7])).unwrap()),
+                amount: num(h[8]),
+                client_tag: n32(h[9]),
+                fee: h[10].parse().unwrap(),
+            }),
+            "end" => dc
+                .end_epoch(|a| bal.get(&a).copied().unwrap_or_default())
+                .unwrap(),
+            "settled" => dc.settled(Height(num(h[1])), StepId(num(h[2]))),
             "rec" => {
                 let b: [u8; DC_REC_BYTES] = unhex(h[4]).try_into().unwrap();
                 want.push((
@@ -240,9 +268,7 @@ fn run_case(lines: &[&str]) -> Recs {
         }
     }
     assert_eq!(dc.error(), None);
-    let got = dc
-        .finish(|a| bal.get(&a).copied().unwrap_or_default())
-        .unwrap();
+    let got = dc.into_out().unwrap();
     for (k, (g, w)) in got.iter().zip(&want).enumerate() {
         assert_eq!(g, w, "record {k}");
     }
@@ -268,7 +294,7 @@ fn blocks(kind: &str) -> Vec<Vec<&'static str>> {
 #[test]
 fn streams_match_the_vectors() {
     let cases = blocks("case ");
-    assert_eq!(cases.len(), 3);
+    assert_eq!(cases.len(), 5);
     for c in &cases {
         run_case(&c[1..]);
     }

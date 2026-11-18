@@ -51,9 +51,10 @@ impl DcType {
         })
     }
 
-    /// `DC_FINAL` and `DC_SETTLED` mark stages; they are not canonical records (10 §8.4 item 3).
+    /// `DC_FINAL`, `DC_SETTLED` and `DC_REVERT` are not canonical: the first two mark stages,
+    /// and a revert names a record the final log does not hold (10 §8.4 items 3 and 9).
     pub const fn is_stage(self) -> bool {
-        matches!(self, Self::Final | Self::Settled)
+        matches!(self, Self::Final | Self::Settled | Self::Revert)
     }
 }
 
@@ -85,6 +86,22 @@ pub struct DcOrder {
     pub handle: Handle,
     pub tick: Tick,
     pub qty: Qty,
+    pub client_tag: u32,
+    pub fee: i64,
+}
+
+/// One accepted `RouteMove` (10 §2.8), answered `Routed` by its lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DcRoute {
+    pub account: AccountId,
+    pub session: SessionId,
+    pub lane_seq: u64,
+    pub index: u8,
+    pub resp_seq: u32,
+    /// 0 quote, 1 base.
+    pub asset: u8,
+    pub to_book: vyrn_types::BookId,
+    pub amount: u64,
     pub client_tag: u32,
     pub fee: i64,
 }
@@ -130,6 +147,61 @@ impl DcRecord {
         b[8..16].copy_from_slice(&step.0.to_le_bytes());
         b[24..32].copy_from_slice(&height.0.to_le_bytes());
         Self(b)
+    }
+
+    /// `DC_ALLOC` (10 §8.4 item 10): `step` = the control step, `ordinal` = asset (bit 0: base)
+    /// | debit (bit 1), bytes 24–31 = the amount credited or debited.
+    pub fn alloc(account: AccountId, step: StepId, asset: u8, debit: bool, amount: u64) -> Self {
+        let mut b = [0; DC_REC_BYTES];
+        b[0] = DcType::Alloc.code();
+        b[1] = DC_DURABLE;
+        let ord = u16::from(asset & 1) | if debit { 2 } else { 0 };
+        b[2..4].copy_from_slice(&ord.to_le_bytes());
+        b[4..8].copy_from_slice(&account.0.to_le_bytes());
+        b[8..16].copy_from_slice(&step.0.to_le_bytes());
+        b[24..32].copy_from_slice(&amount.to_le_bytes());
+        Self(b)
+    }
+
+    /// `DC_ROUTE` (10 §8.4 item 12, a `RouteMove` of §2.8): `step` = the op's LaneSeq,
+    /// `ordinal` = its message index, bytes 24–31 the amount, 32–33 `to_book`, 34 the asset
+    /// (0 quote, 1 base), 36–39 `client_tag`, 40–47 the router fee.
+    pub fn route(r: &DcRoute) -> Self {
+        let mut b = [0; DC_REC_BYTES];
+        b[0] = DcType::Route.code();
+        b[1] = DC_DURABLE;
+        b[2..4].copy_from_slice(&u16::from(r.index).to_le_bytes());
+        b[4..8].copy_from_slice(&r.account.0.to_le_bytes());
+        b[8..16].copy_from_slice(&r.lane_seq.to_le_bytes());
+        b[16..20].copy_from_slice(&r.session.0.to_le_bytes());
+        b[20..24].copy_from_slice(&r.resp_seq.to_le_bytes());
+        b[24..32].copy_from_slice(&r.amount.to_le_bytes());
+        b[32..34].copy_from_slice(&r.to_book.0.to_le_bytes());
+        b[34] = r.asset & 1;
+        b[36..40].copy_from_slice(&r.client_tag.to_le_bytes());
+        b[40..48].copy_from_slice(&r.fee.to_le_bytes());
+        Self(b)
+    }
+
+    /// `DC_REVERT` of `r` (10 §8.4 item 9): `r`'s bytes with type 7, and `r`'s type at bytes
+    /// 36–39 in place of its `client_tag`, so `(step, ordinal)` reads as `r`'s own.
+    pub fn revert(r: &DcRecord) -> Self {
+        let mut b = r.0;
+        b[0] = DcType::Revert.code();
+        b[36..40].copy_from_slice(&u32::from(r.0[0]).to_le_bytes());
+        Self(b)
+    }
+
+    /// `DC_REVERT`: the type of the reverted record.
+    pub fn reverted(&self) -> Option<DcType> {
+        u8::try_from(self.u32_at(36))
+            .ok()
+            .and_then(DcType::from_code)
+    }
+
+    /// `DC_ALLOC`: the amount at bytes 24–31.
+    pub fn amount(&self) -> u64 {
+        self.u64_at(24)
     }
 
     /// `DC_EOD` with `ordinal` and five 8-byte words at bytes 8–47.

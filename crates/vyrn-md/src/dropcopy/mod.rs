@@ -25,13 +25,15 @@
 //! | a final block | `DC_FINAL` on every stream that got a record since its last one |
 //! | epoch end | `DC_EOD` totals, fees, balances, then the stream hash |
 //!
-//! `flags.bit2` (durable) is always set: the observer replays only frames it holds from both
-//! paths. The canonical stream is every record except `DC_FINAL` and `DC_SETTLED`; the last
-//! `DC_EOD` carries the BLAKE3 hash of its canonical records before it, concatenated.
+//! | [`DropCopy::revert_after`] | `DC_REVERT` of every record after the kept step |
+//! | [`DropCopy::alloc`] | `DC_ALLOC` after its control step |
+//! | [`DropCopy::settled`] | `DC_SETTLED` on streams with unsettled final records |
+//! | [`DropCopy::route`] | `DC_ROUTE` |
 //!
-//! **Not rebuilt yet:** `DC_REVERT` (replay has no revert path), `DC_SETTLED`, `DC_ALLOC` and
-//! `DC_ROUTE` (no replay output carries them); the codec has them. Closing balances come from
-//! the shell ([`Balances`]).
+//! `flags.bit2` (durable) is always set: the observer replays only frames it holds from both
+//! paths. The canonical stream is the final records except `DC_FINAL`, `DC_SETTLED` and
+//! `DC_REVERT`; the last `DC_EOD` carries the BLAKE3 hash of its canonical records before it.
+//! Closing balances come from the shell ([`Balances`]).
 
 mod record;
 pub mod server;
@@ -47,7 +49,7 @@ use vyrn_types::{
 use vyrn_wire::Msg;
 
 pub use record::{
-    DC_DURABLE, DC_REC_BYTES, DC_SELL, DC_TAKER, DcOrder, DcRecord, DcRecordError, DcType,
+    DC_DURABLE, DC_REC_BYTES, DC_SELL, DC_TAKER, DcOrder, DcRecord, DcRecordError, DcRoute, DcType,
     EOD_BALANCES, EOD_FEES, EOD_HASH, EOD_TOTALS,
 };
 
@@ -121,6 +123,8 @@ pub enum DcError {
     Overflow,
     /// A case this version does not rebuild.
     Unsupported(&'static str),
+    /// A revert that reaches a final step, or a call that the epoch's end ruled out.
+    Final,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,8 +149,44 @@ struct Stream {
     quote_sold: u64,
     fees: i64,
     msg_fees: u64,
-    /// Release steps of canonical records no `DC_FINAL` covers yet, ascending, deduplicated.
-    unfinal: VecDeque<u64>,
+    /// Canonical records and message fees no `DC_FINAL` covers yet, with their release steps.
+    /// They are hashed and totalled when one does, and a revert drops them (10 §8.4 item 3).
+    pend: VecDeque<(u64, Pend)>,
+    /// Release steps of final canonical records no `DC_SETTLED` covers yet, deduplicated.
+    unsettled: VecDeque<u64>,
+}
+
+/// What a stream holds until it is final.
+#[derive(Clone, Copy, Debug)]
+enum Pend {
+    Rec(DcRecord),
+    MsgFee(u64),
+}
+
+/// The state a revert restores (10 §8.4 item 9).
+#[derive(Clone, Copy, Debug)]
+enum Undo {
+    Order((u8, u32), Option<Resting>),
+    Taker(Option<((LaneId, LaneSeq), u32)>),
+}
+
+/// The asset of a `DC_ALLOC` (byte 1 of `CtlAllocCredit`, 10 §2.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocAsset {
+    Quote = 0,
+    Base = 1,
+}
+
+/// One allocation reply of the control path (`AllocCredited` / `AllocDebited`, 10 §2.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Alloc {
+    /// The control step that applied it.
+    pub step: StepId,
+    pub account: AccountId,
+    pub asset: AllocAsset,
+    pub debit: bool,
+    /// Credited, or actually debited (`min(amount, free)`).
+    pub amount: u64,
 }
 
 impl Stream {
@@ -162,7 +202,8 @@ impl Stream {
             quote_sold: 0,
             fees: 0,
             msg_fees: 0,
-            unfinal: VecDeque::new(),
+            pend: VecDeque::new(),
+            unsettled: VecDeque::new(),
         }
     }
 }
@@ -189,8 +230,18 @@ pub struct DropCopy<O: DcOut> {
     /// The release step of the records being emitted: the step whose release carries them.
     rel: u64,
     finals: VecDeque<(Height, StepId)>,
+    /// The newest step a `DC_FINAL` covers: no revert reaches it.
+    final_step: StepId,
+    /// The newest `DC_FINAL` sent, for an allocation of its block that comes after it.
+    last_final: Option<(Height, StepId)>,
+    /// Allocations waiting for their control step's release.
+    allocs: VecDeque<Alloc>,
+    /// Order-state changes of steps no `DC_FINAL` covers yet, with their release steps.
+    undo: VecDeque<(u64, Undo)>,
     /// The source of the last step and its taker fills so far (a `CONT` run).
     taker_acc: Option<((LaneId, LaneSeq), u32)>,
+    /// `DC_EOD` is out: only `DC_SETTLED` may follow.
+    ended: bool,
     out: O,
     err: Option<DcError>,
 }
@@ -264,7 +315,12 @@ impl<O: DcOut> DropCopy<O> {
             released: StepId(0),
             rel: 0,
             finals: VecDeque::new(),
+            final_step: StepId(0),
+            last_final: None,
+            allocs: VecDeque::new(),
+            undo: VecDeque::new(),
             taker_acc: None,
+            ended: false,
             out,
             err: None,
         }
@@ -294,16 +350,163 @@ impl<O: DcOut> DropCopy<O> {
             return;
         }
         self.finals.push_back((height, last_step));
-        self.flush_finals(false);
+        if let Err(e) = self.flush_finals(false) {
+            self.fail(e);
+        }
     }
 
-    /// Ends the epoch: the pending `DC_FINAL`s, then each stream's `DC_EOD` records in stream
-    /// order (10 §8.4 item 8). `balances` gives an account's closing balances.
+    /// An allocation reply of the control path (10 §2.5). It goes out right after its control
+    /// step's records, once that step is released (10 §8.4 item 10).
+    pub fn alloc(&mut self, a: Alloc) {
+        if self.err.is_some() {
+            return;
+        }
+        if self.ended {
+            return self.fail(DcError::Final);
+        }
+        self.allocs.push_back(a);
+        // An allocation of a step whose block's DC_FINAL went out already gets that DC_FINAL
+        // again in its streams, after it (10 §8.4 item 10).
+        let r = self
+            .flush_allocs(self.released)
+            .and_then(|()| match self.last_final {
+                Some((h, s)) => self.final_to(h, s),
+                None => Ok(()),
+            });
+        if let Err(e) = r {
+            self.fail(e);
+        }
+    }
+
+    /// An accepted `RouteMove` (10 §2.8). The engine has no route op yet, so the shell hands it
+    /// over at its position in its interval, as a [`Tap::lane_op`] would be; it is released
+    /// with the step that closes the interval (10 §8.4 item 12).
+    pub fn route(&mut self, r: &DcRoute) {
+        if self.err.is_some() {
+            return;
+        }
+        if self.ended {
+            return self.fail(DcError::Final);
+        }
+        self.rel = self.released.0.saturating_add(1);
+        let rec = DcRecord::route(r);
+        for id in self.targets(r.account).into_iter().flatten() {
+            self.push(id, &rec);
+        }
+    }
+
+    /// Steps after `kept` are not in the final log (07 §9.6; a deposed tenure's seal stops at
+    /// `kept`). Every record released after `kept` gets a `DC_REVERT`, in stream order, and the
+    /// order state goes back to just after `kept`, so the replay of the final log continues from
+    /// there (10 §8.4 item 9). `kept` must be at least the newest final step.
+    pub fn revert_after(&mut self, kept: StepId) {
+        if self.err.is_some() {
+            return;
+        }
+        if self.ended || kept < self.final_step {
+            return self.fail(DcError::Final);
+        }
+        let k = kept.0;
+        let ids: Vec<StreamId> = self.streams.keys().copied().collect();
+        for id in ids {
+            let Some(st) = self.streams.get_mut(&id) else {
+                continue;
+            };
+            let at = st
+                .pend
+                .iter()
+                .position(|(r, _)| *r > k)
+                .unwrap_or(st.pend.len());
+            let gone: Vec<(u64, Pend)> = st.pend.drain(at..).collect();
+            for (_, p) in gone {
+                if let Pend::Rec(r) = p {
+                    self.push(id, &DcRecord::revert(&r));
+                }
+            }
+        }
+        while self.undo.back().is_some_and(|(r, _)| *r > k) {
+            match self.undo.pop_back() {
+                Some((_, Undo::Order(key, Some(o)))) => {
+                    self.orders.insert(key, o);
+                }
+                Some((_, Undo::Order(key, None))) => {
+                    self.orders.remove(&key);
+                }
+                Some((_, Undo::Taker(t))) => self.taker_acc = t,
+                None => {}
+            }
+        }
+        self.allocs.retain(|a| a.step <= kept);
+        self.finals.retain(|f| f.1 <= kept);
+        self.released = self.released.min(kept);
+        self.rel = self.released.0;
+    }
+
+    /// Block `height`, whose last step is `last_step`, is settled (`BASE`: the ledger credited
+    /// the epoch statement, 10 §10; `CHAIN`: 09's settlement covers it). Every stream holding a
+    /// final record released at a step ≤ `last_step` that no `DC_SETTLED` covers gets one. It may
+    /// come after the epoch's `DC_EOD` (10 §8.4 item 11).
+    pub fn settled(&mut self, height: Height, last_step: StepId) {
+        if self.err.is_some() {
+            return;
+        }
+        if last_step > self.final_step {
+            return self.fail(DcError::Final);
+        }
+        let ids: Vec<StreamId> = self
+            .streams
+            .iter()
+            .filter(|(_, x)| x.unsettled.front().is_some_and(|r| *r <= last_step.0))
+            .map(|(k, _)| *k)
+            .collect();
+        for id in ids {
+            if let Some(x) = self.streams.get_mut(&id) {
+                while x.unsettled.front().is_some_and(|r| *r <= last_step.0) {
+                    x.unsettled.pop_front();
+                }
+            }
+            self.push(
+                id,
+                &DcRecord::stage(DcType::Settled, id.account, last_step, height),
+            );
+        }
+    }
+
+    /// Ends the epoch and hands back the output ([`DropCopy::end_epoch`], then the output).
     pub fn finish(mut self, balances: impl Fn(AccountId) -> Balances) -> Result<O, DcError> {
+        self.end_epoch(balances)?;
+        Ok(self.out)
+    }
+
+    /// Hands back the output; after [`DropCopy::end_epoch`] and any `DC_SETTLED`.
+    pub fn into_out(self) -> Result<O, DcError> {
+        match self.err {
+            Some(e) => Err(e),
+            None => Ok(self.out),
+        }
+    }
+
+    /// Ends the epoch: the pending allocations and `DC_FINAL`s (the epoch's end makes every
+    /// released step final), then each stream's `DC_EOD` records in stream order (10 §8.4
+    /// item 8). `balances` gives an account's closing balances.
+    pub fn end_epoch(&mut self, balances: impl Fn(AccountId) -> Balances) -> Result<(), DcError> {
         if let Some(e) = self.err {
             return Err(e);
         }
-        self.flush_finals(true);
+        if self.ended {
+            return Err(DcError::Final);
+        }
+        self.flush_allocs(StepId(u64::MAX))?;
+        self.flush_finals(true)?;
+        // Records no block's DC_FINAL covered are final with the epoch.
+        let ids: Vec<StreamId> = self.streams.keys().copied().collect();
+        for id in &ids {
+            self.commit_upto(*id, u64::MAX)?;
+        }
+        self.undo.clear();
+        // The epoch's end makes every released step final, so they can settle.
+        self.final_step = self.final_step.max(self.released);
+        self.ended = true;
         // Each account's balance once, into its own stream and its master's (10 §8.4 item 6).
         let mut bal: BTreeMap<StreamId, Balances> = BTreeMap::new();
         for (a, x) in &self.accts {
@@ -331,7 +534,7 @@ impl<O: DcOut> DropCopy<O> {
                 }
             }
         }
-        let ids: Vec<StreamId> = self.streams.keys().copied().collect();
+        self.rel = self.released.0;
         for id in ids {
             let b = bal.get(&id).copied().unwrap_or_default();
             let Some(s) = self.streams.get(&id) else {
@@ -348,18 +551,24 @@ impl<O: DcOut> DropCopy<O> {
             #[allow(clippy::cast_sign_loss, clippy::as_conversions)]
             let fees = [s.fees as u64, s.msg_fees, 0, 0, 0];
             let acct = id.account;
-            self.push(id, &DcRecord::eod(acct, EOD_TOTALS, totals));
-            self.push(id, &DcRecord::eod(acct, EOD_FEES, fees));
             let bal = [b.quote_free, b.quote_resv, b.base_free, b.base_resv, 0];
-            self.push(id, &DcRecord::eod(acct, EOD_BALANCES, bal));
+            for r in [
+                DcRecord::eod(acct, EOD_TOTALS, totals),
+                DcRecord::eod(acct, EOD_FEES, fees),
+                DcRecord::eod(acct, EOD_BALANCES, bal),
+            ] {
+                self.push(id, &r);
+                self.commit_upto(id, u64::MAX)?;
+            }
             let Some(s) = self.streams.get(&id) else {
                 continue;
             };
             let h = *s.hasher.finalize().as_bytes();
             let r = DcRecord::eod_hash(acct, s.n, &h);
             self.push(id, &r);
+            self.commit_upto(id, u64::MAX)?;
         }
-        Ok(self.out)
+        Ok(())
     }
 
     fn fail(&mut self, e: DcError) {
@@ -369,29 +578,105 @@ impl<O: DcOut> DropCopy<O> {
     }
 
     /// Sends each due `DC_FINAL(s)` to every stream holding a record released at a step ≤ `s`
-    /// that no earlier `DC_FINAL` covers (10 §8.4 item 7).
-    fn flush_finals(&mut self, all: bool) {
+    /// that no earlier `DC_FINAL` covers, and makes those records canonical (10 §8.4 item 7).
+    fn flush_finals(&mut self, all: bool) -> Result<(), DcError> {
         while let Some(&(h, s)) = self.finals.front() {
             if !all && s > self.released {
-                return;
+                return Ok(());
             }
             self.finals.pop_front();
-            let ids: Vec<StreamId> = self
-                .streams
-                .iter()
-                .filter(|(_, x)| x.unfinal.front().is_some_and(|r| *r <= s.0))
-                .map(|(k, _)| *k)
-                .collect();
-            for id in ids {
-                if let Some(x) = self.streams.get_mut(&id) {
-                    while x.unfinal.front().is_some_and(|r| *r <= s.0) {
-                        x.unfinal.pop_front();
-                    }
+            self.final_step = self.final_step.max(s);
+            self.last_final = Some((h, s));
+            while self.undo.front().is_some_and(|(r, _)| *r <= s.0) {
+                self.undo.pop_front();
+            }
+            self.final_to(h, s)?;
+        }
+        Ok(())
+    }
+
+    /// `DC_FINAL(s)` to every stream holding a record released at a step ≤ `s` that no
+    /// earlier `DC_FINAL` covers; those records become canonical.
+    fn final_to(&mut self, h: Height, s: StepId) -> Result<(), DcError> {
+        let ids: Vec<StreamId> = self
+            .streams
+            .iter()
+            .filter(|(_, x)| x.pend.front().is_some_and(|(r, _)| *r <= s.0))
+            .map(|(k, _)| *k)
+            .collect();
+        for id in ids {
+            self.commit_upto(id, s.0)?;
+            let r = DcRecord::stage(DcType::Final, id.account, s, h);
+            self.push(id, &r);
+        }
+        Ok(())
+    }
+
+    /// Hashes and totals every pending entry of `id` released at a step ≤ `upto`.
+    fn commit_upto(&mut self, id: StreamId, upto: u64) -> Result<(), DcError> {
+        let ts = self.tick_size;
+        let Some(s) = self.streams.get_mut(&id) else {
+            return Ok(());
+        };
+        while let Some(&(rel, p)) = s.pend.front().filter(|(r, _)| *r <= upto) {
+            s.pend.pop_front();
+            if s.unsettled.back() != Some(&rel) {
+                s.unsettled.push_back(rel);
+            }
+            let r = match p {
+                Pend::MsgFee(f) => {
+                    s.msg_fees = s.msg_fees.checked_add(f).ok_or(DcError::Overflow)?;
+                    continue;
                 }
-                let r = DcRecord::stage(DcType::Final, id.account, s, h);
+                Pend::Rec(r) => r,
+            };
+            s.hasher.update(&r.0);
+            s.n += 1;
+            if r.kind() != DcType::Fill {
+                continue;
+            }
+            let n = u64::from(r.qty().0)
+                .checked_mul(u64::from(r.tick().0))
+                .and_then(|x| x.checked_mul(ts))
+                .ok_or(DcError::Overflow)?;
+            s.fills = s.fills.checked_add(1).ok_or(DcError::Overflow)?;
+            let (base, quote) = match r.side() {
+                Side::Buy => (&mut s.base_bought, &mut s.quote_bought),
+                Side::Sell => (&mut s.base_sold, &mut s.quote_sold),
+            };
+            *base = base
+                .checked_add(u64::from(r.qty().0))
+                .ok_or(DcError::Overflow)?;
+            *quote = quote.checked_add(n).ok_or(DcError::Overflow)?;
+            s.fees = s.fees.checked_add(r.fee()).ok_or(DcError::Overflow)?;
+        }
+        Ok(())
+    }
+
+    /// Sends the allocations of control steps up to `upto`, each after its step's records.
+    fn flush_allocs(&mut self, upto: StepId) -> Result<(), DcError> {
+        while let Some(a) = self.allocs.front().copied().filter(|a| a.step <= upto) {
+            self.allocs.pop_front();
+            self.rel = a.step.0;
+            let r = DcRecord::alloc(a.account, a.step, a.asset as u8, a.debit, a.amount);
+            for id in self.targets(a.account).into_iter().flatten() {
                 self.push(id, &r);
             }
         }
+        Ok(())
+    }
+
+    fn set_order(&mut self, key: (u8, u32), o: Option<Resting>) {
+        let old = match o {
+            Some(o) => self.orders.insert(key, o),
+            None => self.orders.remove(&key),
+        };
+        self.undo.push_back((self.rel, Undo::Order(key, old)));
+    }
+
+    fn set_taker(&mut self, t: Option<((LaneId, LaneSeq), u32)>) {
+        let old = std::mem::replace(&mut self.taker_acc, t);
+        self.undo.push_back((self.rel, Undo::Taker(old)));
     }
 
     /// The streams a record of `account` goes to: its own, its master's, and its own master
@@ -426,38 +711,15 @@ impl<O: DcOut> DropCopy<O> {
         };
         s.seq += 1;
         if !r.kind().is_stage() {
-            s.hasher.update(&r.0);
-            s.n += 1;
-            if s.unfinal.back() != Some(&self.rel) {
-                s.unfinal.push_back(self.rel);
-            }
+            s.pend.push_back((self.rel, Pend::Rec(*r)));
         }
         self.out.push(id, s.seq, r);
     }
 
-    /// One record of `account` to each of its streams, with its fill totals.
+    /// One record of `account` to each of its streams.
     fn emit(&mut self, o: &DcOrder) -> Result<(), DcError> {
         let r = DcRecord::order(o);
-        let n = if o.kind == DcType::Fill {
-            self.notional(o.qty, o.tick)?
-        } else {
-            0
-        };
         for id in self.targets(o.account).into_iter().flatten() {
-            if let Some(s) = self.streams.get_mut(&id)
-                && o.kind == DcType::Fill
-            {
-                s.fills = s.fills.checked_add(1).ok_or(DcError::Overflow)?;
-                let (base, quote) = match o.side {
-                    Side::Buy => (&mut s.base_bought, &mut s.quote_bought),
-                    Side::Sell => (&mut s.base_sold, &mut s.quote_sold),
-                };
-                *base = base
-                    .checked_add(u64::from(o.qty.0))
-                    .ok_or(DcError::Overflow)?;
-                *quote = quote.checked_add(n).ok_or(DcError::Overflow)?;
-                s.fees = s.fees.checked_add(o.fee).ok_or(DcError::Overflow)?;
-            }
             self.push(id, &r);
         }
         Ok(())
@@ -473,10 +735,7 @@ impl<O: DcOut> DropCopy<O> {
     fn charge_msg_fee(&mut self, account: AccountId, fee: u32) -> Result<(), DcError> {
         for id in self.targets(account).into_iter().flatten() {
             if let Some(s) = self.streams.get_mut(&id) {
-                s.msg_fees = s
-                    .msg_fees
-                    .checked_add(u64::from(fee))
-                    .ok_or(DcError::Overflow)?;
+                s.pend.push_back((self.rel, Pend::MsgFee(u64::from(fee))));
             }
         }
         Ok(())
@@ -513,16 +772,16 @@ impl<O: DcOut> DropCopy<O> {
                 },
             ) => {
                 let side = side_of(flags.side);
-                self.orders.insert(
+                self.set_order(
                     key(handle),
-                    Resting {
+                    Some(Resting {
                         account,
                         session: op.session,
                         side,
                         tick,
                         open: qty.0,
                         client_tag,
-                    },
+                    }),
                 );
                 base(DcType::Ack, side, handle, tick, qty, client_tag, index)
             }
@@ -535,12 +794,10 @@ impl<O: DcOut> DropCopy<O> {
                     client_tag,
                 },
             ) => {
-                let o = self.orders.get_mut(&key(handle)).ok_or(DcError::Order)?;
+                let mut o = *self.orders.get(&key(handle)).ok_or(DcError::Order)?;
                 o.open = o.open.checked_sub(canceled.0).ok_or(DcError::Order)?;
                 let (side, tick) = (o.side, o.tick);
-                if o.open == 0 {
-                    self.orders.remove(&key(handle));
-                }
+                self.set_order(key(handle), (o.open != 0).then_some(o));
                 base(
                     DcType::Cancel,
                     side,
@@ -561,7 +818,8 @@ impl<O: DcOut> DropCopy<O> {
                     ..
                 },
             ) => {
-                let o = self.orders.remove(&key(handle)).ok_or(DcError::Order)?;
+                let o = *self.orders.get(&key(handle)).ok_or(DcError::Order)?;
+                self.set_order(key(handle), None);
                 base(DcType::Out, o.side, handle, o.tick, qty, client_tag, index)
             }
             (_, Resp::Reject { .. }) => return Ok(()),
@@ -659,12 +917,9 @@ impl<O: DcOut> DropCopy<O> {
                     handle, tick, qty, ..
                 } => {
                     let mkey = (h.lane.0, handle.0);
-                    let o = self.orders.get_mut(&mkey).ok_or(DcError::Order)?;
-                    o.open = o.open.checked_sub(qty.0).ok_or(DcError::Order)?;
-                    let m = *o;
-                    if m.open == 0 {
-                        self.orders.remove(&mkey);
-                    }
+                    let mut m = *self.orders.get(&mkey).ok_or(DcError::Order)?;
+                    m.open = m.open.checked_sub(qty.0).ok_or(DcError::Order)?;
+                    self.set_order(mkey, (m.open != 0).then_some(m));
                     if opposite(m.side) != tside {
                         return Err(DcError::Order);
                     }
@@ -715,10 +970,9 @@ impl<O: DcOut> DropCopy<O> {
                     qty,
                     client_tag,
                 } => {
-                    let m = self
-                        .orders
-                        .remove(&(h.lane.0, handle.0))
-                        .ok_or(DcError::Order)?;
+                    let mkey = (h.lane.0, handle.0);
+                    let m = *self.orders.get(&mkey).ok_or(DcError::Order)?;
+                    self.set_order(mkey, None);
                     if let Some(a) = m.account {
                         self.emit(&DcOrder {
                             kind: DcType::Out,
@@ -753,16 +1007,16 @@ impl<O: DcOut> DropCopy<O> {
                     client_tag,
                 } => {
                     let left = qty.0.checked_sub(filled).ok_or(DcError::Order)?;
-                    self.orders.insert(
+                    self.set_order(
                         (src.lane.0, handle.0),
-                        Resting {
+                        Some(Resting {
                             account: taker_acct,
                             session: src.session,
                             side: tside,
                             tick,
                             open: left,
                             client_tag,
-                        },
+                        }),
                     );
                     if let Some(a) = taker_acct {
                         self.emit(&DcOrder {
@@ -811,7 +1065,7 @@ impl<O: DcOut> DropCopy<O> {
                 Resp::CancelAck { .. } => return Err(DcError::Unsupported("taker record")),
             }
         }
-        self.taker_acc = Some((key, filled));
+        self.set_taker(Some((key, filled)));
         Ok(())
     }
 }
@@ -820,6 +1074,9 @@ impl<O: DcOut> Tap for DropCopy<O> {
     fn lane_op(&mut self, op: &TapOp) {
         if self.err.is_some() {
             return;
+        }
+        if self.ended {
+            return self.fail(DcError::Final);
         }
         if let Err(e) = self.on_lane_op(op) {
             self.fail(e);
@@ -830,10 +1087,15 @@ impl<O: DcOut> Tap for DropCopy<O> {
         if self.err.is_some() {
             return;
         }
-        if let Err(e) = self.on_step(st) {
-            self.fail(e);
-            return;
+        if self.ended {
+            return self.fail(DcError::Final);
         }
-        self.flush_finals(false);
+        let r = self
+            .on_step(st)
+            .and_then(|()| self.flush_allocs(st.step))
+            .and_then(|()| self.flush_finals(false));
+        if let Err(e) = r {
+            self.fail(e);
+        }
     }
 }
