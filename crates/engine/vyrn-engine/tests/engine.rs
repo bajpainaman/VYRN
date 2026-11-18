@@ -137,6 +137,43 @@ fn replay_reproduces_every_record_response_and_fill_packet() {
 }
 
 #[test]
+fn replay_takes_shed_deadlines_from_lane_ops_and_prio_ts() {
+    // Two BBO Shed steps whose deadlines replay must rebuild as the lane did (05 §6.3, §6.8):
+    // - lane 2: a Heartbeat-only packet (no LaneSeq) at rx 1000, then an IOC (LaneSeq 1) at
+    //   rx 3000. The IOC's deadline is 3000 + 615, not the heartbeat's 1000 + 615.
+    // - lane 1: a join at rx 8000, then an IOC at rx 7000. prio_ts = max(7000, 8000) = 8000,
+    //   so the deadline is 8615, not 7615.
+    use Side::Buy;
+    use Tif::{Day, Ioc};
+    let p = |l, a, rx_ts, msgs| Act::Pkt {
+        l,
+        a,
+        rx_ts,
+        now: rx_ts,
+        msgs,
+    };
+    let dl = u64::from(FWD_DL);
+    let s = vec![
+        p(2, 1, 1_000, vec![vyrn_wire::Msg::Heartbeat]),
+        p(2, 1, 3_000, vec![new(Buy, Ioc, 105, 1, 1)]),
+        Act::Step(Some(3_000 + dl + 1)),
+        Act::Run,
+        p(1, 1, 8_000, vec![new(Buy, Day, 50, 1, 2)]),
+        Act::Run,
+        p(1, 1, 7_000, vec![new(Buy, Ioc, 105, 1, 3)]),
+        Act::Step(Some(8_000 + dl + 1)),
+        Act::Run,
+    ];
+    let (j, store, _, _) = live(&s);
+    let shed: Vec<_> = steps(&j.recs)
+        .filter(|e| e.kind == StepKind::Shed.code())
+        .map(|e| (e.src_lane.0, e.src_lane_seq))
+        .collect();
+    assert_eq!(shed, vec![(2, LaneSeq(1)), (1, LaneSeq(2))]);
+    assert_eq!(replay(&j.recs, &store).0, Ok(()));
+}
+
+#[test]
 fn replay_rejects_a_changed_record_at_its_index() {
     let (j, store, _, _) = live(&script());
     // A packet record whose fills_applied differs from the replayed lane's.

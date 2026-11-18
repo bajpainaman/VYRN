@@ -18,7 +18,7 @@ use vyrn_lane::{
 };
 use vyrn_types::{LaneId, LaneSeq, PacketRecord, StepId};
 
-/// Packets per lane whose `(first_lane_seq, count, rx_ts)` replay keeps (`ENG_FWD_RING`).
+/// Packets per lane whose op range and `prio_ts` replay keeps (`ENG_FWD_RING`).
 pub(crate) const PKT_HIST: usize = vyrn_cut::ENG_FWD_RING;
 /// Records one fill TX packet can carry (`TxEntry.n_rec` is a `u8`).
 const TX_RECS: usize = 256;
@@ -138,9 +138,11 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     cut: Vec<LaneSeq>,
     deltas: [CutDelta; MAX_LANES],
     recs: Vec<Record>,
-    /// Replay: each lane's recent packets, `(first_lane_seq, count, rx_ts)`, ring of
-    /// [`PKT_HIST`] per lane.
-    pub(crate) pkts: Vec<(LaneSeq, u8, u64)>,
+    /// Replay: each lane's recent packets with ops, `(first LaneSeq, last LaneSeq, prio_ts)`,
+    /// ring of [`PKT_HIST`] per lane (0 = empty).
+    pub(crate) pkts: Vec<(u64, u64, u64)>,
+    /// Replay: each lane's `prio_ts` (05 §6.3: `rx_ts` clamped to be non-decreasing).
+    pub(crate) prio: Vec<u64>,
     pub(crate) pkt_next: Vec<usize>,
     pub(crate) scratch: Vec<PacketRecord>,
 }
@@ -238,7 +240,8 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             cut: vec![LaneSeq(0); n],
             deltas: [CutDelta::default(); MAX_LANES],
             recs: Vec::with_capacity(TX_RECS),
-            pkts: vec![(LaneSeq(0), 0, 0); n.saturating_mul(PKT_HIST)],
+            pkts: vec![(0, 0, 0); n.saturating_mul(PKT_HIST)],
+            prio: vec![0; n],
             pkt_next: vec![0; n],
             scratch: Vec::with_capacity(32),
         })

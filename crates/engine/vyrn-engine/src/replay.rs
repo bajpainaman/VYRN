@@ -14,7 +14,7 @@ use vyrn_bbo::admit::{FixedClock, NeverLate};
 use vyrn_bbo::{CutDelta, MAX_LANES, StepEntry};
 use vyrn_cut::Visibility;
 use vyrn_lane::RxIn;
-use vyrn_types::{PacketFlags, PacketRecord, StepKind};
+use vyrn_types::{LaneSeq, PacketFlags, PacketRecord, StepKind};
 
 use crate::engine::{Engine, Fault, PKT_HIST, Rec, Sink};
 
@@ -209,6 +209,7 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                         pkt_hash: pk.pkt_hash,
                     };
                     let shed = pk.flags & PacketFlags::SHED != 0;
+                    let before = self.lanes.get(l).map_or(LaneSeq(0), |x| x.seq());
                     let res = if shed {
                         self.ingest(l, rx, &FixedClock(u64::MAX), &mut tee)
                     } else {
@@ -216,7 +217,8 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
                     };
                     res.map_err(|f| at(Why::Fault(f)))?;
                     if !shed {
-                        self.remember(l, pk);
+                        let after = self.lanes.get(l).map_or(LaneSeq(0), |x| x.seq());
+                        self.remember(l, before, after, pk.rx_ts.0);
                     }
                     tee.pkts.len()
                 }
@@ -238,14 +240,25 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
         Ok(())
     }
 
-    /// Lane `l` accepted `p`: keep its op range and `rx_ts` for later steps' deadline tests.
-    fn remember(&mut self, l: usize, p: &PacketRecord) {
+    /// Lane `l` accepted a packet received at `rx_ts` and gave its ops the `LaneSeq`s
+    /// `before + 1 ..= after` (Heartbeat and ResendReq take none, so the message count is not
+    /// the range). The lane keys the packet at `prio_ts = max(rx_ts, previous prio_ts)` (05
+    /// §6.3), and its forwarded ops' deadlines are built from that, so that is what is kept.
+    fn remember(&mut self, l: usize, before: LaneSeq, after: LaneSeq, rx_ts: u64) {
+        let Some(prio) = self.prio.get_mut(l) else {
+            return;
+        };
+        *prio = rx_ts.max(*prio);
+        let ts = *prio;
+        if after <= before {
+            return;
+        }
         let Some(n) = self.pkt_next.get_mut(l) else {
             return;
         };
         let slot = l.saturating_mul(PKT_HIST).saturating_add(*n);
         if let Some(x) = self.pkts.get_mut(slot) {
-            *x = (p.first_lane_seq, p.count, p.rx_ts.0);
+            *x = (before.0.saturating_add(1), after.0, ts);
         }
         *n = n.saturating_add(1).checked_rem(PKT_HIST).unwrap_or(0);
     }
@@ -262,10 +275,9 @@ impl<V: Visibility, const NA: usize> Engine<'_, V, NA> {
             .pkts
             .get(l.saturating_mul(PKT_HIST)..l.saturating_add(1).saturating_mul(PKT_HIST))?;
         let q = e.src_lane_seq.0;
-        let rx = ring.iter().find_map(|(first, n, rx)| {
-            let end = first.0.saturating_add(u64::from(*n));
-            (*n > 0 && first.0 <= q && q < end).then_some(*rx)
-        })?;
+        let rx = ring
+            .iter()
+            .find_map(|(lo, hi, ts)| (*lo != 0 && *lo <= q && q <= *hi).then_some(*ts))?;
         let [a, b, c, d, ..] = rx
             .wrapping_add(u64::from(cfg.fwd_deadline_ns))
             .to_le_bytes();
