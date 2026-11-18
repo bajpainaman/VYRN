@@ -6,7 +6,9 @@
 //! yields them, on one engine that started from the tenure's initial state. `blk.lanes` holds
 //! `PacketRecord`s (Advance records included) and `RouteRecord`s; `blk.steps` the merged steps.
 //! The payload of every packet comes from `P` ([`crate::DataJoin`] in the replica), which the
-//! shell fills before the call and releases after it ([`RustReplay::payloads_mut`]).
+//! shell fills before the call ([`RustReplay::payloads_mut`]). After the call, the shell releases
+//! only [`RustReplay::settled`], the records the call replayed ([`RustReplay::release`] for a
+//! `DataJoin`): a record the engine carries into the next block still needs its payload.
 //!
 //! **Order.** The packet records go to `Engine::replay_wire` in the order the block holds them
 //! (each lane in O-order, lanes interleaved), the route records in any order, and the steps in
@@ -43,7 +45,9 @@ use vyrn_cut::Visibility;
 use vyrn_engine::{Engine, Payloads, Rec, Responses, Sink, WireStep};
 use vyrn_lane::RespPkt;
 use vyrn_log::LaneRec;
-use vyrn_types::{AcctTake, Hash, LaneId, PacketRecord, RouteRecord};
+use vyrn_types::{AcctTake, Hash, Height, LaneId, PacketRecord, RouteRecord};
+
+use crate::DataJoin;
 
 use crate::ports::{
     BlockInputs, BlockOutputs, CanonicalStateWriter, ReplayEngine, ReplayError, StateSnapshot,
@@ -63,6 +67,9 @@ pub struct RustReplay<'a, V: Visibility, const NA: usize, P, R, S> {
     routes: Vec<RouteRecord>,
     lane_out: Vec<Vec<u8>>,
     tx_out: Vec<u8>,
+    /// The records the last `replay_block` settled: those carried into it and its own, minus
+    /// those it carried on.
+    settled: Vec<LaneRec>,
 }
 
 impl<'a, V: Visibility, const NA: usize, P: Payloads, R: Responses, S: Sink>
@@ -80,10 +87,17 @@ impl<'a, V: Visibility, const NA: usize, P: Payloads, R: Responses, S: Sink>
             routes: Vec::new(),
             lane_out: vec![Vec::new(); n],
             tx_out: Vec::new(),
+            settled: Vec::new(),
         }
     }
 
-    /// The payload store, to fill before a block and release after it.
+    /// The records the last block replayed, whose payloads may be released. A record the engine
+    /// carries into the next block is not here until that block settles it.
+    pub fn settled(&self) -> &[LaneRec] {
+        &self.settled
+    }
+
+    /// The payload store, to fill before a block.
     pub fn payloads_mut(&mut self) -> &mut P {
         &mut self.payloads
     }
@@ -108,6 +122,14 @@ impl<'a, V: Visibility, const NA: usize, P: Payloads, R: Responses, S: Sink>
         } else {
             Err(ReplayError("response log not used up".into()))
         }
+    }
+}
+
+impl<V: Visibility, const NA: usize, R: Responses, S: Sink> RustReplay<'_, V, NA, DataJoin, R, S> {
+    /// Releases the payloads of [`RustReplay::settled`] after block `height`
+    /// ([`DataJoin::release`]).
+    pub fn release(&mut self, height: Height) {
+        self.payloads.release(height, &self.settled);
     }
 }
 
@@ -139,6 +161,7 @@ impl<V: Visibility, const NA: usize, P: Payloads, R: Responses, S: Sink, const N
             .iter()
             .map(|m| WireStep::of(&m.rec, &m.payload))
             .collect();
+        let before: Vec<PacketRecord> = self.engine.carried().to_vec();
         self.lane_out.iter_mut().for_each(Vec::clear);
         self.tx_out.clear();
         let mut tee = Tee {
@@ -161,6 +184,15 @@ impl<V: Visibility, const NA: usize, P: Payloads, R: Responses, S: Sink, const N
                     blk.header.height.0, d.at, d.why
                 ))
             })?;
+        let after = self.engine.carried();
+        self.settled.clear();
+        self.settled.extend(
+            before
+                .iter()
+                .chain(&self.pkts)
+                .filter(|p| !after.contains(p))
+                .map(|p| LaneRec::Pkt(*p)),
+        );
         Ok(BlockOutputs {
             output_hash: output_hash(&self.lane_out, &self.tx_out),
         })

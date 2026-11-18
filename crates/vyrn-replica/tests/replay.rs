@@ -279,6 +279,7 @@ fn replay(
     for b in blocks {
         rep.payloads_mut().check(b).unwrap();
         hashes.push(rep.replay_block(b)?.output_hash);
+        rep.release(b.header.height);
     }
     rep.finish()?;
     Ok((rep.into_sink(), hashes))
