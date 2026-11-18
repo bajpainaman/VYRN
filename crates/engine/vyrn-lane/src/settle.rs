@@ -435,11 +435,18 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
     }
 
     /// 05 §8.8 item 6: after the last uncross chunk, every auction-only order visible at `C*[l]`
-    /// with `open > 0` is dead (§2.5 P2). The lane ends each one with an unsolicited
-    /// `Out { cause: AUCTION }` (04 `AUCTION_UNFILLED`) for its open quantity, session by
-    /// session in creation order. The BBO core stops seeing them at the same step (vyrn-bbo
-    /// `State::adead`).
+    /// with `open > 0` is dead (§2.5 P2). B1 queues one `PendK::AuctionOut` per auction-only
+    /// root created at or before `C*`, session by session in creation order, into B2 at `C*`:
+    /// every op at or before `C*` (a cancel, reduce or `CancelAll`) settles first, and every
+    /// later one finds the order ended. The settle sends the `Out` (`settle_auction_out`).
+    /// The BBO core stops seeing these orders at the same step (vyrn-bbo `State::adead`).
     fn end_auction_only(&mut self, cstar: LaneSeq) {
+        let at = self
+            .pend
+            .iter()
+            .position(|p| p.seq > cstar)
+            .unwrap_or(self.pend.len());
+        let mut q = Vec::new();
         for si in 0..MAX_SESSIONS_PER_LANE {
             let Some(s) = u16::try_from(si)
                 .ok()
@@ -459,32 +466,60 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
                     && cur.flags.tif() == Tif::AuctionOnly
                     && cur.ins_seq <= cstar
                 {
-                    let open = self.open_of(r, rp.cur);
-                    if open > 0 {
-                        self.flush_events(Some(rp.cur));
-                        self.release(cur.leg);
-                        if let Some(x) = self.slot_mut(cur.leg) {
-                            x.dead = true;
-                        }
-                        self.end_root(r, PROTO_D_OUT);
-                        let handle = self.handle(r);
-                        self.emit(
-                            rp.cur,
-                            rp.sess,
-                            0,
-                            Record::Out {
-                                index: INDEX_MAKER,
-                                cause: OUT_AUCTION,
-                                handle,
-                                qty: Qty(open),
-                                client_tag: rp.tag,
-                            },
-                        );
-                    }
+                    q.push(PendE {
+                        seq: cstar,
+                        k: PendK::AuctionOut,
+                        root: r,
+                        v: rp.cur,
+                        w: 0,
+                        r: 0,
+                        ix: INDEX_MAKER,
+                        sess: rp.sess,
+                        pkt: 0,
+                        tag: rp.tag,
+                    });
                 }
                 r = rp.next;
             }
         }
+        for (k, p) in q.into_iter().enumerate() {
+            self.pend.insert(at.saturating_add(k), p);
+        }
+    }
+
+    /// The `Out { cause: AUCTION }` of an auction-only remainder (04 `AUCTION_UNFILLED`), for
+    /// its open quantity, unless an op at or before `C*` ended it. The record follows every
+    /// event record already queued (05 §8.10 rule 4.2), so no event is flushed here.
+    fn settle_auction_out(&mut self, p: &PendE) {
+        let Some(rp) = self.root(p.root).copied() else {
+            return;
+        };
+        if !rp.live || rp.ended {
+            return;
+        }
+        let open = self.open_of(p.root, rp.cur);
+        if open == 0 {
+            return;
+        }
+        let leg = self.slot(rp.cur).map_or(0, |s| s.leg);
+        self.release(leg);
+        if let Some(x) = self.slot_mut(leg) {
+            x.dead = true;
+        }
+        self.end_root(p.root, PROTO_D_OUT);
+        let handle = self.handle(p.root);
+        self.emit(
+            rp.cur,
+            p.sess,
+            0,
+            Record::Out {
+                index: INDEX_MAKER,
+                cause: OUT_AUCTION,
+                handle,
+                qty: Qty(open),
+                client_tag: p.tag,
+            },
+        );
     }
 
     fn on_end(&mut self, ev: &FillEvent, kind: FillKind) {
@@ -839,6 +874,7 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
             }
             PendK::ReplaceAck => self.settle_replace(p, h),
             PendK::CancelAllAck => self.settle_cancel_all(p),
+            PendK::AuctionOut => self.settle_auction_out(p),
         }
     }
 

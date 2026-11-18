@@ -221,6 +221,9 @@ pub(crate) enum PendK {
     ReduceAck,
     ReplaceAck,
     CancelAllAck,
+    /// 05 §8.8 item 6: the auction-only remainder of `root` ends at `C*` (`seq`), after every
+    /// op at or before `C*` settles and before any later one.
+    AuctionOut,
 }
 
 #[derive(Clone, Copy, Debug)]

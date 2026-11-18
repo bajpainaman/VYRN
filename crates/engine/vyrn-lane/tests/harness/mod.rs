@@ -398,6 +398,12 @@ impl Rig<'_> {
         r
     }
 
+    /// Queues a control command for the BBO core (05 §8.8).
+    pub fn command(&mut self, c: &vyrn_bbo::ControlCmd) {
+        self.note(format!("command {c:?}"));
+        self.ctl_p.push(&Hw, c.encode()).unwrap();
+    }
+
     /// Lane `l` keeps its snapshot and runs no idle polls until its next packet.
     pub fn hold(&mut self, l: usize) {
         self.note(format!("hold {l}"));

@@ -1338,3 +1338,102 @@ fn a_same_tick_replace_reduction_pays_the_reduce_message_bucket() {
     assert_eq!(acks.count(), 3);
     assert_eq!(base_resv(&mut x, 0, 3), 7);
 }
+
+#[test]
+fn ops_before_the_freeze_settle_before_the_auction_out() {
+    // 05 §8.8 item 6 (#193 review 1): a reduce and a cancel of auction-only orders, both before
+    // the freeze cut C*, settle in the same boundary as the last uncross chunk (the lane polls
+    // no boundary between them). Sequentially they come first: the reduce by 4 of the 10 is
+    // `CancelAck(4)` and its remainder `Out AUCTION(6)`; the canceled order is `CancelAck(2)`
+    // with no `Out`. The `Out` follows the lane's auction fill (05 §8.10 rule 4.2).
+    use vyrn_bbo::{ControlCmd, OrderFlags, Phase, Stp, Tif};
+    let ao = |side| OrderFlags::new(side, Tif::AuctionOnly, false, Stp::None);
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Auction,
+        lo: Tick(0),
+        hi: Tick(0),
+    });
+    x.settle(&mut bbo);
+    x.send(1, 1, 1_000, &[new(day(Side::Sell), 104, 1, 1)]);
+    x.send(
+        0,
+        1,
+        2_000,
+        &[
+            new(ao(Side::Buy), 101, 10, 4),
+            new(ao(Side::Buy), 99, 2, 5),
+            new(ao(Side::Buy), 106, 1, 8),
+        ],
+    );
+    x.settle(&mut bbo);
+    let acks: Vec<_> = x
+        .records(0, 1)
+        .into_iter()
+        .filter_map(|r| match r {
+            Record::Ack { handle, .. } => Some(handle),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acks.len(), 3);
+    let m = [
+        Msg::Reduce {
+            handle: acks[0],
+            by: Qty(4),
+            client_tag: 6,
+        },
+        cancel(acks[1], 7),
+    ];
+    assert_eq!(x.send(0, 1, 3_000, &m), Rx::Accepted);
+    x.command(&ControlCmd::Phase {
+        phase: Phase::Frozen,
+        lo: Tick(1),
+        hi: Tick(u32::MAX - 1),
+    });
+    x.command(&ControlCmd::Uncross {
+        price: Tick(105),
+        qty: 1,
+    });
+    while x.bbo_step(&mut bbo).is_some() {}
+    x.settle(&mut bbo);
+    let recs: Vec<_> = x
+        .records(0, 1)
+        .into_iter()
+        .filter(|r| !matches!(r, Record::Ack { .. }))
+        .collect();
+    let auction_out = |h: Handle, q: u32| Record::Out {
+        index: vyrn_bbo::INDEX_MAKER,
+        cause: vyrn_bbo::OUT_AUCTION,
+        handle: h,
+        qty: Qty(q),
+        client_tag: 4,
+    };
+    assert!(
+        recs.contains(&Record::CancelAck {
+            index: 0,
+            handle: acks[0],
+            canceled: Qty(4),
+            client_tag: 6
+        }),
+        "{recs:?}"
+    );
+    assert!(
+        recs.contains(&Record::CancelAck {
+            index: 1,
+            handle: acks[1],
+            canceled: Qty(2),
+            client_tag: 7
+        }),
+        "{recs:?}"
+    );
+    let outs: Vec<_> = recs
+        .iter()
+        .filter(|r| matches!(r, Record::Out { .. }))
+        .copied()
+        .collect();
+    assert_eq!(outs, vec![auction_out(acks[0], 6)], "{recs:?}");
+    let fill = recs.iter().position(|r| matches!(r, Record::Fill { .. }));
+    let out = recs.iter().position(|r| matches!(r, Record::Out { .. }));
+    assert!(fill.is_some() && fill < out, "{recs:?}");
+}
