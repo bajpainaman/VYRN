@@ -283,3 +283,82 @@ fn a_step_too_long_for_any_frame_is_refused() {
             .is_err()
     );
 }
+
+/// The decoded lane records of `frames`.
+fn lane_recs(layout: Layout, frames: &[Vec<u8>]) -> Vec<LaneRec> {
+    let mut dec = StreamDecoder::new(layout, 0).unwrap();
+    let mut recs = Vec::new();
+    for f in frames {
+        if let Body::Order { sections, .. } = dec.decode(f).unwrap().body {
+            for s in sections {
+                if let Section::LaneRun { recs: r, .. } = s {
+                    recs.extend(r);
+                }
+            }
+        }
+    }
+    recs
+}
+
+#[test]
+fn a_take_frames_right_before_its_packet() {
+    // 07 §3.6, 05 §6.9: a pooled lane's `AcctTake` sits right before the record it covers;
+    // `lane_seq` is not on the wire and decodes as the lane's next LaneSeq. Pooled lanes 1 and 2
+    // share one session table, so lane 2's session takes the next pool slot, not lane 2's slot 0.
+    let layout = Layout::new(3, 1, 0b110).unwrap();
+    let ident = Ident {
+        book: BookId(2),
+        epoch: Epoch(3),
+        tenure: 0,
+        sender: 0,
+    };
+    let take = |lane: u8, first: u64, ver: u32| vyrn_types::AcctTake {
+        lane: LaneId(lane),
+        account: vyrn_types::AccountId(77),
+        ver,
+        lane_seq: LaneSeq(first),
+    };
+    let mut w = SeqWriter::new(layout, ident, ts(), SEED, 1472).unwrap();
+    let mut frames = Vec::new();
+    let (p1, p2, p3) = (
+        pkt(1, 0x11, 1, 1, 2),
+        pkt(2, 0x33, 1, 1, 1),
+        pkt(1, 0x11, 2, 3, 1),
+    );
+    for (t, p) in [
+        (take(1, 1, 1), p1),
+        (take(2, 1, 2), p2),
+        (take(1, 3, 3), p3),
+    ] {
+        frames.extend(w.take(t).unwrap());
+        frames.extend(w.packet(p, Some(Hash([1; 32]))).unwrap());
+    }
+    frames.extend(w.close_block().unwrap().0);
+    let pk = |p: PacketRecord| {
+        LaneRec::Pkt(PacketRecord {
+            pkt_hash: PktHash(0),
+            ..p
+        })
+    };
+    assert_eq!(
+        lane_recs(layout, &frames),
+        vec![
+            LaneRec::Take(take(1, 1, 1)),
+            pk(p1),
+            LaneRec::Take(take(2, 1, 2)),
+            pk(p2),
+            LaneRec::Take(take(1, 3, 3)),
+            pk(p3)
+        ]
+    );
+
+    // A take on a dedicated lane, and one whose `lane_seq` is not the lane's next, are refused.
+    for (t, p) in [(take(0, 1, 1), pkt(0, 0x22, 1, 1, 1)), (take(1, 2, 1), p1)] {
+        let mut w = SeqWriter::new(layout, ident, ts(), SEED, 1472).unwrap();
+        let r = w
+            .take(t)
+            .and_then(|_| w.packet(p, Some(Hash([1; 32]))))
+            .and_then(|_| w.close_block().map(|_| ()));
+        assert!(r.is_err(), "{t:?} framed");
+    }
+}

@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 
 use vyrn_bbo::admit::{FixedClock, NeverLate};
 use vyrn_bbo::{Bbo, OrderFlags, Phase, Record, Side, Stp, Tif, TxEntry};
-use vyrn_cut::Hw;
+use vyrn_cut::{Hw, PoolTok};
 use vyrn_engine::{
     Engine, NoResponses, OwnedRec, Payloads, Rec, Responses, Shared, Sink, WireStep,
 };
@@ -99,6 +99,31 @@ pub fn new_box() -> (Bbo, Box<Shared<Hw>>) {
     let bbo = Bbo::new(bbo_cfg());
     let sh = Shared::new(&Hw, N, arena_cfg(), &bbo.initial_snapshot()).unwrap();
     (bbo, sh)
+}
+
+/// Pooled account 77: session 1 of lanes 1 and 2, lane-local slot 1, pool-wide index 9.
+pub const POOLED: AccountId = AccountId(77);
+/// The pooled lanes of [`pooled_engine`] (`vyrn_bbo::Config.pool`, `vyrn_log::Layout` pool).
+pub const POOL_MASK: u64 = 0b110;
+
+/// The harness box with lanes 1 and 2 pooled (`pool` false: the same box, nothing pooled).
+pub fn pooled_engine<'a>(
+    sh: &'a mut Shared<Hw>,
+    tok: &'a PoolTok,
+    pool: bool,
+) -> Engine<'a, Hw, NA> {
+    let bbo = Bbo::new(vyrn_bbo::Config {
+        pool: if pool { POOL_MASK } else { 0 },
+        ..bbo_cfg()
+    });
+    let mut e = engine(bbo, sh);
+    if pool {
+        for l in [1, 2] {
+            assert!(e.lane_mut(l).unwrap().set_pool_index(AcctSlot(1), 9));
+            assert!(e.pool_session(l, sid(l, 1), POOLED, tok));
+        }
+    }
+    e
 }
 
 /// Every lane with sessions 1..NA, each funded.

@@ -32,13 +32,15 @@
 //! **Limits of this version.** One substream (`Layout::streams() == 1`, the CONSUMER and AWS
 //! layout, 07 §2.2): with two, a step's cut-only record and the second substream's header
 //! inputs need the B side, which is a follow-up. Step payloads (Rescan, Control, Seal, Uncross)
-//! are passed through as given. Session slots are bound in first-seen order and never reused.
+//! are passed through as given. Session slots are bound in first-seen order and never reused;
+//! pooled lanes share one slot space (07 §3.6), so a session bound on one pool lane keeps its
+//! slot on another.
 //!
 //! **Errors.** Every encoder error is returned and poisons the writer (the encoder fails
 //! closed, [`StreamEncoder::encode`]); the sequencer fail-stops on it.
 
+use vyrn_types::{AcctTake, RouteRecord, SessionId, StepId, StepKind};
 use vyrn_types::{BlockHeader, Hash, LaneId, LaneSeq, PacketFlags, PacketRecord, PktHash};
-use vyrn_types::{RouteRecord, SessionId, StepId, StepKind};
 
 use crate::block::sign_header;
 use crate::frame::FRAME_HEADER_BYTES;
@@ -54,6 +56,8 @@ const RUN: usize = 1 + LEB;
 /// One lane record: `h`, slot (< 4098, 2 bytes), `rx_ts` ZZ, `fills_applied`, `first_lane_seq`,
 /// `pkt_seq` (5 bytes) and `snap_lag` (3 bytes).
 const REC: usize = 1 + 2 + LEB + LEB + LEB + 5 + 3;
+/// An `AcctTake`, encoded: `h`, the slot (2 bytes), `account` and `ver` (≤ 5 bytes each).
+const TAKE: usize = 1 + 2 + 5 + 5;
 /// `SessionBind`: tag, lane, slot (2), session (4), `next_pkt_seq` (5).
 const BIND: usize = 1 + 1 + 2 + 4 + 5;
 /// A `HashRun`'s tag, lane and count, and one entry.
@@ -77,8 +81,10 @@ pub struct SeqWriter {
     half: usize,
     /// Per lane: `(first_lane_seq, pkt_hash)` of packets whose hash is not framed yet.
     waiting: Vec<Vec<(LaneSeq, PktHash)>>,
-    /// Per lane: bound sessions, slot = index.
+    /// Per session table: bound sessions, slot = index. Pooled lanes share one (07 §3.6).
     slots: Vec<Vec<SessionId>>,
+    /// Per lane: its index in `slots`; every pooled lane names the first pooled lane's.
+    table: Vec<usize>,
     /// Full hashes of this block's non-Advance packets, in O-order.
     full: Vec<Hash>,
     last_step: StepId,
@@ -110,6 +116,10 @@ impl SeqWriter {
         }
         let n = usize::from(layout.n_lanes());
         let first = StepId(ts.first_step.0.saturating_sub(1));
+        let pool = (0..layout.n_lanes()).find(|&l| layout.is_pool(l));
+        let table = (0..layout.n_lanes())
+            .map(|l| usize::from(pool.filter(|_| layout.is_pool(l)).unwrap_or(l)))
+            .collect();
         Ok(Self {
             enc: StreamEncoder::new(layout, 0, ident)?,
             asm: BlockAssembler::from_tenure(ident.book, &ts),
@@ -123,6 +133,7 @@ impl SeqWriter {
             half: n,
             waiting: vec![Vec::new(); n],
             slots: vec![Vec::new(); n],
+            table,
             full: Vec::new(),
             pend_lseq: vec![None; n],
             pend_step: first,
@@ -172,7 +183,8 @@ impl SeqWriter {
         } else {
             Some(full.ok_or(RepErr::Count)?)
         };
-        let slots = self.slots.get(lane).ok_or(RepErr::Half)?;
+        let t = *self.table.get(lane).ok_or(RepErr::Half)?;
+        let slots = self.slots.get(t).ok_or(RepErr::Half)?;
         let new_bind = !advance && !slots.contains(&p.session);
         let new_run =
             !matches!(self.sections.last(), Some(Section::LaneRun { lane: l, .. }) if *l == p.lane);
@@ -181,7 +193,7 @@ impl SeqWriter {
         let need = REC.saturating_add(bind).saturating_add(run);
         let out = self.reserve(need)?;
         if let Some(full) = full {
-            let slots = self.slots.get_mut(lane).ok_or(RepErr::Half)?;
+            let slots = self.slots.get_mut(t).ok_or(RepErr::Half)?;
             if !slots.contains(&p.session) {
                 let slot = u16::try_from(slots.len()).map_err(|_| RepErr::Range)?;
                 slots.push(p.session);
@@ -223,6 +235,25 @@ impl SeqWriter {
             !matches!(self.sections.last(), Some(Section::LaneRun { lane: l, .. }) if *l == t.lane);
         let out = self.reserve(if new_run { 3 + RUN } else { 3 })?;
         let rec = LaneRec::Route(t);
+        match self.sections.last_mut() {
+            Some(Section::LaneRun { lane: l, recs }) if *l == t.lane => recs.push(rec),
+            _ => self.sections.push(Section::LaneRun {
+                lane: t.lane,
+                recs: vec![rec],
+            }),
+        }
+        Ok(out)
+    }
+
+    /// One `AcctTake` (07 §3.6, 05 §6.9) of a pooled lane: pushed right before the
+    /// `PacketRecord` it covers, as the lane logs it. Its `lane_seq` is not on the wire; the
+    /// encoder checks it is the lane's next LaneSeq (`RepErr::Range`), and a take on a dedicated
+    /// lane is `RepErr::Count`.
+    pub fn take(&mut self, t: AcctTake) -> Result<Frames, RepErr> {
+        let new_run =
+            !matches!(self.sections.last(), Some(Section::LaneRun { lane: l, .. }) if *l == t.lane);
+        let out = self.reserve(if new_run { TAKE + RUN } else { TAKE })?;
+        let rec = LaneRec::Take(t);
         match self.sections.last_mut() {
             Some(Section::LaneRun { lane: l, recs }) if *l == t.lane => recs.push(rec),
             _ => self.sections.push(Section::LaneRun {
