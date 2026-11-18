@@ -1,8 +1,24 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderNodes } from "./render";
 import { getSectionIndex, parseMarkdown } from "./spec";
+
+// Outside Next, "use cache" is inert, so every render would re-parse the whole spec for each index.
+// Keep each index's first result, as the deployed site's cache does.
+vi.mock("./spec", async (importOriginal) => {
+  const spec = await importOriginal<typeof import("./spec")>();
+  const once = <T,>(f: () => Promise<T>) => {
+    let p: Promise<T> | undefined;
+    return () => (p ??= f());
+  };
+  return {
+    ...spec,
+    getIdIndex: once(spec.getIdIndex),
+    getSectionIndex: once(spec.getSectionIndex),
+    getChapterSlugs: once(spec.getChapterSlugs),
+  };
+});
 
 const render = (markdown: string, slug: string) => renderNodes(parseMarkdown(markdown), slug);
 
