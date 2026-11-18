@@ -1,7 +1,8 @@
 //! #183 (b): the failover redirect burst of a 2,000-session box on one shard. Four validators
 //! each send 12 REDIRECT_BATCHes covering every session at once (8,000 redirects, about twice
 //! the shard's hop ring), with a lagging replica's KEY-fetch flood behind them. The RX core
-//! paces the burst against the full ring: every redirect reaches the client and none is dropped.
+//! paces the burst against the full ring: every redirect reaches the client and none is dropped,
+//! and client copies arriving during the burst still reach the shard: ingest wins the ring.
 #![allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
@@ -172,12 +173,31 @@ fn a_failover_burst_twice_the_hop_ring_is_paced_not_dropped() {
         .encode();
         inject(&nic, ep(2, 4001), me_fetch, &q);
     }
+    // Client copies keep arriving through the burst (#197's run lost first copies here): four
+    // a turn, each a new packet of its session.
+    let mut copies = 0u32;
     for t in 0..2000u64 {
+        if copies < 2 * SESSIONS {
+            for _ in 0..4 {
+                let (s, q) = (1 + copies % SESSIONS, 2 + copies / SESSIONS);
+                assert!(inject(&nic, client, me_in, &req(s, q)));
+                copies += 1;
+            }
+        }
         turn!(1000 + t);
-        if got - base == 4 * SESSIONS as usize {
+        if got - base == 4 * SESSIONS as usize && copies >= 2 * SESSIONS {
             break;
         }
     }
+    for t in 0..200 {
+        turn!(4000 + t);
+    }
+    assert_eq!(
+        cores[0].counters().stored,
+        u64::from(SESSIONS + copies),
+        "ingest wins the shard ring: no client copy dropped ({:?})",
+        rx.counters()
+    );
     let k = *rx.counters();
     assert_eq!(
         got - base,

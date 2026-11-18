@@ -41,6 +41,9 @@ use crate::spread::{session_of, shard_of};
 /// Entries per hop ring.
 pub const HOP_RING: usize = 4096;
 
+/// Free slots a shard ring keeps for ingest: a redirect waits while fewer are free.
+pub const REDIRECT_HEADROOM: usize = HOP_RING / 2;
+
 /// One request packet as the RX core received it (the UDP payload).
 #[derive(Clone, Copy, Debug)]
 pub struct Pkt {
@@ -113,8 +116,13 @@ fn hop<T: Copy, const N: usize>(p: &mut Producer<'_, T, N, 1, Hw>, v: T, c: &mut
 }
 
 /// Hands one redirect of a `down → to` move to the shard that owns its session (07 §5.7 step 3):
-/// the operator line, kind 4 and each kind-5 entry. `false` when that shard's ring is full
-/// (counted in `hop_full`).
+/// the operator line, kind 4 and each kind-5 entry. `false` when that shard's ring has no
+/// headroom for it.
+///
+/// *Reading (#197's 2,000-session run):* ingest wins the ring. A redirect goes in only while
+/// the ring is under half full ([`REDIRECT_HEADROOM`] free); otherwise it waits in the RX
+/// core's [`Pending`] (not counted in `hop_full`, which stays a count of real drops), so queued
+/// redirects can never take the slots a client copy needs.
 fn redirect_to_owner(shards: &mut [ShardTx<'_>], r: Redirect, c: &mut Counters) -> bool {
     let n = shards.len();
     let to = ToShard::Redirect {
@@ -125,7 +133,7 @@ fn redirect_to_owner(shards: &mut [ShardTx<'_>], r: Redirect, c: &mut Counters) 
     };
     shards
         .get_mut(shard_of(r.session, n))
-        .is_some_and(|q| hop(q, to, c))
+        .is_some_and(|q| q.free(&Hw) > REDIRECT_HEADROOM as u64 && hop(q, to, c))
 }
 
 /// Hands `r` to its owner, or queues it behind earlier refused ones (the RX core's
