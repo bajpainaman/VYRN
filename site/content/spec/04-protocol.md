@@ -673,7 +673,7 @@ each).
 Budget: an open takes ≤ 50 ms, most of it TLS and the finality of the open record. Opens are
 never on the 1 µs path. From `E_pq` (01 §14.20 G) the admin TLS 1.3 stream accepts only the hybrid
 key-exchange group `X25519MLKEM768`, because it carries `k_seq` and `k_out`: +2,272 B and under
-0.1 ms per handshake. Which TLS provider does it is open question PQ-12.
+0.1 ms per handshake. The stack is `rustls` with VYRN's own provider (01 §14.20 H).
 
 `vyrn-admin` gives each box only the keys of that box. The replicas of the home also receive
 every box's `k_seq`, so they can check `tag_seq` on the data copies they use (§2.4). BASE mode

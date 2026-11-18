@@ -120,8 +120,8 @@ certificate (§6.6) or is an ancestor of a final block.
 - UDP ports: `REP_UDP_ORDER` = 7400 (frames), `REP_UDP_CTRL` = 7401 (NACK, acks, retransmits,
   unicast), `REP_UDP_DATA` = 7402 (data frames), `REP_UDP_REPAIR` = 7403 (peer repair).
   Consensus, TailReports and state-root votes use `commonware-p2p` (authenticated, encrypted,
-  TCP) on the same VLANs. From `E_pq` its handshake is hybrid X25519 + ML-KEM-768 (01 §14.20 G,
-  PQ-12).
+  TCP) on the same VLANs. From `E_pq` its handshake is hybrid X25519 + ML-KEM-768: VYRN's `HybridSake`
+  (01 §14.20 G, H).
 - MTU 9216 on both VLANs. ORDER frames are ≤ 250 B on the wire (`REP_ORDER_FRAME_MAX`, §4.5),
   because CTPIO write time grows with size and bounds the gate (§4.7). HASH frames are ≤ 9000 B
   and go by DMA.

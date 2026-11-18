@@ -939,6 +939,39 @@ audit status not checked]
 | KG2 | ML-KEM keys are fresh, never shared between uses, and sit in the `KexKey`s of the scheme-1 `NodeCert` (09 §2.3), so SG4's lead covers them. An encapsulation key passes the FIPS 203 check when the chain includes it. |
 | KG3 | ML-KEM decapsulation has implicit rejection: a bad ciphertext yields a pseudorandom secret, not an error. For `K_seq` only the client suffers. For `K_com`, all 4 members decapsulate the same ciphertext with the same decapsulation key and get the same secret, so a bad ciphertext cannot split them; the anchor check (09 §5.4) then fails at every member alike. "Same key" means the same whole seed `(d, z)`, not only the same public key, because the rejection secret `z` does not enter the public key; `CommitteeKey.seed_hash` binds it (09 §2.4). [Certain: ML-KEM.Decaps is deterministic in its key and ciphertext] |
 
+**H. TLS and p2p key agreement (PQ-12).** Both run on VYRN code over public traits, with no fork
+and nothing that waits for a release upstream. [Reading]
+
+- **p2p.** `commonware-p2p`'s `Config<U: Upgrader>` takes any upgrader, and `commonware-stream`'s
+  `Cups<H, C>` takes any `H: Handshake` that returns a `Transcript`. [Certain: both are public
+  traits in the 2026.10.0 sources] `vyrn-crypto::p2p::HybridSake` implements `Handshake` as SAKE V1
+  with three changes. `Syn` also carries the dialer's ephemeral ML-KEM-768 encapsulation key,
+  committed after `X` and before `sig_D`. `SynAck` also carries the listener's ciphertext to it,
+  committed after `Y` and before `sig_L`. And the ML-KEM secret is committed after the X25519
+  secret, before the confirmations. Its namespace is `"_VYRN_SAKE_HYBRID"`, so it never verifies
+  as SAKE. The identity signatures are the node keys' scheme (scheme 1 from `E_pq`), which SAKE
+  already takes as a generic signer. Voters run `Cups<HybridSake<S>, C>` from `E_pq`. Cost:
+  `Syn` +1,184 B, `SynAck` +1,088 B, about 50 µs per connection. VYRN offers the design to
+  Commonware as a SAKE version; using an upstream version later is an ordinary dependency upgrade
+  (11 §2.6). `commonware-stream` is in a BETA stability scope, and the exact pin catches a trait
+  change at upgrade time.
+- **TLS** (the BASE admin stream, 04 §4.4). `rustls` 0.23 with default features off, so it pulls
+  no `ring` or `aws-lc-rs`, plus a `CryptoProvider` that VYRN owns in `vyrn-crypto::tls`. The
+  provider has exactly one of each: the suite `TLS13_CHACHA20_POLY1305_SHA256`, the group
+  `X25519MLKEM768` (x25519-dalek ‖ `libcrux-ml-kem`, the code of G), and Ed25519 certificates
+  (ed25519-dalek under 11 §2.5). The AEAD and HMAC-SHA-256 for HKDF come from `libcrux`'s
+  HACL\*-derived crates. Clients need TLS 1.3 with that group and suite, which OpenSSL 3.5 and
+  rustls support. [Likely]
+
+| Candidate | Verdict | Why |
+|---|---|---|
+| `rustls` + VYRN provider (above) | chosen | One crypto stack: dalek and libcrux, already on the allowlist. `rustls` has `#![forbid(unsafe_code)]`; the libcrux AEAD, Poly1305, HACL, HMAC and SHA-2 crates have no `unsafe` |
+| `rustls-graviola` 0.4.0 | tier T only, as the interop reference | Production-grade, by rustls's author, with formally verified s2n-bignum assembly, but a second stack: its own X25519, Ed25519, AES-GCM, SHA-2 and ML-KEM, with 352 `unsafe` uses and 91 x86-64 assembly files |
+| `rustls-rustcrypto` 0.1.0-pre.0 | rejected | README: "DO NOT USE THIS IN PRODUCTION"; no ML-KEM group |
+| `rustls-provider-libcrux-pq` 0.1.1, `rustls-pure` 0.15.5 | rejected | One author each, weeks old, 58 and 968 downloads |
+
+[Certain for the crates' sources, READMEs and crates.io counts on 2026-11-18]
+
 **Decided by the owner (2026-11-18)**
 
 | # | Question | Ruling |
@@ -949,16 +982,16 @@ audit status not checked]
 | — | Codex review of #51: operator identity keys need an ML-DSA-65 transaction scheme | Adopted: `TxEnvelope.scheme` 3 (09 §4.4). |
 | — | Codex review of #51: forged classical evidence after the switch | Adopted: SG7 (09 §8.1 item 2a). |
 | PQ-3 | Can `commonware-consensus::simplex` take a custom hybrid scheme and speculative signing? | Yes, with no upstream patch. `commonware-cryptography` 2026.10.0's `certificate::Scheme` is a public trait, and Simplex's voter calls its synchronous `sign(&self, subject)` only when it decides to send. VYRN's hybrid `Scheme` in `vyrn-crypto` returns a signature the PQ cores made ahead and cached by subject, and signs inline only on a miss (07 §6.5a). `E_pq` waits for B-PQ-2. |
-| PQ-4 | When is `E_pq`? | The first epoch after all of: B-PQ-1 to B-PQ-3 pass on `REF`; the libcrux audits and the differential tests of 11 §2.5a pass (PQ-2); every node's hybrid `NodeCert` and every hybrid `G(e, s)` is on chain `CHN_KEY_LEAD_EPOCHS` ahead (SG4); the release keys' ML-DSA halves exist (PQ-7); and PQ-12's dependencies have landed. CHAIN schedules it by `Upgrade` with the 72 h timelock (SG5). Not a trigger: after an alarm, the fastest switch is 4 epochs of key lead plus the timelock, ≈ 4.3 days of forgeable votes. The cost from then on is D's budgets. |
+| PQ-4 | When is `E_pq`? | The first epoch after all of: B-PQ-1 to B-PQ-3 pass on `REF`; the libcrux audits and the differential tests of 11 §2.5a pass (PQ-2); every node's hybrid `NodeCert` and every hybrid `G(e, s)` is on chain `CHN_KEY_LEAD_EPOCHS` ahead (SG4); the release keys' ML-DSA halves exist (PQ-7); and PQ-12's two components (VYRN's TLS provider and hybrid SAKE) pass their tests. CHAIN schedules it by `Upgrade` with the 72 h timelock (SG5). Not a trigger: after an alarm, the fastest switch is 4 epochs of key lead plus the timelock, ≈ 4.3 days of forgeable votes. The cost from then on is D's budgets. |
 | PQ-5 | When does governance deploy the post-quantum bridge and raise `PqAlarm`; is the 10% daily cap acceptable until then? | Deploy the second bridge (09 §6.8 step 3) when Ethereum ships a post-quantum signature precompile. `PqAlarm` is raised at once (tightening) on a published estimate that a cryptographically relevant quantum computer exists or is within the timelock horizon, or on any public demonstration that a secp256k1 or Ed25519 private key was computed from its public key. From `PqAlarm`, `BadPost` evidence changes no bond and no jail (09 §8.1 item 2a). The 10% cap is accepted until then. `CHN_PQ_OWNER_CUTOFF` stays open (09 open question 12). |
 | PQ-6 | Make key agreement hybrid (X25519 + ML-KEM-768)? | Yes, in full at `E_pq`: session keys `K_seq` and `K_out`, committee keys and their transport, the BASE admin TLS stream and the p2p handshake (G). `libcrux-ml-kem` at tier S. |
 | PQ-7 | Which token holds the release keys' ML-DSA-65 half? | For now, none: each maintainer's Ed25519 half stays on the current hardware token, and the ML-DSA-65 half is held encrypted on that maintainer's air-gapped Linux machine, still 2 of 3 (11 §9.5). The half moves to a token with FIPS 204 firmware when one is chosen. |
+| PQ-12 | Key-agreement parts that depend on code outside VYRN: `commonware-p2p`'s SAKE handshake hardcodes ephemeral X25519, and no TLS 1.3 stack with `X25519MLKEM768` is on the allowlist. | Reading (2026-11-18), recorded in H; neither waits on upstream. |
 | PQ-9 | CHAIN's one-fault case under scheme 1 is 8.91 ms from block start, 0.09 ms inside the 9.00 ms gate (07 §6.5a, 09 §4.8). Accept that margin, or raise CHAIN's gate, add PQ cores or lag `excl_root`? | Accept the 0.09 ms margin: `FIN_GATE_BLOCKS` stays 8 in CHAIN. B-CHN-3 and B-PQ-2 on CHAIN re-check it; PQ-10 and PQ-11 can still move the number. |
 
 **Open questions for the owner**
 
 | # | Question | Default if not decided | Settled by |
 |---|---|---|---|
-| PQ-10 | A header that reaches the leader between its `RangeFix` and the end of its `verify` waits a whole extra view (07 §6.3), and the 07 §6.6 maxima do not include that view. How large is the extra view at the maximum, and does it break the 5.70 / 8.70 ms (BASE) or 8.91 ms (CHAIN) budgets? | budget it once B-PQ-2 measures it; if it breaks a budget, let the leader extend its range at `verify` time with one late signature | 07: B-PQ-2 |
-| PQ-11 | In CHAIN, a header late in a view plus the data lag, `verify` and the post-verify leader signature (≤ 0.75 ms) can push an honest proposal past `t_l` = 2 ms, so an honest view can nullify (07 §6.5a). Lengthen CHAIN's `t_l` under scheme 1 (and recompute the one-fault budget), add PQ cores for the CHAIN leader, or lag `excl_root`? | unchanged `t_l`; B-PQ-2 on CHAIN counts honest-leader nullifies | 07, 09: B-PQ-2 |
-| PQ-12 | Two key-agreement parts depend on code outside VYRN. `commonware-cryptography`'s SAKE handshake, which `commonware-p2p` runs, hardcodes ephemeral X25519. And no TLS 1.3 stack with `X25519MLKEM768` is on the 11 §2.2 allowlist; `ring` and `aws-lc-rs` are banned. rustls providers built on libcrux or RustCrypto exist (`rustls-provider-libcrux-pq` 0.1.1, `rustls-pure` 0.15.4) but have not been evaluated. | `E_pq` waits for both: an ML-KEM-768 SAKE variant proposed upstream to Commonware, and a TLS provider evaluated and added at tier S | owner, 07, 11 |
+| PQ-10 | A header that reaches the leader between its `RangeFix` and the end of its `verify` waits a whole extra view (07 §6.3), and the 07 §6.6 maxima do not include that view. How large is the extra view at the maximum, and does it break the 5.70 / 8.70 ms (BASE) or 8.91 ms (CHAIN) budgets? **Model result (2026-11-18):** a scratch discrete-event model of the view pipeline with 1 kHz headers and 07 §6.6's delays shows the wait is not specific to PQ-8. Views take longer than a block at the maximum, so a header that misses a proposal waits up to one view period: 1.7–2.1 ms under scheme 0 and 2.0–3.0 ms under scheme 1. No-fault worst case, all delays at the maximum: BASE 6.95 ms (scheme 0) and 7.51 ms (scheme 1), against 5.65 / 5.70. With the 3.00 ms fault row added, the one-fault maximum exceeds `FINALITY_MAX_MS` = 10 in both schemes. [Likely: a model of the budgets, not a run of the protocol] | budget it once B-PQ-2 measures it; if it breaks a budget, let the leader extend its range at `verify` time with one late signature | 07: B-PQ-2 |
+| PQ-11 | In CHAIN, a header late in a view plus the data lag, `verify` and the post-verify leader signature (≤ 0.75 ms) can push an honest proposal past `t_l` = 2 ms, so an honest view can nullify (07 §6.5a). Lengthen CHAIN's `t_l` under scheme 1 (and recompute the one-fault budget), add PQ cores for the CHAIN leader, or lag `excl_root`? **Model result (2026-11-18):** with every delay at its maximum, the CHAIN leader's proposal reaches voters 0.81 + 0.75 + 0.80 = 2.36 ms after they enter the view, so every honest view passes `t_l`. Every voter then nullifies, and a voter that nullified never sends finalize, so finality stops: a liveness failure at the budget, not extra latency. With delays drawn below the maximum, 0.3% of honest CHAIN views nullify, and 0.05% of honest BASE views. [Likely] | unchanged `t_l`; B-PQ-2 on CHAIN counts honest-leader nullifies | 07, 09: B-PQ-2 |
