@@ -2447,9 +2447,32 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     .map_err(|e| format!("reap {}: {e}", n.name))?;
             }
             seq_killed = Some(seq);
-            nodes.wait(&rx, paused + wait, "vyrn-seq-standby READY", |ns| {
-                ns.get(sb).is_some_and(|n| line(n, &ready).is_some())
-            })?;
+            nodes
+                .wait(&rx, paused + wait, "vyrn-seq-standby READY", |ns| {
+                    ns.get(sb).is_some_and(|n| line(n, &ready).is_some())
+                })
+                .map_err(|e| {
+                    // Why no promotion: each node's failover lines.
+                    let why: Vec<String> = nodes
+                        .0
+                        .iter()
+                        .flat_map(|n| {
+                            n.lines
+                                .iter()
+                                .filter(|l| {
+                                    [
+                                        "DEPOSED", "SEAL", "RESEAL", "NO_SEAL", "PROMOTED",
+                                        "STANDBY",
+                                    ]
+                                    .iter()
+                                    .any(|p| l.starts_with(p))
+                                        || (l.starts_with("FINAL ") && l.contains("kind=1"))
+                                })
+                                .map(move |l| format!("{}: {l}", n.name))
+                        })
+                        .collect();
+                    format!("{e}; failover lines: {why:?}")
+                })?;
             lane_addrs = nodes
                 .0
                 .get(sb)

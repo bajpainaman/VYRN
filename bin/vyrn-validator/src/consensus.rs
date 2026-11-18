@@ -89,6 +89,9 @@ struct Held {
     /// `depose.rs`) once it holds one.
     deposed: bool,
     seal: Option<Seal>,
+    /// Headers of candidates a `RESEAL` replaced: a seal Simplex already proposed may still
+    /// finalize, and the standby needs its header (Vercel r4619446790).
+    superseded: Vec<BlockHeader>,
     /// A finalized seal at this height named a standby (07 §9.5): its `seq_key` signs every
     /// header above it, and the tenure is live again.
     promoted: Option<(u64, PubKey)>,
@@ -150,9 +153,23 @@ impl Source {
 
     /// This voter's seal candidate (07 §9.4).
     pub fn set_seal(&self, seal: Seal) {
-        if let Some(mut h) = self.held() {
-            h.seal = Some(seal);
+        if let Some(mut h) = self.held()
+            && let Some(old) = h.seal.replace(seal)
+        {
+            h.superseded.push(old.header);
         }
+    }
+
+    /// The header of this voter's current or a replaced seal candidate whose `header_hash`
+    /// is `hash`.
+    pub fn seal_header(&self, hash: Hash) -> Option<BlockHeader> {
+        let h = self.held()?;
+        h.seal
+            .iter()
+            .map(|s| &s.header)
+            .chain(&h.superseded)
+            .find(|x| header_hash(x) == hash)
+            .cloned()
     }
 
     /// The seal finalized at `height` with `next_seq` naming `seq_key`'s box (07 §9.5): the
@@ -167,6 +184,7 @@ impl Source {
             }
             h.deposed = false;
             h.seal = None;
+            h.superseded.clear();
             h.promoted = Some((height.0, seq_key));
         }
     }
@@ -731,10 +749,8 @@ pub fn run(
                         && let Some(k) = plan.seq_order.get(usize::from(x.next_seq))
                         && source.promoted().is_none()
                     {
-                        if let Some(s) = BlockSource::seal(&source, plan.epoch)
-                            .filter(|s| header_hash(&s.header) == c.proposal.last_hash)
-                        {
-                            let h = vyrn_log::block::encode_header(&s.header).to_vec();
+                        if let Some(s) = source.seal_header(c.proposal.last_hash) {
+                            let h = vyrn_log::block::encode_header(&s).to_vec();
                             to_standby = Some((h, 20));
                         }
                         source.promote(c.proposal.last_height, *k);
@@ -803,5 +819,14 @@ mod seal_tests {
         assert_eq!(s.check_seal(Epoch(0), &seal), Verdict::Valid);
         s.invalid_from(Height(6));
         assert_eq!(s.check_seal(Epoch(0), &seal), Verdict::Invalid);
+
+        // Vercel r4619446790: a RESEAL replaces the candidate, but the replaced one may be
+        // the seal that finalizes, so its header is still found for the standby.
+        let mut late = seal.clone();
+        late.header.data_root = Hash([4; 32]);
+        s.set_seal(late.clone());
+        assert_eq!(s.seal_header(header_hash(&seal.header)), Some(seal.header));
+        assert_eq!(s.seal_header(header_hash(&late.header)), Some(late.header));
+        assert_eq!(s.seal_header(Hash([9; 32])), None);
     }
 }

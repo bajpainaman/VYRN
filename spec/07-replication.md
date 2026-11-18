@@ -2555,6 +2555,7 @@ Clients resend every packet that has no response, from their retained buffer.
   no `BlockInputs`), and every session's `resp_seq`, which restarts in the fresh engine.
 - **No `SeqChange` and no resend dedupe** yet: the e2e harness moves its client to the standby.
 - **One failover per run**: tenure 1 has no silence detection.
+- **No ORDER repair in tenure 1 (known gap)**: a replica's `[repair]` Nacks still go to the deposed box's CTRL address after promotion, so a lost tenure-1 ORDER frame stalls that replica. Fix: give the roster standby a repair endpoint and switch `Rep.to` to it at `TENURE_OPEN` (Codex r4619459510).
 - **Known gap: the voters' p2p network starts only after block 0.** `vyrn-validator` starts its
   `commonware-p2p` network, tail channel included, once the order core accepts the tenure's first
   header (its Simplex genesis). Until then no standby report can arrive, so a sequencer that dies
