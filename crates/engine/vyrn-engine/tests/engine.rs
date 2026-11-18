@@ -342,6 +342,31 @@ fn a_join_dependency_matches_on_entry() {
             (3, 'F', 97, 1),
         ]
     );
+    // A cancel between the capped dependency and its source stays out of the CONT steps' cut:
+    // in index order Sell 97 sweeps the 11 at 98 before the Buy 98 is canceled (the cancel's
+    // record is the lane's).
+    assert_eq!(
+        run(
+            vec![new(Sell, Day, 97, 7, 1), new(Sell, Day, 99, 1, 6)],
+            vec![
+                new(Buy, Day, 98, 18, 2),
+                new(Buy, Day, 99, 2, 3),
+                new(Sell, Day, 97, 18, 4),
+                cancel(Handle::new(1, 1).unwrap(), 7),
+                new(Buy, Day, 101, 1, 5),
+            ]
+        ),
+        vec![
+            (0, 'F', 97, 7),
+            (0, 'A', 98, 0),
+            (1, 'F', 99, 1),
+            (1, 'A', 99, 0),
+            (2, 'F', 99, 1),
+            (2, 'F', 98, 11),
+            (2, 'A', 97, 0),
+            (4, 'F', 97, 1),
+        ]
+    );
 }
 
 #[test]

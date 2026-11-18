@@ -676,8 +676,17 @@ impl Bbo {
         }
         let k = self.pair.k();
         let prev = self.cut;
-        let floors: [Option<LaneSeq>; MAX_LANES] =
-            core::array::from_fn(|l| self.q.get(l).and_then(LaneQ::min_floor));
+        // Until its source has run, a forwarded op whose dependency swept keeps its floor: no
+        // later op of its lane (a cancel of a maker the dependency still sweeps) enters a cut
+        // before the op it follows in index order (05 §3.7 (2)).
+        let pending = self.cont.filter(|_| self.dcont.is_some());
+        let floors: [Option<LaneSeq>; MAX_LANES] = core::array::from_fn(|l| {
+            let q = self.q.get(l).and_then(LaneQ::min_floor);
+            match pending.filter(|f| f.lane == l).map(|f| f.floor()) {
+                Some(h) => Some(q.map_or(h, |x| x.min(h))),
+                None => q,
+            }
+        });
         let chosen = match self.cont {
             Some(f) => Some((f, true)),
             None if self.unc.is_some() || self.ctl.is_some() => None,
