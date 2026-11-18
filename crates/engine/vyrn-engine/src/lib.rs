@@ -89,7 +89,12 @@
 //!   it covers, and must be reproduced right before that packet's group (its own route
 //!   records and the packet, in emitted order) with the same `ver`. Otherwise replay fails
 //!   with [`Why::Mismatch`] at the take, including when a route record of another packet, on
-//!   any lane, sits between them. [`Engine::replay_wire`] does not take them yet.
+//!   any lane, sits between them. [`Engine::replay_wire`] takes the block's `AcctTake`s as a
+//!   separate input (07 §3.6). Each take the replayed lane call emits must be the input's
+//!   lowest-`ver` unreproduced take of its `(lane, lane_seq)`, a pooled record waits until
+//!   every lower-`ver` take of its account is reproduced (07 §7.1 item 2), and a take carries
+//!   with its packet. A take no replayed or carried record owns is [`Why::Mismatch`] at
+//!   [`WireAt::End`].
 //! - Control steps carry their kind, not their command, in the order stream. A replayer
 //!   queues the commands through [`Engine::command`] before [`Engine::replay`].
 //! - On a delayed backend (`Sim`), a step's lines may become visible after `Bbo::poll`

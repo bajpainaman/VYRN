@@ -1589,13 +1589,19 @@ into one sequence by this rule, so the Rust and Vx clients run the same schedule
    any lane record of the same packet between them (such as a route record), are replayed with
    `r`, as one lane call.
 2. Before step `s`, every lane in increasing lane id replays, in O-order, each of its remaining
-   records with `f(r) < s`. Then step `s` is replayed.
+   records with `f(r) < s`. Then step `s` is replayed. A pooled record whose `AcctTake` (§3.6)
+   has `ver = v` is due only once every take of the same account with a lower `ver` in the
+   block's (and the carried) inputs has been reproduced; the lane passes repeat in lane id order
+   until no lane replays another record, so the pool's take order is replayed exactly. Each take
+   the replayed lane call emits must equal the input's lowest-`ver` unreproduced take of its
+   `(lane, lane_seq)` (`Why::Mismatch` otherwise).
 3. After the block's last step, every lane in increasing lane id replays its remaining records
    with `f(r)` at most the last step, in O-order, and stops at the first record with `f(r)`
    greater than the last step. That record and every later record of its lane, with their route
    records, **carry** into the next block, where they come before the next block's records. A
-   packet's routes are its route records (§3.6), which travel with it, so no record waits for a
-   later block's steps. A record carried past a cut that covers one of its ops is
+   packet's routes are its route records (§3.6), and its `AcctTake` sits right before it, so
+   both travel with it and no record waits for a later block's steps. A take that no replayed
+   or carried record of its block owns is `Why::Mismatch` at the block end. A record carried past a cut that covers one of its ops is
    `REP_E_ORDER`.
 
 `REP_MERGE` respects both dependencies above: a lane reads a step's fill events only after the
@@ -1622,6 +1628,13 @@ replayed right after the later of its `fills_applied` step and the step that pub
 later version exists then. A `MID` raises the due step, and the live lane takes a `MID` only
 while that step's version is within `W` of the packet's snapshot. The lag itself stays within
 `W = min(u16::MAX, REPLAY_SNAP_HIST − 1)` (05 §6.5 rule 3; §3.6).
+
+**In-log replay (`Engine::replay`).** Replaying the engine's own journal replays each record at
+its journal position rather than by `REP_MERGE`. The bound is the same ring: when a packet record
+is replayed, the version it names must be within `REPLAY_SNAP_HIST` versions of the newest version
+the replayed BBO has published at that point of the journal, or replay refuses it with
+`Why::NoSnapshot`. A live journal meets it, since the live lane logs a lag ≤ `W` against a
+version already published when the packet was accepted.
 
 **Fields replay derives.** 07's `StepRecord` carries the kind, the source with its `CROSS`
 route bit (§3.8), the cut and the kind payload; the lane's route records (§3.6) carry the route

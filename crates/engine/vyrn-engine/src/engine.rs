@@ -192,6 +192,11 @@ pub struct Engine<'a, V: Visibility, const NA: usize> {
     /// The route records of the carried packets, and the buffer the next one is built in.
     pub(crate) carry_routes: Vec<RouteRecord>,
     pub(crate) carry_routes_next: Vec<RouteRecord>,
+    /// The `AcctTake`s of the carried packets, the buffer the next one is built in, and the
+    /// takes the current `replay_wire` call has reproduced (05 §6.9, 07 §7.1).
+    pub(crate) carry_takes: Vec<AcctTake>,
+    pub(crate) carry_takes_next: Vec<AcctTake>,
+    pub(crate) taken: Vec<AcctTake>,
 }
 
 impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
@@ -300,6 +305,9 @@ impl<'a, V: Visibility, const NA: usize> Engine<'a, V, NA> {
             carry_next: Vec::new(),
             carry_routes: Vec::new(),
             carry_routes_next: Vec::new(),
+            carry_takes: Vec::new(),
+            carry_takes_next: Vec::new(),
+            taken: Vec::new(),
         })
     }
 

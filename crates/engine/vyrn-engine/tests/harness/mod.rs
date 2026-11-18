@@ -359,7 +359,7 @@ pub fn to_wire(recs: &[OwnedRec]) -> (Vec<PacketRecord>, Vec<vyrn_types::RouteRe
         match r {
             OwnedRec::Packet(p) => lanes.push(*p),
             OwnedRec::Route(x) => routes.push(*x),
-            // `replay_wire` does not take `AcctTake`s yet (PR follow-up F4b).
+            // `AcctTake`s are a separate input (`takes_of`); the harness box logs none.
             OwnedRec::Take(_) => {}
             OwnedRec::Step(e, d) => {
                 for x in &d[..usize::from(e.n_delta)] {
@@ -378,6 +378,16 @@ pub fn to_wire(recs: &[OwnedRec]) -> (Vec<PacketRecord>, Vec<vyrn_types::RouteRe
         }
     }
     (lanes, routes, steps)
+}
+
+/// The `AcctTake`s of `recs`, in order: `Engine::replay_wire`'s `takes` input.
+pub fn takes_of(recs: &[OwnedRec]) -> Vec<vyrn_types::AcctTake> {
+    recs.iter()
+        .filter_map(|r| match r {
+            OwnedRec::Take(t) => Some(*t),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One step as `to_wire` gives it: step, kind, source, `CROSS`, cut, payload.
@@ -433,8 +443,9 @@ pub fn replay_blocks(
             })
             .collect();
         let r = match &mut rl {
-            Some(l) => e.replay_wire(lanes, routes, &ws, store, l, &mut j),
-            None => e.replay_wire(lanes, routes, &ws, store, &mut NoResponses, &mut j),
+            // The harness box has no pooled lanes, so it logs no `AcctTake`.
+            Some(l) => e.replay_wire(lanes, routes, &[], &ws, store, l, &mut j),
+            None => e.replay_wire(lanes, routes, &[], &ws, store, &mut NoResponses, &mut j),
         };
         if r.is_err() {
             return (r, j, e.carried().len());

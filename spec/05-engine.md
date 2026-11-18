@@ -1486,6 +1486,11 @@ RxQueue[c] consumer lock (64 B) { lock: u32, next: u32 }   per pool core's RX VI
 - **Token.** Before it touches pooled account `a` (pass 1 of a packet of `a`, or B1/B2 work for
   `a`'s orders), core `c` takes `AcctTok[a]` with `CAS(holder: free → c)` (~20 ns inside the L3),
   increments `ver`, and writes `AcctTake { account: a, ver, lane: c }` into its own `OsRing` before the work.
+  The take sits right before the **group** of the packet it covers: that packet's own records in
+  the order the lane emits them, the packet record and then its route records, so a crossing
+  pooled IOC logs `[Take, Packet, Route]` (ruling on #135). A record of another packet, a route
+  record included, between the take and its group is a misplaced take (`Why::Mismatch` at the
+  take in `vyrn-engine`).
   It releases the token (`Release` store) when the packet or boundary work is done. While `c`
   holds it, `c` is the only writer of every field of `PoolAcct[a]` (`INV-WRITER` per field, in
   time slices that the token orders).
