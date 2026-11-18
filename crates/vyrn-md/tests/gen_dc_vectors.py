@@ -9,6 +9,7 @@ reference algorithm over hashlib's SHA-512, and BLAKE3 comes from the `b3sum` CL
 Usage: python3 -I gen_dc_vectors.py <out dir>
 """
 
+import copy
 import hashlib
 import struct
 import subprocess
@@ -104,6 +105,21 @@ def stage(kind, account, step, height):
     return struct.pack("<BBHIQIIQ", kind, DURABLE, 0, account, step, 0, 0, height) + bytes(16)
 
 
+def alloc_rec(account, step, asset, debit, amount):
+    return struct.pack("<BBHIQIIQ", ALLOC, DURABLE, asset | (2 if debit else 0), account, step,
+                       0, 0, amount) + bytes(16)
+
+
+def route_rec(account, lane_seq, index, session, resp_seq, asset, to_book, amount, tag, fee_):
+    return (struct.pack("<BBHIQIIQHBB", ROUTE, DURABLE, index, account, lane_seq, session,
+                        resp_seq, amount, to_book, asset, 0)
+            + struct.pack("<Iq", tag, fee_))
+
+
+def revert_rec(b):
+    return bytes([REVERT]) + b[1:36] + struct.pack("<I", b[0]) + b[40:]
+
+
 def eod(account, ordinal, words):
     return struct.pack("<BBHI5Q", EOD, DURABLE, ordinal, account, *[w % 2**64 for w in words])
 
@@ -132,13 +148,18 @@ class Model:
         self.orders = {}
         self.released = 0
         self.finals = []
+        self.final_step = 0
+        self.allocs = []
         self.run = None
+        # State after each released step, for a revert (an independent stand-in for the undo log).
+        self.snaps = {0: (copy.deepcopy(self.orders), None)}
         self.rel = 0  # release step of the records being emitted
         self.out = []  # (acct, master, seq, bytes)
 
     @staticmethod
     def new_stream():
-        return dict(seq=0, canon=[], unfinal=[], fills=0, bb=0, bs=0, qb=0, qs=0, fees=0, msg=0)
+        return dict(seq=0, canon=[], pend=[], unsettled=[], fills=0, bb=0, bs=0, qb=0, qs=0,
+                    fees=0, msg=0)
 
     def targets(self, acct):
         t = [(acct, 0)]
@@ -152,28 +173,39 @@ class Model:
     def push(self, sid, b):
         s = self.streams[sid]
         s["seq"] += 1
-        if b[0] not in (FINAL, SETTLED):
-            s["canon"].append(b)
-            if not s["unfinal"] or s["unfinal"][-1] != self.rel:
-                s["unfinal"].append(self.rel)
+        if b[0] not in (FINAL, SETTLED, REVERT):
+            s["pend"].append((self.rel, "rec", b))
         self.out.append((sid[0], sid[1], s["seq"], b))
 
     def emit(self, acct, kind, side, taker, ordinal, step, sess, rs, handle, tick, qty, tag, f):
         b = rec(kind, side | (TAKER if taker else 0), ordinal, acct, step, sess, rs, handle,
                 tick, qty, tag, f)
         for sid in self.targets(acct):
-            s = self.streams[sid]
-            if kind == FILL:
+            self.push(sid, b)
+
+    def commit(self, sid, upto):
+        """Records and message fees released at a step <= upto become canonical."""
+        s = self.streams[sid]
+        while s["pend"] and s["pend"][0][0] <= upto:
+            rel, what, x = s["pend"].pop(0)
+            if not s["unsettled"] or s["unsettled"][-1] != rel:
+                s["unsettled"].append(rel)
+            if what == "msg":
+                s["msg"] += x
+                continue
+            s["canon"].append(x)
+            if x[0] == FILL:
+                side = x[1] & SELL
+                tick, qty = struct.unpack("<II", x[28:36])
+                (f,) = struct.unpack("<q", x[40:48])
                 s["fills"] += 1
-                n = qty * tick * self.ts
                 if side == 0:
                     s["bb"] += qty
-                    s["qb"] += n
+                    s["qb"] += qty * tick * self.ts
                 else:
                     s["bs"] += qty
-                    s["qs"] += n
+                    s["qs"] += qty * tick * self.ts
                 s["fees"] += f
-            self.push(sid, b)
 
     def lane_op(self, lane, seq, sess, rs, msg, r):
         self.rel = self.released + 1
@@ -207,7 +239,51 @@ class Model:
         self.rel = step
         if src is not None:
             self.step_src(step, kind, flags, src, tx)
+        self.flush_allocs(step)
         self.flush(False)
+        self.snaps[step] = (copy.deepcopy(self.orders), copy.deepcopy(self.run))
+
+    def route(self, acct, *a):
+        self.rel = self.released + 1
+        for sid in self.targets(acct):
+            self.push(sid, route_rec(acct, *a))
+
+    def alloc(self, step, acct, asset, debit, amount):
+        self.allocs.append((step, acct, asset, debit, amount))
+        self.flush_allocs(self.released)
+
+    def flush_allocs(self, upto):
+        while self.allocs and self.allocs[0][0] <= upto:
+            step, acct, asset, debit, amount = self.allocs.pop(0)
+            self.rel = step
+            for sid in self.targets(acct):
+                self.push(sid, alloc_rec(acct, step, asset, debit, amount))
+
+    def revert(self, kept):
+        assert kept >= self.final_step
+        for sid in sorted(self.streams):
+            s = self.streams[sid]
+            gone = [p for p in s["pend"] if p[0] > kept]
+            s["pend"] = [p for p in s["pend"] if p[0] <= kept]
+            for _, what, x in gone:
+                if what == "rec":
+                    self.push(sid, revert_rec(x))
+        orders, run = self.snaps[kept]
+        self.orders, self.run = copy.deepcopy(orders), copy.deepcopy(run)
+        self.snaps = {k: v for k, v in self.snaps.items() if k <= kept}
+        self.allocs = [a for a in self.allocs if a[0] <= kept]
+        self.finals = [f for f in self.finals if f[1] <= kept]
+        self.released = min(self.released, kept)
+        self.rel = self.released
+
+    def settled(self, height, last):
+        assert last <= self.final_step
+        for sid in sorted(self.streams):
+            u = self.streams[sid]["unsettled"]
+            if u and u[0] <= last:
+                while u and u[0] <= last:
+                    u.pop(0)
+                self.push(sid, stage(SETTLED, sid[0], last, height))
 
     def step_src(self, step, kind, flags, src, tx):
         slane, sseq, ssess, msg = src
@@ -217,7 +293,7 @@ class Model:
             a = self.accts[tacct]
             f = a["mc"] if flags & CROSS else a["mi"]
             for sid in self.targets(tacct):
-                self.streams[sid]["msg"] += f
+                self.streams[sid]["pend"].append((self.rel, "msg", f))
         thdr = next((h for h, _ in tx if h[0] == TAKER_ROLE), None)
         # Record tuples: ("fill", index, liq, handle, tick, qty), ("ack", index, handle, tick,
         # tag), ("out", index, cause, handle, qty, tag), ("rej", index, reason).
@@ -281,27 +357,34 @@ class Model:
     def flush(self, all_):
         while self.finals and (all_ or self.finals[0][1] <= self.released):
             h, s = self.finals.pop(0)
+            self.final_step = max(self.final_step, s)
             # DC_FINAL(s) to every stream with a record released at a step <= s that no
-            # earlier DC_FINAL covers.
+            # earlier DC_FINAL covers; those records become canonical.
             for sid in sorted(self.streams):
-                u = self.streams[sid]["unfinal"]
-                if u and u[0] <= s:
-                    while u and u[0] <= s:
-                        u.pop(0)
+                p = self.streams[sid]["pend"]
+                if p and p[0][0] <= s:
+                    self.commit(sid, s)
                     self.push(sid, stage(FINAL, sid[0], s, h))
 
     def finish(self, bal):
+        self.flush_allocs(2**64)
         self.flush(True)
+        for sid in sorted(self.streams):
+            self.commit(sid, 2**64)
+        self.rel = self.released
         for sid in sorted(self.streams):
             acct, master = sid
             members = [a for a, x in self.accts.items()
                        if (a == acct) or (master and x["master"] == acct)]
             b = [sum(bal.get(m, (0, 0, 0, 0))[i] for m in members) for i in range(4)]
             s = self.streams[sid]
-            self.push(sid, eod(acct, 0, [s["fills"], s["bb"], s["bs"], s["qb"], s["qs"]]))
-            self.push(sid, eod(acct, 1, [s["fees"], s["msg"], 0, 0, 0]))
-            self.push(sid, eod(acct, 2, b + [0]))
+            for r in (eod(acct, 0, [s["fills"], s["bb"], s["bs"], s["qb"], s["qs"]]),
+                      eod(acct, 1, [s["fees"], s["msg"], 0, 0, 0]),
+                      eod(acct, 2, b + [0])):
+                self.push(sid, r)
+                self.commit(sid, 2**64)
             self.push(sid, eod_hash(acct, len(s["canon"]), b3(b"".join(s["canon"]))))
+            self.commit(sid, 2**64)
 
 
 # --- the scripted cases -----------------------------------------------------------------------
@@ -371,6 +454,31 @@ LATE_FINAL_CASE = [
     ("final", 1, 1),
     ("final", 2, 2),
 ]
+# A tenure is deposed after step 1 is final: steps 2 and 3 (a fill, an ack, an allocation) are
+# not in the final log and are reverted; the final log's step 2 fills the same maker again,
+# which needs its open quantity back at 5. Settlement comes after the epoch's DC_EOD.
+REVERT_CASE = [
+    ("op", 0, 1, S01, 1, ("new", 1, 105, 5, 11), ("ack", 0, h(1), 105, 11)),
+    ("step", 1, "idle", 0, None, []),
+    ("final", 1, 1),
+    ("step", 2, "cross", CROSS, (1, 1, S11, ("new", 0, 105, 3, 31)), [
+        ((TAKER_ROLE, 1, S11, 1), ("fill", 0, 1, h(1), 105, 3)),
+        ((MAKER, 0, S01, 0), ("fill", 0xFF, 0, h(1), 105, 3)),
+    ]),
+    ("op", 0, 2, S02, 1, ("new", 1, 110, 2, 21), ("ack", 0, h(2), 110, 21)),
+    ("route", 102, 3, 1, S02, 2, 0, 8, 500, 22, 3),
+    ("step", 3, "idle", 0, None, []),
+    ("alloc", 3, 101, 0, False, 1000),
+    ("revert", 1),
+    ("step", 2, "cross", CROSS, (2, 1, S21, ("new", 0, 105, 5, 41)), [
+        ((TAKER_ROLE, 2, S21, 1), ("fill", 0, 1, h(1), 105, 5)),
+        ((MAKER, 0, S01, 0), ("fill", 0xFF, 0, h(1), 105, 5)),
+    ]),
+    ("alloc", 2, 102, 1, True, 7),
+    ("route", 101, 2, 0, S01, 2, 1, 9, 40, 14, -1),
+    ("step", 3, "idle", 0, None, []),
+    ("final", 2, 2),
+]
 BAL = {101: (1000, 20, 7, 0), 102: (5, 0, 3, 1), 201: (77, 0, 0, 0)}
 
 
@@ -386,7 +494,7 @@ def fmt_rec(r):
     return " ".join(str(x) for x in r)
 
 
-def run_case(lines, name, tick_size, events, bal):
+def run_case(lines, name, tick_size, events, bal, post_settled=()):
     m = Model(tick_size, ACCTS)
     lines.append(f"case {name}")
     lines.append(f"tick_size {tick_size}")
@@ -410,6 +518,16 @@ def run_case(lines, name, tick_size, events, bal):
                 lines.append(f"tx {role} {lane} {s:#x} {rs} | {fmt_rec(r)}")
             lines.append("release")
             m.step(sid, kind, flags, src, tx)
+        elif ev[0] == "alloc":
+            _, step, acct, asset, debit, amount = ev
+            lines.append(f"alloc {step} {acct} {asset} {int(debit)} {amount}")
+            m.alloc(step, acct, asset, debit, amount)
+        elif ev[0] == "route":
+            lines.append("route " + " ".join(str(x) for x in ev[1:]))
+            m.route(*ev[1:])
+        elif ev[0] == "revert":
+            lines.append(f"revert {ev[1]}")
+            m.revert(ev[1])
         else:
             _, height, last = ev
             lines.append(f"final {height} {last}")
@@ -418,6 +536,9 @@ def run_case(lines, name, tick_size, events, bal):
         lines.append(f"bal {a} {b[0]} {b[1]} {b[2]} {b[3]}")
     m.finish(bal)
     lines.append("end")
+    for height, last in post_settled:
+        lines.append(f"settled {height} {last}")
+        m.settled(height, last)
     for acct, master, seq, b in m.out:
         lines.append(f"rec {acct} {master} {seq} {b.hex()}")
     lines.append("endcase")
@@ -456,6 +577,7 @@ def main(out_dir):
     m0 = run_case(lines, "cross", 1_000, CROSS_CASE, BAL)
     m1 = run_case(lines, "quiet", 10, [], {})
     run_case(lines, "late_final", 10, LATE_FINAL_CASE, {})
+    run_case(lines, "revert_settle", 100, REVERT_CASE, BAL, post_settled=[(9, 2)])
     # Sessions over a store of epoch 5 (case cross, ended) and epoch 6 (case quiet, open).
     E0, E1 = 5, 6
     seeds = {101: bytes([1]) * 32, 102: bytes([2]) * 32, 900: bytes([9]) * 32,

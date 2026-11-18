@@ -1674,9 +1674,12 @@ carries its label.
    `DC_CANCEL` with `qty` = canceled, a lane `Out` `DC_OUT`. `step` is the op's LaneSeq,
    `ordinal` its message index, `resp_seq` the lane response packet's. A `Reject` changes no
    order state and has no record; the client's trading session has it. \[Likely\]
-3. **Canonical stream.** Every record except `DC_FINAL` and `DC_SETTLED` is canonical: those two
-   mark stages of earlier records (§8.2), and their position depends on when the quorum signed,
-   not on the log. The `DC_EOD` hash covers the canonical records only. \[Guessing\]
+3. **Canonical stream.** The canonical stream is the stream's final records: every record except
+   `DC_FINAL`, `DC_SETTLED` and `DC_REVERT`, once a `DC_FINAL` covers it (item 7), or at epoch
+   end. The first two mark stages of earlier records (§8.2), whose position depends on when the
+   quorum signed, not on the log; a reverted record and its `DC_REVERT` are not in the final
+   log. The `DC_EOD` totals and hash cover the canonical records only, so they are the same on
+   every replica whatever reverts it saw. \[Guessing\]
 4. **Fills.** Maker `Fill` `k` of step `s` (its position among the step's maker `Fill`s in TX
    order, as `MD_EXEC`'s ordinal, §7.9 item 4) gives the maker's `DC_FILL` and the taker's,
    both `(s, k)`, at the match's tick and qty. The taker's per-level `Fill` record equals the
@@ -1708,9 +1711,30 @@ carries its label.
    master's stream, and, for a master's own orders, to both of the master's. Each stream has its
    own seq, from 1 per epoch. \[Likely\]
 
-Not rebuilt yet: `DC_REVERT` (replay has no revert path yet), `DC_SETTLED`, `DC_ALLOC` and
-`DC_ROUTE` (no replay output carries them; the codec has them), and every case `SinkStream`
-leaves `Unsupported` (§7.9).
+9. **`DC_REVERT`.** When a deposed tenure's seal keeps steps `≤ k` (07 §9.6), the shell calls
+   `revert_after(k)`, `k` ≥ the newest final step. Every record released after `k` gets a
+   `DC_REVERT`, in stream order: its own bytes with type 7 and its type at bytes 36–39 in place of
+   `client_tag`, so `(step, ordinal)` names the reverted execution. The order state goes back to
+   just after `k`, and the replay of the final log continues from step `k + 1`; its records are
+   new records with new seqs. Allocations and `DC_FINAL`s queued for steps after `k` are dropped.
+   Every `DC_REVERT` therefore precedes the `DC_FINAL` that covers its step (§8.2). \[Likely\]
+10. **`DC_ALLOC`.** The control path's `AllocCredited` / `AllocDebited` reply (§2.5) is a
+    `DC_ALLOC` right after its control step's other records: `step` = the control step,
+    `ordinal` bit 0 the asset (base), bit 1 a debit, bytes 24–31 the amount credited or actually
+    debited. No replay output carries the reply (the StepRecord does not carry the command,
+    §7.9 item 9), so the observer's shell hands it over as it hands over `CtlTimerTick`.
+    \[Guessing\]
+11. **`DC_SETTLED`.** `settled(height, s)`, `s` ≤ the newest final step, goes to every stream
+    holding a canonical record released at a step ≤ `s` that no `DC_SETTLED` covers; layout as
+    `DC_FINAL`. It may follow the epoch's `DC_EOD`, since `BASE` settles on the ledger's credit of
+    the epoch statement (§8.2). \[Likely\]
+12. **`DC_ROUTE`.** An accepted `RouteMove` (§2.8) is a `DC_ROUTE` released like a lane op:
+    `step` = its LaneSeq, `ordinal` = its message index, `session`, `resp_seq` of its `Routed`,
+    bytes 24–31 the amount, 32–33 `to_book`, 34 the asset, 36–39 `client_tag`, 40–47 the router
+    fee. The engine has no route op yet, so the shell hands it over at its interval position.
+    \[Guessing\]
+
+Not rebuilt yet: every case `SinkStream` leaves `Unsupported` (§7.9).
 
 ### 8.5 Session wire, authentication and subscription
 

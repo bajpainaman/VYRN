@@ -3,3 +3,7 @@
 /fuzz/target
 
 .vercel
+
+# Python bytecode (tests/gen_*.py)
+__pycache__/
+*.pyc
