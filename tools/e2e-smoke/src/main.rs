@@ -30,7 +30,7 @@
 //! | `validators` | each validator reports heights `0..=H` contiguous with the box's `first_step`/`last_step`, every verdict `Valid`, no `FAULT` (R5 for `REP_E_HASHLAG`) |
 //! | `replay` | the tap's `OrderCore` readies the same blocks, holding every packet sent exactly once, `DataJoin::check` passes on each, `RustReplay` replays every block, and its responses equal the responses the client received from the box |
 //! | `replica-out` | with `--data` every validator replays (`[replay]`) and its `out=<hex>` on each `BLOCK` line equals the tap's output hash of that block; one stopped at `REP_E_HASHLAG` is compared on the blocks it printed (R5); SKIP while no validator replays |
-//! | `finality` | with `--finality`: each validator prints `FINAL height=<h>` up to `H`; SKIP without it |
+//! | `finality` | with `--finality` (default 4 validators, a DEV roster as in `bin/vyrn-validator/tests/committee.rs`, `[consensus]` in every validator and the box): while the box still runs, the box's listener (`FINAL height=<h> ... from=<votes\|cert>`) and every validator that did not stop print `FINAL` through the box's last block. A validator's `OUT_OF_ORDER`, `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT` line fails `validators`; `REP_E_HASHLAG` follows R5 and R6. SKIP without it |
 //! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed reports no gap or rejected frame, and that join is the one `replay` reads; SKIP without `--data` |
 //!
 //! **Readings** (the spec does not settle these; PR body):
@@ -48,7 +48,14 @@
 //!   data RX queue, checks `data_root` (vote-rule item 3), fetches gaps from the node, and
 //!   replays (`[replay]`, the box's engine and sessions), so `replica-out` runs. Without it they
 //!   have no data and no replay.
-//! - R4. `FINAL height=<h>` is this harness's guess at a validator's finality line.
+//! - R4. The validators' `FINAL height=<last_height> view= first= kind= sigs=` and the box's
+//!   `FINAL height=<h> view= from=` (#121) are parsed by `height=` only. The committee is a DEV
+//!   roster: vote seeds `[i + 1; 32]`, genesis `[0; 32]`, the run's `seq_key` as primary and a
+//!   dummy standby, repl and CTRL ports picked below the ephemeral range, `delta_ms = 500`.
+//! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
+//!   no quorum is left and the box cannot finalize the rest: DEV timing, a `WARN`. The box must
+//!   still have finalized from votes when quorum held for two heights or more, so a broken vote
+//!   path fails. `--strict-hashlag` drops the exception.
 //! - R5. `REP_E_HASHLAG` (07 §3.7 INV-REP-8) is a 1 ms real-time bound that the validator
 //!   measures with user-space receive times and that 07 §7.2 budgets for pinned cores. On an
 //!   unpinned DEV machine one preemption between an ORDER frame and its HASH frame trips it, so
@@ -122,8 +129,9 @@ struct Cli {
     /// Workload config (default: the embedded wl-smoke.toml).
     #[arg(long)]
     workload: Option<PathBuf>,
-    #[arg(long, default_value_t = 3)]
-    validators: usize,
+    /// Validators (default 3, or 4 with --finality: n = 3f + 1 with f = 1).
+    #[arg(long)]
+    validators: Option<usize>,
     #[arg(long, default_value_t = 1500)]
     packets: u64,
     /// Messages per second (replaces the workload's rate).
@@ -316,6 +324,15 @@ impl Nodes {
             }
         }
         Ok(())
+    }
+
+    /// Takes every line already queued, without waiting.
+    fn drain(&mut self, rx: &Lines) {
+        while let Ok((i, l)) = rx.try_recv() {
+            if let Some(n) = self.0.get_mut(i) {
+                n.lines.push(l);
+            }
+        }
     }
 
     /// Closes stdin (`--stop-on-stdin-eof`) and waits for the child to exit and its `STATS`.
@@ -562,7 +579,12 @@ impl Report {
     }
 }
 
-fn seq_config(dir: &Path, order: &[String], sessions: &[Sess]) -> Result<PathBuf, String> {
+fn seq_config(
+    dir: &Path,
+    order: &[String],
+    sessions: &[Sess],
+    cons: Option<&Cons>,
+) -> Result<PathBuf, String> {
     let mut s = format!(
         r#"schema = 1
 protocol = 1
@@ -611,12 +633,21 @@ seq = "env:VYRN_E2E_SEQ_SEED"
             hex(&x.k_out)
         ));
     }
+    if let Some(c) = cons {
+        s.push_str(&format!(
+            "\n[consensus]\nctrl = \"{}\"\nroster = \"{}\"\nroster_hash = \"{}\"\ngenesis_hash = \"{}\"\n",
+            c.ctrl,
+            c.roster.display(),
+            c.roster_hash,
+            hex(&[0; 32])
+        ));
+    }
     let p = dir.join("seq.toml");
     std::fs::write(&p, s).map_err(|e| e.to_string())?;
     Ok(p)
 }
 
-/// `n` free UDP ports below the kernel's ephemeral range, for the validators' data queues. Ports
+/// `n` free UDP and TCP ports below the kernel's ephemeral range, for the validators' data queues. Ports
 /// the kernel hands out (port 0, as every other node binds) never fall there, so a port picked
 /// here and released stays free until its validator binds it, whatever starts in between.
 fn data_ports(n: usize) -> Result<Vec<u16>, String> {
@@ -628,7 +659,10 @@ fn data_ports(n: usize) -> Result<Vec<u16>, String> {
     let start = 20_000 + u16::try_from(std::process::id() % u32::from(span)).unwrap_or(0);
     let ports: Vec<u16> = (0..span)
         .map(|k| 20_000 + (start - 20_000 + k) % span)
-        .filter(|&p| UdpSocket::bind(("127.0.0.1", p)).is_ok())
+        .filter(|&p| {
+            UdpSocket::bind(("127.0.0.1", p)).is_ok()
+                && std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
+        })
         .take(n)
         .collect();
     if ports.len() < n {
@@ -645,9 +679,16 @@ fn validator_config(
     i: usize,
     data: Option<(SocketAddrV4, u16)>,
     sessions: &[Sess],
+    cons: Option<&Cons>,
 ) -> Result<PathBuf, String> {
     let key = hex(&vyrn_crypto::ed25519::public_key(&SEQ_SEED));
     let data_port = data.map_or(0, |(_, p)| p);
+    // The vote key resolves only with [consensus]; without it the handle is read and unused.
+    let vote = if cons.is_some() {
+        "env:VYRN_E2E_VOTE_SEED".to_owned()
+    } else {
+        format!("dev:validator-{i}")
+    };
     let mut s = format!(
         r#"schema = 1
 protocol = 1
@@ -667,7 +708,7 @@ data_port = {data_port}
 seq_keys = ["{key}"]
 
 [keys]
-vote = "dev:validator-{i}"
+vote = "{vote}"
 "#
     );
     if let Some((fetch, _)) = data {
@@ -684,6 +725,15 @@ vote = "dev:validator-{i}"
                 hex(&x.k_seq)
             ));
         }
+    }
+    if let Some(c) = cons {
+        s.push_str(&format!(
+            "\n[consensus]\nroster = \"{}\"\nroster_hash = \"{}\"\ngenesis_hash = \"{}\"\nhome = \"LDN\"\nobservers = [\"{}\"]\ndelta_ms = 500\n",
+            c.roster.display(),
+            c.roster_hash,
+            hex(&[0; 32]),
+            c.ctrl
+        ));
     }
     let p = dir.join(format!("validator-{i}.toml"));
     std::fs::write(&p, s).map_err(|e| e.to_string())?;
@@ -736,7 +786,8 @@ listen = "127.0.0.1:0"
 
 fn run(cli: &Cli) -> Result<bool, String> {
     // R5's HASHLAG exception needs validators that actually report; zero would pass vacuously.
-    if cli.validators == 0 {
+    let n_val = cli.validators.unwrap_or(if cli.finality { 4 } else { 3 });
+    if n_val == 0 {
         return Err("--validators must be at least 1".into());
     }
     let wait = Duration::from_secs(cli.wait_s);
@@ -765,10 +816,19 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let stop_tap = Arc::new(AtomicBool::new(false));
     // With --data, each validator's data port (07 §5.4), picked before vyrn-data starts and
     // outside the ephemeral range, so no node's port-0 bind can take it meanwhile.
+    // With --finality also each validator's TCP repl port and the box's CTRL port, from the
+    // same range in one pick, so no two picks overlap.
+    let want = if cli.data { n_val } else { 0 } + if cli.finality { n_val + 1 } else { 0 };
+    let mut picked = data_ports(want)?;
     let val_data: Vec<u16> = if cli.data {
-        data_ports(cli.validators)?
+        picked.drain(..n_val).collect()
     } else {
         Vec::new()
+    };
+    let cons = if cli.finality {
+        Some(Cons::new(&dir, &picked)?)
+    } else {
+        None
     };
     // --data: a vyrn-data node takes copy 2 from the client and fans DATA frames out to the
     // tap's data socket and every validator's data port (07 §5.1, §5.2). It starts first, so
@@ -809,18 +869,21 @@ fn run(cli: &Cli) -> Result<bool, String> {
         None
     };
 
-    let vals: Vec<usize> = (0..cli.validators)
+    let vals: Vec<usize> = (0..n_val)
         .map(|i| {
             let data = data_node
                 .as_ref()
                 .zip(val_data.get(i))
                 .map(|((_, _, fetch, _), port)| (*fetch, *port));
-            let cfg = validator_config(&dir, i, data, &sessions)?;
+            let cfg = validator_config(&dir, i, data, &sessions, cons.as_ref())?;
             let mut c = command(
                 &bin_dir.join("vyrn-validator"),
                 cli.validator_cpus.as_deref(),
             );
-            c.arg("--config").arg(cfg).arg("--stop-on-stdin-eof");
+            c.arg("--config")
+                .arg(cfg)
+                .arg("--stop-on-stdin-eof")
+                .env("VYRN_E2E_VOTE_SEED", hex(&vote_seed(i)));
             nodes.spawn(&format!("validator-{i}"), &mut c, &tx)
         })
         .collect::<Result<_, String>>()?;
@@ -858,7 +921,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
     let cl_recv = cl_sock.try_clone().map_err(|e| e.to_string())?;
 
-    let cfg = seq_config(&dir, &order, &sessions)?;
+    let cfg = seq_config(&dir, &order, &sessions, cons.as_ref())?;
     let mut c = command(&bin_dir.join("vyrn-seq"), cli.seq_cpus.as_deref());
     c.arg("--config")
         .arg(cfg)
@@ -906,6 +969,32 @@ fn run(cli: &Cli) -> Result<bool, String> {
     while let Some(d) = settle.checked_duration_since(Instant::now()) {
         std::thread::park_timeout(d);
     }
+    // --finality: with the box still up (its listener prints FINAL), wait until the box and
+    // every validator that did not stop finalize through the box's last block so far. Every
+    // line queued during the run is taken first, so the target is the box's last block
+    // before its stop, not an early prefix; the block its stop closes is checked against the
+    // validators below.
+    nodes.drain(&rx);
+    let last = |ns: &[Node]| ns.get(seq).and_then(|n| blocks(n).last().map(|b| b.0.0));
+    let fin_wait = if cli.finality {
+        nodes.wait(
+            &rx,
+            Instant::now() + wait,
+            "FINAL through the last block",
+            |ns| {
+                let t = last(ns);
+                t.is_some()
+                    && ns.get(seq).is_some_and(|n| finals(n).last().copied() >= t)
+                    && vals.iter().all(|&i| {
+                        ns.get(i)
+                            .is_some_and(|n| stopped(n).is_some() || finals(n).last().copied() >= t)
+                    })
+            },
+        )
+    } else {
+        Ok(())
+    };
+    let fin_target = last(&nodes.0);
     let seq_ok = nodes.stop(seq, &rx, Instant::now() + wait)?;
     // The data node flushes its open frames on stop.
     let data_ok = data_idx.map(|i| nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
@@ -918,18 +1007,30 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let deadline = Instant::now() + wait;
     let reached = nodes.wait(&rx, deadline, "validators at the last block", |ns| {
         vals.iter().all(|&i| {
-            ns.get(i).is_some_and(|n| {
-                n.lines.iter().any(|l| l.starts_with("FAULT"))
-                    || blocks(n).last().map(|b| b.0.0) >= top
-            })
+            ns.get(i)
+                .is_some_and(|n| stopped(n).is_some() || blocks(n).last().map(|b| b.0.0) >= top)
         })
     });
-    if cli.finality {
-        let _ = nodes.wait(&rx, deadline, "validators FINAL", |ns| {
-            vals.iter()
-                .all(|&i| ns.get(i).is_some_and(|n| finals(n).last().copied() >= top))
-        });
-    }
+    // --finality: the block the box's stop closed is not in its own FINAL target, so the
+    // validators still running finalize through it too, unless HASHLAG stops left no quorum
+    // (R6, checked below).
+    let q = vals.len() - (vals.len().saturating_sub(1)) / 3;
+    let fin_tail = if cli.finality {
+        nodes.wait(
+            &rx,
+            Instant::now() + wait,
+            "validator FINAL through the last block",
+            |ns| {
+                let up: Vec<&Node> = vals.iter().filter_map(|&i| ns.get(i)).collect();
+                up.iter().filter(|n| stopped(n).is_none()).count() < q
+                    || up
+                        .iter()
+                        .all(|n| stopped(n).is_some() || finals(n).last().copied() >= top)
+            },
+        )
+    } else {
+        Ok(())
+    };
     let mut val_ok = Vec::new();
     for &i in &vals {
         val_ok.push(nodes.stop(i, &rx, Instant::now() + wait).unwrap_or(false));
@@ -1006,7 +1107,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
             let Some(n) = nodes.0.get(i) else { continue };
             let bs = blocks(n);
             let ids: Vec<_> = bs.iter().map(|b| b.0).collect();
-            let fault = n.lines.iter().find(|l| l.starts_with("FAULT"));
+            let fault = stopped(n);
             // R5: on an unpinned DEV machine REP_E_HASHLAG is a scheduling alarm. The blocks
             // before it must still be the box's, in order.
             let lag = fault.is_some_and(|f| f.starts_with("FAULT REP_E_HASHLAG "));
@@ -1254,29 +1355,75 @@ fn run(cli: &Cli) -> Result<bool, String> {
 
     if cli.finality {
         rep.check("finality", {
-            let short: Vec<String> = vals
-                .iter()
-                .filter_map(|&i| nodes.0.get(i))
-                .filter(|n| finals(n).last().copied() < top)
-                .map(|n| format!("{} at {:?}", n.name, finals(n).last()))
-                .collect();
-            if short.is_empty() {
+            let n = vals.len();
+            let target = fin_target.unwrap_or(0);
+            let val_target = top.unwrap_or(0).max(target);
+            let seq_final = nodes.0.get(seq).and_then(|x| finals(x).last().copied());
+            let mut errs = Vec::new();
+            let mut short = Vec::new();
+            let mut lagged = 0usize;
+            let mut lag_at: Vec<u64> = Vec::new();
+            for &i in &vals {
+                let Some(v) = nodes.0.get(i) else { continue };
+                match stopped(v) {
+                    Some(f) if f.starts_with("FAULT REP_E_HASHLAG ") && !cli.strict_hashlag => {
+                        lagged += 1;
+                        lag_at.extend(field(f, "height").and_then(|h| h.parse::<u64>().ok()));
+                    }
+                    // Any other stop already fails `validators`.
+                    Some(_) => {}
+                    None if finals(v).last().copied() < Some(val_target) => short.push(format!(
+                        "{} final {:?}",
+                        v.name,
+                        finals(v).last()
+                    )),
+                    None => {}
+                }
+            }
+            // R6: more than n − Q validators stopped at REP_E_HASHLAG leaves no quorum; the
+            // box cannot finalize the rest, which is DEV timing, not a fault.
+            let no_quorum = n - lagged < q;
+            // R6: quorum held below the (n − Q + 1)-th smallest stop height; when that spans at
+            // least two heights, the box must still have finalized from votes, so a broken vote
+            // path cannot pass.
+            lag_at.sort_unstable();
+            let quorum_until = lag_at.get(n - q).copied().unwrap_or(target);
+            // R6: without quorum the survivors cannot finalize the rest either.
+            if !no_quorum {
+                errs.append(&mut short);
+                if seq_final < Some(target) {
+                    errs.push(format!("vyrn-seq final {seq_final:?}"));
+                }
+            }
+            if no_quorum && quorum_until >= 2 && seq_final.is_none() {
+                errs.push(format!(
+                    "vyrn-seq finalized nothing, though Q validators ran through height {quorum_until}"
+                ));
+            }
+            if !no_quorum {
+                errs.extend(fin_wait.as_ref().err().cloned());
+                errs.extend(fin_tail.as_ref().err().cloned());
+            }
+            if no_quorum && errs.is_empty() {
+                println!(
+                    "WARN {lagged} of {n} validators stopped at REP_E_HASHLAG, below Q = {q}; vyrn-seq finalized through {seq_final:?} of {target} (R6)"
+                );
+            }
+            if errs.is_empty() && no_quorum {
                 Ok(format!(
-                    "every validator finalized through {}",
-                    top.unwrap_or(0)
+                    "no quorum after HASHLAG stops (R6); vyrn-seq finalized through {seq_final:?} while Q validators ran through {quorum_until}"
+                ))
+            } else if errs.is_empty() {
+                Ok(format!(
+                    "vyrn-seq through {target} and {} running validators through {val_target} finalized (Q = {q} of {n})",
+                    n - lagged
                 ))
             } else {
-                Err(format!(
-                    "not finalized through {top:?}: {}",
-                    short.join(", ")
-                ))
+                Err(format!("not finalized through {target}: {}", errs.join(", ")))
             }
         });
     } else {
-        Report::skip(
-            "finality",
-            "off (consensus is not wired into the binaries on this build; enable with --finality)",
-        );
+        Report::skip("finality", "off (enable with --finality)");
     }
     match (data_idx, data_ok) {
         (Some(i), Some(ok)) => rep.check("data", {
@@ -1325,7 +1472,105 @@ fn run(cli: &Cli) -> Result<bool, String> {
     Ok(rep.0)
 }
 
-/// Heights of a validator's `FINAL height=<h>` lines (R4).
+/// The line that stopped or stalled a validator: a sequencer `FAULT`, `OUT_OF_ORDER` (a stall
+/// with no repair), `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT`.
+fn stopped(n: &Node) -> Option<&str> {
+    const STOP: [&str; 5] = [
+        "FAULT ",
+        "OUT_OF_ORDER ",
+        "VOTER_FAULT ",
+        "DATA_FAULT ",
+        "REPLAY_FAULT ",
+    ];
+    n.lines
+        .iter()
+        .map(String::as_str)
+        .find(|l| STOP.iter().any(|p| l.starts_with(p)))
+}
+
+fn vote_seed(i: usize) -> [u8; 32] {
+    [u8::try_from(i + 1).unwrap_or(u8::MAX); 32]
+}
+
+/// The DEV committee of `--finality`: a BASE roster (08 §9.6) of one home, as in
+/// `bin/vyrn-validator/tests/committee.rs` (R4): voters `vote_seed(i)` at pre-picked TCP repl
+/// ports, this run's `seq_key` as the primary, a dummy standby; and the box's pre-picked CTRL
+/// address, which every validator lists as its observer.
+struct Cons {
+    roster: PathBuf,
+    roster_hash: String,
+    ctrl: SocketAddrV4,
+}
+
+impl Cons {
+    /// `ports`: `n` TCP repl ports, then the box's CTRL port (`data_ports`).
+    fn new(dir: &Path, ports: &[u16]) -> Result<Self, String> {
+        let (repl, ctrl) = ports.split_at(ports.len().saturating_sub(1));
+        let n = repl.len();
+        use vyrn_epoch::{Addr, Domain, Home, Roster, SeqEntry, Voter};
+        let addr = |port: u16| {
+            let mut ip = [0u8; 16];
+            ip[10] = 0xff;
+            ip[11] = 0xff;
+            ip[12..].copy_from_slice(&[127, 0, 0, 1]);
+            Addr { ip, port }
+        };
+        let seq_key = vyrn_crypto::ed25519::public_key(&SEQ_SEED);
+        let mut voters = Vec::with_capacity(n);
+        for i in 0..n {
+            let k = vyrn_crypto::ed25519::public_key(&vote_seed(i)).to_vec();
+            voters.push(Voter {
+                client: u8::try_from(i % 2).map_err(|e| e.to_string())?,
+                facility: u8::try_from(i + 1).map_err(|e| e.to_string())?,
+                node_key: k.clone(),
+                vote_key: k,
+                xchg_key: vec![0x55; 32],
+                data_addr: addr(0),
+                repl_addr: addr(*repl.get(i).ok_or("repl port")?),
+            });
+        }
+        let seq = [seq_key, [0x77; 32]]
+            .iter()
+            .zip(1u8..)
+            .map(|(k, f)| SeqEntry {
+                facility: f,
+                node_key: k.to_vec(),
+                seq_key: k.to_vec(),
+                xchg_key: vec![0x66; 32],
+                client_addr: addr(0),
+                repl_addr: addr(0),
+            })
+            .collect();
+        let home = Home {
+            voters,
+            seq,
+            recovery: 0,
+            data: Vec::new(),
+        };
+        let r = Roster {
+            sig_scheme: 0,
+            epoch_from: Epoch(0),
+            homes: [home.clone(), home.clone(), home],
+            bridge: None,
+        };
+        let domain = Domain {
+            genesis_hash: Hash([0; 32]),
+            mode: vyrn_types::Mode::Base,
+        };
+        let roster = dir.join("roster.hex");
+        std::fs::write(&roster, hex(&r.encode())).map_err(|e| e.to_string())?;
+        Ok(Self {
+            roster,
+            roster_hash: hex(&r.hash(&domain).0),
+            ctrl: SocketAddrV4::new(
+                std::net::Ipv4Addr::LOCALHOST,
+                *ctrl.first().ok_or("ctrl port")?,
+            ),
+        })
+    }
+}
+
+/// Heights of a validator's `FINAL height=<h>` lines, and of the box's (R4).
 fn finals(n: &Node) -> Vec<u64> {
     n.lines
         .iter()

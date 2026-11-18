@@ -1179,6 +1179,7 @@ dependencies = [
  "vyrn-crypto",
  "vyrn-cut",
  "vyrn-engine",
+ "vyrn-epoch",
  "vyrn-lane",
  "vyrn-log",
  "vyrn-replica",
