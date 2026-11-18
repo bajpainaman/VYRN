@@ -19,7 +19,9 @@
 //!
 //! Each fact is written and fsynced before the call returns, so a caller signs or votes only
 //! after its fact is durable (08 §5.3 rule 4, F4). On open, a last line without its `\n` is a
-//! write that never completed and is dropped; any other malformed line fails the open.
+//! write that never completed and is dropped; any other malformed line fails the open. The file
+//! holds an exclusive lock while open, so only one guard can admit records, and a newly created
+//! journal's parent directory is fsynced before `open` returns.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -161,6 +163,8 @@ pub enum JournalErr {
     Handoff(#[from] HandoffErr),
     #[error("an earlier write failed; reopen the journal")]
     Failed,
+    #[error("the journal is open in another guard or process")]
+    Locked,
 }
 
 /// The durable `SignOnce` admissions and `armed(e+1)` facts of one replica.
@@ -193,11 +197,20 @@ fn hex(b: &[u8]) -> String {
 impl EpochJournal {
     /// Opens or creates the journal at `path` and rebuilds its state.
     pub fn open(path: &Path) -> Result<Self, JournalErr> {
+        let created = !path.exists();
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(path)?;
+        // One writer per journal: a second guard over the same file could admit a conflicting
+        // record as Fresh. The lock is held for the life of `file`.
+        file.try_lock().map_err(|_| JournalErr::Locked)?;
+        if created {
+            // A new file's directory entry is durable only once its parent directory is synced.
+            let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+            File::open(dir.unwrap_or(Path::new(".")))?.sync_all()?;
+        }
         let mut text = String::new();
         file.read_to_string(&mut text)?;
         let keep = text.rfind('\n').map_or(0, |i| i.saturating_add(1));

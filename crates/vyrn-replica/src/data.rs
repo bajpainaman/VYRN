@@ -5,8 +5,9 @@
 //! ([`DataJoin::put`]). A resend of one `pkt_seq` may differ in its unsigned bytes (04 D3), so a
 //! key holds every variant, and a record picks the variant whose `pkt_hash` it names.
 //!
-//! **Readers.** The vote reads [`DataJoin::check`] for a ready block: `Pending` while a payload
-//! is missing, an error when its own `data_root` differs from the header's. Replay reads payloads
+//! **Readers.** The vote reads [`DataJoin::check`] for a ready block: `Missing` (ask again)
+//! while a payload is absent, `Count` when a payload with the record's hash has another number of
+//! numbered messages, `Root` when its own `data_root` differs from the header's. Replay reads payloads
 //! through [`vyrn_engine::Payloads`].
 //!
 //! **Hashes.** A packet's full hash is BLAKE3 of its signed bytes, `0 .. 16 + 16·count`, the
@@ -35,6 +36,10 @@ pub enum DataErr {
     /// A PacketRecord has no payload with its `pkt_hash` yet: ask again (07 §5.5 fetches it).
     #[error("payload missing for session {session:?} pkt_seq {pkt_seq}")]
     Missing { session: SessionId, pkt_seq: u32 },
+    /// A payload with the record's `pkt_hash` whose numbered messages do not match the
+    /// record's `count` (07 §5.4).
+    #[error("count of session {session:?} pkt_seq {pkt_seq} differs from its payload")]
+    Count { session: SessionId, pkt_seq: u32 },
     /// Every payload is joined, and the block's `data_root` is not the header's.
     #[error("data_root differs from the header")]
     Root,
@@ -52,6 +57,20 @@ fn signed(bytes: &[u8]) -> &[u8] {
     bytes
         .get(..n.saturating_mul(16).saturating_add(16))
         .unwrap_or(bytes)
+}
+
+/// Whether a record's `count` fits its payload (07 §5.4, 05 §3.1). As the merged lane assigns
+/// them (`vyrn-lane` pass 1), every message takes a LaneSeq except a Heartbeat or ResendReq in a
+/// packet with no header-level reject; a header reject numbers every message. The replica cannot
+/// see that reject, so either count is accepted [Likely: spec gap, PR body].
+pub fn count_fits(count: u8, bytes: &[u8]) -> bool {
+    let n = bytes.get(8).copied().unwrap_or(0);
+    let unnumbered = (0..usize::from(n))
+        .filter_map(|i| bytes.get(i.saturating_mul(16).saturating_add(16)))
+        .filter(|&&k| k == vyrn_wire::Msg::HEARTBEAT || k == vyrn_wire::Msg::RESEND_REQ)
+        .count();
+    let numbered = usize::from(n).saturating_sub(unnumbered);
+    usize::from(count) == numbered || count == n
 }
 
 /// The full hash of a packet (01 §3).
@@ -83,9 +102,19 @@ impl DataJoin {
             .find(|v| prefix(&v.full) == r.pkt_hash)
     }
 
-    /// The payload and full hash a record names, if held.
-    pub fn resolve(&self, r: &PacketRecord) -> Option<(&[u8], Hash)> {
-        self.variant(r).map(|v| (v.bytes.as_slice(), v.full))
+    /// The payload and full hash a record names, if held and its `count` fits (07 §5.4).
+    pub fn resolve(&self, r: &PacketRecord) -> Result<(&[u8], Hash), DataErr> {
+        let v = self.variant(r).ok_or(DataErr::Missing {
+            session: r.session,
+            pkt_seq: r.pkt_seq,
+        })?;
+        if !count_fits(r.count, &v.bytes) {
+            return Err(DataErr::Count {
+                session: r.session,
+                pkt_seq: r.pkt_seq,
+            });
+        }
+        Ok((v.bytes.as_slice(), v.full))
     }
 
     /// Vote-rule item 3 for one ready block: every packet is joined and `data_root` matches.
@@ -96,10 +125,7 @@ impl DataJoin {
             if p.flags & PacketFlags::ADVANCE != 0 {
                 continue;
             }
-            let (_, full) = self.resolve(p).ok_or(DataErr::Missing {
-                session: p.session,
-                pkt_seq: p.pkt_seq,
-            })?;
+            let (_, full) = self.resolve(p)?;
             let half = usize::from(i >= b.split);
             if let Some(h) = halves.get_mut(half) {
                 h.push(full);
@@ -125,6 +151,6 @@ impl DataJoin {
 
 impl vyrn_engine::Payloads for DataJoin {
     fn get(&self, r: &PacketRecord) -> Option<&[u8]> {
-        self.resolve(r).map(|(b, _)| b)
+        self.resolve(r).ok().map(|(b, _)| b)
     }
 }

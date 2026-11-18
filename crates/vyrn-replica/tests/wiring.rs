@@ -85,6 +85,10 @@ fn journal_survives_restart_and_drops_a_torn_tail() {
     let r = record(2, 80);
     {
         let mut j = EpochJournal::open(&path).unwrap();
+        assert!(
+            matches!(EpochJournal::open(&path), Err(JournalErr::Locked)),
+            "a second guard over one journal"
+        );
         assert_eq!(j.admit(&r).unwrap(), Signed::Fresh);
         assert_eq!(j.admit(&r).unwrap(), Signed::Repeat);
         j.arm(Epoch(3)).unwrap();
@@ -193,4 +197,53 @@ fn data_join_checks_data_root_per_half() {
         Err(DataErr::Root)
     );
     assert_eq!(vyrn_engine::Payloads::get(&j, &a), Some(pa.as_slice()));
+    // A record whose count disagrees with its payload's numbered messages (07 §5.4).
+    let mut bad = a;
+    bad.count = 2;
+    assert_eq!(
+        j.resolve(&bad).map(|(_, h)| h),
+        Err(DataErr::Count {
+            session: SessionId(7),
+            pkt_seq: 1
+        })
+    );
+    assert_eq!(vyrn_engine::Payloads::get(&j, &bad), None);
+}
+
+#[test]
+fn count_follows_the_lane_numbering() {
+    // Two messages: a New (0x01) and a Heartbeat (0x10).
+    let mut p = vec![0u8; 16 + 32 + 16];
+    p[8] = 2;
+    p[16] = 0x01;
+    p[32] = 0x10;
+    assert!(
+        vyrn_replica::data::count_fits(1, &p),
+        "the heartbeat takes no LaneSeq"
+    );
+    assert!(
+        vyrn_replica::data::count_fits(2, &p),
+        "a header reject numbers every message"
+    );
+    assert!(!vyrn_replica::data::count_fits(0, &p));
+}
+
+#[test]
+fn a_running_order_core_takes_its_epoch_fence() {
+    let layout = vyrn_log::Layout::new(4, 2, 0).unwrap();
+    let mut core =
+        vyrn_replica::OrderCore::<4, _>::new(layout, ActiveEpoch::new(activation(), BookId(1)))
+            .unwrap();
+    assert_eq!(
+        core.verdict(Height(81), Height(81)),
+        vyrn_consensus::Verdict::Pending
+    );
+    assert!(
+        core.view_mut()
+            .set_fence(Fence::from_record(&record(2, 80)))
+    );
+    assert_eq!(
+        core.verdict(Height(81), Height(81)),
+        vyrn_consensus::Verdict::Invalid
+    );
 }

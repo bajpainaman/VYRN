@@ -3700,6 +3700,7 @@ dependencies = [
  "vyrn-epoch",
  "vyrn-log",
  "vyrn-types",
+ "vyrn-wire",
 ]
 
 [[package]]
