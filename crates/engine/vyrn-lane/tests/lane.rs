@@ -850,6 +850,48 @@ fn pooled_lanes_hand_the_bbo_the_pool_wide_account_index() {
 }
 
 #[test]
+fn a_cancel_after_reject_stp_is_too_late_with_detail_out() {
+    // 04 §6.8, §6.4: a CancelNewest aggressor that meets its own resting order before any fill
+    // gets `Reject STP`, but the order was in the matching step and the exchange ended it, so a
+    // later `Cancel` of its handle is `TOO_LATE` with `PROTO_D_OUT` (3), as the vx oracle's
+    // `stp_end` records (END_OUT), not `PROTO_D_CANCELED` (2).
+    let (mut bbo, mut w) = setup();
+    let mut x = w.rig();
+    x.open(0, 30, 1, vyrn_risk::SessionBuckets::default());
+    x.send(0, 1, 1_000, &[new(day(Side::Sell), 105, 1, 11)]);
+    x.settle(&mut bbo);
+    let f = vyrn_bbo::OrderFlags::new(
+        Side::Buy,
+        vyrn_bbo::Tif::Day,
+        false,
+        vyrn_bbo::Stp::CancelNewest,
+    );
+    x.send(0, 30, 2_000, &[new(f, 105, 1, 22)]);
+    x.settle(&mut bbo);
+    let taker = Handle::new(2, 1).unwrap();
+    assert_eq!(
+        x.records(0, 30),
+        vec![Record::Reject {
+            index: 0,
+            reason: RejectReason::Stp,
+            detail: Handle::new(1, 1).unwrap().0,
+            client_tag: 22
+        }]
+    );
+    x.send(0, 30, 3_000, &[cancel(taker, 33)]);
+    x.settle(&mut bbo);
+    assert_eq!(
+        x.records(0, 30)[1],
+        Record::Reject {
+            index: 0,
+            reason: RejectReason::TooLate,
+            detail: vyrn_lane::lane::PROTO_D_OUT,
+            client_tag: 33
+        }
+    );
+}
+
+#[test]
 fn a_replayed_log_reproduces_the_original_forwarding() {
     // 05 §10: in replay, op (l, q) is forwarded iff a StepRecord has src = (l, q). Original run:
     // with no ask, sell 5 @ 110 improves and is forwarded (05 §6.5): Improve step, src (0, 1).

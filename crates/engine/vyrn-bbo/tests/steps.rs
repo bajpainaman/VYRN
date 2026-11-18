@@ -703,6 +703,8 @@ fn stp_cancel_newest_rejects_before_a_fill_and_outs_after_one() {
     // Case A: own ask 1 @ 102, CancelNewest buy 1 @ 102 (msg index 3) → Reject, maker stays.
     // Case B: account 2's ask 1 @ 101 and own ask 1 @ 102; CancelNewest buy 3 @ 102. Step 1
     // fills 1 @ 101 (one level per step, D14); the CONT step meets the own ask → Out STP, qty 2.
+    // Case C: account 2's ask 1 @ 102, then own ask 1 @ 102 (same level); CancelNewest buy 3 @
+    // 102. One step, not CONT: Fill 1, then Out STP, qty 2 (a fill came first in this step).
     let f = OrderFlags::new(Side::Buy, Tif::Day, false, Stp::CancelNewest);
     let (mut bbo, mut w) = setup(0);
     let mut x = w.lanes();
@@ -756,6 +758,36 @@ fn stp_cancel_newest_rejects_before_a_fill_and_outs_after_one() {
             client_tag: u32::try_from(q).unwrap() + 1000,
         }]]
     );
+
+    let (mut bbo, mut w) = setup(0);
+    let mut x = w.lanes();
+    rest(&mut x, &mut bbo, 1, 10, Side::Sell, 102, 1, 2);
+    rest(&mut x, &mut bbo, 1, 11, Side::Sell, 102, 1, 1);
+    let (q, slot) = x.forward(1, 20, f, 102, 3, 1, 3, &[], BIG_DEADLINE);
+    x.publish_cut();
+    let s = step_src(&mut x, &mut bbo, 1);
+    assert_eq!(s.entry.flags & STEP_CONT, 0);
+    let h = Handle::new(slot, vyrn_bbo::mem::MEM_GEN).unwrap();
+    assert_eq!(
+        s.role(ROLE_TAKER),
+        vec![vec![
+            Record::Fill {
+                index: 3,
+                liq: LIQ_TAKER,
+                handle: h,
+                tick: Tick(102),
+                qty: Qty(1),
+            },
+            Record::Out {
+                index: 3,
+                cause: OUT_STP,
+                handle: h,
+                qty: Qty(2),
+                client_tag: u32::try_from(q).unwrap() + 1000,
+            }
+        ]]
+    );
+    assert!(!bbo.continuing());
 }
 
 #[test]
