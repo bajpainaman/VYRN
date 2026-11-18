@@ -52,6 +52,8 @@ pub const BYTES: usize = 24;
 pub const GOSSIP_EVERY_NS: u64 = 10_000_000;
 /// How many times each redirect round goes out (reading).
 pub const REDIRECT_ROUNDS: u8 = 3;
+/// Every session's home before any move: entry 0 of its `KeyBundle.data` (reading s).
+const FIRST_HOME: u8 = 0;
 /// REDIRECTs sent per [`GOSSIP_EVERY_NS`] to each live box (reading): 12 800/s with bursts of
 /// 128, under `vyrn-data`'s default fetch bucket.
 pub const REDIRECT_BATCH: usize = 128;
@@ -192,9 +194,10 @@ pub struct Failover {
     /// Queued REDIRECTs `(session, resend_from, down, to)`, and when the next batch may leave.
     outbox: VecDeque<(SessionId, u32, u8, u8)>,
     next_batch: u64,
-    /// The sessions' last home move `(down, to)`, and the sessions queued a REDIRECT for it: a
-    /// session first released after its rounds is queued then (Codex r4612821618).
-    moved: Option<(u8, u8)>,
+    /// Whether the home moved, and the sessions queued a REDIRECT for its last move: a session
+    /// first released after the rounds is queued then (Codex r4612821618), from the home every
+    /// session starts on to the current one, since it has followed no move (Codex r4612923593).
+    moved: bool,
     redirected: BTreeSet<SessionId>,
     /// The highest `pkt_seq` per session in a final block.
     final_max: BTreeMap<SessionId, u32>,
@@ -214,11 +217,11 @@ impl Failover {
             votes: vec![BTreeSet::new(); n],
             effective: vec![false; n],
             gossiped: vec![None; n],
-            home: 0,
+            home: FIRST_HOME,
             rounds: Vec::new(),
             outbox: VecDeque::new(),
             next_batch: 0,
-            moved: None,
+            moved: false,
             redirected: BTreeSet::new(),
             final_max: BTreeMap::new(),
             unfinal: VecDeque::new(),
@@ -299,7 +302,7 @@ impl Failover {
                 if let Some(to) = vyrn_data::redirect::backup_home(d, &live) {
                     self.home = to;
                     self.rounds.push((d, to, REDIRECT_ROUNDS, now));
-                    self.moved = Some((d, to));
+                    self.moved = true;
                     self.redirected.clear();
                 }
             }
@@ -342,11 +345,11 @@ impl Failover {
         }
         // After a home move, a session not redirected yet gets its rounds now, from its lowest
         // `pkt_seq` in this block, which is not final yet (reading t).
-        if let Some((down, to)) = self.moved {
+        if self.moved {
             for (s, (lo, _)) in &m {
                 if self.redirected.insert(*s) {
                     for _ in 0..REDIRECT_ROUNDS {
-                        self.outbox.push_back((*s, *lo, down, to));
+                        self.outbox.push_back((*s, *lo, FIRST_HOME, self.home));
                     }
                 }
             }
@@ -548,6 +551,21 @@ mod tests {
         );
         f.released(3, [(SessionId(9), 8)]);
         assert!(f.batch(GOSSIP_EVERY_NS).is_empty(), "queued once");
+    }
+
+    /// Codex r4612923593: after 0 → 1 and 1 → 2, a late session still sends to box 0, so its
+    /// redirect is 0 → 2 (DR2 drops a 1 → 2 one).
+    #[test]
+    fn a_late_session_moves_from_its_first_home() {
+        let mut f = Failover::new(3, 0, 1, 0, 1);
+        f.silent(&[0], 0);
+        assert_eq!(f.step(0).1, vec![(0, 1)]);
+        f.silent(&[1], 1);
+        assert_eq!(f.step(1).1, vec![(1, 2)]);
+        f.released(1, [(SessionId(9), 4)]);
+        let sent = f.batch(0);
+        assert!(!sent.is_empty());
+        assert!(sent.iter().all(|r| (r.1, r.2, r.3) == (4, 0, 2)));
     }
 
     /// Session 5 is final through 9, so past it; 6 has a released block not final yet below

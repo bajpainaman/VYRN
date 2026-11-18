@@ -1272,7 +1272,8 @@ fetch bucket (`vyrn-data` defaults: burst 256, 20 000/s). `resend_from` is the s
 `pkt_seq` in any block the replica holds that is not final yet, resolved there or not, because a
 payload one replica repaired before finality may be held by no other; if it holds none, it is one
 past the highest `pkt_seq` in a final block. Shed records count toward neither. A session the replica first
-releases after the home moved gets its own rounds then, from its lowest `pkt_seq` in that block. `REP_DATA_SILENCE_MS`
+releases after the home moved gets its own rounds then, from its lowest `pkt_seq` in that block,
+with `down` its first home and `to` the current one, since it has followed no move. `REP_DATA_SILENCE_MS`
 is 1 ms. A DEV validator may raise it (`[data] silence_us`) for an unpinned host.
 
 **Backup addresses (interim reading).** Step 3 needs every live box to know the affected
