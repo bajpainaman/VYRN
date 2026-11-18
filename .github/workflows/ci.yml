@@ -117,9 +117,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: actionlint 1.7.12
         run: |
-          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash -o /tmp/dl-actionlint.bash
-          echo "72fa3e45ac20f3c3a512d6747b4fcf719e21f890e8c43e78d48a41fdfb900c4e  /tmp/dl-actionlint.bash" | sha256sum -c --quiet -
-          bash /tmp/dl-actionlint.bash 1.7.12
+          # The release tarball itself, checked against its sha256 from the release's
+          # checksums.txt (CDPI S9): upstream's download script pipes an unchecked tarball to tar.
+          curl --proto '=https' --tlsv1.2 -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz -o /tmp/actionlint.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  /tmp/actionlint.tar.gz" | sha256sum -c --quiet -
+          tar -xzf /tmp/actionlint.tar.gz actionlint
           ./actionlint -color
 
   deny:

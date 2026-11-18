@@ -26,6 +26,10 @@ BINSTALL_URL="https://raw.githubusercontent.com/cargo-bins/cargo-binstall/v1.27.
 BINSTALL_SHA256="d3a93702160e0ec03e2a4e996855db1f01adee801fb84a43add24e0877ef8eae"
 FOUNDRYUP_URL="https://raw.githubusercontent.com/foundry-rs/foundryup/d8a3201f2a7a2a0b85201e9cbd297a6800dc29bf/foundryup-init.sh"
 FOUNDRYUP_SHA256="5a8990dff59498a094cb3562ed4be917b3000f32781b50c2b60b399b4ea37dd7"
+# apt.llvm.org's signing key (fingerprint 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421): the trust
+# root of the LLVM packages, so it is checked like the installers.
+LLVM_KEY_URL="https://apt.llvm.org/llvm-snapshot.gpg.key"
+LLVM_KEY_SHA256="8b2a587ffd672c4687e7581dad4b2f6c1bb2ad6b480cd9771ba2ff48e0b8c75d"
 
 # Downloads $1 to the file $3 and fails unless its sha256 is $2.
 fetch_checked() {
@@ -106,8 +110,8 @@ llvm_repo() {
   local list="/etc/apt/sources.list.d/llvm-${version}.list"
   [[ -f "$list" ]] && return 0
   if [[ ! -f /usr/share/keyrings/llvm-snapshot.gpg ]]; then
-    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
-      sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
+    fetch_checked "$LLVM_KEY_URL" "$LLVM_KEY_SHA256" /tmp/llvm-snapshot.gpg.key
+    sudo gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg </tmp/llvm-snapshot.gpg.key
   fi
   echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-${version} main" |
     sudo tee "$list" >/dev/null
