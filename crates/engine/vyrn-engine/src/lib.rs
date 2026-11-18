@@ -14,6 +14,8 @@
 //! | `LaneCut[l]` | engine, stream-core role | lane `l` | written after the step's `StepEntry` and every `CutDelta` line were read from the `StepLog` (frame first, `INV-FRAME-FIRST`) | 05 §4.15 |
 //! | each lane's `SnapshotLine` | engine, snapshot fan-out | lane `l` | copied from the BBO's line before every BBO poll and before every lane poll | 05 §4.14 |
 //! | order stream ([`Rec`]) | engine, in call order | [`Sink`], [`Engine::replay`] | lane records in each lane's production order; a step's [`Rec::Step`] after its last lane record that the step's cut covers | 01 §6.6, 05 §6.2 |
+//! | pool account tokens (`vyrn_cut::PoolTok`) and their [`AcctTake`](vyrn_types::AcctTake) records | engine, pool-core role ([`Engine::pool_session`]) | pool cores, [`Sink::take`] | per record of a pooled session: take (CAS), [`Sink::take`], release, then the record; `ver` is gapless across the pool | 01 §14.17.4, 05 §6.9 |
+//! | control commands | caller, control role ([`Engine::command`]) | BBO core | one per step, before ring heads; replay queues the same commands before the stream | 05 §4.1, §8.8 |
 //! | responses | lanes ([`Sink::lane_resp`]) and the fill TX role ([`Sink::tx`]) | gateway | lane packets carry their `Gate`; TX packets go out after their `StepEntry` | 05 §8.10 |
 //!
 //! **Modes** (`C-ONEBIN`: one code path, chosen by the call, not by a build flag).
@@ -52,7 +54,15 @@
 //!   derived from its first step's kind, because the log does not carry the live
 //!   classification. A `Cross` that STP stops before any fill is logged as `Improve`, so it
 //!   replays with the `Improve` bucket: a known divergence until the spec logs the route.
-//! - Pooled lanes (`AcctTake`) and auction control steps.
+//! - Pooled lanes. Each record of a pooled session takes the account's token, logs
+//!   `AcctTake` and releases it. The lane's work for that record is already done: one thread
+//!   plays every pool core, so nothing else can write the account in between. Boundary work
+//!   (B1 fills, B2 settlement) on a pooled account takes no token and logs no `AcctTake`,
+//!   because the lane does not report which accounts a boundary touched. The account's ledger
+//!   and sessions stay lane-local (`vyrn-lane` has no shared `PoolAcct`). Replay does not yet
+//!   check `AcctTake` records, and [`OwnedRec`] cannot hold one.
+//! - Control steps carry their kind, not their command, in the order stream. A replayer
+//!   queues the commands through [`Engine::command`] before [`Engine::replay`].
 //! - On a delayed backend (`Sim`), a step's lines may become visible after `Bbo::poll`
 //!   publishes it. The stream role reads step `s` once the BBO snapshot shows `done_step ≥ s`
 //!   (published after the step's other lines) and polls the BBO core again only after that, so
