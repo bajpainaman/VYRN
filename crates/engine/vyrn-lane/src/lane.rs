@@ -50,6 +50,8 @@ pub const PROTO_D_OUT: u32 = 3;
 /// `SESSION_CLOSED` detail of a draining session (04 M4): 7, after the six close causes of
 /// 04 §4.3, so a client tells it from `PROTO_D_LOGOUT` (1).
 pub const PROTO_D_DRAINING: u32 = 7;
+/// The `BAD_MAC` close cause (04 §4.3), set by a V6 failure.
+pub const PROTO_D_BAD_MAC: u32 = 2;
 
 /// Book and lane parameters, fixed at epoch start (05 §13).
 #[derive(Clone, Copy, Debug)]
@@ -459,6 +461,36 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         }
         true
     }
+    /// Moves an open session to `DRAINING` (04 §4.3): `New` and `Replace` then get
+    /// `SESSION_CLOSED` (`PROTO_D_DRAINING`), everything else still works. `false` unless the
+    /// session is open on this lane.
+    pub fn drain_session(&mut self, id: SessionId) -> bool {
+        match self.sess.find(id).and_then(|i| self.sess.get_mut(i)) {
+            Some(s) if s.state == SessState::Open => {
+                s.state = SessState::Draining;
+                true
+            }
+            _ => false,
+        }
+    }
+    /// Closes a session with a `PROTO_D_*` cause other than `BAD_MAC` (04 §4.3), which V6 sets
+    /// itself: emits the final in-stream `Reject SESSION_CLOSED` with detail = `cause` at index
+    /// 0xFF, and from then V7 answers out of stream with the same detail. `false` if the
+    /// session is not open or draining on this lane.
+    pub fn close_session(&mut self, id: SessionId, cause: u32) -> bool {
+        let Some(si) = self.sess.find(id) else {
+            return false;
+        };
+        let Some(s) = self.sess.get(si).copied() else {
+            return false;
+        };
+        if !matches!(s.state, SessState::Open | SessState::Draining) {
+            return false;
+        }
+        let echo = s.expected.saturating_sub(1);
+        self.close(si, cause, RejectReason::SessionClosed, cause, echo);
+        true
+    }
     /// The account and its balance in this lane's book (control path: credits, limits).
     pub fn account_mut(&mut self, a: AcctSlot) -> Option<(&mut AcctRisk, &mut BookBal)> {
         self.accts.get_mut(a).ok()
@@ -824,23 +856,13 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         }
         // V6.
         if !req.verify_seq(&s.k_seq) {
-            self.sess.set_state(sid, SessState::Closed);
-            let mut r = RespPkt::new(sid, s.next_resp, pkt_seq, Gate::None);
-            r.push(Record::Reject {
-                index: vyrn_wire::INDEX_NONE,
-                reason: RejectReason::BadMac,
-                detail: 0,
-                client_tag: 0,
-            });
-            if let Some(x) = self.sess.get_mut(si) {
-                x.next_resp = x.next_resp.wrapping_add(1);
-            }
-            self.out.resp(r);
+            // 04 §4.3: the final record of a BAD_MAC close has detail = the offending pkt_seq.
+            self.close(si, PROTO_D_BAD_MAC, RejectReason::BadMac, pkt_seq, pkt_seq);
             return Rx::Closed;
         }
-        // V7.
+        // V7: detail = the close cause (04 §3.1).
         if s.state == SessState::Closed {
-            self.oos(si, pkt_seq, RejectReason::SessionClosed, 0);
+            self.oos(si, pkt_seq, RejectReason::SessionClosed, s.close_cause);
             return Rx::OutOfStream(RejectReason::SessionClosed);
         }
         // V8.
@@ -975,6 +997,25 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
 
     fn stored_tag(&self, h: Handle) -> u32 {
         self.root(h.slot()).filter(|r| r.live).map_or(0, |r| r.tag)
+    }
+
+    /// Closes session `si` with `cause` and emits its final in-stream record (04 §4.3):
+    /// `Reject reason` with `detail` at index 0xFF, echoing `echo`.
+    fn close(&mut self, si: u16, cause: u32, reason: RejectReason, detail: u32, echo: u32) {
+        let Some(x) = self.sess.get_mut(si) else {
+            return;
+        };
+        x.state = SessState::Closed;
+        x.close_cause = cause;
+        let mut r = RespPkt::new(x.id, x.next_resp, echo, Gate::None);
+        x.next_resp = x.next_resp.wrapping_add(1);
+        r.push(Record::Reject {
+            index: vyrn_wire::INDEX_NONE,
+            reason,
+            detail,
+            client_tag: 0,
+        });
+        self.out.resp(r);
     }
 
     fn oos(&mut self, si: u16, pkt_seq: u32, reason: RejectReason, detail: u32) {

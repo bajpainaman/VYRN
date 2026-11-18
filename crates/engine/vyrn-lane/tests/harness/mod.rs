@@ -354,6 +354,12 @@ impl Rig<'_> {
         self.send_impl(l, a, rx_ts, rx_ts, msgs, mids, Some(routes))
     }
 
+    /// As [`Self::send`], tagged under `key` instead of the session's `K_seq` (a V6 failure
+    /// when they differ).
+    pub fn send_keyed(&mut self, l: usize, a: u32, rx_ts: u64, msgs: &[Msg], key: &[u8; 16]) -> Rx {
+        self.send_impl_keyed(l, a, rx_ts, rx_ts, msgs, &[], None, Some(key))
+    }
+
     fn send_impl(
         &mut self,
         l: usize,
@@ -364,11 +370,26 @@ impl Rig<'_> {
         mids: &[Mid],
         routes: Option<&[(LaneSeq, Route)]>,
     ) -> Rx {
+        self.send_impl_keyed(l, a, rx_ts, now, msgs, mids, routes, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_impl_keyed(
+        &mut self,
+        l: usize,
+        a: u32,
+        rx_ts: u64,
+        now: u64,
+        msgs: &[Msg],
+        mids: &[Mid],
+        routes: Option<&[(LaneSeq, Route)]>,
+        key: Option<&[u8; 16]>,
+    ) -> Rx {
         let ai = usize::try_from(a).unwrap();
         self.pkt[l][ai] += 1;
         let hdr = ReqHeader::new(sid(l, a), self.pkt[l][ai], Epoch(0).low16(), BOOK, false);
         let mut buf = [0u8; MAX_REQ_PAYLOAD];
-        let n = encode_request(&mut buf, hdr, msgs, &kseq(l, a), None).unwrap();
+        let n = encode_request(&mut buf, hdr, msgs, key.unwrap_or(&kseq(l, a)), None).unwrap();
         let rx = RxIn {
             bytes: &buf[..n],
             rx_ts: Nanos(rx_ts),
@@ -427,6 +448,15 @@ impl Rig<'_> {
             book: BOOK,
             buckets,
         }));
+    }
+
+    /// Closes session `a` of lane `l` with `cause` from the control path and collects its final
+    /// record.
+    pub fn close_session(&mut self, l: usize, a: u32, cause: u32) -> bool {
+        let ok = self.lanes[l].close_session(sid(l, a), cause);
+        self.collect(l);
+        self.note_out();
+        ok
     }
 
     /// Takes lane `l`'s next forward-ring entry before the BBO core sees it (its header line;
