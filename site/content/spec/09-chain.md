@@ -187,13 +187,18 @@ committee key per possible sequencer.
   dealer also encapsulates to the ML-KEM part of each member's exchange key and puts the 1,088 B
   ciphertext `ct` beside the wrap. The wrap key's material is the X25519 secret ‖ the ML-KEM secret
   ‖ BLAKE3(`ct`). The wrapped private half is the X25519 scalar and the ML-KEM seed (96 B, 112 B
-  with the tag). Each member also checks that ML-KEM key generation from the seed gives the
-  published ML-KEM key, so the dealer still cannot give members different keys. Cost: 3
+  with the tag). The seed is `(d, z)` (FIPS 203): the public key depends on `d` only, and `z` is the
+  implicit-rejection secret, so a matching public key alone does not prove that members hold the
+  same decapsulation key. `CommitteeKey` therefore carries `seed_hash` = BLAKE3 of the 64-byte seed,
+  and before confirming, each member checks both that ML-KEM key generation from its seed gives the
+  published ML-KEM key and that BLAKE3 of its seed equals `seed_hash`. The dealer then cannot give
+  members different `d` or different `z` (01 §14.20 KG3). Cost: 3
   encapsulations per record and one decapsulation per member, ≤ 0.1 ms in all.
 
 ```
 CommitteeKey {
     epoch: Epoch, seq_op: OpIdx, pub_key: KexKey,   // 32 B, or 1,216 B for e ≥ E_pq
+    seed_hash: Hash,                          // e ≥ E_pq only: BLAKE3 of the ML-KEM seed (d, z)
     wrapped: [(OpIdx, [u8; 48]); 3],          // to the 3 other members; for e ≥ E_pq
                                               //   [u8; 1,088 + 112]: ct ‖ wrapped hybrid half
     confirms: [(OpIdx, [u8; 64]); ≥ 3],      // Ed25519 by each member's NK
@@ -1347,8 +1352,9 @@ side checks them.
    `PqAlarm` on a published estimate that a cryptographically relevant quantum computer exists or
    is within the timelock horizon, or at once on any public demonstration that a secp256k1 or
    Ed25519 private key was computed from its public key. From `PqAlarm`, `BadPost` evidence is
-   verified and recorded but moves no bond (§8.1 item 2a), because a quantum attacker can forge
-   the secp256k1 signature it rests on.
+   verified and recorded but changes no bond and no jail (§8.1 item 2a, overriding §8.4's slash and
+   jail), because a quantum attacker can forge the secp256k1 signature it rests on, and two forged
+   jails would stop 4-of-5 finality.
 5. **Disclosure.** The service contract states: "Funds in the L1 bridge and accounts with classical
    owner keys are not protected against a quantum attacker. VYRN's ordering, finality and history
    are." 01 §14.20 PQ-5 (decided) fixes when step 3 deploys and when step 4 is raised;
@@ -1459,7 +1465,7 @@ Anyone submits an `Evidence` item. Its handling is automatic:
    | `DoubleCommit` | `a.sig`, `b.sig` | — |
    | `Censorship` | the `seq_sig` of every book header in `(lastb(C), h]` | the finalization certificate of `C` |
    | `WrongExclusion` | the finalization certificate of the block | — (the disclosure is a hash preimage) |
-   | `BadPost` | `sig` (secp256k1, outside SG7; moves no bond from `PqAlarm`, §6.8) | — |
+   | `BadPost` | `sig` (secp256k1, outside SG7; no bond and no jail from `PqAlarm`, §6.8) | — |
 
    Why: after the switch a quantum
    attacker can forge scheme-0 signatures for the old epochs at will, and two forged `DoubleVote`s
@@ -1468,7 +1474,7 @@ Anyone submits an `Evidence` item. Its handling is automatic:
    switch goes unpunished on chain; honest nodes submit `EvidenceCommit` as soon as they detect a
    conflict, within milliseconds. Replay of history keeps classical verification. `BadPost`
    evidence rests on secp256k1 bridge signatures and stays classical after `E_pq`; it slashes
-   until `PqAlarm` is raised and moves no bond from then on (PQ-5, §6.8).
+   and jails until `PqAlarm` is raised and changes no bond and no jail from then on (PQ-5, §6.8).
 3. The slash applies at the end of the including chain block: bond balance moves to the insurance
    fund, and `CHN_REPORTER_SHARE` (5%) goes to the submitting account. A jail takes effect at the
    next boundary (§4.6), and the operator leaves the leader schedule and the sequencer schedule.
