@@ -1159,6 +1159,20 @@ move. 04 binds a session to its lane for life, so for a moved account:
 (`NodeCert.valid_from`), in BASE by an admin record. A new box follows for at least one epoch before
 it is listed, so it passes `EpoReady`'s lag and B4 checks. A box leaves after its home's last epoch.
 
+### 9.5 Bridge signer table (CHAIN)
+
+The bridge signer table maps an L1 rotation number to its `SignerSet` (09 §6.7: five bridge keys
+and five guardian keys). It is a key table like `VK`, `SK` and `XK`, so this chapter owns it and it
+changes only at a boundary (E9):
+
+- A governance-approved set with rotation number r + 1 is scheduled for the first boundary after
+  its approval and becomes active when that epoch activates; if that epoch is skipped, at the next
+  activation.
+- Rotation numbers are consecutive from genesis 0. No key is zero, and no key repeats within its
+  list (the contract's `_writeSet` check).
+- Every activated set stays readable by rotation number, because posts accepted under an earlier
+  set stay claimable on L1 (09 §6.7 step 4). L1's own 72 h queue is separate from this table.
+
 ### 9.4 Software upgrades
 
 | Rule | Statement | Reason |

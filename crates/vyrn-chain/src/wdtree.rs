@@ -13,7 +13,7 @@
 //! 0, `wdRoot` 0); OpenZeppelin has no empty tree.
 
 use crate::eip712::{Address, U256};
-use crate::keccak::{keccak256, keccak256_parts};
+use crate::{keccak256, keccak256_parts};
 
 /// One withdrawal (09 §6.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

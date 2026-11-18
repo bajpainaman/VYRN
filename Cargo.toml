@@ -42,6 +42,9 @@ curve25519-dalek = "=5.0.0"
 ed25519-dalek = { version = "=3.0.0", features = ["digest"] }
 x25519-dalek = { version = "=3.0.0", features = ["static_secrets"] }
 k256 = "=0.14.0"
+# Keccak-256 for L1-facing code only (01 §14.11). keccak 0.2 picks the ARMv8 SHA3 backend at run time
+# (cpufeatures) and falls back to portable code, so no target feature is set. Defaults off: no OID.
+sha3 = { version = "=0.11.0", default-features = false }
 # All commonware-* crates move together on one release tag (§2.6).
 commonware-consensus = "=2026.10.0"
 commonware-p2p = "=2026.10.0"

@@ -1242,6 +1242,11 @@ The L1 delay exists on its own because the contract cannot see VYRN's governance
 keys are stolen, the thief can try to rotate to its own keys, and the 72 h window lets guardians
 veto and pause. Guardian keys rotate by the same flow.
 
+**Owner.** The signer table (rotation number → `SignerSet`) is a key table, owned by `vyrn-epoch`
+with the other per-epoch keys (08 §9.5). A set that governance approves activates at the first epoch
+boundary after approval, and every activated set stays readable by rotation number, because posts
+accepted under it stay claimable (step 4). `vyrn-chain` reads it through `Epochs::bridge_signers`.
+
 ## 7. Forced inclusion
 
 ### 7.1 Path

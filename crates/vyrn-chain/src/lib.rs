@@ -14,7 +14,7 @@
 //! | [`wdtree`] | keccak256 sorted-pair Merkle tree of `Withdrawal` (OpenZeppelin `StandardMerkleTree`) | 09 §6.2 | the post builder, [`bridge::build_post`] | `VyrnBridge.claim`, wallets |
 //! | [`smt`] | BLAKE3 sparse Merkle tree, depth 256; `AccountLeaf`, `BalanceLeaf` | 09 §9.3; contracts/README §Leaf encoding | the commit box | `VyrnBridge.escapeClaim`, light clients (09 §10.4) |
 //! | [`bridge`] | [`bridge::Checkpoint`] → `Post`; the guardian's veto decision | 09 §6.4, §6.5 | validators (build), guardians (review) | relayers, L1 |
-//! | [`keccak`] | Keccak-256 (Ethereum padding) | 01 §14.11 | — | [`eip712`], [`wdtree`] |
+//! | [`keccak256`] | Keccak-256 (Ethereum padding), RustCrypto `sha3` (11 §2.2) | 01 §14.11 | — | [`eip712`], [`wdtree`] |
 //!
 //! **Ordering.** Post `k` names post `k − 1` by its EIP-712 struct hash in `prev_post`; post 1 has
 //! zero. A post's `commit` and `smt_root` are those of a finalized `StateCommit` whose SMT already
@@ -36,9 +36,11 @@
 //!
 //! # What this crate reads from other crates
 //!
-//! `vyrn-replica` and `vyrn-epoch` (spec/11-build.md §1.4: `vyrn-chain` sits in layer 7 above
-//! both) are not dependencies yet. The crate owns the two narrow traits it needs, [`Replica`] and
-//! [`Epochs`]; wiring them to the real crates is a follow-up.
+//! `vyrn-chain` sits in layer 7, above `vyrn-replica` and `vyrn-epoch` (spec/11-build.md §1.4). It
+//! reads each through a narrow trait it owns. [`Epochs`] is implemented here over
+//! [`vyrn_epoch::BridgeSignerTable`], which owns the bridge signer table (09 §6.7: rotated at epoch
+//! boundaries). `vyrn-replica` is not a dependency yet, so [`Replica`] has no implementation here;
+//! wiring it is a follow-up.
 //!
 //! # Not implemented yet
 //!
@@ -51,7 +53,6 @@
 
 pub mod bridge;
 pub mod eip712;
-pub mod keccak;
 pub mod smt;
 pub mod wdtree;
 
@@ -61,6 +62,22 @@ pub use bridge::{Checkpoint, Guardian, Verdict, VetoReason, build_post};
 pub use eip712::{Address, Domain, Post, SigError, SignerSet, Unpause};
 pub use smt::{AccountLeaf, BalanceLeaf, Proof, Smt};
 pub use wdtree::Withdrawal;
+
+/// Keccak-256 as Ethereum uses it (pad `0x01 … 0x80`, not SHA3's `0x06`). 01 §14.11 allows it only
+/// in the L1-facing [`eip712`] and [`wdtree`] code.
+pub fn keccak256(bytes: &[u8]) -> [u8; 32] {
+    keccak256_parts(&[bytes])
+}
+
+/// Keccak-256 of the concatenation of `parts`, without building it.
+pub fn keccak256_parts(parts: &[&[u8]]) -> [u8; 32] {
+    use sha3::Digest as _;
+    let mut h = sha3::Keccak256::new();
+    for p in parts {
+        h.update(p);
+    }
+    h.finalize().into()
+}
 
 /// What CHAIN mode reads from the replica (`vyrn-replica`, 07; 09 §9.3, §9.5). The replica owns
 /// the finalized log and the replayed state; this crate only reads it.
@@ -79,4 +96,15 @@ pub trait Epochs {
     /// The bridge signer set with L1 rotation number `rotation_no` (genesis 0), as governance
     /// activated it.
     fn bridge_signers(&self, rotation_no: u64) -> Option<SignerSet>;
+}
+
+/// The bridge signer table is `vyrn-epoch`'s (09 §6.7, 08 §9.5); this is the only reader.
+impl Epochs for vyrn_epoch::BridgeSignerTable {
+    fn bridge_signers(&self, rotation_no: u64) -> Option<SignerSet> {
+        self.get(rotation_no).map(|s| SignerSet {
+            rotation_no: s.rotation_no,
+            bridge_keys: s.bridge_keys,
+            guardian_keys: s.guardian_keys,
+        })
+    }
 }

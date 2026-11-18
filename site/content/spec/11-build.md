@@ -233,6 +233,7 @@ and `tools/`.
 | `zerocopy` | E | `vyrn-wire`, `vyrn-cut` | Safe reinterpretation of `#[repr(C)]` byte layouts with compile-time layout checks. It keeps `unsafe` out of the wire parser. |
 | `curve25519-dalek`, `ed25519-dalek`, `x25519-dalek` | S | `vyrn-crypto` (non-hot API), `vyrn-chain` | Ed25519 and X25519 in Rust. Verification uses the ZIP-215 rules (§2.5). |
 | `k256` | S | `vyrn-chain` | secp256k1 verify for EVM wallet session opens (01 §4), pure Rust. Chain mode only. |
+| `sha3` (with `keccak`) | S | `vyrn-chain` | Keccak-256 for the L1-facing EIP-712 digests and withdrawal tree only (01 §14.11). RustCrypto; `keccak` selects the ARMv8 SHA3 instructions at run time and falls back to portable code, so the binary runs on CPUs without them. Default features off. |
 | `commonware-consensus` | S | `vyrn-consensus` | Simplex (DESIGN §5). |
 | `commonware-p2p` | S | `vyrn-consensus`, `vyrn-data` (control channel) | Authenticated peer connections between replicas. |
 | `commonware-runtime` | S, T | `vyrn-consensus`, `vyrn-sim` | Tokio runtime in production, the `deterministic` runtime in `vyrn-sim` (§6.4). One trait boundary gives both. |
