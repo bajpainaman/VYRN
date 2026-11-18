@@ -839,7 +839,8 @@ FwdDep (16 B, 4 per line; ceil(n_dep / 4) lines follow their FwdEntry in the rin
   snapshot) steps as `Improve`, and an `Improve` that trades steps as `Cross` (§8.1). The BBO
   core copies the bit into `StepEntry.flags` (§4.15) and decides nothing on it. Wire bytes 2–3
   are 0 (01 §6.2) and the index is 0–9, so bits 4–6 stay 0. An op the lane classifies and then
-  rejects is never pushed; its route goes into a `RouteRecord` instead (§10).
+  rejects is never pushed. Every op it classifies, pushed or not, also logs its route as a
+  `RouteRecord` (§10).
 - Both rings are SPSC. An entry is new when its first word is greater than the consumer's last
   seen value; `lane_seq` and `step` grow strictly, so no separate producer index exists. The
   consumer skips `ceil(n_dep / 4)` lines after an entry, so dependency lines are never parsed as
@@ -2519,26 +2520,26 @@ A replica runs `vyrn-engine` with the same lane, BBO and settlement code. Three 
 | two cut cores → half-cuts | `StepRecord.cut` is the step's cut `C_s`; `step_cut` and partial-cut choices are not repeated |
 | `pick_source` over ring heads, band test, the BBO deadline test | `StepRecord.src_*`, `kind` (incl. `Shed`, `CONT`, `CROSS`) and the `Rescan` band (request R2; without it, the band is all ticks, which is correct by the superset corollary of Lemma 9.7) |
 | `LaneCut[l]` read by the lane | `PacketRecord.fills_applied = f` and `C_f[l]` from `StepRecord f` |
-| snapshot routing in `classify` | op `(l, q)` is forwarded iff a `StepRecord` has `src = (l, q)`, with route `Cross` iff that record has `flags.CROSS`, else `Improve`. An op that a `RouteRecord` names (01 §6.6) takes its route (`cross`) and is rejected by the lane as live. Every other op is local (`Join`). The step kind never gives the route (§4.12) |
+| snapshot routing in `classify` | an op that a `RouteRecord` names (01 §6.6) takes its route (`cross`); the replayed pass 1 then forwards it or rejects it as live, and a forwarded op is the one a `StepRecord` names as `src = (l, q)`, whose `flags.CROSS` must agree. Every other op is local (`Join`). The step kind never gives the route (§4.12) |
 | dependency lists in `FwdEntry` | recomputed from the packet's bytes by the replayed pass 1 (§6.6: a function of the messages and lane state) |
 | core 51's `uncross_price` | the replica's control role computes it from its own lanes' histograms at `C*` |
 | pool token CAS and stealing (§6.9) | `AcctTake { account, ver, lane }` records: a lane waits at one until the account's previous `ver` is replayed |
 
 **Routes (10 M8).** Lane risk charges a `New` or new-priority `Replace` by its route before it
 forwards or rejects it, so replay must give pass 1 the live route, not one derived from the step
-kind or the replayed snapshot. Two records carry it, both in 07's stream: `StepRecord.flags.CROSS`
-for a forwarded op, and a `RouteRecord` for an op the lane classified `Cross` or `Improve` and
-then rejected itself (for example `POST_ONLY_WOULD_CROSS`), which no step names. The lane writes
-the `RouteRecord` in pass 1, at the reject, into its order ring after the packet's
-`PacketRecord`. `vyrn-lane`'s `Lane::replay_packet(vis, p, clock, mids, routes)` takes the union
-of both as `routes`.
+kind or the replayed snapshot. The lane writes a `RouteRecord` for every op it classifies `Cross`
+or `Improve`, forwarded or rejected by itself (for example `POST_ONLY_WOULD_CROSS`), in pass 1,
+into its order ring after the packet's `PacketRecord`. The route travels with its packet: the
+`StepRecord` that names a forwarded op can fall in a later block. `StepRecord.flags.CROSS`
+repeats a forwarded op's route, and `replay_step` checks it. `vyrn-lane`'s
+`Lane::replay_packet(vis, p, clock, mids, routes)` takes the packet's route records as `routes`.
 
 **Scheduler.** The replica schedules lanes and the BBO core as a dataflow:
 
 - Lane `l` may run the boundary of record `r` once steps `≤ r.fills_applied` are done.
-- Lane `l` may run pass 1 for op `q` once it knows whether `q` is forwarded: that is known at the
-  first `StepRecord` with `cut[l] ≥ q`, or with `src = (l, q')` for some `q' ≥ q` (its `src` is
-  `(l, q)` or not). Dependencies follow from pass 1.
+- Lane `l` may run pass 1 for op `q` once it has `q`'s packet and route records: the route
+  records say which ops are classified, and the replayed pass 1 forwards or rejects them as live.
+  Dependencies follow from pass 1.
 - The BBO core may run step `s` once every lane has run pass 1 for its source and pass 2 for
   every independent op `≤ C_s[l]`.
 

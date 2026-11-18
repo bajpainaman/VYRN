@@ -38,9 +38,9 @@ pub enum Rec<'d> {
     Packet(PacketRecord),
     /// A step with its changed cut entries (05 §4.15).
     Step(StepEntry, &'d [CutDelta]),
-    /// The route of an op its lane classified `Cross` or `Improve` and then rejected itself
-    /// (07 §3.6 `RouteRecord`, G9). The lane writes it in pass 1, so it comes before its
-    /// packet's `PacketRecord` in the lane's output.
+    /// The route of an op its lane classified `Cross` or `Improve`, forwarded or rejected by the
+    /// lane itself (07 §3.6 `RouteRecord`, G12). The lane writes it in pass 1, so it comes
+    /// before its packet's `PacketRecord` in the lane's output.
     Route(RouteRecord),
 }
 

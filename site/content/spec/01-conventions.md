@@ -230,8 +230,8 @@ StepRecord    { step: StepId, kind: StepKind, src_lane: LaneId, src_lane_seq: La
                                                // clear = Improve; 0 without a source (05 §4.15)
                 cut: [LaneSeq; N_LANES] }      // kind = Cross | Improve | Depletion | Rescan | Idle
 RouteRecord   { lane: LaneId, lane_seq: LaneSeq, cross: bool }
-                                          // an op the lane classified Cross (true) or Improve and
-                                          // then rejected itself; replay routes it the same way
+                                          // an op the lane classified Cross (true) or Improve,
+                                          // forwarded or rejected; replay routes it the same way
                                           // (05 §10, 10 M8)
 BlockHeader   { height: Height, epoch: Epoch, book: BookId, first_step: StepId,
                 last_step: StepId, prev: Hash, order_root: Hash, data_root: Hash,

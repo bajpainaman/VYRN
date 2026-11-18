@@ -13,7 +13,7 @@
 //! | half-cuts A and B | engine, cut-core role ([`Engine::step`]) | BBO core | each lane's `CounterLine` is read (Acquire), then both halves are published through `CutWriter` (`INV-CUT-MONO`; a backwards entry is [`Fault::CutNotMonotone`]) before every BBO poll | 05 §4.13, §7.1 |
 //! | `LaneCut[l]` | engine, stream-core role | lane `l` | written after the step's `StepEntry` and every `CutDelta` line were read from the `StepLog` (frame first, `INV-FRAME-FIRST`) | 05 §4.15 |
 //! | each lane's `SnapshotLine` | engine, snapshot fan-out | lane `l` | copied from the BBO's line before every BBO poll and before every lane poll | 05 §4.14 |
-//! | order stream ([`Rec`]) | engine, in call order | [`Sink`], [`Engine::replay`] | lane records ([`Rec::Packet`], and [`Rec::Route`] for an op the lane classified and then rejected itself) in each lane's production order; a step's [`Rec::Step`] after its last lane record that the step's cut covers | 01 §6.6, 05 §6.2, 07 §3.6 |
+//! | order stream ([`Rec`]) | engine, in call order | [`Sink`], [`Engine::replay`] | lane records ([`Rec::Packet`], and [`Rec::Route`] for each op the lane classified, forwarded or rejected) in each lane's production order; a step's [`Rec::Step`] after its last lane record that the step's cut covers | 01 §6.6, 05 §6.2, 07 §3.6 |
 //! | pool account tokens (`vyrn_cut::PoolTok`) and their [`AcctTake`](vyrn_types::AcctTake) records | engine, pool-core role ([`Engine::pool_session`]) | pool cores, [`Sink::take`] | per record of a pooled session: take (CAS), [`Sink::take`], release, then the record; `ver` is gapless across the pool | 01 §14.17.4, 05 §6.9 |
 //! | control commands | caller, control role ([`Engine::command`]) | BBO core | one per step, before ring heads; replay queues the same commands before the stream | 05 §4.1, §8.8 |
 //! | responses | lanes ([`Sink::lane_resp`]) and the fill TX role ([`Sink::tx`]) | gateway | lane packets carry their `Gate`; TX packets go out after their `StepEntry` | 05 §8.10 |
@@ -32,10 +32,9 @@
 //!   cut cores still publish before it, since it reads the half-cuts. Each packet goes through
 //!   `vyrn_lane::Lane::replay_packet`: its `MID` Advance records become `Mid` boundaries at
 //!   `(f, C_f[l])`, with `C_f` from the replayed step `f`'s cut (kept for the last
-//!   `ENG_STEP_LOG` steps), and op `(l, q)` is forwarded iff a later `StepRecord` has
-//!   `src = (l, q)`, never by the lane's snapshot (05 §10 rows 1–3, 7). Its route is that
-//!   step's `STEP_CROSS` bit, or, for an op the lane classified and rejected itself, its
-//!   [`Rec::Route`] record (07 §3.6); every other op is a `Join`. A non-`MID` Advance
+//!   `ENG_STEP_LOG` steps), and each op's route from its packet's [`Rec::Route`] records, never
+//!   from the lane's snapshot or a step's kind (05 §10 rows 1–3, 7; 07 §3.6): the replayed pass 1
+//!   then forwards or rejects the op as live, and every other op is a `Join`. A non-`MID` Advance
 //!   record is replayed as the lane boundary it logs, at `(fills_applied, C_f[l])` like a `MID`
 //!   record, not as an idle poll on the newest `LaneCut`: live, the poll may have read an older
 //!   one. Every call's output records are checked against the log.

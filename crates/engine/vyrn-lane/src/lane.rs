@@ -275,8 +275,8 @@ pub struct Lane<'a, V: Visibility, const NA: usize> {
     pub(crate) mids: [Option<Mid>; 20],
     /// The packet's boundaries are the caller's `mids` (replay): no `LaneCut` polls inside it.
     pub(crate) scripted: bool,
-    /// The route `route_of` gave the op in pass 1, until the packet loop logs a `RouteRecord`
-    /// for it on a reject (G9) or the next op starts.
+    /// The route `route_of` gave the op in pass 1, until the packet loop logs its `RouteRecord`
+    /// (G12) or the next op starts.
     classified: Option<Route>,
     /// Replay routes (05 §10): `Some` while a [`Lane::replay_packet`] runs; the listed ops are
     /// forwarded with their route, every other op is local.
@@ -806,9 +806,11 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
                     self.pass1(vis, ix, raw, m, prio_ts)
                 }
             };
-            // G9: a Cross or Improve the lane rejects itself has no step; log its route, so
-            // replay charges and rejects it the same way (01 §6.6, 10 M8).
-            if let (Err(_), Some(r)) = (&res, self.classified.take()) {
+            // G12: every op classified Cross or Improve logs its route, forwarded or rejected
+            // here, so the route travels with its packet and replay charges, forwards or
+            // rejects it the same way without waiting for the step that names it (01 §6.6,
+            // 07 §3.6, 10 M8).
+            if let Some(r) = self.classified.take() {
                 self.out.log(LogRec::Route(RouteRecord {
                     lane: self.cfg.lane,
                     lane_seq: self.seq,
