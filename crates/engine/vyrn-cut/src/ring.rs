@@ -153,6 +153,15 @@ impl<T: Copy, const N: usize, const C: usize, V: Visibility> Producer<'_, T, N, 
     pub fn pushed(&self) -> u64 {
         self.tail
     }
+
+    /// Slots free to push now: re-reads the consumers' heads, so it is exact as of this call
+    /// (a consumer may free more at once). Lets a producer of several kinds keep room for one.
+    pub fn free(&mut self, vis: &V) -> u64 {
+        let heads = self.ring.heads.iter().filter_map(|h| vis.try_read(&h.0));
+        let min = heads.map(|[h]| h).min().unwrap_or(0);
+        self.free_to = min.saturating_add(Ring::<T, N, C, V>::CAP);
+        self.free_to.saturating_sub(self.tail)
+    }
 }
 
 /// Consumer `id`: the only writer of `heads[id]`.

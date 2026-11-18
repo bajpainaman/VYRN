@@ -334,8 +334,13 @@ fn shards_forward_one_data_seq_per_dest_and_answer_key_fetches_from_the_owner() 
     let s = sessions[0];
     let total = shards::HOP_RING as u32 + 100;
     let asked: Vec<(SessionId, u32)> = (0..total).map(|i| (SessionId(s), i)).collect();
-    assert_eq!(rx.redirect(1, 3, &asked, &mut to_shard), shards::HOP_RING);
-    assert_eq!(rx.counters().redirect_retried, 100);
+    // Half the ring stays free for ingest (shards::REDIRECT_HEADROOM).
+    let now = shards::HOP_RING - shards::REDIRECT_HEADROOM;
+    assert_eq!(rx.redirect(1, 3, &asked, &mut to_shard), now);
+    assert_eq!(
+        rx.counters().redirect_retried,
+        u64::from(total) - now as u64
+    );
     let mut got = vec![];
     for t in 0..1000u64 {
         turn!(50 + t);
