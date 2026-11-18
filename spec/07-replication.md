@@ -1220,7 +1220,19 @@ sequencer actually matched, so it settles every conflict (§5.6).
 **Escalation (reading, semantics).** Each source gets `REP_DATA_WAIT_US` in turn: a record still
 unresolved 300 µs after its ORDER frame is fetched from source 1, and each further 300 µs without
 its payload moves to the next source (2, then 3, then 1 again), skipping any source the replica
-has not configured. Source 2's peer turns round-robin across fetches.
+has not configured. Source 2's peer turns round-robin across fetches. **Every unresolved record
+escalates on its own (reading, `vyrn-validator`):** once every data box answers the first one's KEY
+fetch with a miss (a `FETCH_RESP` with no packets; a box that is not the session's home lacks it
+anyway, so one box's miss is not enough: it was lost at its box), a replica asks for all of them at
+once, not for one key after another: a round at most every 100 µs examines at most 256 pending
+records and asks at most 32 keys, starting where the last round stopped, so every missing key gets
+its turn however long the backlog, and keeps its timer until two full passes of the scan go by
+without it. A replica catching up, whose data is still in flight, never gets its home's miss and
+keeps asking for one (a 600 µs timer in its place stopped a restarted voter at `REP_E_HASHLAG` in 8 of 40
+loaded runs). Source 3 holds a packet only
+`REP_SEQ_PKT_RETAIN_MS` after the newest one it took, so a burst lost at the data box (a socket
+overflow) that is walked one key at a time, at up to 3 × 300 µs a key, outlives that window: 89
+lost packets stalled every replica on `Missing` for good.
 
 **`PeerDataFetch` bytes (reading, wire; source 2).** The request is the same 32-byte KEY fetch
 as `DataFetch` and `SeqDataReq`, sent to the peer's data port; the answer goes to the request's

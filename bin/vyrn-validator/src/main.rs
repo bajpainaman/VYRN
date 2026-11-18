@@ -1099,11 +1099,24 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             && let Ok(n) = self.repair.recv(&mut buf)
         {
             answers += 1;
-            if let Ok(fed) = self.feed.on_frame(
-                Self::join(&mut self.join, &mut self.replay),
-                buf.get(..n).unwrap_or(&[]),
-                now,
-            ) && let Some(g) = fed.gap
+            let b = buf.get(..n).unwrap_or(&[]);
+            // A box's empty answer to a KEY fetch: it lacks the key (reading (j)).
+            if let Ok(f) = vyrn_data::frame::decode(b)
+                && f.hdr.kind == vyrn_data::frame::Kind::FetchResp
+                && f.n_pkts == 0
+                && usize::from(f.hdr.src) < self.boxes.len()
+            {
+                let q = f.hdr.data_seq;
+                self.sources.box_missed(
+                    vyrn_types::SessionId(u32::try_from(q >> 32).unwrap_or(u32::MAX)),
+                    u32::try_from(q & u64::from(u32::MAX)).unwrap_or(u32::MAX),
+                    f.hdr.src,
+                );
+            }
+            if let Ok(fed) =
+                self.feed
+                    .on_frame(Self::join(&mut self.join, &mut self.replay), b, now)
+                && let Some(g) = fed.gap
             {
                 gaps.push(g);
             }
@@ -1205,10 +1218,13 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
     }
 
     /// Item 3 for the pending blocks, in height order: a block whose payloads are all joined
-    /// passes or contradicts; a missing payload waits. A payload still missing
-    /// `REP_DATA_WAIT_US` after it was first seen missing is fetched by key, from each of 07
-    /// §5.5's sources in turn (`fetch.rs`), so a lost RANGE request or reply, or a data box that
-    /// lacks it, does not stall the queue.
+    /// passes or contradicts; a missing payload waits. The front block's first missing payload is
+    /// fetched by key; once it is `Sources::stuck` (lost at its box), every payload the pending
+    /// blocks miss is too: a round at most every `fetch::ROUND_NS` examines at most
+    /// `fetch::FETCH_SCAN_MAX` records and asks at most `fetch::FETCH_KEYS_MAX` keys, going on
+    /// where the last round stopped. Each is fetched once it has been missing `REP_DATA_WAIT_US`, from each of 07 §5.5's sources in turn, each key on
+    /// its own timer (`fetch.rs`, reading (j)), so a lost RANGE request or reply, or a data box
+    /// that lacks a burst, does not stall the queue.
     ///
     /// With `durable` (an observer), a block also waits until every frame through its [`Mark`]
     /// arrived on both paths (10 §8.2), so the drop copy's `flags.bit2` holds.
@@ -1248,8 +1264,58 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             if !(self.replay_dead && durable.is_some()) {
                 match Self::join(&mut self.join, &mut self.replay).check(b) {
                     Err(DataErr::Missing { session, pkt_seq }) => {
+                        if !self.sources.begin_round(now) {
+                            return;
+                        }
                         let to = self.sources.due(session, pkt_seq, now);
                         fetch::send_key(&self.repair, session, pkt_seq, &to);
+                        // Lost at its box: so may the packets after it be. Every key the pending
+                        // blocks miss escalates at once (07 §5.5, `fetch.rs` reading (j)), so a
+                        // burst reaches source 3 while the sequencer still retains it.
+                        if self.sources.stuck(session, pkt_seq) {
+                            let join = Self::join(&mut self.join, &mut self.replay);
+                            // From where the last round stopped, found by height from the front
+                            // (heights are consecutive), to at most FETCH_SCAN_MAX steps and
+                            // FETCH_KEYS_MAX fetches, or the last record: no walk of the backlog.
+                            let (sh, si) = self.sources.scan_start();
+                            let front = self.pending.front().map_or(0, |(b, _)| b.header.height.0);
+                            let (mut bi, mut ri) = sh
+                                .checked_sub(front)
+                                .and_then(|d| usize::try_from(d).ok())
+                                .filter(|&i| {
+                                    self.pending
+                                        .get(i)
+                                        .is_some_and(|(b, _)| b.header.height.0 == sh)
+                                })
+                                .map_or((0, 0), |i| (i, si));
+                            let mut steps = 0usize;
+                            let mut sent = 0usize;
+                            let mut ended = false;
+                            while steps < fetch::FETCH_SCAN_MAX && sent < fetch::FETCH_KEYS_MAX {
+                                let Some((b, _)) = self.pending.get(bi) else {
+                                    ended = true;
+                                    break;
+                                };
+                                steps = steps.saturating_add(1);
+                                let Some(r) = b.lanes.get(ri) else {
+                                    (bi, ri) = (bi.saturating_add(1), 0);
+                                    continue;
+                                };
+                                ri = ri.saturating_add(1);
+                                let LaneRec::Pkt(p) = r else { continue };
+                                if p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED) != 0
+                                    || (p.session, p.pkt_seq) == (session, pkt_seq)
+                                    || !matches!(join.resolve(p), Err(DataErr::Missing { .. }))
+                                {
+                                    continue;
+                                }
+                                let to = self.sources.due(p.session, p.pkt_seq, now);
+                                sent = sent.saturating_add(usize::from(!to.is_empty()));
+                                fetch::send_key(&self.repair, p.session, p.pkt_seq, &to);
+                            }
+                            let at = self.pending.get(bi).map_or(0, |(b, _)| b.header.height.0);
+                            self.sources.scanned((at, ri), ended);
+                        }
                         return;
                     }
                     Ok(()) => source.valid(h),
@@ -1263,6 +1329,11 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             let Some((b, _)) = self.pending.pop_front() else {
                 return;
             };
+            self.sources
+                .released(b.lanes.iter().filter_map(|r| match r {
+                    LaneRec::Pkt(p) => Some((p.session, p.pkt_seq)),
+                    _ => None,
+                }));
             if let Some(fo) = self.failover.as_mut() {
                 fo.released(
                     h.0,
