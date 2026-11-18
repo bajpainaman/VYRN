@@ -357,8 +357,7 @@ than 1 ms. That is a sequencer fault.
 DEV only: `vyrn-validator`'s `[replay] hashlag_us` (with `dev = true`) sets a larger bound for
 unpinned DEV and CI hosts, which do not meet the pinned-core budget of §7.2. A validator without
 `dev = true` refuses any value other than the 1 ms above, so production behaviour is unchanged.
-In `tools/e2e-smoke`, the observer gets its own DEV bound of 200 ms while voters keep the run's
-(50 ms in CI): it also replays, feeds the drop copy and finalizes on its order thread. The
+In `tools/e2e-smoke`, the observer and the voters share the run's bound (20 ms in CI). The
 bound runs from each frame's `rx_ts`, the kernel's receive time (`SO_TIMESTAMPNS` on Linux
 kernel_udp, 06 §6.6), not from when the order thread gets to the frame, so time a frame waits
 in the socket queue behind a stalled thread does not count. Both paths' frames reach the order
@@ -370,8 +369,16 @@ later than the earliest frame held behind it, and each held frame keeps its own 
 deadlines run at most up to the oldest frame still held behind a gap or waiting for the next
 poll, and while a burst is full, up to its last frame read, so a timely HashRun among them is not
 counted late; a HashRun is still checked against its own lane at its own receive time. Frames
-held behind a gap whose repair gave up no longer hold the deadlines back. The observer's 200 ms stays until
-loaded DEV runs show it within the voters' bound. A stuck HashRun still fails the observer.
+held behind a gap whose repair gave up no longer hold the deadlines back, and a held frame keeps
+them back by at most one bound, so a hole that is never filled (no repair) delays
+`REP_E_HASHLAG` but cannot stop it. Each HashRun entry is checked against its own record, as a
+gap fill can leave a lane's records out of receive order. The monotonic/realtime offset is read
+again when the pair of reads took more than 20 µs. Measured on a loaded 2-vCPU host (every
+replica and the harness on one CPU, two CPU hogs; not a latency result), with voters and observer
+at one bound: 1 ms 3 of 5 runs stopped, 2 ms 1 of 5, 5 ms 1 of 7, 10 ms 1 of 10, 20 ms 0 of 40,
+50 ms 0 of 20. The stops at 2 and 5 ms hit every replica at one height, the box's sender preempted
+between an ORDER frame and its HASH frame, which no receive stamp removes. Before `rx_ts` the
+observer needed 200 ms. CI runs 20 ms. A stuck HashRun still fails the observer. \[Likely\]
 \[DEV only\]
 
 The H-part is not part of `order_root` (§6.1). It is implied by `data_root`, which covers the full
