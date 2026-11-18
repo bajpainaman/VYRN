@@ -169,3 +169,46 @@ fn refuses_open_mode_outside_dev() {
     assert!(child.wait().unwrap().success());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A stop during a bad-MAC flood loses no event silently: every one the node raised is an
+/// `EVENT` line or counted in `STATS` (`events_unprinted`, `events_dropped`).
+#[test]
+fn a_stop_accounts_for_every_event() {
+    let dir = std::env::temp_dir().join(format!("vyrn-data-drain-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let replica = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let cfg = config(&dir, replica.local_addr().unwrap(), false, true);
+    let mut child = cmd(&cfg)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    out.read_line(&mut ready).unwrap();
+    let ingest = field(ready.trim(), "ingest=").to_owned();
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut pkt = [0u8; MAX_REQ_PAYLOAD];
+    for q in 1..=3000u32 {
+        let h = ReqHeader::new(SessionId(5), q, 9, BookId(3), false);
+        let n = encode_request(&mut pkt, h, &[Msg::Heartbeat], &[9; 16], None).unwrap();
+        client.send_to(&pkt[..n], &ingest).unwrap();
+    }
+    drop(child.stdin.take());
+    let mut rest = String::new();
+    out.read_to_string(&mut rest).unwrap();
+    assert!(child.wait().unwrap().success());
+    let printed = rest
+        .lines()
+        .filter(|l| l.starts_with("EVENT bad_mac "))
+        .count() as u64;
+    let stats = rest.lines().find(|l| l.starts_with("STATS ")).unwrap();
+    let n = |k: &str| field(stats, k).parse::<u64>().unwrap();
+    assert!(n("bad_mac=") > 0, "{stats}");
+    assert_eq!(
+        printed + n("events_unprinted=") + n("events_dropped="),
+        n("bad_mac="),
+        "{stats}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
