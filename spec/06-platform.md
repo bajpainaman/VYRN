@@ -1010,6 +1010,7 @@ to the cores as follows:
 | Use | Unit and integration tests on Linux, every network test on macOS, the management plane, small lab books |
 | Sockets | One non-blocking UDP socket per lane bound to `PORT_BASE + L`. Linux: `recvmmsg`/`sendmmsg` in a busy loop, `SO_BUSY_POLL`. macOS: `kqueue` with `EVFILT_READ` polled with a zero timeout, then `recvmsg` until `EAGAIN` |
 | Timestamps | Linux: `SO_TIMESTAMPING` with `SOF_TIMESTAMPING_RX_HARDWARE` where the NIC provides it, else software stamps. As built, kernel_udp sets `SO_TIMESTAMPNS` on every Linux socket and takes the kernel's software receive stamp (`CLOCK_REALTIME`) from its `SCM_TIMESTAMPNS` message, falling back to a read of the clock after `recvmmsg` when a datagram carries none; the hardware path is not built. macOS: `clock_gettime_nsec_np(CLOCK_REALTIME)` right after `recvmsg` returns. Source `Kernel`. |
+| Send errors | As built: a full socket or interface queue (`EAGAIN`, `ENOBUFS`) is `TxFull` (`tx_full`). A datagram the kernel refuses for any other reason is dropped, as loss on the wire, and counted in `tx_drop` and in `tx_err`, with the first refusal's errno in `tx_errno`, so a hard error does not read as congestion. \[Likely\] |
 | Steering | By socket port (`Socket`) |
 | Latency class | E: ≤ 50 µs p99 on Linux (budget); unbounded on macOS |
 | Targets | DEV, CI, tests |

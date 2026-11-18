@@ -364,19 +364,19 @@
   {
    "asciiIndex": 9,
    "heading": "7.4 Build and link",
-   "line": 1219,
+   "line": 1220,
    "ascii": "c/vyrn-nic-shim/shim.c─clang -flto=thin -march=x86-64-v3──► shim.bc ─┐\nvendored libciul (ef_vi), built with clang -flto=thin ────► .bc  ────┤\nvendored DPDK static libs + mlx5/ena PMDs (meson, clang, b_lto) ──────┤\nrustc -C linker-plugin-lto -C target-cpu=x86-64-v3 ───────► .rlib ────┴─► lld + LLVM LTO ─► vyrn-seq"
   },
   {
    "asciiIndex": 10,
    "heading": "8.1 What time is for",
-   "line": 1257,
+   "line": 1258,
    "ascii": "        GNSS                                             facility\n          │\n   GM-1 ──┤ leaf A (PTP BC) ── NIC0 PHC ◄── ptp4l (client, hardware stamps)\n   GM-2 ──┘ leaf B (PTP BC)      │\n                                 ├──► phc2sys ──► NIC1 PHC\n                                 ├──► phc2sys ──► NIC2 PHC\n                                 ├──► phc2sys ──► NIC3 PHC\n                                 ├──► phc2sys ──► NIC4, NIC5 PHC (replication; rx_ts unused)\n                                 └──► phc2sys ──► CLOCK_REALTIME / CLOCK_TAI ──► TAI map (§8.4)\n vyrn-timemon: two-way timestamped probes NIC0 ⇄ NICk through the leaves → measured skew\n vyrn-timemon: PTM cross-timestamp TSC ⇄ PHC of each client card, 100 Hz → TSC↔PHC lines (§8.4)"
   },
   {
    "asciiIndex": 12,
    "heading": "8.6 Time state and eligibility",
-   "line": 1457,
+   "line": 1458,
    "ascii": "             ptp4l s2 and |GM offset| < 100 ns for 60 s and skew < 50 ns\n   UNSYNC ──────────────────────────────────────────────────────────────► LOCKED\n     ▲  ▲                                                                   │  ▲\n     │  │ holdover > PLT_HOLDOVER_MAX_S (300 s)        GM lost / ptp4l ≠ s2 │  │ GM back,\n     │  └──────────────────────────── HOLDOVER ◄────────────────────────────┘  │ offset ok\n     │                                   └─────────────────────────────────────┘\n     │ skew > 100 ns for 1 s (from any state)\n   SKEWED ── skew back < 50 ns for 60 s ──► UNSYNC\n     │ any client card: map err0 > 20 ns or line > 50 ms old (from any state)\n   MAPERR ── every line err0 < 10 ns for 60 s ──► UNSYNC\n   FREERUN: lab and standalone CONSUMER only; never in a facility"
   }
  ],

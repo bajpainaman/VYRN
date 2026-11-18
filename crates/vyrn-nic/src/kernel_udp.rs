@@ -356,6 +356,20 @@ impl KernelTx {
         }
     }
 
+    /// Counts a send the kernel refused with a hard error (`tx_err`), keeping the first errno.
+    fn hard_err(&self, e: &std::io::Error) {
+        NicCounters::add(&self.ext.tx_err, 1);
+        if ExtCounters::get(&self.ext.tx_errno) == 0 {
+            let n = e
+                .raw_os_error()
+                .and_then(|n| u64::try_from(n).ok())
+                .unwrap_or(0);
+            self.ext
+                .tx_errno
+                .store(n, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Counts the frames from `*taken` up to `to` as dropped and moves `taken` past them.
     #[cfg(target_os = "linux")]
     fn drop_to(&self, taken: &mut usize, to: usize) {
@@ -401,7 +415,8 @@ impl KernelTx {
                     return Err(taken);
                 }
                 // The kernel refused this one datagram; the next call sends from the one after.
-                Err(_) => {
+                Err(e) => {
+                    self.hard_err(&e);
                     self.drop_to(&mut taken, at[x] + 1);
                     x += 1;
                 }
@@ -415,7 +430,8 @@ impl KernelTx {
 impl TxRing for KernelTx {
     /// Sends the payload of a fast-path frame to its destination. The kernel takes a datagram
     /// whole or not at all. A full socket buffer is `TxFull`; a frame that does not parse, or
-    /// that the kernel refuses for any other reason, is dropped and counted (`tx_drop`).
+    /// that the kernel refuses for any other reason, is dropped and counted (`tx_drop`; a refusal
+    /// is also `tx_err`, with its errno in `tx_errno`).
     #[cfg(target_os = "linux")]
     fn send(&mut self, frame: &[u8]) -> Result<(), TxFull> {
         if self.send_burst(&[frame]) == 1 {
@@ -439,14 +455,20 @@ impl TxRing for KernelTx {
                     self.done += 1;
                     return Ok(());
                 }
-                Ok(_) => break,
+                Ok(_) => {
+                    NicCounters::add(&self.ext.tx_err, 1);
+                    break;
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 // ENOBUFS is how Linux and macOS report a full interface queue.
                 Err(e) if e.kind() == ErrorKind::WouldBlock || is_enobufs(&e) => {
                     NicCounters::add(&self.counters.tx_full, 1);
                     return Err(TxFull);
                 }
-                Err(_) => break,
+                Err(e) => {
+                    self.hard_err(&e);
+                    break;
+                }
             }
         }
         NicCounters::add(&self.ext.tx_drop, 1);

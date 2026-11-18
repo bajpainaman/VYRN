@@ -283,6 +283,12 @@ pub struct ExtCounters {
     /// (`kernel_udp`) not a fast-path frame or refused by the kernel for a reason other than a
     /// full buffer. Like loss on the wire; the frame is never partly sent.
     pub tx_drop: AtomicU64,
+    /// The `tx_drop`s the kernel refused with a hard error (`kernel_udp`: not `EAGAIN` or
+    /// `ENOBUFS`, which are `tx_full`), so a broken route or a bad address does not look like a
+    /// congestion drop.
+    pub tx_err: AtomicU64,
+    /// The first such error's errno (0: none yet, or a short write without one).
+    pub tx_errno: AtomicU64,
 }
 
 impl ExtCounters {

@@ -59,7 +59,9 @@
 //! `BLOCK height=<h> first_step=<s> last_step=<s>`, `NOTICE lane=<l> next=<e> secs=<s>`,
 //! `CONTROL step=<id> phase=<halt|resume>` as it frames a finality-gate `Control` step, and at
 //! exit `STATS records=<n> steps=<n> blocks=<n> responses=<n> tx=<n> tx_unsent=<n>
-//! seal_violations=<n> handoff_full=<n>`, then with `[repair]` `REPAIR_STATS retain_dropped=<n>
+//! seal_violations=<n> handoff_full=<n> tx_drop=<n> tx_err=<n> tx_errno=<n>` (the stream
+//! thread's NIC TX queues: dropped frames, kernel refusals with a hard error among them, and the
+//! first refusal's errno, 0 for none), then with `[repair]` `REPAIR_STATS retain_dropped=<n>
 //! served=<n> missed=<n> limited=<n> bad=<n>`.
 //!
 //! **Control** (stdin, one line each; *reading*, like `vyrn-data`'s: 07 and 08 name no
@@ -102,8 +104,8 @@ use vyrn_log::stream::has_src;
 use vyrn_log::{Ident, LaneBase, Layout, SeqWriter, TenureStart};
 use vyrn_nic::frame::{self, Endpoint, FrameHdr};
 use vyrn_nic::{
-    BackendKind, KernelUdp, LatencyClass, NicBackend, NicConfig, PortConfig, PortId, RxBind,
-    SimNic, TxClass,
+    BackendKind, ExtCounted, KernelUdp, LatencyClass, NicBackend, NicConfig, PortConfig, PortId,
+    RxBind, SimNic, TxClass,
 };
 use vyrn_risk::{AcctRisk, AcctSlot, BookSpec, SessionBuckets};
 use vyrn_types::{
@@ -174,6 +176,11 @@ struct Stats {
     full: AtomicU64,
     /// Retention copies lost to a full repair ring (the engine never waits on it).
     retain_dropped: AtomicU64,
+    /// The stream thread's two NIC TX queues' `ExtCounters` at its exit: frames dropped, those
+    /// the kernel refused with a hard error, and the first such errno.
+    tx_drop: AtomicU64,
+    tx_err: AtomicU64,
+    tx_errno: AtomicU64,
 }
 
 fn fail(what: &str, e: impl std::fmt::Display) -> ExitCode {
@@ -423,7 +430,19 @@ where
                     // thread exits: a return, an error, or a panic that unwinds.
                     let _done = Done([stream_done, &stop]);
                     let mut rx = rx;
-                    s.run(&mut rx, engine_done, block)
+                    let r = s.run(&mut rx, engine_done, block);
+                    let (o, f) = (s.order_tx.ext_counters(), s.resp_tx.ext_counters());
+                    let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+                    let st = &s.stats;
+                    st.tx_drop
+                        .store(g(&o.tx_drop) + g(&f.tx_drop), Ordering::Release);
+                    st.tx_err
+                        .store(g(&o.tx_err) + g(&f.tx_err), Ordering::Release);
+                    let errno = [g(&o.tx_errno), g(&f.tx_errno)]
+                        .into_iter()
+                        .find(|&e| e != 0);
+                    st.tx_errno.store(errno.unwrap_or(0), Ordering::Release);
+                    r
                 })
                 .map_err(|e| e.to_string())?
         };
@@ -519,7 +538,7 @@ where
         }
         let g = |c: &AtomicU64| c.load(Ordering::Acquire);
         println!(
-            "STATS records={} steps={} blocks={} responses={} tx={} tx_unsent={} seal_violations={} handoff_full={}",
+            "STATS records={} steps={} blocks={} responses={} tx={} tx_unsent={} seal_violations={} handoff_full={} tx_drop={} tx_err={} tx_errno={}",
             g(&stats.records),
             g(&stats.steps),
             g(&stats.blocks),
@@ -527,7 +546,10 @@ where
             g(&stats.fills),
             g(&stats.unsent),
             g(&stats.seal_violations),
-            g(&stats.full)
+            g(&stats.full),
+            g(&stats.tx_drop),
+            g(&stats.tx_err),
+            g(&stats.tx_errno)
         );
         if let Some(Ok(rs)) = &r {
             println!(

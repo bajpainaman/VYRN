@@ -333,7 +333,7 @@ fn kernel_udp_truncated_datagram_in_a_burst_is_a_drop() {
 
 /// A burst the kernel takes only part of: a frame to the limited broadcast address (refused,
 /// EACCES, as the socket has no SO_BROADCAST) makes `sendmmsg` stop short. `send_burst` counts it
-/// in `tx_drop`, sends every frame after it in order, and counts the rest as sent, exactly as
+/// in `tx_drop` and `tx_err` (errno in `tx_errno`), sends every frame after it in order, and counts the rest as sent, exactly as
 /// calling `send` on each would. Frames that do not parse are dropped in place too.
 #[cfg(target_os = "linux")]
 #[test]
@@ -364,6 +364,12 @@ fn kernel_udp_send_burst_resumes_after_a_partial_send() {
     );
     assert_eq!(ExtCounters::get(&tx.counters().tx_pkts), 36);
     assert_eq!(ExtCounters::get(&tx.ext_counters().tx_drop), 4);
+    // Only the two refusals are hard errors; the unparseable frames are not the kernel's.
+    assert_eq!(ExtCounters::get(&tx.ext_counters().tx_err), 2);
+    assert_eq!(
+        ExtCounters::get(&tx.ext_counters().tx_errno),
+        libc::EACCES as u64
+    );
     assert_eq!(ExtCounters::get(&tx.counters().tx_full), 0);
     assert_eq!(tx.reap(), 36);
     let mut buf = [0u8; 2048];
