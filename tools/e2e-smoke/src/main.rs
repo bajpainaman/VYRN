@@ -34,7 +34,7 @@
 //! | `finality` | with `--finality` (default 4 validators, a DEV roster as in `bin/vyrn-validator/tests/committee.rs`, `[consensus]` in every validator and the box): while the box still runs, the box's listener (`FINAL height=<h> ... from=<votes\|cert>`) and every validator that did not stop print `FINAL` through the box's last block. A validator's `OUT_OF_ORDER`, `VOTER_FAULT`, `DATA_FAULT` or `REPLAY_FAULT` line fails `validators`; `REP_E_HASHLAG` follows R5 and R6. SKIP without it |
 //! | `dropcopy` | with `--dropcopy` (needs `--data` and `--finality`): an observer (`vyrn-validator`, `role = "observer"`, data destination `n + 1`, in the box's order list on both paths (R12) and every validator's `[consensus] observers`) replays every block into its output ring and finalizes from the validators' certificates; `vyrn-dropcopy` serves the ring over Noise, and one client per session logs in to its account's stream. Each stream's served records, without stage markers, equal an in-process `DropCopy` over the tap's `RustReplay` byte for byte, with gapless seqs, and end in a `DC_FINAL`; every record with a `resp_seq` (acks, cancels, outs, taker fills) names a response packet the client received (10 §8.3). It prints a DEV timing of those records after their response packets (R9); SKIP without it |
 //! | `failover` | with `--data-kill` (R13): the home data box is killed mid-run, the validators reach Q `DataDown`s and REDIRECT, the backup admits a sealed one and redirects every session, and every session moves copy 2; SKIP without it |
-//! | `voter-kill` | with `--kill-voter` (R16): at half the packets, once it has finalized a height, the last validator is killed; its blocks were the box's, and the box finalizes past the kill with the `n − 1` left. `finality` then needs the box and every running validator through the last block, with Q of the whole committee; SKIP without it |
+//! | `voter-kill` | with `--kill-voter` (R16): at half the packets, once it has finalized a height, the last validator is killed; its blocks were the box's, and the box finalizes a height past the victim's last `BLOCK`, one it never accepted, with the `n − 1` left. `finality` then needs the box and every running validator through the last block, with Q of the whole committee; SKIP without it |
 //! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed has no rejected frame and no gap left unrepaired (R14), and that join is the one `replay` reads; SKIP without `--data` |
 //!
 //! **Readings** (the spec does not settle these; PR body):
@@ -2535,7 +2535,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
 
     // R16: the killed validator had voted (finalized something), printed no fault (R5's HASHLAG
     // WARN aside), and the blocks it printed were the box's, `Valid`, with the tap's `out=`; the
-    // box finalized past the kill with the n - 1 left (`finality` checks it reached the end).
+    // box finalized a height the victim never accepted, so without it (`finality` checks the end).
     match voter_killed {
         Some((i, at)) => rep.check("voter-kill", {
             let v = nodes.0.get(i).ok_or("killed validator")?;
@@ -2561,9 +2561,14 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 ))
             } else if seq_blocks.get(..ids.len()) != Some(&ids[..]) {
                 Err(format!("{}: its {} blocks are not the box's", v.name, ids.len()))
-            } else if seq_final <= at.map(|h| h + 1) {
+            } else if seq_final <= ids.last().map(|b| b.0) {
+                // The victim's output is complete (it is dead and its pipe drained), so a height
+                // past its last BLOCK is one it never accepted, voted for, or helped finalize.
+                // The box's own FINAL lines carry no order against the kill (another thread
+                // reads its pipe), so `at` is only reported.
                 Err(format!(
-                    "vyrn-seq finalized through {seq_final:?} after the kill at {at:?}"
+                    "vyrn-seq finalized through {seq_final:?}, not past the victim's last block {:?}",
+                    ids.last().map(|b| b.0)
                 ))
             } else {
                 Ok(format!(
