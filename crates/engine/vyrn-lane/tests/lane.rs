@@ -2044,4 +2044,5 @@ fn a_boundary_that_drains_two_auctions_outs_the_first_before_the_second_fills() 
         ],
         "{recs:?}"
     );
+    assert_eq!(x.lanes[0].multi_auction_drains(), 1, "the drain is counted");
 }

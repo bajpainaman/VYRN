@@ -191,6 +191,7 @@ fn main() -> ExitCode {
     let failed: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
     let known_hits: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
     let (events, fills) = (AtomicU64::new(0), AtomicU64::new(0));
+    let multi = AtomicU64::new(0);
     std::thread::scope(|sc| {
         for _ in 0..a.jobs.max(1) {
             sc.spawn(|| {
@@ -203,6 +204,7 @@ fn main() -> ExitCode {
                     let r = cluster::run(seed, &swarm_schedule(seed, &a));
                     events.fetch_add(r.stats.events, Ordering::Relaxed);
                     fills.fetch_add(r.stats.fills, Ordering::Relaxed);
+                    multi.fetch_add(r.stats.multi_auction_drains, Ordering::Relaxed);
                     let bad = match (&r.violation, a.canary) {
                         (None, false) => None,
                         (Some(v), _) if known.iter().any(|k| k == v.check) => {
@@ -245,6 +247,11 @@ fn main() -> ExitCode {
         a.classes,
         if a.canary { ", canary" } else { "" }
     );
+    // Shown only when it happens: boundaries that drained 2..=ENG_AUCTION_DRAIN uncrosses.
+    let m = multi.load(Ordering::Relaxed);
+    if m > 0 {
+        println!("  multi-auction boundaries: {m}");
+    }
     for (seed, why) in known_hits.iter().take(5) {
         println!("  known seed {seed:016x}: {why}");
     }

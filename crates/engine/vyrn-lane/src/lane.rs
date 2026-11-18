@@ -292,6 +292,8 @@ pub struct Lane<'a, V: Visibility, const NA: usize> {
     /// One entry per uncross B1 applied at this boundary, oldest first, with the uncross's
     /// step: a held lane can drain more than one auction at one boundary (05 §8.10 rule 4.2).
     pub(crate) auction_out: std::collections::VecDeque<(LaneSeq, StepId)>,
+    /// Boundaries whose B1 applied more than one uncross (diagnostic; 05 §8.10 drain bound).
+    pub(crate) multi_auction_drains: u64,
     /// Step of the event B1 is applying, or of the uncross B2 is ending; tags held records.
     pub(crate) ev_step: StepId,
     pub(crate) evbuf: std::collections::VecDeque<vyrn_bbo::FillEvent>,
@@ -433,6 +435,7 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
             pend: std::collections::VecDeque::with_capacity(n),
             auction_out: std::collections::VecDeque::with_capacity(ENG_AUCTION_DRAIN),
             ev_step: StepId(0),
+            multi_auction_drains: 0,
             evbuf: std::collections::VecDeque::with_capacity(ENG_FILL_RING),
             fwd: std::collections::VecDeque::with_capacity(ENG_FWD_RING),
             out: Outbox::new(cfg.out_cap),
@@ -540,6 +543,12 @@ impl<'a, V: Visibility, const NA: usize> Lane<'a, V, NA> {
         self.pend.len()
     }
     /// An engine fault (05 §14.3): the caller fail-stops.
+    /// Boundaries that drained more than one uncross (05 §8.10); a swarm reports a nonzero
+    /// count so runs near `ENG_AUCTION_DRAIN` are visible.
+    pub fn multi_auction_drains(&self) -> u64 {
+        self.multi_auction_drains
+    }
+
     pub fn fault(&self) -> bool {
         self.fault || self.out.overflow
     }

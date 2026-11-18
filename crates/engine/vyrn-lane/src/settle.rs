@@ -112,6 +112,9 @@ impl<V: Visibility, const NA: usize> Lane<'_, V, NA> {
             self.apply_event(&ev, &mut taker);
         }
         self.taker_end(taker.take());
+        if self.auction_out.len() > 1 {
+            self.multi_auction_drains = self.multi_auction_drains.saturating_add(1);
+        }
         // B2.
         let c = at.cut.min(self.applied);
         loop {
