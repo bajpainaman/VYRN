@@ -117,7 +117,7 @@ starts with a domain-separation context (§17.3).
      ├──► NodeCert(i, TYO) ─┬─ node key      NK  (Ed25519)  p2p identity, TagFault, attestations
      ├──► NodeCert(i, LDN)  ├─ vote key      VK  (Ed25519)  consensus votes, commit votes
      └──► NodeCert(i, NYC)  ├─ seq key       SK  (Ed25519)  seq_sig on book blocks
-                            └─ exchange key  XK  (X25519)   K_seq derivation, committee-key transport
+                            └─ exchange key  XK  (X25519; + ML-KEM-768 from E_pq)   K_seq derivation, committee-key transport
   bridge key BK_i   (secp256k1, HSM)    signs L1 posts and signer rotations
   guardian key GK_i (secp256k1, online) pauses the bridge, vetoes an L1 post
 ```
@@ -125,7 +125,7 @@ starts with a domain-separation context (§17.3).
 | Key | Scheme | Where it lives | Rotation |
 |---|---|---|---|
 | `OIK_i` | Ed25519; hybrid Ed25519 + ML-DSA-65 (scheme 2) before `E_pq` (01 §14.20) | Air-gapped Linux machine or COTS HSM | Governance (§2.10), timelocked |
-| `NK`, `VK`, `SK`, `XK` | Ed25519 / X25519; `NK`, `VK`, `SK` hybrid Ed25519 + ML-DSA-44 (scheme 1) from `E_pq`; `XK` stays X25519 (01 §14.20 F, PQ-6) | The node's boxes, in memory, loaded from an encrypted file at start | New `NodeCert`; active from the node's next active epoch |
+| `NK`, `VK`, `SK`, `XK` | Ed25519 / X25519; `NK`, `VK`, `SK` hybrid Ed25519 + ML-DSA-44 (scheme 1) from `E_pq`; `XK` a hybrid X25519 + ML-KEM-768 `KexKey` from `E_pq` (01 §14.20 G) | The node's boxes, in memory, loaded from an encrypted file at start | New `NodeCert`; active from the node's next active epoch |
 | `BK_i` | secp256k1 | COTS HSM on the commit box | L1 signer rotation (§6.7) |
 | `GK_i` | secp256k1 | Online watcher process on the commit box | L1 signer rotation |
 
@@ -147,11 +147,14 @@ NodeCert {
     node_key:     PubKey,       // 32 B (scheme 0) or 1,344 B (scheme 1)
     vote_key:     PubKey,
     seq_key:      PubKey,
-    xchg_key:     [u8; 32],     // X25519
+    xchg_key:     KexKey,       // 32 B (scheme 0) or 1,216 B (scheme 1): X25519 ‖ ML-KEM-768 (01 §3)
     client_kind:  u8,           // 0 Rust, 1 Vx
     sig:          Sig,          // by OIK_op, in OIK's scheme, over ctx "vyrn      v1 nodecert" ‖ fields
 }
 ```
+
+A scheme-1 `NodeCert` is invalid unless the ML-KEM-768 part of every `KexKey` in it passes the
+FIPS 203 encapsulation-key check (01 §14.20 KG2).
 
 **Scheme of the cert in force.** For epoch e, the cert in force is the newest one with
 `valid_from ≤ e` **and** `scheme = EpoConfig(e).sig_scheme`. A hybrid `NodeCert` for the switch
@@ -179,11 +182,25 @@ committee key per possible sequencer.
 - Each member decrypts, checks that the scalar multiplied by the base point equals the published
   public key, and signs a confirmation. The record takes effect with 3 confirmations, so one absent
   member does not block it.
+- **From `E_pq`** (01 §14.20 G, KG1), for every e ≥ `E_pq`: `G(e, s)` is a hybrid pair, an X25519
+  key plus an ML-KEM-768 key generated from a 64-byte seed, and `pub_key` is their `KexKey`. The
+  dealer also encapsulates to the ML-KEM part of each member's exchange key and puts the 1,088 B
+  ciphertext `ct` beside the wrap. The wrap key's material is the X25519 secret ‖ the ML-KEM secret
+  ‖ BLAKE3(`ct`). The wrapped private half is the X25519 scalar and the ML-KEM seed (96 B, 112 B
+  with the tag). The seed is `(d, z)` (FIPS 203): the public key depends on `d` only, and `z` is the
+  implicit-rejection secret, so a matching public key alone does not prove that members hold the
+  same decapsulation key. `CommitteeKey` therefore carries `seed_hash` = BLAKE3 of the 64-byte seed,
+  and before confirming, each member checks both that ML-KEM key generation from its seed gives the
+  published ML-KEM key and that BLAKE3 of its seed equals `seed_hash`. The dealer then cannot give
+  members different `d` or different `z` (01 §14.20 KG3). Cost: 3
+  encapsulations per record and one decapsulation per member, ≤ 0.1 ms in all.
 
 ```
 CommitteeKey {
-    epoch: Epoch, seq_op: OpIdx, pub_key: [u8; 32],
-    wrapped: [(OpIdx, [u8; 48]); 3],          // to the 3 other members
+    epoch: Epoch, seq_op: OpIdx, pub_key: KexKey,   // 32 B, or 1,216 B for e ≥ E_pq
+    seed_hash: Hash,                          // e ≥ E_pq only: BLAKE3 of the ML-KEM seed (d, z)
+    wrapped: [(OpIdx, [u8; 48]); 3],          // to the 3 other members; for e ≥ E_pq
+                                              //   [u8; 1,088 + 112]: ct ‖ wrapped hybrid half
     confirms: [(OpIdx, [u8; 64]); ≥ 3],      // Ed25519 by each member's NK
 }
 ```
@@ -791,6 +808,8 @@ SessionOpen {                               // TxEnvelope kind 0x01, signed by t
     first_epoch:    Epoch,
     n_epochs:       u8,                     // 1 ..= CHN_SESSION_MAX_EPOCHS (3)
     anchors:        [[Hash; 5]; n_epochs],  // A(e, s) for each epoch and each possible sequencer
+    kem_cts:        [[[u8; 1088]; 10]; n_pq], // per epoch ≥ E_pq in range: ct_seq(e, s) for s = 0..4,
+                                              //   then ct_com(e, s) for s = 0..4 (§5.3)
 }
 ```
 
@@ -803,6 +822,12 @@ Validity, checked against the state after the parent chain block:
 3. `x25519_pub` is not a low-order point and is not used by any other session, open or closed.
 4. `bond ≥ max(CHN_SESSION_BOND_MIN, CHN_BOND_PER_MSGRATE × max_msgs_per_s)` and the free balance
    covers the bond plus the fee.
+5. `n_pq` is the number of epochs in `[first_epoch, first_epoch + n_epochs − 1]` with
+   `EpoConfig(e).sig_scheme` ≥ 1, and `kem_cts` holds exactly those epochs, in order (01 §14.20
+   KG1). `E_pq` is scheduled under the 72 h timelock (9 epochs), more than a session's 3, so the
+   wallet always knows it. Each ciphertext is exactly 1,088 B; a ciphertext that ML-KEM would reject
+   still decapsulates (KG3) and only breaks the session's own keys. Size: ≤ 32,640 B for 3 epochs,
+   within the envelope's 16-bit `body_len`; 8 fit in `CHN_MAX_ITEM_BYTES`.
 
 The session gets the next `SessionId` at the end of the chain block C that includes it. Its keys
 reach the lane of each book b of the group at the first boundary after C is final: ~5.5 ms after
@@ -818,14 +843,18 @@ future. One day is also a natural rotation period for trading keys.
 ### 5.3 Key derivation
 
 All derivations use BLAKE3 `derive_key(context, material)` (01 §4). `le(e)` is the epoch as 4
-little-endian bytes. `x` is the session's X25519 private key.
+little-endian bytes. `x` is the session's X25519 private key. For e ≥ `E_pq` the wallet
+encapsulates to the ML-KEM part of `XK(s, home(e))` and of `G(e, s).pub`, which gives the
+ciphertexts `ct_seq(e, s)` and `ct_com(e, s)` of §5.2 and the secrets `m_seq(e, s)` and
+`m_com(e, s)`. The node holding the private half gets the same secret by decapsulation. Before
+`E_pq` the `m` and `ct` terms are absent (01 §14.20 G).
 
 ```
-P_seq(e, s)    = X25519(x, XK(s, home(e)))                       // client ↔ sequencer node of s
+P_seq(e, s)    = X25519(x, XK(s, home(e))) ‖ m_seq(e, s) ‖ BLAKE3(ct_seq(e, s))   // client ↔ sequencer node of s
 K_seq(e, s)    = derive_key("vyrn      v1 session", P_seq ‖ x25519_pub ‖ le(e) ‖ [s] ‖ "seq")[0..16]
 K_out(e, s)    = derive_key("vyrn      v1 session", P_seq ‖ x25519_pub ‖ le(e) ‖ [s] ‖ "out")[0..16]
 
-P_com(e, s)    = X25519(x, G(e, s).pub)                          // client ↔ committee(e) minus s
+P_com(e, s)    = X25519(x, G(e, s).pub) ‖ m_com(e, s) ‖ BLAKE3(ct_com(e, s))      // client ↔ committee(e) minus s
 head(e, s)     = derive_key("vyrn      v1 kcom head", P_com ‖ x25519_pub ‖ le(e) ‖ [s])   // 32 B
 c(e, s, N)     = head(e, s)
 c(e, s, k − 1) = BLAKE3(c(e, s, k))          for k = N, N−1, …, 1
@@ -1310,6 +1339,8 @@ side checks them.
    contract that governance adds and users opt into. Its signature check is a pluggable verifier
    address fixed at deployment: a precompile when Ethereum offers one, or a proof that VYRN's
    hybrid `CommitCert` verifies. Bridge keys `BK′` are then hybrid. Its design is out of scope.
+   Governance deploys it when Ethereum ships a post-quantum signature precompile (01 §14.20 PQ-5);
+   a Solidity ML-DSA verifier or a ZK proof of the `CommitCert` is not built before that.
 4. **`PqAlarm`.** A governance action (tightening, so it acts at once, §2.10). The immutable
    contract has no deposit-only switch, and `pause()` (§6.6) also blocks proposals and claims, so
    `PqAlarm` does not pause it. Instead: the validators sign only posts whose withdrawals all go to
@@ -1317,10 +1348,17 @@ side checks them.
    refuse to build deposits to the old bridge and point to the new one; and deposits that still
    arrive are credited as usual, so no funds are stranded. Guardians keep `pause()` for an attack in
    progress, as today. The old bridge then holds a shrinking balance that its 10% cap protects.
-   [Likely: deposits stop by tooling, not by the contract]
+   [Likely: deposits stop by tooling, not by the contract] **Trigger (PQ-5):** governance raises
+   `PqAlarm` on a published estimate that a cryptographically relevant quantum computer exists or
+   is within the timelock horizon, or at once on any public demonstration that a secp256k1 or
+   Ed25519 private key was computed from its public key. From `PqAlarm`, `BadPost` evidence is
+   verified and recorded but changes no bond and no jail (§8.1 item 2a, overriding §8.4's slash and
+   jail), because a quantum attacker can forge the secp256k1 signature it rests on, and two forged
+   jails would stop 4-of-5 finality.
 5. **Disclosure.** The service contract states: "Funds in the L1 bridge and accounts with classical
    owner keys are not protected against a quantum attacker. VYRN's ordering, finality and history
-   are." 01 §14.20 open question PQ-5 asks the owner when to deploy step 3 and raise step 4.
+   are." 01 §14.20 PQ-5 (decided) fixes when step 3 deploys and when step 4 is raised;
+   `CHN_PQ_OWNER_CUTOFF` stays open (§19 question 12).
 
 ## 7. Forced inclusion
 
@@ -1415,7 +1453,7 @@ Anyone submits an `Evidence` item. Its handling is automatic:
    if it, or `EvidenceCommit { hash }` of its encoding, is in a chain block final before `E_pq`
    began. Otherwise it is still verified, each signature under the rules of its own scheme (a
    hybrid `NodeCert` signature under 01 §14.20 A, a scheme-0 vote under 11 §2.5), and, if valid,
-   recorded; it changes no bond and no jail. `BadPost`'s secp256k1 signature is not a `SigScheme`; PQ-5 covers it (below).
+   recorded; it changes no bond and no jail. `BadPost`'s secp256k1 signature is not a `SigScheme`; `PqAlarm` covers it (below).
 
    | Evidence | Offending signatures (the misconduct itself) | Signatures it relies on besides |
    |---|---|---|
@@ -1427,7 +1465,7 @@ Anyone submits an `Evidence` item. Its handling is automatic:
    | `DoubleCommit` | `a.sig`, `b.sig` | — |
    | `Censorship` | the `seq_sig` of every book header in `(lastb(C), h]` | the finalization certificate of `C` |
    | `WrongExclusion` | the finalization certificate of the block | — (the disclosure is a hash preimage) |
-   | `BadPost` | `sig` (secp256k1, outside SG7) | — |
+   | `BadPost` | `sig` (secp256k1, outside SG7; no bond and no jail from `PqAlarm`, §6.8) | — |
 
    Why: after the switch a quantum
    attacker can forge scheme-0 signatures for the old epochs at will, and two forged `DoubleVote`s
@@ -1435,8 +1473,8 @@ Anyone submits an `Evidence` item. Its handling is automatic:
    cost: a fault committed in the last moments of `E_pq − 1` and not committed on chain before the
    switch goes unpunished on chain; honest nodes submit `EvidenceCommit` as soon as they detect a
    conflict, within milliseconds. Replay of history keeps classical verification. `BadPost`
-   evidence rests on secp256k1 bridge signatures and stays classical after `E_pq`; whether it
-   stops slashing at `PqAlarm` is part of PQ-5 (§6.8).
+   evidence rests on secp256k1 bridge signatures and stays classical after `E_pq`; it slashes
+   and jails until `PqAlarm` is raised and changes no bond and no jail from then on (PQ-5, §6.8).
 3. The slash applies at the end of the including chain block: bond balance moves to the insurance
    fund, and `CHN_REPORTER_SHARE` (5%) goes to the submitting account. A jail takes effect at the
    next boundary (§4.6), and the operator leaves the leader schedule and the sequencer schedule.
@@ -1910,7 +1948,8 @@ the same property that `CLIENT_SPLIT_CHAIN` gives finality.
 
 ### 14.3 The version handshake
 
-Every p2p connection starts with:
+Every p2p connection starts with the transport handshake, hybrid X25519 + ML-KEM-768 from `E_pq`
+(01 §14.20 G, PQ-12), and then:
 
 ```
 Hello { chain_id: u32, genesis_hash: Hash, op: OpIdx, home: HomeCode, client_kind: u8,
@@ -2137,4 +2176,4 @@ qty`, where `qty` is the reversed quantity of the original fill.
 | 9 | False-positive rate of FQ-1–FQ-3 with an honest sequencer, and detection power against a simulated front-runner | 11 | B-CHN-5: `vyrn-sim` with an injected 300 ns front-running strategy |
 | 10 | The SMT and LtHash code on the commit box is Rust for every operator. Is that a common-mode risk that needs a Vx implementation? | 11 | Review after B-CHN-2; diff test of both if built |
 | 11 | How many BUSY sheds do item ops at block boundaries cause, and is `CHN_ITEM_OPS_PER_BLOCK` = 16 right? | 05 | B3 with a bust over 10k accounts and 500 items per chain block |
-| 12 | When does governance deploy the post-quantum bridge and raise `PqAlarm`, and when does `CHN_PQ_OWNER_CUTOFF` take effect (§6.8, 01 §14.20 PQ-5)? | owner | a published estimate of a cryptographically relevant quantum computer, and an Ethereum post-quantum verifier VYRN can afford |
+| 12 | When does `CHN_PQ_OWNER_CUTOFF` take effect (§6.8)? The bridge and `PqAlarm` triggers are decided (01 §14.20 PQ-5). | owner | at or after `PqAlarm`, once hybrid `OwnerKey` wallets are available |
