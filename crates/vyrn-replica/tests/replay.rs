@@ -1200,6 +1200,18 @@ fn the_vx_client_replays_control_steps() {
     );
     let (j, _) = live07(&control_script());
     assert_vx_matches(&control_script(), 0..j.recs.len() - 1);
+    // 07 §3.8: an empty Rescan band is all ticks; both engines replay it as such.
+    let Some(lib) = vx_lib() else { return };
+    let mut all = blocks;
+    let r = all[0]
+        .steps
+        .iter_mut()
+        .find(|m| m.rec.kind == StepKind::Rescan)
+        .unwrap();
+    r.payload.clear();
+    let (_, rust_hashes) = replay(&live_j, &store, &all).unwrap();
+    let vx = vx_replay(&store, &all, &lib).unwrap();
+    assert_eq!(vec![vx[0].2], rust_hashes);
 }
 
 /// `snap_lag` (05 §6.5, 07 §7.1) on the Vx client: each packet is classified against the

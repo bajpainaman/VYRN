@@ -2284,8 +2284,15 @@ fn exec_step(c : *mut Ctx, sp : *mut i8) -> void {
       exec_control(c, pay, plen);
     } else if kind == K_RESCAN {
       if has_src || (*b).has_cont != 0u64 || (*b).phase != PH_CONT { fail_bbo(c, E_KIND); return; }
-      if plen != 8u64 { fail_bbo(c, E_BAD_RECORD); return; }
-      exec_rescan(c, rd32(pay, 0i64), rd32(pay, 4i64));
+      // An empty band is the arena's whole tick range (07 §3.8, as Engine::replay_wire reads it).
+      if plen == 0u64 {
+        exec_rescan(c, (*c).tick_min, (*c).tick_max);
+      } else if plen == 8u64 {
+        exec_rescan(c, rd32(pay, 0i64), rd32(pay, 4i64));
+      } else {
+        fail_bbo(c, E_BAD_RECORD);
+        return;
+      }
     } else {
       fail_bbo(c, E_UNSUPPORTED);
       return;
