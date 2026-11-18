@@ -18,6 +18,21 @@ VX_LLVM=22
 VX_SRC="$HOME/.local/src/vx"
 LOCAL_BIN="$HOME/.local/bin"
 
+# Installer scripts piped to a shell are pinned to a tag or commit and checked against these
+# sha256s (CDPI audit S9). To move a pin, fetch the new URL, review the diff, then update both.
+RUSTUP_INIT_URL="https://raw.githubusercontent.com/rust-lang/rustup/1.29.3/rustup-init.sh"
+RUSTUP_INIT_SHA256="d890e2fef6fa991b19cde2e608199bc1dca4e37f41f884edf8849ff693048de6"
+BINSTALL_URL="https://raw.githubusercontent.com/cargo-bins/cargo-binstall/v1.27.0/install-from-binstall-release.sh"
+BINSTALL_SHA256="d3a93702160e0ec03e2a4e996855db1f01adee801fb84a43add24e0877ef8eae"
+FOUNDRYUP_URL="https://raw.githubusercontent.com/foundry-rs/foundryup/d8a3201f2a7a2a0b85201e9cbd297a6800dc29bf/foundryup-init.sh"
+FOUNDRYUP_SHA256="5a8990dff59498a094cb3562ed4be917b3000f32781b50c2b60b399b4ea37dd7"
+
+# Downloads $1 to the file $3 and fails unless its sha256 is $2.
+fetch_checked() {
+  curl --proto '=https' --tlsv1.2 -fsSL "$1" -o "$3"
+  echo "$2  $3" | sha256sum -c --quiet -
+}
+
 step() {
   local name="$1"
   shift
@@ -55,8 +70,8 @@ apt_base() {
 
 rustup_install() {
   if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
-      sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+    fetch_checked "$RUSTUP_INIT_URL" "$RUSTUP_INIT_SHA256" /tmp/rustup-init.sh
+    sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain none
   fi
 }
 
@@ -145,8 +160,8 @@ vxc_build() {
 
 cargo_tools() {
   if ! command -v cargo-binstall >/dev/null; then
-    curl -L --proto '=https' --tlsv1.2 -sSf \
-      https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+    fetch_checked "$BINSTALL_URL" "$BINSTALL_SHA256" /tmp/binstall-install.sh
+    BINSTALL_VERSION=1.27.0 bash /tmp/binstall-install.sh
   fi
   # deny/vet/fuzz/show-asm are named by 11 (L54, L58, L102, L613); nextest is a faster runner for
   # the unit tier; cyclonedx writes the release SBOM (11 L316); vx/build.sh checks the vxc pin
@@ -163,7 +178,8 @@ cargo_tools() {
 foundry_install() {
   # Bridge contract work and the B-CHN-4 gas report (09 L1113, L2020).
   if [[ ! -x "$HOME/.foundry/bin/forge" ]]; then
-    curl -fsSL https://foundry.paradigm.xyz | bash >/dev/null
+    fetch_checked "$FOUNDRYUP_URL" "$FOUNDRYUP_SHA256" /tmp/foundryup-init.sh
+    bash /tmp/foundryup-init.sh >/dev/null
     "$HOME/.foundry/bin/foundryup" --install stable >/dev/null
   fi
 }
