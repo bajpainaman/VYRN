@@ -11,15 +11,32 @@
 /// replay and tests pass [`NeverLate`] or a fixed value.
 pub trait Clock {
     fn now(&self) -> u64;
+    /// The BBO deadline test at this clock: [`is_late`] on the low 32 bits of [`Clock::now`].
+    #[inline(always)]
+    fn late(&self, deadline: u32) -> bool {
+        let now = self.now().to_le_bytes();
+        is_late(
+            u32::from_le_bytes([now[0], now[1], now[2], now[3]]),
+            deadline,
+        )
+    }
 }
 
-/// A clock for replay: every op is on time.
+/// A clock for replay: every op is on time, whatever its deadline.
+///
+/// A fixed `now` cannot say that: [`is_late`] wraps, so any fixed instant is late for half of
+/// the deadlines in a 2^32 ns wrap (`now = 0` is late for every `deadline > 2^31`). So
+/// `NeverLate` answers the test itself.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NeverLate;
 
 impl Clock for NeverLate {
     fn now(&self) -> u64 {
         0
+    }
+    #[inline(always)]
+    fn late(&self, _deadline: u32) -> bool {
+        false
     }
 }
 
@@ -45,9 +62,5 @@ pub fn is_late(now_lo32: u32, deadline: u32) -> bool {
 /// The test the main loop runs on a source at step start.
 #[inline(always)]
 pub fn late<C: Clock>(clock: &C, deadline: u32) -> bool {
-    let now = clock.now().to_le_bytes();
-    is_late(
-        u32::from_le_bytes([now[0], now[1], now[2], now[3]]),
-        deadline,
-    )
+    clock.late(deadline)
 }

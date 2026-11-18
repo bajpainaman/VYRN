@@ -65,7 +65,7 @@ impl World {
 }
 
 /// One step as the stream and fill TX cores see it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seen {
     pub entry: StepEntry,
     pub deltas: Vec<CutDelta>,
@@ -395,6 +395,39 @@ impl Lanes<'_> {
             events,
             tx,
         }
+    }
+
+    /// One `replay_step` call; a published step is read back as `poll` does.
+    pub fn replay(&mut self, bbo: &mut Bbo, rec: &ReplayStep) -> Result<Poll, Diverge> {
+        let mut ports = Ports {
+            half_a: self.half_a,
+            half_b: self.half_b,
+            fwd: &mut self.fwd_c,
+            control: &mut self.ctl_c,
+            fill: &mut self.fill_p,
+            step_log: &mut self.log_p,
+            tx: &mut self.tx_p,
+            snapshot: self.snap,
+            floor: self.floor,
+        };
+        let r = bbo.replay_step(&Hw, &mut ports, &self.book, rec);
+        if let Ok(Poll::Step(_)) = r {
+            let seen = self.read_step(bbo);
+            self.seen.push(seen);
+        }
+        r
+    }
+
+    /// Replay `rec` until its step is published.
+    pub fn replay_ok(&mut self, bbo: &mut Bbo, rec: &ReplayStep) -> Seen {
+        for _ in 0..4 {
+            match self.replay(bbo, rec).unwrap() {
+                Poll::Step(_) => return self.seen.last().unwrap().clone(),
+                Poll::Fault => panic!("engine fault"),
+                _ => {}
+            }
+        }
+        panic!("no step")
     }
 
     /// Poll until a step is published.
