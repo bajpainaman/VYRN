@@ -23,7 +23,8 @@
 //! is the only source of its bytes. Such a packet still names an open session and a `pkt_seq` in
 //! its V5 window, so a sender picks among a few thousand keys against ≥ 2 × slots buckets and
 //! cannot aim several at one bucket. Repeating one key fills its bucket, but an unchecked packet
-//! never takes a way from an accepted (MAC-checked) one. A record joins only the variant its `pkt_hash` names (07
+//! never takes a way from an accepted (MAC-checked) one. A shed copy displaced this way is lost
+//! (05 §18 Q17). A record joins only the variant its `pkt_hash` names (07
 //! §5.4), so foreign bytes never enter a block.
 //!
 //! **Window.** A packet is served while its `rx_ts` is within [`REP_SEQ_PKT_RETAIN_NS`] of the

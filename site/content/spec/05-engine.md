@@ -1509,8 +1509,8 @@ The packets kept are the lane verdicts `Accepted` and `Shed`.
     and the sequencer holds the only copy a replica can fetch. Such a packet must still name an open
     session and a `pkt_seq` inside its V5 window, so a sender cannot aim several keys at one bucket.
     Repeating one key can fill its bucket, but an unchecked packet never takes an index way from an
-    `Accepted` (MAC-checked) one; it stays unindexed instead. Shed copies a flood displaces fall to
-    07 §5.5's DAV-3 unavailable rule. A record joins only the variant its `pkt_hash` names (07 §5.4).
+    `Accepted` (MAC-checked) one; it stays unindexed instead. A shed copy a flood displaces is
+    lost: its record cannot be resolved unless another source holds the bytes, which Q17 covers. A record joins only the variant its `pkt_hash` names (07 §5.4).
 - **Determinism.** Retention changes no engine state and no output. Replay neither reads it nor
   rebuilds it.
 
@@ -3081,3 +3081,4 @@ Q9's `liq` half (`liq = 2`), Q12's percentile form (cold lines are paid before t
 | Q14 | `MakerSeq` gives 8 spare numbers, which a market maker hit by many consecutive crosses can use up before its lane refills (`eng_maker_seq_wait`). | 01, 05 | B3 with a market maker at the touch |
 | Q15 | 01 §14.14 bounds every maker fill by the taker's first bit. At index 9 about five continuation steps (≤ 40 fills) fit; later steps' maker fills exceed `LAT_MAX_NS`. Cap the fills one taker may take, or re-budget? | 01 | decision; B3 with a 64-maker sweep |
 | Q16 | A crash after an ack but before its boundary record leaves loses the boundary's position (01 §14.16 gates on op and step records). Gate on the boundary record too? | 07 | failover test with acks in flight |
+| Q17 | Test D (§6.8) sheds before V6, so a packet with a bad MAC still gets a logged `SHED` record whose bytes only the sequencer holds (§6.10). Repeating one key can push those bytes out of retention. The record then stays unresolved and its block's vote waits: DAV-3 (07 §5.5) needs DAV-1's quorum of `DataMissing` (> 16 source-3 resolutions in 10 ms), which one such record does not reach. Check the MAC before logging `SHED`, exempt unchecked `SHED` records from `data_root`, or make an unrepairable `SHED` record unavailable directly? | 05, 07, 13 | decision; `vyrn-sim` shed flood on one key |
