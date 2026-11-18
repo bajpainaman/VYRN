@@ -571,7 +571,7 @@ order-entry path:
 
 ```rust
 struct OpenSessionReq {
-    account: AccountId, books: Vec<BookId>, proto_version: u16,   // 1 for this chapter
+    account: AccountId, books: Vec<BookId>, proto_version: u16,   // 2 for this chapter (§12)
     src: SocketAddrV4,                                            // becomes the bound address
     cod: Cod,                                                     // Off | On
     timeout_ms: u32,                                              // §4.8
@@ -610,7 +610,7 @@ reserved u16, detail u32).
 | Offset | Size | Field | Value |
 |---|---|---|---|
 | 0 | 4 | `account` | `AccountId` |
-| 4 | 2 | `proto_version` | 1 |
+| 4 | 2 | `proto_version` | 2 (§12) |
 | 6 | 1 | `cod` | 0 `Off`, 1 `On` |
 | 7 | 1 | `rate_tier` | 0–3 (T0–T3, 10) |
 | 8 | 6 | `src` | `SocketAddrV4` |
@@ -1819,7 +1819,17 @@ do not count V16 as acknowledged.
 
 **The wire carries no version field.** The protocol version is fixed per session at open
 (`proto_version` in BASE, the open transaction in CHAIN). This keeps the header at
-`PKT_HDR_BYTES` and the lane never branches on a per-packet version. This chapter is version 1.
+`PKT_HDR_BYTES` and the lane never branches on a per-packet version. This chapter is version 2
+(`PROTO_VERSION` in vyrn-wire).
+
+Version 2 differs from version 1 in one place: the `RATE_LIMIT` detail ids of 10's buckets moved
+from 1–4 to 8–11 (§9.1, Q13), so they no longer overlap §9's buckets 1–7. That changes the meaning
+of a v1 field value, which VR2 forbids; it was allowed once because version 1 was never released.
+No box accepts `proto_version` 1, and `OpenSessionReq` with it is refused (admin vector B08). Every
+other rule and layout of version 1 is unchanged, so "v1" in VR1–VR3 and in the table below means
+the base layout that versions 1 and 2 share. Protocol versions are numbered apart from product
+scope: "v2" in 01, 02 and 10 (isolated-margin perpetuals) is a product release, which will need
+a later protocol version.
 
 | ID | Rule |
 |---|---|
