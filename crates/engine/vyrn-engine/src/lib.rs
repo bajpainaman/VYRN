@@ -50,10 +50,6 @@
 //! - Live mode is the single-threaded schedule of 11 §6.4 (`vyrn-sim` order). The engine
 //!   crates may not spawn threads (11 §3.3), so pinned cores are the binary's: it runs the same
 //!   roles from [`role`] on its own threads.
-//! - A forwarded op's route (`Cross` or `Improve`, which risk charges to different buckets) is
-//!   derived from its first step's kind, because the log does not carry the live
-//!   classification. A `Cross` that STP stops before any fill is logged as `Improve`, so it
-//!   replays with the `Improve` bucket: a known divergence until the spec logs the route.
 //! - Pooled lanes. Each record of a pooled session takes the account's token, logs
 //!   `AcctTake` and releases it. The lane's work for that record is already done: one thread
 //!   plays every pool core, so nothing else can write the account in between. Boundary work
