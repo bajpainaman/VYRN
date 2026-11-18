@@ -398,6 +398,14 @@ fn unreferenced_payloads_expire_after_finality_and_are_capped() {
     j.put(SessionId(6), 1, bytes(0xF1));
     assert!(j.resolve(&retry).is_ok(), "the SHED window keeps it");
     assert_eq!(j.evictions().capped, 0);
+
+    // Released before its payload arrives: the late payload is still in its SHED window.
+    let mut j = DataJoin::with_cap(1);
+    j.release(Height(1), &[LaneRec::Pkt(shed)]);
+    j.put(SessionId(5), 1, p.clone());
+    j.put(SessionId(6), 1, bytes(0xF1));
+    assert!(j.resolve(&retry).is_ok(), "late SHED payload is kept");
+    assert_eq!(j.evictions().capped, 0);
 }
 
 #[test]

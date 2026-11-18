@@ -61,6 +61,9 @@ pub struct DataJoin {
     /// Variants kept for a bounded window after a release, `(height released, key, hash)`: a
     /// `SHED` record's variant (for its retry), and the unused variants of an accepted packet.
     shed: VecDeque<(Height, (SessionId, u32), PktHash)>,
+    /// How many `shed` entries name each variant: one in its window is held for release, not
+    /// subject to the unreferenced cap, even when its payload arrives after the release.
+    shed_open: BTreeMap<((SessionId, u32), PktHash), u32>,
     /// Records of ready blocks naming each key, not released yet: a SHED record and its retry
     /// share a key, so one release must not end the other's reference.
     refs: BTreeMap<(SessionId, u32), u32>,
@@ -148,6 +151,7 @@ impl DataJoin {
         Self {
             by_key: BTreeMap::new(),
             shed: VecDeque::new(),
+            shed_open: BTreeMap::new(),
             refs: BTreeMap::new(),
             unref: BTreeMap::new(),
             unref_keys: BTreeMap::new(),
@@ -171,7 +175,8 @@ impl DataJoin {
             .or_default();
         if !vars.iter().any(|v| v.full == full) {
             vars.push(Variant { full, bytes });
-            if !self.refs.contains_key(&key) {
+            if !self.refs.contains_key(&key) && !self.shed_open.contains_key(&(key, prefix(&full)))
+            {
                 let n = self.next_arrival;
                 self.next_arrival = n.wrapping_add(1);
                 self.unref
@@ -307,7 +312,7 @@ impl DataJoin {
                 }
             }
             if p.flags & PacketFlags::SHED != 0 {
-                self.shed.push_back((height, key, p.pkt_hash));
+                self.open_shed(height, key, p.pkt_hash);
             } else {
                 self.evict(key, p.pkt_hash);
                 // Other variants of an accepted packet (resends the sequencer did not take) have
@@ -318,8 +323,8 @@ impl DataJoin {
                     .map(|vs| vs.keys().copied().collect())
                     .unwrap_or_default();
                 for h in rest {
-                    if !self.shed.iter().any(|&(_, k, x)| k == key && x == h) {
-                        self.shed.push_back((height, key, h));
+                    if !self.shed_open.contains_key(&(key, h)) {
+                        self.open_shed(height, key, h);
                     }
                 }
             }
@@ -329,11 +334,22 @@ impl DataJoin {
                 break;
             }
             self.shed.pop_front();
+            let open = self.shed_open.get_mut(&(key, hash)).map(|n| {
+                *n = n.saturating_sub(1);
+                *n
+            });
             // A later SHED record of the same variant (the retry was shed again) keeps it.
-            if !self.shed.iter().any(|&(_, k, x)| k == key && x == hash) {
+            if open == Some(0) {
+                self.shed_open.remove(&(key, hash));
                 self.evict(key, hash);
             }
         }
+    }
+
+    fn open_shed(&mut self, height: Height, key: (SessionId, u32), hash: PktHash) {
+        self.shed.push_back((height, key, hash));
+        let n = self.shed_open.entry((key, hash)).or_default();
+        *n = n.saturating_add(1);
     }
 
     fn evict(&mut self, key: (SessionId, u32), hash: PktHash) {
