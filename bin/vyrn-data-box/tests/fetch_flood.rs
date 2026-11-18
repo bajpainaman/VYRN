@@ -6,6 +6,8 @@
 //! takes one second of KEY fetches that all miss. Each fetch is cheap; the risk is that the RX
 //! and shard threads never idle, so they take the sender's turns. The test measures the gaps
 //! between frames at a replica during the flood.
+// Linux only: the box pins its cores (`[shards] cpus`), which `vyrn_nic::sys` supports only there.
+#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::io::{BufRead, BufReader};
@@ -22,8 +24,6 @@ const FLOOD: Duration = Duration::from_secs(1);
 /// `DATA_HB` to an idle destination every `hb_ns` (the binary's default, 100 µs).
 const HB: Duration = Duration::from_micros(100);
 
-/// Linux only: the box pins its cores (`[shards] cpus`), which `vyrn_nic::sys` supports only there.
-#[cfg(target_os = "linux")]
 #[test]
 fn heartbeats_keep_their_cadence_under_a_fetch_flood() {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
