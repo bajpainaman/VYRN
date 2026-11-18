@@ -232,3 +232,50 @@ fn the_vx_client_replays_sim_seed_6f() {
         .collect();
     assert_eq!(got, want);
 }
+
+/// One swarm seed's live run (its generated fault schedule) replayed by both engines.
+fn swarm_seed<const N: usize>(seed: u64, lib: &std::path::Path) {
+    let cfg = cluster::Config::from_seed(seed);
+    let (report, out, store) = cluster::run_log(seed, &Schedule::generate(seed, &cfg));
+    let blocks = blocks::<N>(&out, &store);
+    let (bbo, mut sh) = cluster::new_box(N);
+    let mut rust = RustReplay::new(
+        cluster::engine(bbo, &mut sh, &report.config),
+        data(&store),
+        vyrn_engine::NoResponses,
+        Out::default(),
+    );
+    let want: Vec<Hash> = blocks
+        .iter()
+        .map(|b| rust.replay_block(b).unwrap().output_hash)
+        .collect();
+    let mut vx = VxReplay::new(lib, &vx_config(&report.config), data(&store)).unwrap();
+    let got: Vec<Hash> = blocks
+        .iter()
+        .map(|b| {
+            vx.replay_block(b)
+                .unwrap_or_else(|e| panic!("seed {seed:x}: {e:?}"))
+                .output_hash
+        })
+        .collect();
+    assert_eq!(got, want, "seed {seed:x}");
+}
+
+/// Every one of the first 149 `vyrn-sim` swarm seeds (11 §6.4) replays to the same output hash
+/// with the Vx client as with `RustReplay`, with no UNSUPPORTED allowance (11 §5.3).
+#[test]
+fn the_vx_client_replays_the_swarm_seeds() {
+    let Some(lib) = vx_lib() else { return };
+    for seed in 1..=149u64 {
+        match cluster::Config::from_seed(seed).lanes {
+            1 => swarm_seed::<1>(seed, &lib),
+            2 => swarm_seed::<2>(seed, &lib),
+            3 => swarm_seed::<3>(seed, &lib),
+            4 => swarm_seed::<4>(seed, &lib),
+            5 => swarm_seed::<5>(seed, &lib),
+            6 => swarm_seed::<6>(seed, &lib),
+            7 => swarm_seed::<7>(seed, &lib),
+            _ => swarm_seed::<8>(seed, &lib),
+        }
+    }
+}

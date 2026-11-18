@@ -346,6 +346,9 @@ struct Bbo {
   kv : u64,
   // The step's deps packet (NONE without one) and each TX record's dependency index.
   dh : i64, tgrp : *mut u64,
+  // The dependency index records of the deps packet take (cg), and a dependency continuation
+  // (Bbo::dcont): the next step resumes at dependency dc_i, mid-sweep when dc_mid.
+  cg : u64, dc_has : u64, dc_i : u64, dc_mid : u64,
 }
 
 struct Ctx {
@@ -2346,6 +2349,8 @@ fn tx_open(c : *mut Ctx, step : u64, session : u64, rs : u64, pkt : u64, l : u64
 }
 fn tx_push(c : *mut Ctx, i : i64, lo : u64, hi : u64) -> void {
   if i == NONE { return; }
+  // The deps packet keeps dependency index order (05 §8.9).
+  unsafe { if i == (*(*c).bbo).dh { tx_push_g(c, i, (*(*c).bbo).cg, lo, hi); return; } }
   let p = tx_slot(c, i);
   let n = rd8(p, 21i64);
   if n >= MAX_RECS { unsafe { (*(*c).bbo).err = E_FAULT; } return; }
@@ -3066,7 +3071,7 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
     let tif = ((*e).flags >> 1u64) & 3u64;
     let rs1 = if (*e).dmask != 0u64 { ((*e).resp_seq + 1u64) & U32_MAX } else { (*e).resp_seq };
     if kind == K_SHED {
-      if (*e).dmask != 0u64 { apply_deps(c, s, l, q, e, true); }
+      if (*e).dmask != 0u64 { let _ = apply_deps(c, s, l, q, e, true, false, 0u64, false); }
       let i = tx_open(c, s, (*e).sess_id, rs1, (*e).pkt_seq, l, ROLE_TAKER);
       event(c, l, EV_REJECT, LIQ_TAKER, BUSY, (*e).vslot, h, (*e).tick, (*e).total);
       tx_push(c, i, rec_lo(R_REJECT, (*e).ix, BUSY, 0u64), rec_hi(0u64, (*e).tag));
@@ -3080,29 +3085,44 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
       (*o).seq = q; (*o).acct = (*e).acct; (*o).sess_id = (*e).sess_id; (*o).tag = (*e).tag;
       (*o).flags = (*e).flags; (*o).vslot = (*e).vslot; (*o).state = 2u64;
     }
-    // 05 §8.5 apply_deps: the dependencies, in index order, before the source.
-    if !cont && (*e).dmask != 0u64 {
-      apply_deps(c, s, l, q, e, false);
+    // 05 §8.5 apply_deps: the dependencies, in index order, before the source. One that
+    // trades ends the step; the rest resume in the next (CONT) step, as Bbo::exec_fwd.
+    let dep_cont = cont && (*b).dc_has != 0u64;
+    if (!cont && (*e).dmask != 0u64) || dep_cont {
+      let from = if dep_cont { (*b).dc_i } else { 0u64 };
+      let mid = dep_cont && (*b).dc_mid != 0u64;
+      (*b).dc_has = 0u64;
+      let stop = apply_deps(c, s, l, q, e, false, cont, from, mid);
       if (*b).err != 0u64 { return; }
+      if stop {
+        (*b).has_cont = 1u64;
+        (*b).cont_lane = l;
+        (*b).cont_seq = q;
+        let got = if cont || (*b).n_fills > 0u64 { K_CROSS } else { K_IMPROVE };
+        if got != kind { fail_bbo(c, E_KIND); } else { }
+        return;
+      }
     }
-    let rs = if cont { 0u64 } else { rs1 };
+    // The source's first run: its own step, or the CONT step its dependencies finish in.
+    let first = !cont || dep_cont;
+    let rs = if first { rs1 } else { 0u64 };
     let src = tx_open(c, s, (*e).sess_id, rs, (*e).pkt_seq, l, ROLE_TAKER);
     let opp = 1u64 - (*e).side;
     let mut ended = false;
     let ph = (*b).phase;
-    if !cont && ph == PH_HALTED {
+    if first && ph == PH_HALTED {
       end_taker(c, l, e, src, EV_REJECT, BOOK_HALTED, true, 0u64);
       ended = true;
-    } else if !cont && ph == PH_FROZEN {
+    } else if first && ph == PH_FROZEN {
       end_taker(c, l, e, src, EV_REJECT, AUCTION_PHASE, true, 0u64);
       ended = true;
-    } else if !cont && ph == PH_AUCTION && (tif == 1u64 || tif == 2u64) {
+    } else if first && ph == PH_AUCTION && (tif == 1u64 || tif == 2u64) {
       end_taker(c, l, e, src, EV_OUT, OUT_AUCTION, false, 0u64);
       ended = true;
-    } else if !cont && ph == PH_CONT && tif == 3u64 {
+    } else if first && ph == PH_CONT && tif == 3u64 {
       end_taker(c, l, e, src, EV_REJECT, AUCTION_PHASE, true, 0u64);
       ended = true;
-    } else if !cont && ph == PH_AUCTION {
+    } else if first && ph == PH_AUCTION {
       // An auction rests the taker without a sweep (Bbo::rest_taker).
       let open = bopen(c, l, r);
       book_add(c, l, r);
@@ -3110,7 +3130,7 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
       event(c, l, EV_RESTED, LIQ_TAKER, 0u64, (*e).vslot, h, (*e).tick, open);
       tx_push(c, src, rec_lo(R_ACK, (*e).ix, 0u64, h), rec_hi((*e).tick, (*e).tag));
       ended = true;
-    } else if !cont {
+    } else if first {
       // entry_checks (05 §2.5 P1, the post-only test and the FOK dry run).
       // The detail is the best opposite tick it would cross (04 §6), as Bbo::entry_checks.
       let post = ((*e).flags & 8u64) != 0u64;
@@ -3151,28 +3171,40 @@ fn exec_fwd(c : *mut Ctx, s : u64, kind : u64, l : u64, q : u64, cross : u64) ->
 
 // 05 §8.5 apply_deps, §3.7 (4), as Bbo::apply_deps: forwarded op q's dependencies in index
 // order, each recorded in the deps packet (resp_seq of the source; the source takes the next).
-// `shed`: every one gets Reject BUSY and nothing is applied (Bbo::exec_shed).
-fn apply_deps(c : *mut Ctx, s : u64, l : u64, q : u64, e : *mut LOp, shed : bool) -> void {
+// `shed`: every one gets Reject BUSY and nothing is applied (Bbo::exec_shed). From dependency
+// `from` (resuming its sweep when `mid`); true when one traded or ended, which ends the step
+// (the rest resume in a CONT step, whose deps packet is a continuation: resp_seq 0).
+fn apply_deps(c : *mut Ctx, s : u64, l : u64, q : u64, e : *mut LOp, shed : bool, cont : bool,
+              from : u64, mid : bool) -> bool {
   unsafe {
     let b = (*c).bbo;
     let li = l as i64;
-    let dh = tx_open(c, s, (*e).sess_id, (*e).resp_seq, (*e).pkt_seq, l, ROLE_DEPS);
-    if dh == NONE { return; }
+    let rs = if cont { 0u64 } else { (*e).resp_seq };
+    let dh = tx_open(c, s, (*e).sess_id, rs, (*e).pkt_seq, l, ROLE_DEPS);
+    if dh == NONE { return false; }
     (*b).dh = dh;
     let ph = (*b).phase;
     let mut g = 0u64;
     let mut back = 63u64;
     while back > 0u64 {
-      if (((*e).dmask >> back) & 1u64) != 0u64 {
+      if (((*e).dmask >> back) & 1u64) != 0u64 && g < from {
+        g = g + 1u64;
+      } else if (((*e).dmask >> back) & 1u64) != 0u64 {
         let dq = q - back;
         let d = lop(c, li, dq);
-        if (*d).seq != dq || (*d).kind != OP_DEP { fail_bbo(c, E_FAULT); return; }
+        if (*d).seq != dq || (*d).kind != OP_DEP { fail_bbo(c, E_FAULT); return false; }
         let r = (*d).root;
         let h = handle(r);
         let dk = (*d).dk;
         // Spec follow-up F2: FwdDep has no message index; Rust takes the source's minus back.
         let ix = sat_sub((*e).ix, back);
-        if shed {
+        (*d).ix = ix;
+        (*b).cg = g;
+        if mid && g == from {
+          // The CONT step of a capped Join dependency's sweep (Bbo::join_dep, resume).
+          let w = join_sweep(c, s, l, d, g);
+          if w != 0u64 { return dep_stop(c, g, w); }
+        } else if shed {
           let dqty = if dk == DK_JOIN { (*d).total } else { 0u64 };
           event(c, l, EV_DEP, dk, BUSY, (*d).vslot, h, (*d).tick, dqty);
           tx_push_g(c, dh, g, rec_lo(R_REJECT, ix, BUSY, 0u64), rec_hi(0u64, 0u64));
@@ -3187,26 +3219,28 @@ fn apply_deps(c : *mut Ctx, s : u64, l : u64, q : u64, e : *mut LOp, shed : bool
           (*o).side = (*d).side; (*o).tick = (*d).tick; (*o).total = (*d).total; (*o).ts = (*d).ts;
           (*o).seq = dq; (*o).acct = (*d).acct; (*o).sess_id = (*d).sess_id; (*o).tag = (*d).tag;
           (*o).flags = (*d).flags; (*o).vslot = (*d).vslot;
-          // It enters like a New (Bbo::join_dep): a Join that crosses at the source's cut would
-          // match before the source and end the step, which the client does not replay.
+          (*o).state = 2u64;
+          // It enters like a New (Bbo::join_dep): one that a visible level crosses at the
+          // source's cut matches first, at that cut, with the sweep's cap (D14).
+          let mut lvl = 0u64;
           if ph == PH_CONT {
             let opp = 1u64 - (*d).side;
-            let from = if opp == 0u64 { (*b).bb } else { (*b).ba };
+            let bf = if opp == 0u64 { (*b).bb } else { (*b).ba };
             let empty = if opp == 0u64 { NO_BID } else { NO_ASK };
-            let lvl = if from == empty { 0u64 } else { level_from(c, opp, from) };
-            let crosses = lvl != 0u64 && (if opp == 1u64 { lvl <= (*d).tick } else { lvl >= (*d).tick });
-            if crosses { fail_bbo(c, E_UNSUPPORTED); return; }
+            let at = if bf == empty { 0u64 } else { level_from(c, opp, bf) };
+            if at != 0u64 && (if opp == 1u64 { at <= (*d).tick } else { at >= (*d).tick }) { lvl = at; }
           } else { }
-          book_add(c, l, r);
-          rest_bound(c, (*d).side, (*d).tick);
-          (*o).dstep = s;
-          (*o).dg = g + 1u64;
-          event(c, l, EV_DEP, DK_JOIN, 0u64, (*d).vslot, h, (*d).tick, (*d).total);
-          tx_push_g(c, dh, g, rec_lo(R_ACK, ix, 0u64, h), rec_hi((*d).tick, (*d).tag));
+          if lvl != 0u64 && ((*d).flags & 8u64) != 0u64 {
+            end_taker(c, l, d, dh, EV_REJECT, POST_ONLY_WOULD_CROSS, true, lvl);
+            if (*b).err != 0u64 { return false; }
+            return dep_stop(c, g, 1u64);
+          }
+          let w = if lvl != 0u64 { join_sweep(c, s, l, d, g) } else { join_rest(c, s, l, d, g) };
+          if w != 0u64 { return dep_stop(c, g, w); }
         } else {
           let o = bord(c, l, r);
           // Not in the book yet: its Join is applied but past the cut (unreplayed).
-          if (*o).state == 0u64 { fail_bbo(c, E_UNSUPPORTED); return; }
+          if (*o).state == 0u64 { fail_bbo(c, E_UNSUPPORTED); return false; }
           let open = if (*o).state == 3u64 { 0u64 } else { bopen(c, l, r) };
           (*o).killed = 1u64;
           book_drop(c, l, r);
@@ -3218,12 +3252,58 @@ fn apply_deps(c : *mut Ctx, s : u64, l : u64, q : u64, e : *mut LOp, shed : bool
             tx_push_g(c, dh, g, rec_lo(R_CXL, ix, 0u64, h), rec_hi(open, (*d).tag));
           }
         }
-        if (*b).err != 0u64 { return; }
+        if (*b).err != 0u64 { return false; }
         g = g + 1u64;
       } else { }
       back = back - 1u64;
     }
   }
+  return false;
+}
+
+// Ends the step at dependency g: w = 2, its sweep is capped (the next step resumes it); else it
+// is done and the next step starts at g + 1.
+fn dep_stop(c : *mut Ctx, g : u64, w : u64) -> bool {
+  unsafe {
+    let b = (*c).bbo;
+    if (*b).err != 0u64 { return false; }
+    (*b).dc_has = 1u64;
+    (*b).dc_i = if w == 2u64 { g } else { g + 1u64 };
+    (*b).dc_mid = if w == 2u64 { 1u64 } else { 0u64 };
+  }
+  return true;
+}
+
+// A crossing Join dependency's capped sweep, then join_rest (Bbo::join_dep): 2 = capped, 1 =
+// it traded (the step ends), 0 = nothing happened.
+fn join_sweep(c : *mut Ctx, s : u64, l : u64, d : *mut LOp, g : u64) -> u64 {
+  unsafe {
+    let b = (*c).bbo;
+    let n0 = (*b).n_fills;
+    let res = sweep(c, l, d, (*b).dh, false, 0u64);
+    if (*b).err != 0u64 { return 0u64; }
+    if res == 1u64 { return 2u64; }
+    let _ = join_rest(c, s, l, d, g);
+    return if (*b).n_fills != n0 { 1u64 } else { 0u64 };
+  }
+}
+
+// A Join dependency with open quantity rests: Dep event and Ack in the deps packet.
+fn join_rest(c : *mut Ctx, s : u64, l : u64, d : *mut LOp, g : u64) -> u64 {
+  unsafe {
+    let r = (*d).root;
+    let open = bopen(c, l, r);
+    if open == 0u64 { return 0u64; }
+    let o = bord(c, l, r);
+    let h = handle(r);
+    book_add(c, l, r);
+    rest_bound(c, (*d).side, (*d).tick);
+    (*o).dstep = s;
+    (*o).dg = g + 1u64;
+    event(c, l, EV_DEP, DK_JOIN, 0u64, (*d).vslot, h, (*d).tick, open);
+    tx_push_g(c, (*(*c).bbo).dh, g, rec_lo(R_ACK, (*d).ix, 0u64, h), rec_hi((*d).tick, (*d).tag));
+  }
+  return 0u64;
 }
 
 // Ends the taker with a Reject (reason) or an Out (cause), its open quantity and its record.
