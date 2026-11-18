@@ -94,6 +94,8 @@ struct Op {
     prio_ts: u64,
     fwd: bool,
     res: Option<Resp>,
+    /// The `resp_seq` of the response packet that carried `res`.
+    resp_seq: u32,
 }
 
 /// A packet's numbered ops: lane, first LaneSeq, and each index's offset (`None`: unnumbered).
@@ -108,6 +110,7 @@ struct PktOps {
 struct Src {
     lane: LaneId,
     seq: LaneSeq,
+    session: SessionId,
     msg: Option<Msg>,
     prio_ts: u64,
 }
@@ -116,6 +119,8 @@ struct Src {
 struct PendStep {
     step: StepId,
     kind: StepKind,
+    /// `StepEntry.flags` (`CONT`, `CROSS`).
+    flags: u8,
     src: Option<Src>,
     /// `(lane, C_s[l])` for every lane whose cut moved.
     covers: Vec<(u8, u64)>,
@@ -124,6 +129,8 @@ struct PendStep {
     ticks: u32,
     taker: Vec<Resp>,
     maker: Vec<(LaneId, Resp)>,
+    /// Every TX record with its packet's header, in TX order (for the [`Tap`]).
+    tx: Vec<(TxEntry, Resp)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -133,16 +140,62 @@ struct Resting {
     qty: Qty,
 }
 
-/// The `MBO` encoder behind a `Sink` (module docs).
-pub struct SinkStream<K: PacketSink> {
+/// A consumer of the adapter's resolved outputs, in its release order (module docs): each
+/// lane op of an interval as it is pushed, then the step that closes the interval. The order
+/// is a function of the log, whatever order the sink calls came in. Drop copy (10 §8) is one.
+pub trait Tap {
+    /// A lane op with its response record, in the interval's `(prio_ts, lane, LaneSeq)` order.
+    fn lane_op(&mut self, _op: &TapOp) {}
+    /// A released step, after its interval's lane ops.
+    fn step(&mut self, _st: &TapStep<'_>) {}
+}
+
+impl Tap for () {}
+
+/// One resolved lane op (forwarded ops are not lane ops: their records come with the step).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapOp {
+    pub lane: LaneId,
+    pub seq: LaneSeq,
+    pub session: SessionId,
+    pub pkt_seq: u32,
+    /// The `resp_seq` of the lane response packet that carried `rec`.
+    pub resp_seq: u32,
+    /// The request message (`None`: it did not parse).
+    pub msg: Option<Msg>,
+    pub rec: Resp,
+}
+
+/// A step's source op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapSrc {
+    pub lane: LaneId,
+    pub seq: LaneSeq,
+    pub session: SessionId,
+    pub msg: Option<Msg>,
+}
+
+/// One released step and its TX records, each with its packet's header, in TX order.
+#[derive(Clone, Copy, Debug)]
+pub struct TapStep<'a> {
+    pub step: StepId,
+    pub kind: StepKind,
+    /// `StepEntry.flags`: bit 0 `CONT`, bit 1 `CROSS` (05 §4.15).
+    pub flags: u8,
+    pub src: Option<TapSrc>,
+    pub tx: &'a [(TxEntry, Resp)],
+}
+
+/// The `MBO` encoder behind a `Sink` (module docs), with an optional [`Tap`].
+pub struct SinkStream<K: PacketSink, T: Tap = ()> {
     enc: MboEncoder,
     out: K,
     err: Option<SinkError>,
     msgs: BTreeMap<(SessionId, u32), Msgs>,
     pkts: BTreeMap<(SessionId, u32), PktOps>,
-    /// Lane responses that came before their packet record (immediate rejects).
-    /// With the packet's first LaneSeq when the response's gate names it.
-    early: Vec<(SessionId, u32, Option<u64>, Resp)>,
+    /// Lane responses that came before their packet record (immediate rejects), with their
+    /// `resp_seq`, and the packet's first LaneSeq when the response's gate names it.
+    early: Vec<(SessionId, u32, Option<u64>, u32, Resp)>,
     /// Per lane: the ops from LaneSeq `base[l]` on, and the lane's priority clock.
     ops: Vec<VecDeque<Op>>,
     base: Vec<u64>,
@@ -156,11 +209,19 @@ pub struct SinkStream<K: PacketSink> {
     /// The newest step source, for the `CONT` steps that follow it.
     last_src: Option<Src>,
     scratch: Vec<(u64, u8, u64, Op)>,
+    tap: T,
 }
 
 impl<K: PacketSink> SinkStream<K> {
     /// An adapter for a box of `n_lanes` lanes that starts at cut 0 (a tenure's first step 1).
     pub fn new(book: BookId, epoch: Epoch, n_lanes: usize, out: K) -> Self {
+        Self::with_tap(book, epoch, n_lanes, out, ())
+    }
+}
+
+impl<K: PacketSink, T: Tap> SinkStream<K, T> {
+    /// [`SinkStream::new`] that also hands its resolved outputs to `tap`.
+    pub fn with_tap(book: BookId, epoch: Epoch, n_lanes: usize, out: K, tap: T) -> Self {
         Self {
             enc: MboEncoder::new(book, epoch),
             out,
@@ -178,7 +239,16 @@ impl<K: PacketSink> SinkStream<K> {
             taker_acc: None,
             last_src: None,
             scratch: Vec::new(),
+            tap,
         }
+    }
+
+    pub fn tap(&self) -> &T {
+        &self.tap
+    }
+
+    pub fn tap_mut(&mut self) -> &mut T {
+        &mut self.tap
     }
 
     /// The first error, if any.
@@ -231,7 +301,12 @@ impl<K: PacketSink> SinkStream<K> {
     }
 
     /// Ends the epoch and hands back the packet sink.
-    pub fn finish(mut self) -> Result<K, SinkError> {
+    pub fn finish(self) -> Result<K, SinkError> {
+        self.finish_tap().map(|(k, _)| k)
+    }
+
+    /// Ends the epoch and hands back the packet sink and the tap.
+    pub fn finish_tap(mut self) -> Result<(K, T), SinkError> {
         if let Some(e) = self.err {
             return Err(e);
         }
@@ -239,7 +314,7 @@ impl<K: PacketSink> SinkStream<K> {
             return Err(SinkError::Unresolved);
         }
         self.enc.finish(&mut self.out).map_err(SinkError::Stream)?;
-        Ok(self.out)
+        Ok((self.out, self.tap))
     }
 
     fn fail(&mut self, e: SinkError) {
@@ -271,7 +346,7 @@ impl<K: PacketSink> SinkStream<K> {
         // the packet record: a reject naming a session-only index means all are numbered.
         let first = p.first_lane_seq.0;
         let mine = |s, q, at: Option<u64>| (s, q) == key && at.is_none_or(|f| f == first);
-        let all = self.early.iter().any(|&(s, q, at, r)| {
+        let all = self.early.iter().any(|&(s, q, at, _, r)| {
             mine(s, q, at)
                 && matches!(r, Resp::Reject { index, .. }
                     if msgs.get(usize::from(index)).is_some_and(session_only))
@@ -301,6 +376,7 @@ impl<K: PacketSink> SinkStream<K> {
                     prio_ts: prio,
                     fwd: false,
                     res: None,
+                    resp_seq: 0,
                 });
             }
         }
@@ -309,7 +385,7 @@ impl<K: PacketSink> SinkStream<K> {
         }
         if n == 0 {
             // Session-only messages, accepted: no op, so nothing to map or to wait for.
-            self.early.retain(|&(s, q, at, _)| !mine(s, q, at));
+            self.early.retain(|&(s, q, at, _, _)| !mine(s, q, at));
             return Ok(());
         }
         self.pkts.insert(
@@ -321,11 +397,11 @@ impl<K: PacketSink> SinkStream<K> {
             },
         );
         let early = std::mem::take(&mut self.early);
-        for (s, q, at, r) in early {
+        for (s, q, at, rs, r) in early {
             if mine(s, q, at) {
-                self.resolve(s, q, at, r)?;
+                self.resolve(s, q, at, rs, r)?;
             } else {
-                self.early.push((s, q, at, r));
+                self.early.push((s, q, at, rs, r));
             }
         }
         Ok(())
@@ -339,7 +415,14 @@ impl<K: PacketSink> SinkStream<K> {
     /// One response record of op `(session, pkt_seq, index)`. `at` is the first LaneSeq of
     /// the packet the response's gate names (immediate rejects and `BUSY`, 05 §8.10 rule 3):
     /// a shed packet and its resend share `(session, pkt_seq)`, so `at` picks the attempt.
-    fn resolve(&mut self, s: SessionId, q: u32, at: Option<u64>, r: Resp) -> Result<(), SinkError> {
+    fn resolve(
+        &mut self,
+        s: SessionId,
+        q: u32,
+        at: Option<u64>,
+        rs: u32,
+        r: Resp,
+    ) -> Result<(), SinkError> {
         let ix = match r {
             Resp::Ack { index, .. }
             | Resp::Fill { index, .. }
@@ -352,7 +435,7 @@ impl<K: PacketSink> SinkStream<K> {
             .get(&(s, q))
             .filter(|k| at.is_none_or(|f| f == k.first))
         else {
-            self.early.push((s, q, at, r));
+            self.early.push((s, q, at, rs, r));
             return Ok(());
         };
         let Some(off) = pk.offset.get(usize::from(ix)).copied().flatten() else {
@@ -364,6 +447,7 @@ impl<K: PacketSink> SinkStream<K> {
             return Err(SinkError::Unsupported("several records for one op"));
         }
         op.res = Some(r);
+        op.resp_seq = rs;
         Ok(())
     }
 
@@ -379,7 +463,7 @@ impl<K: PacketSink> SinkStream<K> {
             _ => None,
         };
         for r in p.records() {
-            self.resolve(p.session, p.echo_pkt, at, *r)?;
+            self.resolve(p.session, p.echo_pkt, at, p.resp_seq, *r)?;
         }
         Ok(())
     }
@@ -393,6 +477,7 @@ impl<K: PacketSink> SinkStream<K> {
             let s = Src {
                 lane: e.src_lane,
                 seq: e.src_lane_seq,
+                session: op.pkt.0,
                 msg: op.msg,
                 prio_ts: op.prio_ts,
             };
@@ -418,12 +503,14 @@ impl<K: PacketSink> SinkStream<K> {
         self.steps.push_back(PendStep {
             step: e.step,
             kind,
+            flags: e.flags,
             src,
             covers,
             tx_left: e.n_tx,
             ticks: 0,
             taker: Vec::new(),
             maker: Vec::new(),
+            tx: Vec::new(),
         });
         Ok(())
     }
@@ -435,6 +522,7 @@ impl<K: PacketSink> SinkStream<K> {
             .find(|s| s.step == h.step)
             .ok_or(SinkError::Book)?;
         st.tx_left = st.tx_left.checked_sub(1).ok_or(SinkError::Book)?;
+        st.tx.extend(recs.iter().map(|r| (*h, *r)));
         match h.role {
             ROLE_TAKER => st.taker.extend_from_slice(recs),
             ROLE_MAKER => st.maker.extend(recs.iter().map(|r| (h.lane, *r))),
@@ -453,6 +541,18 @@ impl<K: PacketSink> SinkStream<K> {
             let st = self.steps.pop_front().ok_or(SinkError::Book)?;
             self.emit_interval(&st.covers)?;
             self.emit_step(&st)?;
+            self.tap.step(&TapStep {
+                step: st.step,
+                kind: st.kind,
+                flags: st.flags,
+                src: st.src.map(|s| TapSrc {
+                    lane: s.lane,
+                    seq: s.seq,
+                    session: s.session,
+                    msg: s.msg,
+                }),
+                tx: &st.tx,
+            });
             for _ in 0..st.ticks {
                 self.push(self.newest, EventKind::TimerTick)?;
             }
@@ -504,10 +604,21 @@ impl<K: PacketSink> SinkStream<K> {
         // derived from the book after the ones before it.
         out.sort_unstable_by_key(|x| (x.0, x.1, x.2));
         let mut res = Ok(());
-        for (ts, lc, _, op) in &out {
+        for (ts, lc, seq, op) in &out {
             res = self.lane_effect(*ts, *lc, op);
             if res.is_err() {
                 break;
+            }
+            if let Some(rec) = op.res {
+                self.tap.lane_op(&TapOp {
+                    lane: LaneId(*lc),
+                    seq: LaneSeq(*seq),
+                    session: op.pkt.0,
+                    pkt_seq: op.pkt.1,
+                    resp_seq: op.resp_seq,
+                    msg: op.msg,
+                    rec,
+                });
             }
         }
         self.scratch = out;
@@ -762,7 +873,7 @@ const fn opposite(s: Side) -> Side {
     }
 }
 
-impl<K: PacketSink> Sink for SinkStream<K> {
+impl<K: PacketSink, T: Tap> Sink for SinkStream<K, T> {
     fn record(&mut self, r: &Rec<'_>) {
         if self.err.is_some() {
             return;
