@@ -1241,7 +1241,13 @@ to the box's fetch port, sealed under the requester's `K_fetch` on a keyed box, 
 same gate and token bucket as any fetch. The box sends no answer; it sends that session's
 `DataRedirect` as above. It acts on every admitted REDIRECT, with no quorum of replicas: every
 replica's copy names the same `down` and `to`, and the first that reaches the client moves copy
-2, so DR2 drops the rest. One session per message; a box limits them per replica at its fetch
+2, so DR2 drops the rest. **Bound without a quorum (ruled).** A faulty keyed replica can make a
+box send redirects on its own, and no more than that: each is sealed under the session's key, so
+it reaches only that session's client; DR2 lets it move copy 2 only to another entry of the
+client's own `KeyBundle.data` list that the latest `DataTierStatus` does not mark down, and every
+data box fans out to every voter (§5.2), so no packet is lost; and the gate's token bucket caps
+its REDIRECTs at the box's per-requester fetch rate. It is a liveness nuisance inside the
+one-fault model, not a safety fault. A Q-of-replicas rule at the box is deferred. One session per message; a box limits them per replica at its fetch
 rate. The box's operator line (`REDIRECT <down> <to> <session>:<resend_from>,…`, DEV) does the
 same for a list.
 

@@ -15,6 +15,11 @@
 //! sender has drained, and the speedup over N = 1. With N + 2 threads on a 2-core orb the cores
 //! share CPUs, so N = 2 measures the hop overhead, not the scaling a REF box would show.
 //!
+//! `paced N R` runs the same box with frames arriving at R packets/s instead of preloaded: the
+//! RX core puts each frame on the ingest queue when it falls due, then polls, as a NIC would
+//! deliver them. It reports what was stored and the drops: a `shard` drop (a full sender ring)
+//! at a rate the box sustains is a real sender bottleneck, not preloaded ingest outrunning it.
+//!
 //! DEV numbers: an orb or a laptop is not the REF box (06 §1); compare before and after on one
 //! machine only.
 #![allow(
@@ -224,6 +229,9 @@ fn main() {
 /// Frames on the sim ingest queue per `pipeline` round.
 const PIPE: usize = 1 << 15;
 
+/// Arrival rates of the `paced` rows, packets/s.
+const PACED: [u64; 2] = [250_000, 500_000];
+
 fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -260,7 +268,11 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
         })
         .collect();
     let mut base = 0.0;
-    for n in [1usize, 2] {
+    let runs = [1usize, 2]
+        .into_iter()
+        .map(|n| (n, None))
+        .chain(PACED.into_iter().flat_map(|r| [(1, Some(r)), (2, Some(r))]));
+    for (n, rate) in runs {
         let mut mpps = Vec::new();
         let (mut allocs, mut rx_drops, mut shard_drops) = (0u64, 0u64, 0u64);
         for _ in 0..ROUNDS {
@@ -291,9 +303,12 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
             let node = NodeConfig::new(home, 1, me, dests);
             let (mut rx, cores, mut sender) = shards::split(&node, ingest, fetch, shard_tx, tx);
             let addr = std::net::SocketAddrV4::new(me.ip, me.port);
-            for f in &frames {
-                assert!(nic.inject(addr, f, Nanos(0)));
+            if rate.is_none() {
+                for f in &frames {
+                    assert!(nic.inject(addr, f, Nanos(0)));
+                }
             }
+            let (nic, frames) = (&nic, &frames);
             let store = MemStore::default();
             let mut shard_rings: Vec<ShardRing> = (0..n).map(|_| ShardRing::new(&Hw)).collect();
             let mut sender_rings: Vec<SenderRing> = (0..=n).map(|_| SenderRing::new(&Hw)).collect();
@@ -334,9 +349,19 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
                 let h_rx = sc.spawn(move || {
                     arrive.wait();
                     go.wait();
+                    let t = Instant::now();
+                    let mut sent = 0;
                     seal_counting();
                     let before = violations();
                     while (rx.counters().rx_pkts as usize) < PIPE {
+                        // Paced: every frame due by now goes on the queue first.
+                        if let Some(r) = rate {
+                            let due = (t.elapsed().as_nanos() as u64 * r / 1_000_000_000) as usize;
+                            for f in &frames[sent..due.min(PIPE)] {
+                                assert!(nic.inject(addr, f, Nanos(0)));
+                            }
+                            sent = sent.max(due.min(PIPE));
+                        }
                         if rx.poll(Nanos(0), &mut to_shard, &mut rx_out) == 0 {
                             std::thread::yield_now();
                         }
@@ -404,6 +429,14 @@ fn pipeline(pkts: &[(u8, [u8; MAX_REQ_PAYLOAD])]) {
             mpps.push(stored as f64 / secs / 1e6);
         }
         let m = median(mpps);
+        if let Some(r) = rate {
+            println!(
+                "paced {n} {:.2}M  {m:>5.2} Mpps stored  ({} threads, median of {ROUNDS}, {PIPE} pkts)  hop_full over {ROUNDS} rounds: rx {rx_drops} shard {shard_drops}  allocs {allocs}",
+                r as f64 / 1e6,
+                n + 2
+            );
+            continue;
+        }
         if n == 1 {
             base = m;
         }
