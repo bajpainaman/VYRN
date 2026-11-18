@@ -42,6 +42,8 @@ pub const DAV_SESSION_REPAIR_PPS: u64 = 2_000;
 /// A bucket holds this much time's worth of tokens.
 const BURST_NS: u64 = 10_000_000;
 const SEC: u64 = 1_000_000_000;
+/// Retention copies the repair thread stores before it polls requests again.
+const DRAIN_BATCH: usize = 1024;
 
 /// A token bucket in token-nanoseconds, so refills need no division.
 #[derive(Clone, Copy, Debug)]
@@ -198,8 +200,10 @@ pub fn run<R: vyrn_wire::RxRing, T: vyrn_wire::TxRing>(
     let mut burst = [vyrn_wire::RxPkt::empty(); vyrn_wire::RX_BURST];
     let mut wire = [0u8; frame::MAX_FRAME_BYTES];
     while !stop.load(std::sync::atomic::Ordering::Acquire) {
+        // A bounded batch, so requests and `stop` are served under sustained ingest.
         let mut work = 0usize;
-        while let Some(k) = copies.pop(&Hw) {
+        while work < DRAIN_BATCH {
+            let Some(k) = copies.pop(&Hw) else { break };
             server.put(k);
             work = work.saturating_add(1);
         }

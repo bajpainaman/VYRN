@@ -157,10 +157,15 @@ impl Retain {
             return;
         };
         let mine = u32::try_from(at.wrapping_add(1)).unwrap_or(0);
-        // A way is free when empty or when its slot left this bucket; else the oldest goes.
+        // A way that already names this slot is reused, so no two ways name one slot. Else a way
+        // is free when empty or when its slot left this bucket; else the oldest goes.
         let mut pick = 0usize;
         let mut oldest = u64::MAX;
+        let reuse = ways.iter().position(|&w| w == mine);
         for (i, &w) in ways.iter().enumerate() {
+            if reuse.is_some() {
+                break;
+            }
             let held = usize::try_from(w.wrapping_sub(1))
                 .ok()
                 .and_then(|a| self.slots.get(a))
@@ -178,6 +183,7 @@ impl Retain {
                 Some(_) => {}
             }
         }
+        let pick = reuse.unwrap_or(pick);
         if let Some(w) = self.index.get_mut(b).and_then(|ws| ws.get_mut(pick)) {
             *w = mine;
         }
@@ -234,6 +240,32 @@ mod tests {
         r.put(pkt(1, 5, 0xF, 2 + REP_SEQ_PKT_RETAIN_NS + 1));
         assert_eq!(r.find(SessionId(1), 2).count(), 0, "outside the window");
         assert_eq!(r.find(SessionId(1), 5).count(), 1);
+    }
+
+    /// A wrapped FIFO that overwrites a slot with another key of the same bucket names it once.
+    #[test]
+    fn an_overwritten_slot_is_indexed_once() {
+        // Capacity 4: 2 × 4 = 8 buckets, so one session's keys share buckets often.
+        for seqs in [[4u32, 7, 1, 2, 3, 9], [1, 9, 17, 25, 33, 41]] {
+            let mut r = Retain::new(4);
+            for (t, &q) in seqs.iter().enumerate() {
+                r.put(pkt(1, q, 1, u64::try_from(t).unwrap()));
+            }
+            for &q in &seqs[2..] {
+                assert_eq!(r.find(SessionId(1), q).count(), 1, "{seqs:?} pkt {q}");
+            }
+        }
+        // Exhaustive over small sequences: every live key is found at most once.
+        for m in 0..4096u32 {
+            let mut r = Retain::new(4);
+            let seqs: Vec<u32> = (0..6).map(|i| 1 + ((m >> (2 * i)) & 3) * 8 + i).collect();
+            for (t, &q) in seqs.iter().enumerate() {
+                r.put(pkt(1, q, 1, u64::try_from(t).unwrap()));
+            }
+            for &q in &seqs {
+                assert!(r.find(SessionId(1), q).count() <= 1, "{seqs:?} pkt {q}");
+            }
+        }
     }
 
     /// At the design load every live packet but a sliver keeps its index entry, with many
