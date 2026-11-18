@@ -426,7 +426,7 @@ pub fn next_seq(
 }
 
 /// `REP_SealExt` (07 §9.4), encoded little-endian.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SealExt {
     /// `F*` of substreams A and B.
     pub end_frame_seq: [u64; 2],

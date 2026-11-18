@@ -21,6 +21,7 @@
 use crate::cert::{CertErr, FinalityCert, finalize_message, verify_finality_cert};
 use crate::membership::Committee;
 use crate::proposal::Proposal;
+use crate::tail::SealExt;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use vyrn_types::{Ed25519Sig, Epoch, Height};
@@ -44,6 +45,8 @@ pub struct FinalizeVote {
     /// The voter index of the signer.
     pub index: u8,
     pub sig: Ed25519Sig,
+    /// A seal's `REP_SealExt` (07 §9.4), as in [`FinalityCert::seal`].
+    pub seal: Option<SealExt>,
 }
 
 impl FinalizeVote {
@@ -54,6 +57,7 @@ impl FinalizeVote {
             parent_view: self.parent_view,
             proposal: self.proposal,
             sigs: vec![(self.index, self.sig)],
+            seal: self.seal.clone(),
         }
     }
 
@@ -74,6 +78,7 @@ impl FinalizeVote {
             proposal: c.proposal,
             index,
             sig,
+            seal: c.seal,
         })
     }
 }
@@ -91,6 +96,9 @@ pub enum VoteErr {
     Cert(#[from] CertErr),
 }
 
+/// `(view, parent_view, proposal, seal)`: what Q votes must agree on.
+type VoteKey = (u64, u64, Proposal, Option<SealExt>);
+
 /// The finality listener of one (home, epoch) (07 §6.8).
 #[derive(Clone, Debug)]
 pub struct Listener {
@@ -98,8 +106,8 @@ pub struct Listener {
     epoch: Epoch,
     final_height: Height,
     final_view: u64,
-    /// Valid votes by `(view, parent_view, proposal)`.
-    pending: BTreeMap<(u64, u64, Proposal), Vec<(u8, Ed25519Sig)>>,
+    /// Valid votes by `(view, parent_view, proposal, seal)`.
+    pending: BTreeMap<VoteKey, Vec<(u8, Ed25519Sig)>>,
     /// `(view, voter)` already counted: one vote per voter per view, so a Byzantine voter holds
     /// at most `VIEW_WINDOW` entries.
     voted: BTreeSet<(u64, u8)>,
@@ -135,7 +143,12 @@ impl Listener {
         if vote.view > self.final_view.saturating_add(VIEW_WINDOW) {
             return Err(VoteErr::Ahead(vote.view));
         }
-        let key = (vote.view, vote.parent_view, vote.proposal);
+        let key = (
+            vote.view,
+            vote.parent_view,
+            vote.proposal,
+            vote.seal.clone(),
+        );
         if let Some(sigs) = self.pending.get(&key)
             && sigs.iter().any(|(i, _)| *i == vote.index)
         {
@@ -149,15 +162,25 @@ impl Listener {
         if p.epoch != self.epoch {
             return Err(CertErr::Epoch.into());
         }
+        if (p.kind == crate::proposal::ProposalKind::Seal) != vote.seal.is_some() {
+            return Err(CertErr::Seal.into());
+        }
         let key_of = self
             .committee
             .voter(vote.index)
             .ok_or(CertErr::Unknown(vote.index))?;
-        let msg = finalize_message(vote.epoch, vote.view, vote.parent_view, p);
+        let msg = finalize_message(
+            vote.epoch,
+            vote.view,
+            vote.parent_view,
+            p,
+            vote.seal.as_ref(),
+        );
         if !vyrn_crypto::ed25519::verify(key_of, &msg, &vote.sig) {
             return Err(CertErr::BadSig(vote.index).into());
         }
         self.voted.insert((vote.view, vote.index));
+        let seal = key.3.clone();
         let sigs = self.pending.entry(key).or_default();
         sigs.push((vote.index, vote.sig));
         if sigs.len() < self.committee.quorum() {
@@ -171,6 +194,7 @@ impl Listener {
             parent_view: vote.parent_view,
             proposal: *p,
             sigs,
+            seal,
         };
         self.finalize(&cert);
         Ok(Some(cert))
@@ -191,7 +215,7 @@ impl Listener {
         self.final_height = self.final_height.max(cert.proposal.last_height);
         self.final_view = self.final_view.max(cert.view);
         let v = self.final_view;
-        self.pending.retain(|(view, _, _), _| *view > v);
+        self.pending.retain(|(view, ..), _| *view > v);
         self.voted.retain(|(view, _)| *view > v);
     }
 }
@@ -261,7 +285,7 @@ mod tests {
             last_hash: Hash([u8::try_from(last % 256).unwrap_or(0); 32]),
             excl_root: Hash([0; 32]),
         };
-        let msg = finalize_message(Epoch(7), view, view - 1, &proposal);
+        let msg = finalize_message(Epoch(7), view, view - 1, &proposal, None);
         FinalizeVote {
             epoch: Epoch(7),
             view,
@@ -269,6 +293,7 @@ mod tests {
             proposal,
             index: i,
             sig: vyrn_crypto::ed25519::sign(&seed(i), &msg),
+            seal: None,
         }
     }
 
