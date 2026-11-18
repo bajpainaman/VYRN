@@ -115,8 +115,14 @@ fn prefix(h: &Hash) -> PktHash {
 /// The harness's live run with the RX path's real `PktHash` (the 8-byte prefix of the packet's
 /// full BLAKE3, 01 §3), which the data join keys on. Returns the journal and every payload.
 fn live07(script: &[Act]) -> (Journal, Store) {
-    let (bbo, mut sh) = new_box();
-    let mut e = engine(bbo, &mut sh);
+    live07_on(script, false)
+}
+
+/// [`live07`] on the harness box, with lanes 1 and 2 pooled when `pool` is set.
+fn live07_on(script: &[Act], pool: bool) -> (Journal, Store) {
+    let (_, mut sh) = new_box();
+    let tok = vyrn_cut::PoolTok::new();
+    let mut e = pooled_engine(&mut sh, &tok, pool);
     let mut j = Journal::default();
     let mut store = Store::default();
     let mut pkt = [[0u32; NA]; N];
@@ -187,14 +193,14 @@ fn tenure() -> TenureStart {
 
 /// Frames the live journal with `SeqWriter`, closing a block after each record index in
 /// `cuts` (or after the routes and `MID` records that follow it) and after the last record.
-fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
+/// Pooled lanes in `layout` frame their `AcctTake`s (07 §3.6).
+fn frames_on(layout: Layout, j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
     let ident = Ident {
         book: BOOK,
         epoch: Epoch(0),
         tenure: 0,
         sender: 0,
     };
-    let layout = Layout::new(N as u8, 1, 0).unwrap();
     let mut w = SeqWriter::new(layout, ident, tenure(), SEED, 9000).unwrap();
     let mut out = Vec::new();
     let mut cut = vec![LaneSeq(0); N];
@@ -210,8 +216,8 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
                 out.extend(w.packet(*p, full).unwrap());
             }
             OwnedRec::Route(t) => out.extend(w.route(*t).unwrap()),
-            // No pooled session in this script, so no `AcctTake` (05 §6.9).
-            OwnedRec::Take(_) => unreachable!("no pooled session"),
+            // Right before its packet, as the pooled lane logs it (05 §6.9).
+            OwnedRec::Take(t) => out.extend(w.take(*t).unwrap()),
             OwnedRec::Step(e, d) => {
                 for x in &d[..usize::from(e.n_delta)] {
                     cut[usize::from(x.lane.0)] = x.seq;
@@ -234,9 +240,10 @@ fn frames(j: &Journal, store: &Store, cuts: &[usize]) -> Vec<Vec<u8>> {
                 );
             }
         }
-        // A packet's routes and `MID` records stay in its block (07 §3.6, §7.1), as vyrn-seq
-        // frames them: a cut right after a packet moves past them.
-        let route_next = matches!(j.recs.get(i + 1), Some(OwnedRec::Route(_)))
+        // A packet's take, routes and `MID` records stay in its block (07 §3.6, §7.1, 05 §6.9),
+        // as vyrn-seq frames them: a cut right after a take or a packet moves past them.
+        let route_next = matches!(r, OwnedRec::Take(_))
+            || matches!(j.recs.get(i + 1), Some(OwnedRec::Route(_)))
             || matches!(j.recs.get(i + 1),
                 Some(OwnedRec::Packet(p)) if p.flags & PacketFlags::MID != 0);
         pending |= cuts.contains(&i);
@@ -279,11 +286,16 @@ fn blocks(cuts: &[usize]) -> (Journal, Store, Vec<BlockInputs<N>>) {
 
 /// [`blocks`] of any script.
 fn blocks_of(script: &[Act], cuts: &[usize]) -> (Journal, Store, Vec<BlockInputs<N>>) {
-    let (live_j, store) = live07(script);
+    blocks_on(script, cuts, false)
+}
+
+/// [`blocks_of`], with lanes 1 and 2 pooled when `pool` is set.
+fn blocks_on(script: &[Act], cuts: &[usize], pool: bool) -> (Journal, Store, Vec<BlockInputs<N>>) {
+    let (live_j, store) = live07_on(script, pool);
     let key = vyrn_crypto::ed25519::public_key(&SEED);
-    let layout = Layout::new(N as u8, 1, 0).unwrap();
+    let layout = Layout::new(N as u8, 1, if pool { POOL_MASK } else { 0 }).unwrap();
     let mut core = OrderCore::<N, _>::new(layout, View(key)).unwrap();
-    for f in frames(&live_j, &store, cuts) {
+    for f in frames_on(layout, &live_j, &store, cuts) {
         core.on_frame(&f, 0).unwrap();
     }
     let blocks: Vec<_> = std::iter::from_fn(|| core.take_ready()).collect();
@@ -305,6 +317,21 @@ fn replay(
     replay_with(live_j, data, blocks)
 }
 
+/// [`replay`] on the pooled box.
+fn replay_pooled(
+    live_j: &Journal,
+    store: &Store,
+    blocks: &[BlockInputs<N>],
+) -> Result<(Journal, Vec<Hash>), vyrn_replica::ReplayError> {
+    let mut data = DataJoin::default();
+    for ((_, s, q, _), b) in &store.0 {
+        data.put(*s, *q, b.clone());
+    }
+    let (_, mut sh) = new_box();
+    let tok = vyrn_cut::PoolTok::new();
+    replay_on(live_j, data, blocks, pooled_engine(&mut sh, &tok, true))
+}
+
 /// [`replay`] over payloads already joined.
 fn replay_with(
     live_j: &Journal,
@@ -312,7 +339,16 @@ fn replay_with(
     blocks: &[BlockInputs<N>],
 ) -> Result<(Journal, Vec<Hash>), vyrn_replica::ReplayError> {
     let (bbo, mut sh) = new_box();
-    let e = engine(bbo, &mut sh);
+    replay_on(live_j, data, blocks, engine(bbo, &mut sh))
+}
+
+/// [`replay_with`] on engine `e`, which must be in its initial state.
+fn replay_on(
+    live_j: &Journal,
+    data: DataJoin,
+    blocks: &[BlockInputs<N>],
+    e: vyrn_engine::Engine<'_, vyrn_cut::Hw, NA>,
+) -> Result<(Journal, Vec<Hash>), vyrn_replica::ReplayError> {
     let mut rep = RustReplay::new(e, data, RespLog::of(live_j), Journal::default());
     let mut hashes = Vec::new();
     for b in blocks {
@@ -1181,4 +1217,69 @@ fn the_vx_client_reports_an_evicted_snapshot() {
     let Some(lib) = vx_lib() else { return };
     let e = vx_replay(&store, &blocks, &lib).unwrap_err();
     assert!(e.0.contains("diverged (fault)"), "{e}");
+}
+
+/// Pooled sessions on lanes 1 and 2 (account 77): takes `ver` 1, 2, 3 across both pool lanes,
+/// a crossing pooled IOC (`[Take, Packet, Route]`), and a dedicated lane in between.
+fn pool_script() -> Vec<Act> {
+    use Side::{Buy, Sell};
+    use Tif::{Day, Ioc};
+    let mut s = Vec::new();
+    for (k, (l, a, m)) in [
+        (1, 1, new(Sell, Day, 200, 2, 1)),
+        (0, 1, new(Sell, Day, 201, 1, 2)),
+        (2, 1, new(Sell, Day, 202, 1, 3)),
+        (1, 1, new(Buy, Ioc, 200, 1, 4)),
+        (2, 2, new(Sell, Day, 203, 1, 5)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let t = 1_000 * (k as u64 + 1);
+        s.push(Act::Pkt {
+            l,
+            a,
+            rx_ts: t,
+            now: t,
+            msgs: vec![m],
+        });
+        s.push(Act::Run);
+    }
+    s
+}
+
+#[test]
+fn pooled_takes_replay_through_framed_blocks() {
+    // Follow-up 1 of #157: `AcctTake`s go through `SeqWriter`, the order core and
+    // `RustReplay`, at every block split, with the live run's bytes and responses.
+    let (live_j, _, _) = blocks_on(&pool_script(), &[], true);
+    let takes: Vec<_> = live_j
+        .recs
+        .iter()
+        .filter_map(|r| match r {
+            OwnedRec::Take(t) => Some((t.lane.0, t.ver)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(takes, vec![(1, 1), (2, 2), (1, 3)]);
+    assert!(
+        live_j.recs.windows(3).any(|w| matches!(
+            w,
+            [OwnedRec::Take(_), OwnedRec::Packet(_), OwnedRec::Route(_)]
+        )),
+        "the pooled IOC logs [Take, Packet, Route]"
+    );
+    for cut in 0..live_j.recs.len() {
+        let cuts: Vec<usize> = if cut == 0 { Vec::new() } else { vec![cut - 1] };
+        let (live_j, store, blocks) = blocks_on(&pool_script(), &cuts, true);
+        let (rep, hashes) = replay_pooled(&live_j, &store, &blocks)
+            .unwrap_or_else(|e| panic!("split {cuts:?}: {e}"));
+        check_same(&live_j, &rep);
+        if cuts.is_empty() {
+            assert_eq!(*hashes.last().unwrap(), live_hash(&live_j));
+        }
+    }
+    // An unpooled engine emits no take, so replaying the pooled blocks diverges at the first.
+    let (live_j, store, blocks) = blocks_on(&pool_script(), &[], true);
+    assert!(replay(&live_j, &store, &blocks).is_err());
 }
