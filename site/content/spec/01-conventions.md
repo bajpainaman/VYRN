@@ -449,7 +449,7 @@ Core 1 reads lanes 0–24 and core 6 reads lanes 25–48. Each writes its own ha
 
 ### 14.9 Chain gate and forced inclusion
 
-- `FIN_GATE_BLOCKS` = 8 (9 from `E_pq`, §14.20 D). In both modes, the sequencer never runs more than 8 blocks ahead of finality. If finality lags more than that, the book halts rather than issue fills that cannot be final within 10 ms.
+- `FIN_GATE_BLOCKS` = 8. In both modes, the sequencer never runs more than 8 blocks ahead of finality. If finality lags more than that, the book halts rather than issue fills that cannot be final within 10 ms.
 - A forced packet, under an honest sequencer, is positioned at the first block boundary after the block that includes it is notarized. It is final ≤ 10 ms after it is sent, like any order. `FIN_GATE_BLOCKS` = 8 is only the deadline after which validators treat its absence as censorship (evidence plus failover, §14.0 fact 3).
 - Orders through the normal path are final ≤ `FINALITY_MAX_MS` = 10 ms.
 
@@ -735,8 +735,8 @@ finality budget of 07 §6.6.
 - **Why ML-DSA-44 for live keys.** It is the fastest FIPS 204 set and the smallest, and the
   Ed25519 half keeps classical security if a lattice attack appears. Live keys rotate by
   `NodeCert` (09 §2.3). ML-DSA-65 costs 1.5–1.7× in time and 889 B more per signature (table B)
-  on every block and vote, which buys nothing the cold keys need speed for. [Likely] Open
-  question PQ-1 asks the owner whether category 2 is enough for live keys.
+  on every block and vote, which buys nothing the cold keys need speed for. [Likely] The owner
+  decided ML-DSA-44 for live keys (PQ-1, 2026-11-18).
 - **Not ML-DSA-87, not SLH-DSA, not Falcon.** ML-DSA-87 is larger and slower again. SLH-DSA
   signatures are 7.8 KB at the smallest and signing takes milliseconds. Falcon (FN-DSA) needs
   floating-point sampling, which §11 forbids in anything every replica must reproduce, and it has
@@ -792,8 +792,9 @@ cores; B-PQ-1 measures the real thing):
 
 [Certain for the table's facts, from the crates' sources and READMEs at these versions. Web
 search was unavailable when this was written, so audit and validation status beyond the READMEs
-is unknown, not assumed.] Open question PQ-2 asks the owner to accept libcrux at a 0.0.x version
-or to fund an audit first.
+is unknown, not assumed.] The owner decided libcrux with VYRN's own cargo-vet audit (PQ-2,
+2026-11-18): no independent audit is required before `E_pq`, but the switch waits until the audit
+and the differential tests of 11 §2.5a pass.
 
 **D. Where the cost goes, and the hot path.**
 
@@ -814,24 +815,29 @@ or to fund an audit first.
   replication path rises by about 2.5 MB/s of HEADER_PQ frames (1,000/s × ~2.54 KB with framing), 0.08% of 3,310 MB/s (07 §3.13).
 - **Per-block budgets.** The ML-DSA part of `seq_sig` travels in its own frame and is checked in
   parallel with the data lag, so it adds nothing to the maximum (07 §6.6). Votes are signed
-  speculatively, in parallel with the hops that precede them (07 §6.5a). Finalize and nullify
-  never miss, and the leader never misses, but a voter can mispredict the notarize range in the
-  fault-free case and re-sign: ≤ 0.75 ms on the notarize hop. Vote checking costs 0.10 → 0.15 ms
-  (max, budget). Finality: typical 2.59 → 2.69 ms, max with no fault 5.65 → 6.45 ms, max with one
-  fault 8.65 → 9.45 ms (reserve 0.55 ms to `FINALITY_MAX_MS`). CHAIN's worst case moves from 8.11
-  to 8.91 ms from block start (09 §4.8). [Likely: budgets built from the measured figures; the
-  speculative signing depends on open question PQ-3]
-- **The finality gate.** Block h is final ≤ 8.45 ms after it closes (BASE), past the 8 closed
-  blocks that `FIN_GATE_BLOCKS` = 8 allows. So `FIN_GATE_BLOCKS` = **9** from `E_pq` in both modes
-  (BASE spare 0.55 ms, CHAIN 1.09 ms; 07 §6.8, 09 §4.6). The cost: outside the fault model, ≤ 1 ms
-  more of fills are released unfinal before the halt. The 1 µs answer and the 10 ms finality
-  maximum are unchanged. PQ-8 would bring both budgets back down by removing the miss. [Likely]
+  speculatively, in parallel with the hops that precede them (07 §6.5a). The leader fixes its
+  proposal range before its `verify` and announces it in an Ed25519-signed `RangeFix` (07 §6.3,
+  PQ-8), so voter and leader sign the one notarize the view can carry, and no signature is made
+  after the proposal arrives in the fault-free case. Vote checking costs 0.10 → 0.15 ms (max,
+  budget). Finality: typical 2.59 → 2.69 ms, max with no fault 5.65 → 5.70 ms, max with one fault
+  8.65 → 8.70 ms (reserve 1.30 ms). CHAIN's worst case moves from 8.11 to 8.16 ms from block start
+  (09 §4.8). [Likely: budgets built from the measured figures; the speculative signing depends on
+  open question PQ-3]
+- **The finality gate** keeps `FIN_GATE_BLOCKS` = 8: block h is final ≤ 7.70 ms after it closes
+  (BASE spare 0.30 ms; CHAIN 0.84 ms; 07 §6.8, 09 §4.6). [Likely]
+- **The cost of a fixed range.** A header that reaches the leader after it sent its `RangeFix`
+  waits for the next view instead of joining the current proposal. Before PQ-8 the cutoff was the
+  leader's `verify` completion, so the window in which that happens grows by at most the leader's
+  `verify` time (≤ 0.81 ms at the maximum); views and blocks both run at ~1 kHz, so normally the
+  leader fixes the range on the arrival of the header it proposes. The 07 §6.6 maxima assume, as
+  before, that a header is in the first proposal after it reaches the leader; B-PQ-2 checks that
+  under scheme 1. [Likely]
 - **If speculative signing is not possible**, the leader's notarize and each voter's notarize
   are signed after `verify`, at ≤ 0.75 ms each, and the one-fault maximum becomes ~10.2 ms, above
   `FINALITY_MAX_MS` = 10. Scheme 1 must then not activate until votes run with `PQ_HEDGE` ≥ 4 on
   voters too. [Likely]
 
-**E. The switch.** Rules SG1–SG6 follow 04 §12's VR4: the set of accepted schemes changes only at
+**E. The switch.** Rules SG1–SG7 follow 04 §12's VR4: the set of accepted schemes changes only at
 an epoch boundary.
 
 | ID | Rule |
@@ -842,6 +848,7 @@ an epoch boundary.
 | SG4 | Hybrid keys are included at least `CHN_KEY_LEAD_EPOCHS` (4) before `E_pq` and become active at `E_pq` (CHAIN: `NodeCert` with `scheme` = 1 and `valid_from = E_pq`, 09 §2.3; BASE: `REP_Membership` with `epoch_from = E_pq`, 07 §13). A key of one scheme is never in force in an epoch of another. The roster of `EpoConfig(E_pq)` then holds only hybrid keys, and `HandoffCert(E_pq − 1)`, the last certificate signed with scheme 0, certifies them. |
 | SG5 | CHAIN activates `E_pq` by an `Upgrade` with the 72 h timelock and both clients ready (09 §14.2); BASE by an admin record. Both client kinds verify both schemes before any switch is scheduled (U5, 08 §9.4). |
 | SG6 | `pq_anchor` = the hash of `HandoffRecord(E_pq − 1)` goes into every release manifest from the switch on, signed by the hybrid release keys (11 §9.5). A light client or a node syncing from genesis accepts only a history through that record. A quantum attacker who forges an older Ed25519 history cannot also forge the anchor. |
+| SG7 | From `E_pq`, evidence whose signatures are all scheme 0 slashes or jails only if it, or an `EvidenceCommit` of its hash, was final on chain before `E_pq` began (09 §8.1). A quantum attacker can forge old classical signatures, so new classical evidence must not move bonds or jails. |
 
 **F. What cannot be made post-quantum here, and how VYRN handles it.** 09 §6.8 holds the detail.
 
@@ -862,15 +869,22 @@ an epoch boundary.
   session's MAC keys. This section covers signatures only. Open question PQ-6 asks for a hybrid
   X25519 + ML-KEM-768 change. [Certain that X25519 is not post-quantum]
 
+**Decided by the owner (2026-11-18)**
+
+| # | Question | Ruling |
+|---|---|---|
+| PQ-1 | Is ML-DSA-44 (category 2) enough for live keys? | Yes: live keys use ML-DSA-44; cold keys stay ML-DSA-65 (A). |
+| PQ-2 | Accept `libcrux-ml-dsa` at 0.0.11 with our own cargo-vet audit, or require an independent audit first? | `libcrux-ml-dsa` with VYRN's own audit; `E_pq` waits for that audit and the differential tests of 11 §2.5a. |
+| PQ-8 | Remove the voter's notarize misprediction with a proposal range fixed before the proposal arrives? | Yes: the leader's `RangeFix` (07 §6.3, §6.5a). Maxima 5.70 / 8.70 ms; `FIN_GATE_BLOCKS` stays 8. |
+| — | Codex review of #51: operator identity keys need an ML-DSA-65 transaction scheme | Adopted: `TxEnvelope.scheme` 3 (09 §4.4). |
+| — | Codex review of #51: forged classical evidence after the switch | Adopted: SG7 (09 §8.1 item 2a). |
+
 **Open questions for the owner**
 
 | # | Question | Default if not decided | Settled by |
 |---|---|---|---|
-| PQ-1 | Is ML-DSA-44 (category 2) enough for live keys, or should they use ML-DSA-65 at +54% sign time and +889 B per signature? | ML-DSA-44 | owner |
-| PQ-2 | Accept `libcrux-ml-dsa` at 0.0.11 with our own cargo-vet audit, or require an independent audit (or a 1.0 release) before `E_pq`? | own audit plus the differential tests of 11 §2.5a; no switch before both pass | owner |
 | PQ-3 | Can `commonware-consensus::simplex` take a custom hybrid scheme and speculative signing (07 §6.5a)? Its schemes are Ed25519, BLS12-381 and secp256r1. | a hybrid `Scheme` implemented in `vyrn-crypto`; a patch upstream if the trait does not allow speculative signing | 07: a `vyrn-sim` run of B-PQ-2 |
 | PQ-4 | When is `E_pq`? It needs a date or a trigger (a published estimate of a cryptographically relevant quantum computer), and an earlier switch costs only the budgets above. | at the first epoch after B-PQ-1 to B-PQ-3 pass on `REF` | owner |
 | PQ-5 | The L1 bridge: when does governance deploy the post-quantum bridge and raise `PqAlarm`, and is a 10% daily cap on the old bridge acceptable until then? | at the first Ethereum post-quantum verifier VYRN can afford (09 §6.8) | owner, 09 |
 | PQ-6 | Make key agreement hybrid (X25519 + ML-KEM-768) for session keys and the p2p handshake? | not in this change | owner, 04, 09 |
 | PQ-7 | Release keys on hardware tokens (11 §9.5): which token holds an ML-DSA-65 key? | an HSM with ML-DSA support for the ML-DSA half, the current tokens for the Ed25519 half | owner, 11 |
-| PQ-8 | Remove the voter's notarize misprediction (07 §6.5a): fix the proposal range by a rule every voter can compute before the proposal arrives (for example, every header closed at least `REP_HOP_MAX_MS` before the view started). That brings the maxima back to 5.70 / 8.70 ms and `FIN_GATE_BLOCKS` back to 8, but it delays each header's proposal by up to one hop. | budget the miss; `FIN_GATE_BLOCKS` = 9 from `E_pq` | owner, 07 |

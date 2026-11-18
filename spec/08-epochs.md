@@ -109,7 +109,7 @@ Rules:
 - 10 publishes the full `lane_map(e+1)` with the same lead (10 §1.4, `ACC_MAP_PUBLISH_LEAD_S`).
 - The `HandoffRecord` covers `EpoConfig` through `log_hash`, so the certificate certifies the next
   epoch's configuration as well as the final state.
-- **`sig_scheme`** follows 01 §14.20 SG1–SG6, the signature form of 04 §12's VR4: it changes only
+- **`sig_scheme`** follows 01 §14.20 SG1–SG7, the signature form of 04 §12's VR4: it changes only
   here, at a boundary, never decreases, and `roster_hash` of an epoch with `sig_scheme` ≥ 1 names
   hybrid keys only. A carried-forward configuration (first rule) keeps the previous
   `sig_scheme`, so a missing record cannot downgrade it. `HandoffCert(e)` is signed under

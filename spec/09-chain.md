@@ -553,12 +553,18 @@ TxEnvelope {
     nonce:   u64,             // per signer; must be last + 1
     max_fee: u64,             // in USDC micro-units; the fee charged is ≤ this
     body:    [u8; body_len],
-    scheme:  u8,              // 0 Ed25519, 1 secp256k1 (EIP-712), 2 hybrid Ed25519 + ML-DSA-44 (§6.8)
-    sig:     [u8; 64, 65 or 2,484],
+    scheme:  u8,              // 0 Ed25519, 1 secp256k1 (EIP-712), 2 hybrid Ed25519 + ML-DSA-44 (§6.8),
+                              //   3 hybrid Ed25519 + ML-DSA-65 (01 §14.20 scheme 2)
+    sig:     [u8; 64, 65, 2,484 or 3,373],
 }
 ```
 
 - **Signatures:** Ed25519 signs `derive_key("vyrn v1 tx", encode(envelope without sig))`.
+  Envelope schemes 2 and 3 sign the same digest under 01 §14.20 A (both parts over
+  `scheme ‖ digest`, with the `SigScheme` code 1 or 2). The envelope scheme must match the signer's
+  key: scheme 3 is the only one an `Operator(OpIdx)` signer can use once its `OIK` is hybrid
+  ML-DSA-65 (§2.2), so `NodeCert` submissions, bond actions and governance stay signable after the
+  switch.
   secp256k1 signs the EIP-712 digest of the same fields, with the domain
   `{name: "VYRN", version: "1", chainId: l1_chain_id, verifyingContract: bridge}`, so that EVM
   wallets can show what they sign.
@@ -577,7 +583,8 @@ TxEnvelope {
 | 0x06 | `Move` | wallet or session key | lane, chain, lane | `Deallocate` on one book, then `Allocate` on another (§4.7). |
 | 0x07 | `Withdraw` | wallet | chain | free → `pending_withdraw`, queued for the next L1 post (§6.5). |
 | 0x08 | `CancelWithdraw` | wallet | chain | Undoes a `Withdraw` that is not yet in an L1 post. |
-| 0x09 | `SetExitAddress` | wallet | chain | Sets the L1 address used by the escape hatch (§6.8). |
+| 0x09 | `SetExitAddress` | wallet | chain | Sets the L1 address used by the escape hatch (§6.6). Rejected for an `exit_frozen` account (§6.8). |
+| 0x0A | `SetOwnerKey` | wallet | chain | Replaces the account's `OwnerKey`, from `E_pq` (§6.8). Never clears `exit_frozen`. |
 | 0x10 | `ForcedPacket` | session key | lane | A request packet on the forced path (§7). |
 | 0x20 | `L1Attest` | node key | chain | Deposits and contract events seen on L1 (§6.3). |
 | 0x21 | `CommitteeKey` | node keys | chain | §2.4. |
@@ -588,6 +595,7 @@ TxEnvelope {
 | 0x26 | `ReadySignal` | node key | chain | Upgrade readiness (§14.2). |
 | 0x30 | `Evidence` | anyone | chain | A slashing proof (§8). |
 | 0x31 | `GovAction` | 4 operator keys | chain | §2.10. |
+| 0x32 | `EvidenceCommit` | anyone | chain | The BLAKE3 hash of an `Evidence` encoding. Locks classical evidence before `E_pq` so it still slashes after the switch (§8.1 item 2a). No effect otherwise. |
 
 Items in one chain block are applied in list order. A leader orders them by arrival, so a leader can
 reorder items within one block. Items do not trade, so the value of reordering them is small, and
@@ -710,8 +718,8 @@ delay bound of the model (01 §14.0 fact 3):
 | `tag_com` of the last payload, exclusion list | 0.05 | 20 ns per packet, incremental; keys precomputed (§5.4) |
 | Hops 2–4: proposal, notarize, finalize → `Q_CHAIN` at every voter and at the sequencer | 2.45 | |
 | Vote signature checks | 0.10 | 0.15 under scheme 1 (hybrid, 01 §14.20): the ML-DSA parts run in parallel with the batched Ed25519 parts |
-| **No fault** | **5.31** | was 4.85 with F1 data homes; 6.11 under scheme 1 (+0.05 checks, +0.75 one notarize re-sign) |
-| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault; under scheme 1, 8.91 with a missed notarize prediction (07 §6.5a), against the 10.00 ms gate of `FIN_GATE_BLOCKS` = 9 (01 §14.20 D), margin 1.09 ms |
+| **No fault** | **5.31** | was 4.85 with F1 data homes; 5.36 under scheme 1 (+0.05 vote checks; notarize signed from the `RangeFix`, 07 §6.3) |
+| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault; under scheme 1, 8.16 (margin 0.84 ms to the 9.00 ms gate of `FIN_GATE_BLOCKS` = 8, 01 §14.20 D) |
 | or a data box redirect (07 §5.7, 3 ms in place of 0.71) | **7.60** | |
 | or the sequencer is the fault | 07 failover; its seal must be final ≤ 9 ms after the last frame | |
 
@@ -1398,6 +1406,18 @@ Anyone submits an `Evidence` item. Its handling is automatic:
    Each check is deterministic.
 2. Evidence older than `CHN_EVIDENCE_EPOCHS` (42 epochs, 14 days) is rejected. Duplicate evidence
    (the same fault by the same operator) is a no-op.
+2a. **Classical evidence after the switch (01 §14.20 SG7).** From the first chain block of `E_pq`,
+   evidence whose signatures are all scheme 0 (Ed25519 votes, `seq_sig`s, handoff and commit
+   votes of epochs < `E_pq`) slashes or jails only if it, or `EvidenceCommit { hash }` of its
+   encoding, is in a chain block final before `E_pq` began. Otherwise it is verified with the
+   scheme-0 rules, recorded, and changes no bond and no jail. Why: after the switch a quantum
+   attacker can forge scheme-0 signatures for the old epochs at will, and two forged `DoubleVote`s
+   would jail two operators and stop finality (4 of 5 needed) without touching a hybrid key. The
+   cost: a fault committed in the last moments of `E_pq − 1` and not committed on chain before the
+   switch goes unpunished on chain; honest nodes submit `EvidenceCommit` as soon as they detect a
+   conflict, within milliseconds. Replay of history keeps classical verification. `BadPost`
+   evidence rests on secp256k1 bridge signatures and stays classical after `E_pq`; whether it
+   stops slashing at `PqAlarm` is part of PQ-5 (§6.8).
 3. The slash applies at the end of the including chain block: bond balance moves to the insurance
    fund, and `CHN_REPORTER_SHARE` (5%) goes to the submitting account. A jail takes effect at the
    next boundary (§4.6), and the operator leaves the leader schedule and the sequencer schedule.
