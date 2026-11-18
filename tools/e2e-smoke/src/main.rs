@@ -149,9 +149,9 @@
 //!   refused redirects are retried since #194 (`redirect_retried`), and `failover` needs
 //!   `redirect_dropped` = 0, and `redirect_unknown` = 0. A backup learned a session's address
 //!   from one first copy, so one lost to a full shard ring (`hop_full`) or the socket left the
-//!   session unmovable; the client now sends four (R13), and ingest winning the shard ring over
-//!   queued redirects is `vyrn-data`'s. CI runs R15 with `continue-on-error` until both are on
-//!   main.
+//!   session unmovable. The client now sends four (R13), and since #203 the box holds
+//!   redirects while its shard ring has 2 048 or fewer free slots, so ingest wins it; R15 gates
+//!   CI.
 //!   The client opens a `DataRedirect` with the key of the session in its bytes 8..12: trying
 //!   every session's key fell behind a burst of 1 600 redirects and moved half the sessions.
 //! - R6. With more than `n − Q` validators stopped at `REP_E_HASHLAG` (Q = n − ⌊(n − 1)/3⌋),
