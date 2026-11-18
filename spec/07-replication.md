@@ -1106,7 +1106,7 @@ Measured: the ML-DSA-44 sign at four attempts is 45 µs p50, 111 µs p99 and ≤
 | Participants | The `n` voters of the active home, in `REP_Membership.voters` order: BASE R1–R4, CHAIN the 5 validators. `vyrn-seq`, the standby and the spares are **not** participants (01 §14.4). |
 | Signing scheme | `simplex::scheme::ed25519`, namespace `b"vyrn-v1"`. |
 | Round | `(Epoch, View)`. Epoch = the VYRN epoch. One Simplex instance per (home, epoch). |
-| Elector | Plain `RoundRobin` over the voters. No index is skipped, and a failover does not change it. With f = 1, a faulty voter leads one view in n, never two in a row. |
+| Elector | Plain `RoundRobin` over the voters: the leader of `(epoch, view)` is `REP_Membership.voters[(epoch + view) mod n]` (u64 arithmetic, wrapping, no shuffle), Commonware `RoundRobin`'s formula over the membership order instead of the sorted keys. No index is skipped, and a failover does not change it. With f = 1, a faulty voter leads one view in n, never two in a row. |
 | Observers | The sequencer (its finality listener on core 51) and the standby receive every finalize vote and every finalization certificate (§6.8). They sign nothing. |
 | Δ (timeouts) | `REP_DELTA_MS` = 1 ms. Leader timeout `t_l = 2Δ` = 2 ms. Advance timeout `t_a = 3Δ` = 3 ms. The skip policy for an inactive leader is enabled. |
 | `Automaton::propose` | §6.4 (leader side) |
@@ -1744,17 +1744,31 @@ A step is in the prefix only when its home record, and its cut-only record if OT
 both in it (§3.8).
 
 ```
-TailReport (inside Silence)
-  epoch u32, tenure u8, reporter u8,
+Silence (LE; one signature covers the Silence and its TailReport)
+  seq u8, reason u8                  0 = silence, 1 = equivocation, 2 = order_root / HASHLAG
+TailReport (inside Silence; its epoch and tenure are the Silence's)
+  epoch u32, tenure u8, reporter u8, reporter: a voter index < n, or n + j for seq_order[j]
   H_i      u64       highest height whose header i holds with a valid seq_sig, together with
                      every ORDER frame through BlockMark(H_i)
+  then, for substream A and then B:
+  mark     u64       frame_seq of BlockMark(H_i) on this substream; mark ≤ F_i
   F_i      u64       highest frame_seq such that i holds every frame 1..F_i of the tenure
-  extra    ≤ 64 ranges [a, b] of frames held above F_i
-  direct   bitmap over (H_i's mark, F_i] plus extra: 1 = received from a sequencer path
-  t_last_rx u64      PTP time at which i received its newest frame of the tenure
+  n_extra  u8        ≤ 64
+  extra    n_extra × (a u64, b u64)   ranges held above F_i: ascending, disjoint, the first
+                     with a > F_i + 1; later ranges may be adjacent to the one before
+  direct   ⌈frames / 8⌉ bytes, LSB first: one bit per frame of (mark, F_i], then of each extra
+                     range in order; 1 = received from a sequencer path. A decoder refuses more
+                     than 2^20 frames.
+  then:
+  t_last_rx u64      PTP time in nanoseconds at which i received its newest frame of the tenure
   replay_lag_us u32, promotable u8   (§9.5)
-  sig      Ed25519 over the above by reporter i (a voter, or the standby under its seq_key)
+sig      [u8; 64]    Ed25519 by the reporter over "vyrn      v1 silence" ‖ every byte above:
+                     a voter with its vote_key, seq_order[j] with its seq_key
 ```
+
+The suspected sequencer, `seq_order[seq]`, never reports on its own tenure: a Silence with
+`reporter = n + seq` is refused even when its signature verifies, because the safety argument
+below needs every reporter honest when the sequencer is the fault.
 
 The leader computes the prefix from every report it holds when the wait of §9.2 ends (≥ Q):
 
@@ -1835,7 +1849,7 @@ seal header  { height: Hs, epoch, book, first_step: last_step(H*) + 1,
 `vyrn-seq` boxes: the epoch's primary, then the warm standby in F2, then the spares in the
 fallback order F3, F4, F1 (08 assigns the primary). No voter is ever in `seq_order`, so no
 failover changes the voting set or `CLIENT_SPLIT`. `next_seq` is the first entry after the deposed
-one that meets all of these:
+one, scanning towards the end of `seq_order` without wrapping around, that meets all of these:
 
 - it has not been deposed in this epoch
 - it sent a TailReport in this failover
