@@ -593,8 +593,8 @@ fn vx_config() -> vyrn_replica::VxConfig {
         tick_max: TICK_MAX,
         tick_size: 1,
         band_bps: 10_000,
-        slot_cap: 1024,
-        seg_cap: 1024,
+        slot_cap: SLOT_CAP,
+        seg_cap: SLOT_CAP,
         ..VxConfig::default()
     };
     for l in 0..N {
@@ -866,4 +866,70 @@ fn the_vx_client_keeps_each_lanes_snapshot_version() {
     }
     assert_eq!(vx[0].1, tx, "fill TX packets");
     assert_eq!(vec![vx[0].2], rust_hashes);
+}
+
+/// More forwarded ops due before one step than the Vx client's forwarded queue holds
+/// (`FWDQ_CAP` = 1024). Live, lane 0 fills Rust's forward ring with 1024 sells, one step lets
+/// the BBO take 10 of them into its lane buffer, and 9 more sells that improve the ask follow
+/// before the lane takes a boundary: 1033 forwarded ops with `fills_applied` 0, all due before
+/// step 1 on replay (the harness's `SLOT_CAP` leaves the lane room for them). Rust replays it;
+/// the Vx client must halt with `PBV_E_FAULT` (a v1 capacity limit, 11 §5.3) instead of
+/// waiting forever on itself (Codex r4610220906).
+fn fwd_overflow_script() -> Vec<Act> {
+    let mut sc = Vec::new();
+    let mut ts = 1_000_000u64;
+    let mut tag = 1u32;
+    let mut pkt = |sc: &mut Vec<Act>, a: u32, n: u32, below: bool| {
+        let msgs = (0..n)
+            .map(|i| {
+                tag += 1;
+                let tick = if below { 190 - i } else { 200 + tag % 300 };
+                new(Side::Sell, Tif::Day, tick, 1, tag)
+            })
+            .collect();
+        sc.push(Act::Pkt {
+            l: 0,
+            a,
+            rx_ts: ts,
+            now: ts,
+            msgs,
+        });
+        ts += 1_000_000;
+    };
+    for i in 0..102u32 {
+        pkt(&mut sc, 1 + i % 15, 10, false);
+    }
+    pkt(&mut sc, 1, 4, false);
+    sc.push(Act::Step(None));
+    pkt(&mut sc, 2, 9, true);
+    for _ in 0..40 {
+        sc.push(Act::Poll);
+        for _ in 0..30 {
+            sc.push(Act::Step(None));
+        }
+    }
+    sc.push(Act::Run);
+    sc
+}
+
+#[test]
+fn the_vx_client_halts_on_a_forwarded_queue_overflow() {
+    let (live_j, store, blocks) = blocks_of(&fwd_overflow_script(), &[]);
+    let pending = lane_pkts(&live_j, 0)
+        .iter()
+        .filter(|p| p.flags == 0 && p.fills_applied.0 == 0)
+        .map(|p| u64::from(p.count))
+        .sum::<u64>();
+    assert_eq!(pending, 1033, "all due before step 1");
+    replay(&live_j, &store, &blocks).unwrap();
+    let Some(lib) = vx_lib() else { return };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(vx_replay(&store, &blocks, &lib).map(|_| ()));
+    });
+    let r = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the Vx client deadlocked on its forwarded queue");
+    let e = r.unwrap_err();
+    assert!(e.0.contains("diverged (fault)"), "{e}");
 }

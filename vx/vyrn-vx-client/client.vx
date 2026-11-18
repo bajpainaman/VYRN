@@ -752,7 +752,7 @@ fn check_tick(c : *mut Ctx, ln : *mut Lane, side : u64, tick : u64, detail : *mu
     return 0u64;
   }
 }
-// The call's snapshot: best bid and ask after step `pkt_first` (the step the call is due at);
+// The op's snapshot: best bid and ask after step `pkt_first`, the lane's latest boundary;
 // an empty ask reads 0, as vyrn-lane's `risk_snap` gives it.
 fn snap_bid(c : *mut Ctx, ln : *mut Lane) -> u64 {
   unsafe { return *offset_mut((*c).hist_bid, (((*ln).pkt_first % HIST)) as i64); }
@@ -1035,6 +1035,10 @@ fn maybe_mid(c : *mut Ctx, l : i64, pass : u64, next : u64) -> void {
     (*ln).next_mid = (*ln).next_mid + 1i64;
     let f = (*m).f;
     boundary(c, l, f, pass, next);
+    (*ln).pkt_first = f;
+    let sv = *offset_mut((*c).hist_ver, ((f % HIST)) as i64);
+    if sv > (*ln).snap_ver { (*ln).snap_ver = sv; }
+    sst(c, 2i64 * l, Y_SNAP_VER, (*ln).snap_ver);
   }
 }
 
@@ -1091,7 +1095,7 @@ fn lane_pkt(c : *mut Ctx, l : i64, r : *mut i8, mids : u64) -> void {
     (*s).expected = ((*s).expected + 1u64) & U32_MAX;
     let prio = max(rx_ts, (*ln).last_prio);
     (*ln).last_prio = prio;
-    // refresh_snapshot at accept: the snapshot after the call's step, never an older one.
+    // The snapshot at accept: the one its last boundary read (fills_applied), never older.
     let sv = *offset_mut((*c).hist_ver, (((*ln).pkt_first % HIST)) as i64);
     if sv > (*ln).snap_ver { (*ln).snap_ver = sv; }
     sst(c, 2i64 * l, Y_SNAP_VER, (*ln).snap_ver);
@@ -1383,6 +1387,10 @@ fn forward(c : *mut Ctx, l : i64, m : *mut i8, op : *mut Op, cross : bool) -> vo
       let t = sld(c, 2i64 * l + 1i64, Y_FWD_TAIL);
       if (*ln).fwd_head - t < FWDQ_CAP { break; }
       if stopped(c) { return; }
+      // As in put_op: the BBO pops this queue only in a later step, but it waits (on a cut, or
+      // in await_ready with U64_MAX) for this lane to get past this op. More than FWDQ_CAP
+      // forwarded ops before one step is a capacity fault, not a wait.
+      if sld(c, 2i64 * l + 1i64, Y_WAIT) >= (*op).seq { fail_lane(ln, E_FAULT); return; }
       spin();
     }
     *offset_mut((*c).fwdq, l * (FWDQ_CAP as i64) + (((*ln).fwd_head % FWDQ_CAP) as i64)) = (*op).seq;
@@ -1650,7 +1658,6 @@ fn lane_call(c : *mut Ctx, l : i64, k : u64) -> void {
     }
     (*ln).n_mid = 0i64;
     (*ln).next_mid = 0i64;
-    let mut due = rd64(r, 40i64);
     for j in 1u64..k {
       let m = in_slot(c, l, (*ln).tail + j);
       let mp : *mut Mid = offset_mut((*ln).mids, (*ln).n_mid);
@@ -1658,10 +1665,11 @@ fn lane_call(c : *mut Ctx, l : i64, k : u64) -> void {
       (*mp).pass = if (mf & F_PASS2) != 0u64 { 2u64 } else { 1u64 };
       (*mp).next = rd64(m, 32i64);
       (*mp).f = rd64(m, 40i64);
-      due = max(due, (*mp).f);
       (*ln).n_mid = (*ln).n_mid + 1i64;
     }
-    (*ln).pkt_first = due;
+    // Lanes read the snapshot only at boundaries: the packet's ops up to its first MID use the
+    // snapshot after its `fills_applied` step; each MID boundary moves to its own (maybe_mid).
+    (*ln).pkt_first = rd64(r, 40i64);
     (*ln).n_routes = rd8(r, 3i64) as i64;
     (*ln).route_hits = 0i64;
     for i in 0i64..(*ln).n_routes {

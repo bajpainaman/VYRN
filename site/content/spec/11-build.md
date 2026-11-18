@@ -989,8 +989,9 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   dependencies, Rescan, Control, Seal, Uncross, step payloads, snapshot and state bytes) stops
   with `PBV_E_UNSUPPORTED` rather than guess, so a v1 Vx validator halts on it instead of
   diverging silently.
-- *Band reference.* A lane call checks the price band against the snapshot published after
-  the latest step its records' `fills_applied` name. The snapshot is Rust's `Bbo` bounds, not
+- *Band reference.* A lane reads the BBO snapshot only at a boundary: every call checks the
+  price band against the snapshot published after the step its packet's `fills_applied` names
+  (a `MID` boundary inside the packet moves it on for the ops after it). The snapshot is Rust's `Bbo` bounds, not
   the exact book: before each step `band_env` widens (B, A) to the envelope of the snapshot
   versions the cut's ops may hold, `touch`, a resting taker and an Idle/Depletion observation
   move them, and `finish` publishes them as a new version when they change. The client keeps
@@ -998,11 +999,15 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   applied seq and snapshot version once the lane has replayed every call due before the step,
   as Rust's cut cores publish them), so a stale bound after a fill empties the last ask rejects
   as in `RustReplay` (`tests/replay.rs`, band test).
-  **Open (05/07):** replay classifies a call against the snapshot after its `fills_applied`
-  step, but a live lane can read a newer snapshot without taking a boundary, and
-  `PacketRecord` does not log which. With a binding band, `RustReplay` then diverges from the
-  live run (both engines agree with each other). Logging the snapshot version, or reading the
-  snapshot only at boundaries, needs a 05/07 ruling.
+  **Ruling (05/07, #137):** live lanes read the snapshot only at boundaries too, so replay is
+  deterministic from the 07 log with no snapshot version on `PacketRecord`. The live lane and
+  engine change and the 05/07 text belong to the engine work; the Vx client already reads at
+  boundaries only.
+- *Capacity.* The op log (`OPLOG_CAP`) and the forwarded queue (`FWDQ_CAP` = 1024 per lane) are
+  fixed. A live lane can have up to `ENG_FWD_RING` + the BBO's lane buffer forwarded ops in
+  flight, so more than `FWDQ_CAP` forwarded ops due before one step (or an op log full before
+  one) is a capacity fault: the client stops with `PBV_E_FAULT` instead of waiting on the BBO,
+  which waits on the lane (`tests/replay.rs`, forwarded-queue test).
 - *Threads.* `VxReplay` creates the `n + 1` threads (W-04) but does not pin them yet: pinning
   comes with the core map (§10.1), and tests run unpinned. W-03 calls libc `sched_yield`, not
   `vyrn_vx_spin`, because vxc cannot declare a host symbol (W-18 in `vx/FRICTION.md`).
