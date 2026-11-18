@@ -262,6 +262,13 @@ fn fetch_keys(cfg: &Config) -> Result<BTreeMap<Ipv4Addr, [u8; 16]>, String> {
         return Err("roster: the file does not hash to roster_hash".into());
     }
     let roster = vyrn_epoch::Roster::decode(mode, &bytes).map_err(|e| format!("roster: {e}"))?;
+    // R3 (08 §9.6): a roster configures only epochs from its `epoch_from`.
+    if roster.epoch_from > vyrn_types::Epoch(r.epoch) {
+        return Err(format!(
+            "roster: epoch_from {} is after the configured epoch {}",
+            roster.epoch_from.0, r.epoch
+        ));
+    }
     let secret = cfg.resolve::<32>(&r.xchg_secret)?;
     let keys = roster
         .box_fetch_keys(
@@ -281,6 +288,10 @@ fn fetch_keys(cfg: &Config) -> Result<BTreeMap<Ipv4Addr, [u8; 16]>, String> {
         if out.insert(ip, k).is_some() {
             return Err(format!("roster: two requesters share {ip}"));
         }
+    }
+    // An empty map is open mode (DEV only): a roster that yields no key must not turn it on.
+    if out.is_empty() {
+        return Err("roster: no requester has a usable K_fetch".into());
     }
     Ok(out)
 }

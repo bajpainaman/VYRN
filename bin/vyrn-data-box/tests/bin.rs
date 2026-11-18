@@ -270,6 +270,44 @@ fn refuses_open_mode_outside_dev() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `[roster]` that cannot key any requester, or that is not yet in force at the configured
+/// epoch (R3), fails the start instead of falling back to open mode.
+#[test]
+fn refuses_a_roster_that_keys_nobody_or_is_early() {
+    let dir = std::env::temp_dir().join(format!("vyrn-data-roster-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let good = std::fs::read_to_string(config(&dir, dest, false, true)).unwrap();
+    let good_hash = hex(&roster().hash(&domain()).0);
+    let mut low_order = roster();
+    for h in &mut low_order.homes {
+        h.voters.iter_mut().for_each(|v| v.xchg_key = vec![0; 32]);
+        h.seq.iter_mut().for_each(|q| q.xchg_key = vec![0; 32]);
+    }
+    let mut early = roster();
+    early.epoch_from = vyrn_types::Epoch(EPOCH + 1);
+    for (name, r, want) in [
+        ("low", low_order, "no requester has a usable K_fetch"),
+        ("early", early, "is after the configured epoch"),
+    ] {
+        let file = dir.join(format!("{name}.hex"));
+        std::fs::write(&file, hex(&r.encode())).unwrap();
+        let text = good
+            .replace(&good_hash, &hex(&r.hash(&domain()).0))
+            .replace(
+                &dir.join("roster.hex").display().to_string(),
+                &file.display().to_string(),
+            );
+        let cfg = dir.join(format!("{name}.toml"));
+        std::fs::write(&cfg, text).unwrap();
+        let o = cmd(&cfg).stdin(Stdio::null()).output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(2), "{name}: {err}");
+        assert!(err.contains(want), "{name}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A stop during a bad-MAC flood loses no event silently: every one the node raised is an
 /// `EVENT` line or counted in `STATS` (`events_unprinted`, `events_dropped`).
 #[test]
