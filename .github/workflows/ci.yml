@@ -77,6 +77,58 @@ jobs:
       - name: every Vx workaround marker matches its vx/FRICTION.md entry (11 §5.6)
         run: cargo run --locked --quiet -p vx-friction
 
+  vx:
+    name: Vx client and oracle against RustReplay (11 §5.2, §5.3)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    # vxc_blake3.x86_64-linux (vx/TOOLCHAIN) was pinned on Debian 13 with HOME=/home/user: vxc
+    # embeds its source and target dirs and links the distro's LLVM/MLIR 22 statically, so the job
+    # builds it there. VX-WORKAROUND W-10 (issue to file): at run time vxc reads its checkout's
+    # stdlib/ and loads .so files beside it and in its build dir, so the cache holds exactly those
+    # with the binary (not the 1.8 GB target dir); vx/build.sh checks the hash.
+    container:
+      image: debian:trixie
+    env:
+      HOME: /home/user
+      # The tests need no clang or lld (as in gates); RUSTFLAGS replaces the config's rustflags.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+      RUSTFLAGS: ""
+      VYRN_REQUIRE_VX: "1"
+      # oracle_scenarios reads its own flag (vyrn-sim, 11 §5.2).
+      VYRN_REQUIRE_VX_ORACLE: "1"
+    steps:
+      - name: base packages
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            ca-certificates curl git sudo build-essential b3sum perl
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: .github/scripts/vxc.sh toolchain
+      - run: .github/scripts/vxc.sh llvm
+      - id: vxc
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /home/user/.local/src/vx/stdlib
+            /home/user/.local/src/vx/target/release/vxc
+            /home/user/.local/src/vx/target/release/*.so
+            /home/user/.local/src/vx/target/release/build/vxc/*/out/*.so
+          key: vxc-v3-debian13-x86_64-${{ hashFiles('vx/TOOLCHAIN', 'rust-toolchain.toml') }}
+      - name: build vxc (cache miss)
+        if: steps.vxc.outputs.cache-hit != 'true'
+        run: .github/scripts/vxc.sh vxc
+      - run: ln -sfn "$HOME/.local/src/vx/target/release/vxc" "$HOME/.local/bin/vxc"
+      - name: vx/build.sh (pinned vxc hash, b3sum-checked libraries)
+        run: vx/build.sh
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: the Vx client against RustReplay (tests/replay.rs)
+        run: cargo test --locked -p vyrn-replica --test replay
+      - name: the Vx oracle's scenarios and the pinned sim seeds
+        run: cargo test --locked -p vyrn-sim --test oracle_scenarios --test vx_golden
+
   sim-swarm:
     name: vyrn-sim swarm (11 §6.4)
     runs-on: ubuntu-24.04
