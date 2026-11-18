@@ -14,26 +14,100 @@ use vyrn_wire::{Msg, ReqHeader, encode_request};
 
 const K: [u8; 16] = [7; 16];
 
-fn config(
-    dir: &std::path::Path,
-    dest: SocketAddr,
-    dev: bool,
-    fetch_key: bool,
-) -> std::path::PathBuf {
-    let fk = if fetch_key {
-        "[[fetch_key]]\nip = \"127.0.0.1\"\nkey = \"env:VYRN_DATA_TEST_KFETCH\"\n"
+/// The test requester's X25519 secret: LDN voter 0, at 127.0.0.1.
+const REQ_SECRET: [u8; 32] = [0x5a; 32];
+/// The box's X25519 secret: LDN data box 0.
+const BOX_SECRET: [u8; 32] = [0x6b; 32];
+const EPOCH: u32 = 8;
+
+fn domain() -> vyrn_epoch::Domain {
+    vyrn_epoch::Domain {
+        genesis_hash: vyrn_types::Hash([0; 32]),
+        mode: vyrn_types::Mode::Base,
+    }
+}
+
+/// A BASE roster (08 §9.6), one home used for all three: 4 voters at 127.0.0.1..=4 (voter 0 has
+/// a real X25519 key), 2 `vyrn-seq` boxes at 127.0.1.1..=2, and one data box with a real key.
+fn roster() -> vyrn_epoch::Roster {
+    use vyrn_epoch::{Addr, DataBox, Home, Roster, SeqEntry, Voter};
+    let addr = |a: [u8; 4]| {
+        let mut ip = [0u8; 16];
+        ip[10] = 0xff;
+        ip[11] = 0xff;
+        ip[12..].copy_from_slice(&a);
+        Addr { ip, port: 7001 }
+    };
+    let x = vyrn_crypto::x25519::public_key;
+    let home = Home {
+        voters: (0..4u8)
+            .map(|i| Voter {
+                client: i % 2,
+                facility: i + 1,
+                node_key: vec![0x10 + i; 32],
+                vote_key: vec![0x10 + i; 32],
+                xchg_key: if i == 0 {
+                    x(&REQ_SECRET).to_vec()
+                } else {
+                    vec![0x55 + i; 32]
+                },
+                data_addr: addr([127, 0, 0, 1 + i]),
+                repl_addr: addr([127, 0, 0, 1 + i]),
+            })
+            .collect(),
+        seq: (0..2u8)
+            .map(|j| SeqEntry {
+                facility: j + 1,
+                node_key: vec![0x20 + j; 32],
+                seq_key: vec![0x20 + j; 32],
+                xchg_key: vec![0x66; 32],
+                client_addr: addr([127, 0, 1, 1 + j]),
+                repl_addr: addr([127, 0, 1, 1 + j]),
+            })
+            .collect(),
+        recovery: 0,
+        data: vec![DataBox {
+            facility: 2,
+            addr: addr([127, 0, 2, 1]),
+            xchg_key: x(&BOX_SECRET).to_vec(),
+        }],
+    };
+    Roster {
+        sig_scheme: 0,
+        epoch_from: vyrn_types::Epoch(0),
+        homes: [home.clone(), home.clone(), home],
+        bridge: None,
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn config(dir: &std::path::Path, dest: SocketAddr, dev: bool, keyed: bool) -> std::path::PathBuf {
+    let fk = if keyed {
+        let r = roster();
+        let file = dir.join("roster.hex");
+        std::fs::write(&file, hex(&r.encode())).unwrap();
+        format!(
+            "[roster]\nfile = \"{}\"\nroster_hash = \"{}\"\ngenesis_hash = \"{}\"\nepoch = {EPOCH}\n\
+             box = 0\nxchg_secret = \"env:VYRN_DATA_TEST_XCHG\"\n\n",
+            file.display(),
+            hex(&r.hash(&domain()).0),
+            hex(&[0; 32]),
+        )
     } else {
-        ""
+        String::new()
     };
     let text = format!(
-        "schema = 1\nprotocol = 1\nrole = \"data\"\nmode = \"BASE\"\nhome = \"DEV\"\ndev = {dev}\n\
+        "schema = 1\nprotocol = 1\nrole = \"data\"\nmode = \"BASE\"\nhome = \"LDN\"\ndev = {dev}\n\
          src = 1\nbooks = [3]\ndests = [\"{dest}\"]\n\n\
          [nic]\nbackend = \"kernel_udp\"\nip = \"127.0.0.1\"\ningest_port = 0\nfetch_port = 0\n\n\
          [ring]\nslots = 64\nindex_key = \"env:VYRN_DATA_TEST_KFETCH\"\n\n\
          [[session]]\nid = 5\nkey = \"env:VYRN_DATA_TEST_KSEQ\"\n\n{fk}\
          [metrics]\nlisten = \"127.0.0.1:0\"\n"
     );
-    let p = dir.join(format!("data-{dev}-{fetch_key}.toml"));
+    let p = dir.join(format!("data-{dev}-{keyed}.toml"));
     std::fs::write(&p, text).unwrap();
     p
 }
@@ -44,7 +118,8 @@ fn cmd(cfg: &std::path::Path) -> Command {
         .arg(cfg)
         .arg("--stop-on-stdin-eof")
         .env("VYRN_DATA_TEST_KSEQ", "07".repeat(16))
-        .env("VYRN_DATA_TEST_KFETCH", "33".repeat(16));
+        .env("VYRN_DATA_TEST_KFETCH", "33".repeat(16))
+        .env("VYRN_DATA_TEST_XCHG", hex(&BOX_SECRET));
     c
 }
 
@@ -101,10 +176,34 @@ fn serves_a_replica_exports_metrics_and_stops() {
     assert_eq!((d.hdr.kind, d.hdr.src, d.hdr.data_seq), (Kind::Data, 1, 1));
     assert_eq!(d.packets().collect::<Vec<_>>(), vec![&out[..n]]);
 
+    // A KEY fetch sealed under the K_fetch the requester derives on its side is served; the
+    // same fetch under another epoch's key is refused (08 §9.6).
+    let fetch_at = field(&ready, "fetch=").to_owned();
+    let q = vyrn_data::frame::Fetch::Key {
+        session: SessionId(5),
+        pkt_seq: 1,
+    };
+    let r = roster();
+    let ldn = vyrn_types::HomeCode::Ldn;
+    let key = |e| r.requester_fetch_key(&domain(), vyrn_types::Epoch(e), ldn, 0, 0, &REQ_SECRET);
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .send_to(&q.seal(&key(EPOCH + 1).unwrap()), &fetch_at)
+        .unwrap();
+    client
+        .send_to(&q.seal(&key(EPOCH).unwrap()), &fetch_at)
+        .unwrap();
+    let got = client.recv(&mut buf).unwrap();
+    let resp = frame::decode(&buf[..got]).unwrap();
+    assert_eq!(resp.hdr.kind, Kind::FetchResp);
+    assert_eq!(resp.packets().collect::<Vec<_>>(), vec![&out[..n]]);
+
     let t = Instant::now();
     loop {
         let m = scrape(&metrics);
-        if m.contains("vyrn_data_stored_total{role=\"data\",home=\"DEV\",src=\"1\"} 1")
+        if m.contains("vyrn_data_stored_total{role=\"data\",home=\"LDN\",src=\"1\"} 1")
             && m.contains("vyrn_data_events_unprinted_total{")
         {
             break;
@@ -125,10 +224,11 @@ fn serves_a_replica_exports_metrics_and_stops() {
     assert_eq!(field(&stats, "stored="), "1", "{stats}");
     assert_eq!(field(&stats, "data_frames="), "1", "{stats}");
     assert_eq!(field(&stats, "events_unprinted="), "0", "{stats}");
+    assert_eq!(field(&stats, "fetch_unauth="), "1", "{stats}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Open-mode fetches (no `[[fetch_key]]`) start only on a box marked `dev = true`.
+/// Open-mode fetches (no `[roster]`) start only on a box marked `dev = true`.
 #[test]
 fn refuses_open_mode_outside_dev() {
     let dir = std::env::temp_dir().join(format!("vyrn-data-open-{}", std::process::id()));

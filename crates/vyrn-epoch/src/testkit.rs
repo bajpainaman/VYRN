@@ -51,6 +51,11 @@ pub fn seq_node_seed(h: u8, j: u8) -> [u8; 32] {
     [0xD0 + 0x08 * h + j; 32]
 }
 
+/// The X25519 secret of data box `i` of home `h`.
+pub fn data_seed(h: u8, i: u8) -> [u8; 32] {
+    [0x30 + 0x08 * h + i; 32]
+}
+
 fn boxes(base: u8, h: u8) -> [SeqBox; 2] {
     [0u8, 1].map(|j| SeqBox {
         index: 5 + j,
@@ -237,6 +242,14 @@ pub fn roster(mode: Mode, scheme: u8) -> crate::Roster {
                 .map(|i| DataBox {
                     facility: i + 1,
                     addr: addr(h, 0x80 + i, 8_000),
+                    // A real X25519 key, so tests can derive K_fetch from `data_seed`.
+                    xchg_key: {
+                        let mut k = vyrn_crypto::x25519::public_key(&data_seed(h, i)).to_vec();
+                        if scheme == 1 {
+                            k.extend_from_slice(&[0xE8 + i; 1_184]);
+                        }
+                        k
+                    },
                 })
                 .collect(),
         }

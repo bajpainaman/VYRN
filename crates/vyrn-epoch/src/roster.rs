@@ -24,6 +24,8 @@ use vyrn_types::{Epoch, Hash, HomeCode, Mode, PubKey};
 pub const ROSTER_VERSION: u8 = 1;
 /// The hashing context, six spaces after "vyrn" like every vyrn-epoch context.
 pub const ROSTER_CONTEXT: &str = "vyrn      v1 roster";
+/// The `K_fetch` context (08 §9.6), padded like every vyrn-epoch context.
+pub const FETCH_CONTEXT: &str = "vyrn      v1 fetch";
 /// `HomeCode` order of [`Roster::homes`].
 pub const HOMES: [HomeCode; 3] = [HomeCode::Tyo, HomeCode::Ldn, HomeCode::Nyc];
 
@@ -84,10 +86,12 @@ pub struct SeqEntry {
 }
 
 /// One `vyrn-data` box.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataBox {
     pub facility: u8,
     pub addr: Addr,
+    /// `KexKey` of `sig_scheme` (01 §3). Its X25519 half keys `K_fetch` ([`fetch_key`]).
+    pub xchg_key: Vec<u8>,
 }
 
 /// The nodes of one home.
@@ -181,6 +185,7 @@ impl Roster {
             for d in &h.data {
                 b.push(d.facility);
                 put_addr(&mut b, d.addr);
+                b.extend_from_slice(&d.xchg_key);
             }
         }
         if let Some(set) = &self.bridge {
@@ -247,6 +252,7 @@ impl Roster {
                     Ok(DataBox {
                         facility: r.u8()?,
                         addr: r.addr()?,
+                        xchg_key: r.take(x)?.to_vec(),
                     })
                 })
                 .collect::<Result<_, RosterErr>>()?;
@@ -387,6 +393,86 @@ impl Roster {
     }
 }
 
+/// `K_fetch(e, i, d)` (08 §9.6): `derive_key(FETCH_CONTEXT, shared ‖ genesis_hash ‖ mode ‖
+/// le(e) ‖ [i] ‖ [d])[0..16]`, where `shared` is X25519 of requester `i`'s and data box `d`'s
+/// `xchg_key` X25519 halves. Both ends compute it: the box from its secret and `i`'s public key,
+/// the requester from its secret and `d`'s.
+pub fn fetch_key(domain: &Domain, epoch: Epoch, i: u8, d: u8, shared: &[u8; 32]) -> [u8; 16] {
+    let mut m = Vec::with_capacity(32 + 33 + 6);
+    m.extend_from_slice(shared);
+    m.extend_from_slice(&domain.prefix());
+    m.extend_from_slice(&epoch.0.to_le_bytes());
+    m.extend_from_slice(&[i, d]);
+    let k = vyrn_crypto::hash::derive_key(FETCH_CONTEXT, &m);
+    core::array::from_fn(|j| k[j])
+}
+
+/// The X25519 half of a `KexKey`: its first 32 bytes (01 §3, PQ-6(a)).
+fn x25519_half(k: &[u8]) -> Option<[u8; 32]> {
+    k.get(..32)?.try_into().ok()
+}
+
+impl Roster {
+    /// Data box `d` of `home`: `K_fetch(e, i, d)` for every requester `i` of `home` (its voters,
+    /// then its `vyrn-seq` boxes, by roster index), with the requester's `repl_addr`. `secret` is
+    /// box `d`'s X25519 private key. `None` if `d` is not a data box of `home`, or its secret does
+    /// not match its roster key. A requester whose key is a low-order point is left out.
+    pub fn box_fetch_keys(
+        &self,
+        domain: &Domain,
+        epoch: Epoch,
+        home: HomeCode,
+        d: u8,
+        secret: &[u8; 32],
+    ) -> Option<Vec<(u8, Addr, [u8; 16])>> {
+        let h = self.home(home);
+        let me = h.data.get(usize::from(d))?;
+        if x25519_half(&me.xchg_key)? != vyrn_crypto::x25519::public_key(secret) {
+            return None;
+        }
+        let requesters = h
+            .voters
+            .iter()
+            .map(|v| (v.xchg_key.as_slice(), v.repl_addr))
+            .chain(h.seq.iter().map(|s| (s.xchg_key.as_slice(), s.repl_addr)));
+        Some(
+            requesters
+                .enumerate()
+                .filter_map(|(i, (pk, addr))| {
+                    let i = u8::try_from(i).ok()?;
+                    let shared = vyrn_crypto::x25519::shared_secret(secret, &x25519_half(pk)?)?;
+                    Some((i, addr, fetch_key(domain, epoch, i, d, &shared)))
+                })
+                .collect(),
+        )
+    }
+
+    /// Requester `i` of `home` (roster index): its `K_fetch(e, i, d)` for data box `d`, from its
+    /// own X25519 private key. `None` if `d` is unknown or its key is a low-order point.
+    pub fn requester_fetch_key(
+        &self,
+        domain: &Domain,
+        epoch: Epoch,
+        home: HomeCode,
+        i: u8,
+        d: u8,
+        secret: &[u8; 32],
+    ) -> Option<[u8; 16]> {
+        let pk = x25519_half(&self.home(home).data.get(usize::from(d))?.xchg_key)?;
+        let shared = vyrn_crypto::x25519::shared_secret(secret, &pk)?;
+        Some(fetch_key(domain, epoch, i, d, &shared))
+    }
+}
+
+impl Addr {
+    /// The IPv4 address of an `::ffff:a.b.c.d` address, else `None`.
+    pub fn ipv4(&self) -> Option<core::net::Ipv4Addr> {
+        let mapped = self.ip[..10].iter().all(|&b| b == 0) && self.ip[10..12] == [0xff, 0xff];
+        let v4: [u8; 4] = self.ip[12..].try_into().ok()?;
+        mapped.then(|| v4.into())
+    }
+}
+
 impl Membership {
     /// The [`Membership`] of `cfg.epoch` from the roster bytes `cfg` names (08 §9.6): checks
     /// `roster_hash`, decodes, checks `sig_scheme`, `epoch_from` and `seq_order`, then takes
@@ -518,6 +604,54 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use crate::testkit::{self, Local};
+
+    /// Both ends of a fetch derive the same `K_fetch`, and it is bound to the epoch, the requester
+    /// and the box: a wrong secret, another epoch, another requester index or another box gives
+    /// another key, and the box refuses a secret that is not its roster key.
+    #[test]
+    fn box_and_requester_derive_the_same_fetch_key() {
+        let mode = Mode::Base;
+        let domain = testkit::domain(mode);
+        let mut r = testkit::roster(mode, 0);
+        let req_secret = [0x5a; 32];
+        // Voter 2 of LDN gets a real X25519 key, so it can play the requester.
+        r.homes[1].voters[2].xchg_key = vyrn_crypto::x25519::public_key(&req_secret).to_vec();
+        let (e, ldn) = (Epoch(8), HomeCode::Ldn);
+        let box0 = testkit::data_seed(2, 0);
+        let keys = r.box_fetch_keys(&domain, e, ldn, 0, &box0).unwrap();
+        let n = r.homes[1].voters.len() + r.homes[1].seq.len();
+        assert_eq!(keys.len(), n);
+        let (_, addr, k) = keys.iter().find(|(i, _, _)| *i == 2).copied().unwrap();
+        assert_eq!(addr, r.homes[1].voters[2].repl_addr);
+        let mine = r.requester_fetch_key(&domain, e, ldn, 2, 0, &req_secret);
+        assert_eq!(mine, Some(k));
+        // Every other binding changes the key.
+        assert_ne!(
+            r.requester_fetch_key(&domain, Epoch(9), ldn, 2, 0, &req_secret),
+            Some(k)
+        );
+        assert_ne!(
+            r.requester_fetch_key(&domain, e, ldn, 3, 0, &req_secret),
+            Some(k)
+        );
+        assert_ne!(
+            r.requester_fetch_key(&domain, e, ldn, 2, 1, &req_secret),
+            Some(k)
+        );
+        assert_ne!(
+            r.requester_fetch_key(&domain, e, ldn, 2, 0, &[0x5b; 32]),
+            Some(k)
+        );
+        let chain = testkit::domain(Mode::Chain);
+        assert_ne!(
+            r.requester_fetch_key(&chain, e, ldn, 2, 0, &req_secret),
+            Some(k)
+        );
+        // Keys differ between requesters, and a box with the wrong secret gets none.
+        assert!(keys.iter().all(|(i, _, x)| *i == 2 || *x != k));
+        assert!(r.box_fetch_keys(&domain, e, ldn, 0, &[0x11; 32]).is_none());
+        assert!(r.box_fetch_keys(&domain, e, ldn, 9, &box0).is_none());
+    }
 
     #[test]
     fn the_roster_builds_the_membership_that_hands_off() {

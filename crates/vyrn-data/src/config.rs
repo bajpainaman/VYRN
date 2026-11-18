@@ -36,8 +36,9 @@ pub struct Config {
     pub dests: Vec<SocketAddrV4>,
     #[serde(default)]
     pub session: Vec<Session>,
+    /// Where `K_fetch` comes from (08 §9.6). Omitted: open-mode fetches, DEV only.
     #[serde(default)]
-    pub fetch_key: Vec<FetchKey>,
+    pub roster: Option<RosterCfg>,
     #[serde(default)]
     pub fetch: FetchCfg,
     #[serde(default)]
@@ -75,11 +76,23 @@ pub struct Session {
     pub key: String,
 }
 
+/// `[roster]`: the roster this box derives every requester's `K_fetch(e, i, d)` from.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FetchKey {
-    pub ip: Ipv4Addr,
-    pub key: String,
+pub struct RosterCfg {
+    /// The roster bytes (08 §9.6), raw or as hex text.
+    pub file: PathBuf,
+    /// `EpoConfig.roster_hash`, hex; the bytes must hash to it (R1).
+    pub roster_hash: String,
+    /// `Domain.genesis_hash`, hex.
+    pub genesis_hash: String,
+    /// The epoch the keys are for.
+    pub epoch: u32,
+    /// This box's position `d` in `home(e).data`.
+    #[serde(rename = "box")]
+    pub data_box: u8,
+    /// This box's X25519 private key handle: the secret of its roster `xchg_key`.
+    pub xchg_secret: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,9 +187,9 @@ impl Config {
         if self.books.is_empty() || self.dests.is_empty() || self.ring.slots == 0 {
             return bad("books/dests/ring.slots", "must not be empty or 0");
         }
-        if self.fetch_key.is_empty() && !self.dev {
+        if self.roster.is_none() && !self.dev {
             return bad(
-                "fetch_key",
+                "roster",
                 "is empty: open-mode fetches are DEV only (set dev = true on a DEV box)",
             );
         }
@@ -222,13 +235,6 @@ impl Config {
             ring_slots: self.ring.slots,
             index_key,
         })
-    }
-
-    pub fn fetch_keys(&self) -> Result<BTreeMap<Ipv4Addr, [u8; 16]>, String> {
-        self.fetch_key
-            .iter()
-            .map(|k| Ok((k.ip, self.resolve::<16>(&k.key)?)))
-            .collect()
     }
 }
 

@@ -95,7 +95,8 @@
 //!   not stored. The block is read through `BlockStore::read`, which checks `order_root`.
 //!
 //! **Authentication and rate (*reading*, recorded in 07 §5.5).** A box configured with
-//! `K_fetch` keys ([`NodeConfig::fetch_keys`], one 16-byte key per requester address) serves only
+//! `K_fetch` keys ([`NodeConfig::fetch_keys`], one 16-byte key per requester address; the `vyrn-data`
+//! binary, `bin/vyrn-data-box`, derives them from the roster, 08 §9.6, `Roster::box_fetch_keys`) serves only
 //! the 40-byte form: the 32 bytes above, then `tag` u64 = SipHash-2-4(`K_fetch`, bytes 0..32).
 //! A fetch from an unkeyed address, a plain fetch, or a bad tag is dropped and counted
 //! (`fetch_unauth`). Each keyed address has a token bucket (`fetch_rate` per second, burst

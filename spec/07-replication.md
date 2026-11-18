@@ -1068,8 +1068,9 @@ fetch, with these sources in order:
 0x4650 "PF", version 1, kind 1 KEY `{session, pkt_seq}`, 2 RANGE `{dst, from, to}`, 3 BLOCK
 `{height}`; layout and vectors in `crates/vyrn-data` docs and `tests/golden/vyrn_data_vectors`).
 A data box with fetch keys accepts only the 40-byte authenticated form: those 32 bytes, then
-`tag` u64 LE = SipHash-2-4(`K_fetch`, bytes 0..32), with one `K_fetch` per requester address
-(operator-provisioned; 09 owns key schedules). It rate-limits each requester with a token bucket
+`tag` u64 LE = SipHash-2-4(`K_fetch`, bytes 0..32), with one `K_fetch(e, i, d)` per requester,
+derived per epoch from the roster's X25519 keys (08 §9.6) and keyed by the requester's `repl_addr`
+IPv4. It rate-limits each requester with a token bucket
 (03 §1: "rate-limit by source address") and drops forged, unkeyed and over-rate fetches before
 any work. Replies are not tagged (next paragraph).
 
