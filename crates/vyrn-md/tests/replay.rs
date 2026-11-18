@@ -32,10 +32,37 @@ use vyrn_wire::{Msg, ReqHeader, encode_request};
 
 const SEED: [u8; 32] = [0x33; 32];
 
-type Md = SinkStream<Vec<Vec<u8>>>;
+/// A `SinkStream` that gets a `CtlTimerTick` right after every step whose id is a multiple of
+/// [`TICK_EVERY`], on the live and the replay side alike.
+struct Md(SinkStream<Vec<Vec<u8>>>);
+
+const TICK_EVERY: u64 = 3;
 
 fn md() -> Md {
-    SinkStream::new(BOOK, Epoch(0), N, Vec::new())
+    Md(SinkStream::new(BOOK, Epoch(0), N, Vec::new()))
+}
+
+impl Md {
+    fn finish(self) -> Result<Vec<Vec<u8>>, SinkError> {
+        self.0.finish()
+    }
+}
+
+impl Sink for Md {
+    fn record(&mut self, r: &Rec<'_>) {
+        self.0.record(r);
+        if let Rec::Step(e, _) = r
+            && e.step.0 % TICK_EVERY == 0
+        {
+            self.0.timer_tick();
+        }
+    }
+    fn lane_resp(&mut self, l: LaneId, p: &RespPkt) {
+        self.0.lane_resp(l, p);
+    }
+    fn tx(&mut self, h: &vyrn_bbo::TxEntry, recs: &[vyrn_bbo::Record]) {
+        self.0.tx(h, recs);
+    }
 }
 
 #[derive(Clone)]
@@ -58,7 +85,8 @@ impl EpochView for View {
 
 /// `vyrn-replica`'s replay script (no `MID` boundary, no `SHED` resend: replay skips both
 /// today), then a second session's improve pair, a cross that sweeps three makers over a run
-/// of `CONT` steps, a rejected reduce, a reduce and a reduce that removes what is left.
+/// of `CONT` steps, a rejected reduce, two reduces of one order in one packet, a reduce that
+/// removes what is left.
 fn script() -> Vec<Act> {
     use BSide::{Buy, Sell};
     use Tif::{Day, Ioc};
@@ -111,11 +139,40 @@ fn script() -> Vec<Act> {
         Act::Run,
         p(1, 2, 33_000, 33_000, vec![reduce(1, 1, 40)]),
         Act::Run,
-        p(1, 2, 34_000, 34_000, vec![reduce(3, 1, 41)]),
+        p(
+            1,
+            2,
+            34_000,
+            34_000,
+            vec![reduce(3, 1, 41), reduce(3, 1, 43)],
+        ),
         Act::Run,
         p(1, 2, 35_000, 35_000, vec![reduce(3, 9, 42)]),
         Act::Run,
     ]
+}
+
+/// [`script`], then a heartbeat-only packet and a join behind a heartbeat. Live only: 07 cannot
+/// frame an accepted packet with a session-only message yet (`SeqWriter` returns `Range`: the
+/// record's `count` is the header's, but session-only messages take no LaneSeq).
+fn script_hb() -> Vec<Act> {
+    let pkt = |rx_ts, msgs| Act::Pkt {
+        l: 0,
+        a: 3,
+        rx_ts,
+        now: rx_ts,
+        msgs,
+    };
+    let mut s = script();
+    s.extend([
+        pkt(36_000, vec![Msg::Heartbeat]),
+        pkt(
+            36_100,
+            vec![Msg::Heartbeat, new(BSide::Sell, Tif::Day, 120, 1, 50)],
+        ),
+        Act::Run,
+    ]);
+    s
 }
 
 fn prefix(h: &Hash) -> PktHash {
@@ -164,7 +221,7 @@ fn live(script: &[Act]) -> (Journal, Store, Result<Vec<Vec<u8>>, SinkError>) {
                 let mut buf = [0u8; MAX_REQ_PAYLOAD];
                 let n = encode_request(&mut buf, hdr, msgs, &kseq(*l, *a), None).unwrap();
                 let bytes = buf[..n].to_vec();
-                s.1.payload(&bytes);
+                s.1.0.payload(&bytes);
                 let rx = RxIn {
                     bytes: &bytes,
                     rx_ts: Nanos(*rx_ts),
@@ -295,7 +352,7 @@ fn replay_md(
     for b in blocks {
         rep.payloads_mut().check(b).unwrap();
         let (p, m) = rep.payloads_and_sink();
-        m.prepare(b, p);
+        m.0.prepare(b, p);
         rep.replay_block(b)?;
         rep.release(b.header.height);
     }
@@ -331,11 +388,12 @@ fn every_block_split_gives_the_same_md() {
 /// The packets carry every book-level kind, and a subscriber that follows 10 §7.4 rebuilds
 /// the book the script leaves, worked out by hand: lane 0's sell 105 (5, then 2 traded, then
 /// canceled), lane 0's sells at 110 and 111 (each traded out), lane 1's sell 105 (traded out)
-/// and buy 100 (4, reduced to 3, then removed) all end, and lane 2's buy 111 of 5 trades
-/// 3 + 1 + 1 over three steps, so it leaves no residual: nothing rests.
+/// and buy 100 (4, reduced to 3 and 2 in one interval, then removed) all end, and lane 2's buy
+/// 111 of 5 trades 3 + 1 + 1 over three steps, so it leaves no residual. Only lane 0's sell 120
+/// of 1, behind a heartbeat, rests. Quiet lane channel 3 heartbeats before the epoch ends.
 #[test]
 fn the_md_rebuilds_the_book() {
-    let (_, _, md) = live(&script());
+    let (_, _, md) = live(&script_hb());
     let md = md.unwrap();
     let recs = records(&md);
     let has = |f: fn(&Record) -> bool| recs.iter().any(f);
@@ -348,10 +406,14 @@ fn the_md_rebuilds_the_book() {
         "step add"
     );
     assert!(has(|r| matches!(r, Record::Delete { .. })), "delete");
-    assert!(
-        has(|r| matches!(r, Record::Reduce { qty: Qty(3), .. })),
-        "reduce to 3"
-    );
+    let reduces: Vec<_> = recs
+        .iter()
+        .filter_map(|r| match r {
+            Record::Reduce { qty, .. } => Some(qty.0),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reduces, vec![3, 2], "the second reduce sees the first");
     let execs: Vec<_> = recs
         .iter()
         .filter_map(|r| match r {
@@ -365,7 +427,22 @@ fn the_md_rebuilds_the_book() {
         sub.on_packet(p).unwrap();
     }
     sub.finish().unwrap();
-    assert!(sub.book().orders().is_empty(), "{:?}", sub.book().orders());
+    let rest: Vec<_> = sub
+        .book()
+        .orders()
+        .iter()
+        .map(|(o, x)| (*o, x.side, x.tick.0, x.qty.0))
+        .collect();
+    assert_eq!(rest.len(), 1, "{rest:?}");
+    let (o, side, tick, qty) = rest[0];
+    assert_eq!((o >> 24, side, tick, qty), (0, vyrn_md::Side::Sell, 120, 1));
+    let quiet = md[..md.len() - 5]
+        .iter()
+        .map(|b| Packet::decode(b).unwrap().header);
+    assert!(
+        quiet.filter(|h| h.channel.index == 3).any(|h| h.count == 0),
+        "a heartbeat on lane channel 3 before the epoch end"
+    );
 }
 
 /// The engine's full conformance cases that 07 replay skips today: a `MID` boundary and a

@@ -1558,8 +1558,10 @@ interleave in (07 §7.1 fixes only each lane's order). The rules below are readi
    echo_pkt, index)`, and its message: `Ack` of a `New` is `MD_ADD` (side and qty from the
    message, priority `rx_ts` the lane's running maximum); `CancelAck` of a `Cancel` is
    `MD_DELETE(1)`; `CancelAck(c)` of a `Reduce` is `MD_REDUCE` to `open − c`, or `MD_DELETE(1)`
-   when `c = open`. A reject or `Out` changes nothing. `open` is the book after step `s − 1`,
-   which is what B2 settles against (05 §7.6). \[Likely\]
+   when `c = open`. A reject or `Out` changes nothing. `open` is the book after step `s − 1` and
+   the interval's earlier ops, applied in the order of item 6, which is what B2 settles against
+   (05 §7.6). A session-only message takes a LaneSeq only when its packet's header is rejected
+   (05 §3.1), which its immediate reject shows. \[Likely\]
 3. **Step records.** Every StepRecord is an `MD_STEP`, Idle and Shed included, so step ids on the
    step channel stay gapless for `MD_SYNC` and the watermark. §7.4 says "every step that changes
    the book"; a subscriber skips the ones that change nothing. \[Guessing\]
@@ -1580,8 +1582,13 @@ interleave in (07 §7.1 fixes only each lane's order). The rules below are readi
    \[Likely\]
 8. **Epoch end.** Lane ops after the last step are not published: no cut orders them, and their
    acks never leave (`INV-ACK-AFTER-CUT`). \[Likely\]
+9. **Timer ticks.** The StepRecord does not carry a control step's command, so the observer's
+   shell, which applies the commands (05 §8.8), reports the `CtlTimerTick` right after its step;
+   the tick is encoded after that step, in step order, and drives §7.3's heartbeats.
+   \[Guessing\]
 
-Not rebuilt yet (`SinkError::Unsupported`): `Replace`, `CancelAll`, dependency TX packets,
+Not rebuilt yet (`SinkError::Unsupported`): `Replace` (local or forwarded) and any step source
+other than `New`, `CancelAll`, dependency TX packets,
 unsolicited lane records (expiry, kills), steps without a source that fill (Rescan, Uncross),
 pooled lanes, and the two cases 07 replay skips today (`MID` Advance records, `SHED` resends).
 

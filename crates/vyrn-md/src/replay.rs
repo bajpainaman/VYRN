@@ -37,7 +37,11 @@
 //! `MD_STEP`; exec `ordinal` is the maker `Fill`'s position in the step's TX packets, not the
 //! BBO's match ordinal, which no output carries; the lane-op tie order `(prio_ts, lane, seq)`.
 //!
-//! **Not covered yet** ([`SinkError::Unsupported`]): `Replace`, `CancelAll`, dependency TX
+//! **Timer ticks.** [`SinkStream::timer_tick`] marks the `CtlTimerTick` after the step that
+//! carries it (10 §7.9 item 9).
+//!
+//! **Not covered yet** ([`SinkError::Unsupported`]): `Replace` (local or forwarded) and any step
+//! source other than `New`, `CancelAll`, dependency TX
 //! packets (`ROLE_DEPS`), unsolicited lane records (expiry, kills), steps without a source that
 //! fill (Rescan, Uncross), STP causes other than STP, and the cases replay skips today (`MID`
 //! Advance records, `SHED` resends).
@@ -113,6 +117,8 @@ struct PendStep {
     /// `(lane, C_s[l])` for every lane whose cut moved.
     covers: Vec<(u8, u64)>,
     tx_left: u8,
+    /// Timer ticks to encode after this step.
+    ticks: u32,
     taker: Vec<Resp>,
     maker: Vec<(LaneId, Resp)>,
 }
@@ -145,7 +151,7 @@ pub struct SinkStream<K: PacketSink> {
     taker_acc: Option<((LaneId, LaneSeq), u32)>,
     /// The newest step source, for the `CONT` steps that follow it.
     last_src: Option<Src>,
-    scratch: Vec<(u64, u8, u64, BookOp)>,
+    scratch: Vec<(u64, u8, u64, Op)>,
 }
 
 impl<K: PacketSink> SinkStream<K> {
@@ -198,6 +204,24 @@ impl<K: PacketSink> SinkStream<K> {
         }
     }
 
+    /// The `CtlTimerTick` boundary (10 §7.3 heartbeats). Call it right after the sink call of
+    /// the step that carries the tick, on the live and the replay side alike; it is encoded
+    /// after that step, in step order, so quiet channels advance their watermark.
+    pub fn timer_tick(&mut self) {
+        if self.err.is_some() {
+            return;
+        }
+        match self.steps.back_mut() {
+            Some(st) => st.ticks += 1,
+            None => {
+                let ts = self.newest;
+                if let Err(e) = self.push(ts, EventKind::TimerTick) {
+                    self.fail(e);
+                }
+            }
+        }
+    }
+
     /// Ends the epoch and hands back the packet sink.
     pub fn finish(mut self) -> Result<K, SinkError> {
         if let Some(e) = self.err {
@@ -229,7 +253,16 @@ impl<K: PacketSink> SinkStream<K> {
         let l = usize::from(p.lane.0);
         let key = (p.session, p.pkt_seq);
         let msgs = self.msgs.remove(&key).ok_or(SinkError::NoPayload)?;
-        let all = msgs.len() == usize::from(p.count);
+        let session_only =
+            |m: &Option<Msg>| matches!(m, Some(Msg::Heartbeat | Msg::ResendReq { .. }));
+        // A session-only message takes a LaneSeq only when the header is rejected (`vyrn-lane`
+        // pass 1), and then every message has an immediate reject, which the lane sends before
+        // the packet record: a reject naming a session-only index means all are numbered.
+        let all = self.early.iter().any(|&(s, q, r)| {
+            (s, q) == key
+                && matches!(r, Resp::Reject { index, .. }
+                    if msgs.get(usize::from(index)).is_some_and(session_only))
+        });
         let prio = p.rx_ts.0.max(*self.prio.get(l).ok_or(SinkError::Book)?);
         self.prio[l] = prio;
         let lane = &mut self.ops[l];
@@ -239,7 +272,7 @@ impl<K: PacketSink> SinkStream<K> {
         let mut offset = Vec::with_capacity(msgs.len());
         let mut n = 0u8;
         for m in &msgs {
-            let numbered = all || !matches!(m, Some(Msg::Heartbeat | Msg::ResendReq { .. }));
+            let numbered = all || !session_only(m);
             offset.push(numbered.then_some(n));
             if numbered {
                 n += 1;
@@ -364,6 +397,7 @@ impl<K: PacketSink> SinkStream<K> {
             src,
             covers,
             tx_left: e.n_tx,
+            ticks: 0,
             taker: Vec::new(),
             maker: Vec::new(),
         });
@@ -395,6 +429,9 @@ impl<K: PacketSink> SinkStream<K> {
             let st = self.steps.pop_front().ok_or(SinkError::Book)?;
             self.emit_interval(&st.covers)?;
             self.emit_step(&st)?;
+            for _ in 0..st.ticks {
+                self.push(self.newest, EventKind::TimerTick)?;
+            }
         }
         Ok(())
     }
@@ -427,18 +464,18 @@ impl<K: PacketSink> SinkStream<K> {
                 if op.fwd {
                     continue;
                 }
-                let Some(r) = op.res else {
+                if op.res.is_none() {
                     return Err(SinkError::Book);
-                };
-                if let Some(b) = self.lane_op(lc, &op, &r)? {
-                    out.push((op.prio_ts, lc, seq, b));
                 }
+                out.push((op.prio_ts, lc, seq, op));
             }
         }
+        // Ops on one order are of one lane, so this keeps their LaneSeq order; each effect is
+        // derived from the book after the ones before it.
         out.sort_unstable_by_key(|x| (x.0, x.1, x.2));
         let mut res = Ok(());
-        for &(ts, _, _, b) in &out {
-            res = self.push(ts, EventKind::LaneOp(b));
+        for (ts, lc, _, op) in &out {
+            res = self.lane_effect(*ts, *lc, op);
             if res.is_err() {
                 break;
             }
@@ -447,8 +484,17 @@ impl<K: PacketSink> SinkStream<K> {
         res
     }
 
-    /// The book change of one resolved lane op (module docs); the book is read as it was
-    /// after the previous step, which is what the lane's B2 saw (05 §7.6).
+    fn lane_effect(&mut self, ts: u64, lane: u8, op: &Op) -> Result<(), SinkError> {
+        let r = op.res.ok_or(SinkError::Book)?;
+        match self.lane_op(lane, op, &r)? {
+            Some(b) => self.push(ts, EventKind::LaneOp(b)),
+            None => Ok(()),
+        }
+    }
+
+    /// The book change of one resolved lane op (module docs). The book is read after the
+    /// previous step and the earlier ops of the interval, which is what the lane's B2 saw
+    /// (05 §7.6).
     fn lane_op(&self, lane: u8, op: &Op, r: &Resp) -> Result<Option<BookOp>, SinkError> {
         let at = |h: Handle| oid(LaneId(lane), h.slot());
         Ok(match (op.msg, *r) {
@@ -515,6 +561,12 @@ impl<K: PacketSink> SinkStream<K> {
     }
 
     fn emit_step(&mut self, st: &PendStep) -> Result<(), SinkError> {
+        if st
+            .src
+            .is_some_and(|s| !matches!(s.msg, Some(Msg::New { .. })))
+        {
+            return Err(SinkError::Unsupported("step source other than New"));
+        }
         let ts = st.src.map_or(self.newest, |s| s.prio_ts);
         let n_exec = st
             .maker
@@ -594,7 +646,7 @@ impl<K: PacketSink> SinkStream<K> {
                 Resp::Fill { qty, .. } => filled += qty.0,
                 Resp::Ack { handle, tick, .. } => {
                     let Some(Msg::New { flags, qty, .. }) = s.msg else {
-                        return Err(SinkError::Unsupported("source other than New"));
+                        return Err(SinkError::Book); // checked above
                     };
                     let left = qty.0.checked_sub(filled).ok_or(SinkError::Book)?;
                     self.push(
