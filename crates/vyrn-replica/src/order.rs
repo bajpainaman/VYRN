@@ -12,7 +12,7 @@ use vyrn_log::{
 use vyrn_types::{BlockHeader, Epoch, Hash, Height, LaneId, LaneSeq, PktHash, StepId};
 
 use crate::check::{StepErr, check_step};
-use crate::hashlag::check_hashlag;
+use crate::hashlag::{REP_HASHLAG_MAX_NS, check_hashlag};
 use crate::lane::{LaneErr, LaneState};
 use crate::ports::{BlockInputs, EpochView};
 
@@ -156,6 +156,8 @@ pub struct OrderCore<const N: usize, V> {
     next_height: u64,
     ready: VecDeque<BlockInputs<N>>,
     fault: Option<Fault>,
+    /// The `REP_E_HASHLAG` bound, in ns: [`REP_HASHLAG_MAX_NS`] unless set for DEV.
+    hashlag_max: u64,
 }
 
 impl<const N: usize, V: EpochView> OrderCore<N, V> {
@@ -193,6 +195,7 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
             next_height: 0,
             ready: VecDeque::new(),
             fault: None,
+            hashlag_max: REP_HASHLAG_MAX_NS,
         })
     }
 
@@ -233,13 +236,19 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
         }
     }
 
+    /// Sets the `REP_E_HASHLAG` bound to `ns`. DEV only (07 §3.7): the spec's bound is
+    /// [`REP_HASHLAG_MAX_NS`], and the validator refuses any other value outside DEV mode.
+    pub fn set_hashlag_max(&mut self, ns: u64) {
+        self.hashlag_max = ns;
+    }
+
     /// Runs the `REP_E_HASHLAG` timer at `now` (ns, the receive clock).
     pub fn tick(&mut self, now: u64) -> Result<(), FrameErr> {
         if let Some(f) = self.fault {
             return Err(FrameErr::Fault(f));
         }
         for (s, sub) in (0u8..).zip(&self.subs) {
-            if let Err(l) = check_hashlag(&sub.lanes, sub.first_lane, now) {
+            if let Err(l) = check_hashlag(&sub.lanes, sub.first_lane, now, self.hashlag_max) {
                 let id = FrameId {
                     tenure: sub.tenure,
                     stream: s,

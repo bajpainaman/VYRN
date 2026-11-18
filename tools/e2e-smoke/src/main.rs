@@ -65,7 +65,9 @@
 //!   which has no real-time bound, must still ready every height. Any other fault, an `Invalid`
 //!   verdict, a stall or a block that differs from the box's fails. `--strict-hashlag` fails a
 //!   `REP_E_HASHLAG` stop too and requires one validator to cover every height. The shipped
-//!   bound stays 1 ms; the harness changes no validator rule. `--seq-cpus` and `--validator-cpus` (taskset masks)
+//!   bound stays 1 ms. `--dev-hashlag-us` (DEV only, needs `--data`) gives the validators
+//!   `dev = true` and a larger `[replay] hashlag_us`; CI runs it with `--strict-hashlag`, so every
+//!   CI run must cover and finalize every height. `--seq-cpus` and `--validator-cpus` (taskset masks)
 //!   keep the box's two polling threads off the validators' cores. Without them all validators
 //!   can stop at one height when the box is preempted between an ORDER frame and its HASH frame.
 //!
@@ -158,6 +160,10 @@ struct Cli {
     /// Route payloads through a vyrn-data node.
     #[arg(long)]
     data: bool,
+    /// DEV only: the validators' REP_E_HASHLAG bound in µs (`dev = true`, `[replay] hashlag_us`;
+    /// needs --data). The spec's bound is 1000; CI sets a larger one with --strict-hashlag (R5).
+    #[arg(long, value_name = "US")]
+    dev_hashlag_us: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -680,6 +686,7 @@ fn validator_config(
     data: Option<(SocketAddrV4, u16)>,
     sessions: &[Sess],
     cons: Option<&Cons>,
+    hashlag_us: Option<u64>,
 ) -> Result<PathBuf, String> {
     let key = hex(&vyrn_crypto::ed25519::public_key(&SEQ_SEED));
     let data_port = data.map_or(0, |(_, p)| p);
@@ -689,8 +696,13 @@ fn validator_config(
     } else {
         format!("dev:validator-{i}")
     };
+    let dev = if hashlag_us.is_some() {
+        "dev = true\n"
+    } else {
+        ""
+    };
     let mut s = format!(
-        r#"schema = 1
+        r#"{dev}schema = 1
 protocol = 1
 role = "validator"
 mode = "BASE"
@@ -716,6 +728,9 @@ vote = "{vote}"
             "\n[data]\nboxes = [\"{fetch}\"]\nme = {}\n\n[replay]\ntick_min = {TICK_MIN}\ntick_max = {TICK_MAX}\nwin_center = {WIN_CENTER}\nslot_cap = {SLOT_CAP}\n",
             i + 1
         ));
+        if let Some(us) = hashlag_us {
+            s.push_str(&format!("hashlag_us = {us}\n"));
+        }
         for x in sessions {
             s.push_str(&format!(
                 "\n[[replay.session]]\nlane = {}\nslot = {}\naccount = {}\nk_seq = \"{}\"\nquote = {QUOTE}\nbase = {BASE}\n",
@@ -789,6 +804,11 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let n_val = cli.validators.unwrap_or(if cli.finality { 4 } else { 3 });
     if n_val == 0 {
         return Err("--validators must be at least 1".into());
+    }
+    if cli.dev_hashlag_us.is_some() && !cli.data {
+        return Err(
+            "--dev-hashlag-us needs --data: hashlag_us sits in the validators' [replay]".into(),
+        );
     }
     let wait = Duration::from_secs(cli.wait_s);
     let bin_dir = match &cli.bin_dir {
@@ -875,7 +895,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 .as_ref()
                 .zip(val_data.get(i))
                 .map(|((_, _, fetch, _), port)| (*fetch, *port));
-            let cfg = validator_config(&dir, i, data, &sessions, cons.as_ref())?;
+            let cfg =
+                validator_config(&dir, i, data, &sessions, cons.as_ref(), cli.dev_hashlag_us)?;
             let mut c = command(
                 &bin_dir.join("vyrn-validator"),
                 cli.validator_cpus.as_deref(),

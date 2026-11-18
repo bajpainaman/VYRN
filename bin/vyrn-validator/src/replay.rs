@@ -32,6 +32,10 @@ pub struct Section {
     pub win_center: u32,
     #[serde(default = "d_cap")]
     pub slot_cap: u32,
+    /// DEV only: the `REP_E_HASHLAG` bound in µs. The spec's 1000 (07 §3.7) is the default and
+    /// the only value accepted without `dev = true`.
+    #[serde(default)]
+    pub hashlag_us: Option<u64>,
     #[serde(default)]
     pub session: Vec<Session>,
 }

@@ -20,16 +20,22 @@ pub struct HashLag {
     pub waited: u64,
 }
 
-/// The oldest record of `lanes` that has waited more than [`REP_HASHLAG_MAX_NS`] at `now`.
+/// The oldest record of `lanes` that has waited more than `max_ns` at `now`. `max_ns` is
+/// [`REP_HASHLAG_MAX_NS`] except under the validator's DEV-only `[replay] hashlag_us`.
 /// `first_lane` is the lane id of `lanes[0]`. The FIFO of each lane is in arrival order, so only
 /// the heads need to be checked.
-pub fn check_hashlag(lanes: &[LaneState], first_lane: u8, now: u64) -> Result<(), HashLag> {
+pub fn check_hashlag(
+    lanes: &[LaneState],
+    first_lane: u8,
+    now: u64,
+    max_ns: u64,
+) -> Result<(), HashLag> {
     let late = lanes
         .iter()
         .zip(first_lane..)
         .filter_map(|(st, l)| st.oldest_awaiting().map(|a| (l, *a)))
         .map(|(l, a)| (l, a, now.saturating_sub(a.arrived)))
-        .filter(|&(_, _, w)| w > REP_HASHLAG_MAX_NS)
+        .filter(|&(_, _, w)| w > max_ns)
         .max_by_key(|&(_, _, w)| w);
     match late {
         Some((l, rec, waited)) => Err(HashLag {
