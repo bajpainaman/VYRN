@@ -621,7 +621,7 @@ u32 | `down` u8 | reserved [u8; 3]. `down` bit i set means entry i of the sessio
 `KeyBundle.data` list is down, the same positions as `DataRedirect` (§7.6). `seq` counts this
 epoch's statuses for the session from 1, so the **latest** status (D4, D5, DR2) is the one with
 the highest `seq` for the current `epoch`; a client ignores a push with another `epoch` or with
-`seq` at or below the last it applied. A new `KeyBundle` starts a new epoch with every entry up.
+`seq` at or below the last it applied. With every `KeyBundle` push and every `OpenSessionResp`, `vyrn-admin` also pushes a snapshot of that epoch's current health as its `seq` 1, so a box that stays down across a boundary stays marked down; until the client holds the snapshot for an epoch, it uses that epoch's `data[0]` only if no status of the previous epoch marked the same address down.
 On a push that marks its current data node down, the client moves copy 2 to the first entry not
 marked down (D4) and sends it **every** transmission it still retains (DR4), unchanged (DR3):
 an acknowledged packet may still be unresolved at the replicas, and a status carries no
