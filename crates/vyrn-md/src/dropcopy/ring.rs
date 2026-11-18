@@ -29,7 +29,8 @@
 //! torn header and reads it again. A reader whose `tail` is more than `cap` behind `head` before
 //! it copies the bytes, or behind `resv` after, has lost data and stops with
 //! [`RingError::Lagged`]: the writer never waits for a reader (03 §4.5), and a lagged drop
-//! copy is rebuilt from the final log (03 §7).
+//! copy is rebuilt from the final log (03 §7). An idle reader whose path now names another
+//! ring stops with [`RingError::Replaced`].
 //!
 //! A frame is `len: u32` then `len` bytes: a kind byte and its fields ([`RingFrame`], 10 §8.6
 //! item 2).
@@ -80,6 +81,9 @@ pub enum RingError {
     Frame {
         at: u64,
     },
+    /// The path now names another ring (a new tenure's writer replaced it): this reader's file
+    /// is no longer written.
+    Replaced,
     /// A batch larger than the ring.
     TooBig(usize),
 }
@@ -550,6 +554,11 @@ impl Tap for RingTap {
     }
 }
 
+fn file_id(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
+}
+
 /// `x` then `!x`, the torn-read check of a header word.
 fn pair(x: u64) -> [u8; 16] {
     let mut h = [0u8; 16];
@@ -562,6 +571,9 @@ fn pair(x: u64) -> [u8; 16] {
 /// the reader opens it is [`RingError::Lagged`].
 pub struct RingReader {
     file: File,
+    path: std::path::PathBuf,
+    /// `(dev, ino)` of `file`.
+    id: (u64, u64),
     cap: u64,
     tail: u64,
     buf: Vec<u8>,
@@ -570,6 +582,7 @@ pub struct RingReader {
 impl RingReader {
     pub fn open(path: &Path) -> Result<Self, RingError> {
         let file = File::open(path).map_err(io)?;
+        let id = file_id(&file.metadata().map_err(io)?);
         let mut h = [0u8; 16];
         file.read_exact_at(&mut h, 0).map_err(io)?;
         if h[..8] != RING_MAGIC {
@@ -581,6 +594,8 @@ impl RingReader {
         }
         Ok(Self {
             file,
+            path: path.to_path_buf(),
+            id,
             cap,
             tail: 0,
             buf: Vec::new(),
@@ -627,7 +642,11 @@ impl RingReader {
         let head = self.head()?;
         self.lagged(head)?;
         if head == self.tail {
-            return Ok(0);
+            // Idle: is the path still this ring? A replaced one is never written again.
+            return match std::fs::metadata(&self.path) {
+                Ok(m) if file_id(&m) == self.id => Ok(0),
+                _ => Err(RingError::Replaced),
+            };
         }
         let n = usize::try_from(head - self.tail).map_err(|_| RingError::TooBig(0))?;
         self.buf.resize(n, 0);

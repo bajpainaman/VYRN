@@ -763,6 +763,14 @@ fn a_reader_the_writer_laps_stops_and_a_torn_head_is_refused() {
     // `!head` that disagrees with `head`: a torn header, read again, never taken.
     f.write_all_at(&0u64.to_le_bytes(), 24).unwrap();
     assert_eq!(RingDc::open(&path).poll(), Err(RingError::Torn));
+    // A new ring at the path: a reader of the old one stops instead of going quiet.
+    let _first = RingTap::create(&path, 512).unwrap();
+    let mut old = RingReader::open(&path).unwrap();
+    assert_eq!(old.poll(|_| {}), Ok(0));
+    let mut fresh = RingTap::create(&path, 512).unwrap();
+    assert_eq!(old.poll(|_| {}), Err(RingError::Replaced));
+    fresh.final_block(Height(1), StepId(1));
+    assert_eq!(RingReader::open(&path).unwrap().poll(|_| {}), Ok(1));
     let _ = std::fs::remove_file(&path);
 }
 
