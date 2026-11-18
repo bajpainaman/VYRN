@@ -749,7 +749,7 @@ delay bound of the model (01 §14.0 fact 3):
 | Vote signature checks | 0.10 | 0.15 under scheme 1 (hybrid, 01 §14.20): the ML-DSA parts run in parallel with the batched Ed25519 parts |
 | **No fault** | **7.04** | 5.31 before the next-proposal row (01 §14.20 PQ-10); 7.01 under scheme 1 (+0.05 vote checks, −0.08 wait). The leader pre-signs with the empty-exclusion `excl_root` (PQ-11, 07 §6.5a), so no signature follows its `verify` unless a client caused an exclusion (§5.7) |
 | One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **9.84** | the sequencer never leads, so a leader fault is a member fault; 9.81 under scheme 1. Past the 9.00 ms gate of `FIN_GATE_BLOCKS` = 8: **pending ruling** (01 §14.20 PQ-14) |
-| or a data box redirect (07 §5.7, 3.80 on top of the 0.71) | **pending ruling** | 10.84 (10.81 scheme 1) with today's redirect; 01 §14.20 PQ-13 |
+| or a data box redirect (07 §5.7, 4.20 on top of the 0.71) | **pending ruling** | 11.24 (11.70 scheme 1) with today's redirect; 01 §14.20 PQ-13 |
 | or the sequencer is the fault | 07 failover; its seal must be final ≤ 9 ms after the last frame | |
 
 The gate counts closed blocks (§4.6): block h must be final before block h + 9 opens, 9.00 ms

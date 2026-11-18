@@ -1139,8 +1139,7 @@ off size field
 
 `data_seq` lets a replica detect loss from one data box. A gap is fetched by `DataFetch{from,
 to}` from that box's RAM ring. A data box sends `DATA_HB` every 100 µs when idle. A replica that
-hears nothing from a data box for `REP_DATA_SILENCE_MS` = 0.6 ms, six heartbeat periods, marks it
-down (§5.7).
+hears nothing from a data box for `REP_DATA_SILENCE_MS` = 1 ms marks it down (§5.7).
 
 ### 5.4 The replica's data store
 
@@ -1303,7 +1302,7 @@ semantics are the same as CHAIN's `excl` rule (09 owns them).
 
 ### 5.7 Data box failure
 
-1. Replicas mark data box `d` down after `REP_DATA_SILENCE_MS` = 0.6 ms of silence, and gossip
+1. Replicas mark data box `d` down after `REP_DATA_SILENCE_MS` = 1 ms of silence, and gossip
    `DataDown{d}`. Q such messages make it effective.
 2. Each session homed on `d` is reassigned to the backup data home `d' = next live box in facility
    order`. This is deterministic, so no message is needed to choose it.
@@ -1451,23 +1450,25 @@ only when the data it expects is late, so the redirect chain comes **on top of**
 
 | Step | Max (ms, budget) |
 |---|---|
-| silence: `REP_DATA_SILENCE_MS` | 0.60 |
+| silence: `REP_DATA_SILENCE_MS` | 1.00 |
 | `DataDown{d}` gossip → Q at the data boxes and replicas | 0.80 |
 | `DataRedirect` → client | 0.80 |
 | client resends copy 2 → `d'` | 0.80 |
 | `d'` → replica | 0.80 |
-| **Stall beyond the data lag** | **3.80** |
+| **Stall beyond the data lag** | **4.20** |
 
 The earlier figure, 1 + 0.5 + 1 + 0.5 = 3 ms in place of the data lag, used typical hops and
 replaced the lag it follows. With every other 07 §6.6 row at its maximum, the stall gives
-10.79 ms (scheme 0) and 10.76 ms (scheme 1) from block start, over `FINALITY_MAX_MS` = 10. How
+11.19 ms (scheme 0) and 11.65 ms (scheme 1) from block start, over `FINALITY_MAX_MS` = 10. How
 to bring it inside is **pending ruling** (01 §14.20 PQ-13). [Likely: scratch model of the view
 pipeline at the 07 §6.6 maxima]
 
-`REP_DATA_SILENCE_MS` = 0.6 ms costs nothing new: a data box already sends `DATA_HB` every 100 µs
-when idle (§5.3), so 0.6 ms is six missed heartbeats. A false trigger needs Q replicas to miss
-six heartbeats of one box, and costs only a redirect: clients resend retained bytes and dedupe
-drops what is already stored (DR3, DR4). [Likely]
+**Why the silence stays 1 ms.** A data box sends `DATA_HB` every 100 µs when idle (§5.3), but
+the delay bound limits each hop to 0.80 ms, not its jitter: a healthy box's heartbeats can reach
+a replica up to 0.10 + 0.80 = 0.90 ms apart, at Q replicas at once and for several boxes at once.
+A shorter silence could mark healthy boxes down together and leave "next live box" with no
+destination, so `REP_DATA_SILENCE_MS` stays above 0.90 ms. A shorter value needs a measured
+jitter bound (B-REP-1). [Likely]
 
 ## 6. Blocks and consensus
 
@@ -1566,10 +1567,15 @@ because views and blocks both run at ~1 kHz. After a nullified view the range ca
 
 **Under scheme 1 the range is fixed before `verify` (01 §14.20 PQ-8, PQ-10, decided).** The leader
 of view v + 1 fixes its range **when view v's proposal reaches it** (L1), one notarize hop before
-it can enter v + 1, so its signature and its `verify` run while view v finishes. If view v's
-proposal has not reached it when its own `t_l` timer for v has `PQ_SIGN_MAX_US` left, it fixes
-then (L1′), so its signature is done when v nullifies; a proposal for v that arrives later makes
-it fix again, and the earlier signature is never sent. If it holds no new header at that moment,
+it can enter v + 1, so its signature and its `verify` run while view v finishes. When its own `t_l` timer for v has `PQ_SIGN_MAX_US` left and it has not seen v notarized, it
+also fixes a second candidate on v's parent, the range a nullified v leaves (L1′), so that
+signature is done when v nullifies, whether or not v's proposal reached it. A proposal for v that
+arrives later makes it fix the first candidate again. When it enters v + 1 it sends the candidate
+whose `parent_view` and `first_height` match the certificate that moved it there (v's
+notarization or its nullification); the others are never sent. If none matches, because v's
+leader sent it a proposal other than the one the quorum notarized, it fixes again on the
+certified parent and signs late, ≤ `PQ_SIGN_MAX_US`: that leader is the one fault f, and the
+cost (6.96 + 0.75 = 7.71 ms at the maximum) is inside the one-fault total of §6.6. [Likely] If it holds no new header at that moment,
 it fixes when the first one arrives. The range is every contiguous header after the parent's
 `last_height` that it holds at that moment with a valid Ed25519 part of `seq_sig`, up to 16. It
 sends every voter
@@ -1715,8 +1721,8 @@ signs before it knows it will send:
 - **Safety.** Signing is not voting: an unsent signature is never stored, logged or sent, and is
   zeroed after the view. The persisted high-water mark of 09 §2.5 is written before **sending**,
   as today. A crash between signing and sending leaks nothing. [Certain: the one-vote rule counts
-  sent votes] The extra CPU is at most one wasted signature per view, when a view nullifies after
-  its `RangeFix`.
+  sent votes] The extra CPU is at most two wasted signatures per view: the next leader's unused
+  candidate (§6.3) and a notarize when a view nullifies after its `RangeFix`.
 - **Mechanism (PQ-3, decided).** Simplex signs through `commonware-cryptography`'s
   `certificate::Scheme` trait. VYRN's hybrid scheme implements it in `vyrn-crypto`, so no fork or
   upstream patch is needed. Simplex's voter calls the trait's synchronous `sign(&self, subject)`
@@ -1724,8 +1730,10 @@ signs before it knows it will send:
   started above, keyed by the subject's encoding (round, vote kind, proposal digest), and returns
   the cached signature on a hit. On a miss (a proposal that differs from its `RangeFix`), it signs
   on the PQ cores and blocks the voter task until the signature is done, ≤ `PQ_SIGN_MAX_US`; that
-  is the late signature the one-fault budget already counts. The cache holds the current view only
-  and is zeroed with it (Safety, above). [Likely: from `commonware-cryptography` and
+  is the late signature the one-fault budget already counts. The cache holds the current view's entries
+  and the next view's candidates (L1, L1′, §6.3), keyed by round. On entering v + 1 it erases
+  every entry of v; once the v + 1 proposal is sent it erases the unsent candidates. An entry
+  is zeroed when it leaves the cache (Safety, above). [Likely: from `commonware-cryptography` and
   `commonware-consensus` 2026.10.0's sources; B-PQ-2 confirms it in `vyrn-sim`]
 
 A **fill is final** when the block holding its step is final. The finality event is the moment
@@ -1758,7 +1766,7 @@ links break it counts as the one fault f.
 | **Total, no fault** | **2.59** (2.69 scheme 1) | **6.99** (6.96 scheme 1) | was 5.65 / 5.70 without the wait row and with the repair reserve inside the sum |
 | One fault: a nullified view | | +2.80 | `t_l` 2 ms + 1 hop; under scheme 1 the next leader's signature is done when the view nullifies (L1′) |
 | **Total, one fault (leader)** | | **9.79** (9.76 scheme 1) | ≤ `FINALITY_MAX_MS` = 10, margin 0.21 (0.24 scheme 1). Under scheme 1 a lost `RangeFix` (+0.75 → 7.71) is a smaller one fault |
-| One fault: a data-box stall | | **pending ruling** | §5.7: 3.80 on top of the data lag gives 10.79 (10.76 scheme 1), over the bound; 01 §14.20 PQ-13 |
+| One fault: a data-box stall | | **pending ruling** | §5.7: 4.20 on top of the data lag gives 11.19 (11.65 scheme 1), over the bound; 01 §14.20 PQ-13 |
 | Reserve, outside the sums: one frame repair | 0.00 | 0.39 | cross-metro, ≤ 0.60 (§4.10); it runs in parallel with the data lag, and `verify` waits for the later, so the pair costs ≤ 0.71. Nothing above spends it: under scheme 1 the leader-fault case is 9.76 by the sums and 9.71 in the model, + 0.39 of reserve |
 | Sequencer fault | | ≤ 9.0 | the seal finalizes the tail ≤ 7.85 ms after the last frame (§9.7) |
 
@@ -2741,7 +2749,7 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | Two voters down (BASE), or a metro partition with no Q | no Q | halted within 8 blocks (gate) | stops | none | restore or heal; backlog clears 16 blocks per view |
 | Leader of one view down | `t_l` timeout | none | +2.8 ms, ≤ 9.79 ms max (9.76 scheme 1) | none | round-robin moves on |
 | Finality lags > 8 closed blocks (any cause) | core 4 gate check | `BOOK_HALTED` (logged `Control` step) | catches up | none | `Control(Resume)` at lag ≤ 4 |
-| Data box down | 0.6 ms silence | none | +3.8 ms on top of the data lag for affected blocks, 10.79 ms max: pending ruling (01 §14.20 PQ-13) | none | redirect to the backup data home (§5.7) |
+| Data box down | 1 ms silence | none | +4.2 ms on top of the data lag for affected blocks, 11.65 ms max: pending ruling (01 §14.20 PQ-13) | none | redirect to the backup data home (§5.7) |
 | Client sends two different copies | hash or root mismatch | none | +1 fetch RTT for that block | its session closed; others unaffected | none |
 | Byzantine voter (any of §10.2) | evidence or counters | none | ≤ +2.8 ms per view it leads badly | none | removed at the next epoch |
 | Recovery replica (R3) down | p2p liveness | none | none | resends older than the hot ring get `RESEND_GONE` | R4 takes the role; R3 restored |
@@ -2829,7 +2837,7 @@ starts. A box that is not caught up at `epoch_from` counts as a faulty voter unt
 | `REP_DATA_UNREF_MAX` | 65,536 | reading | unreferenced payloads a replica holds (§5.4); expiry after `REP_SHED_KEEP_BLOCKS` = 128 final blocks |
 | `REP_SEQ_DATA_MAX_PPS` | 50k | budget | sequencer data-repair cap |
 | `REP_DATA_RING_S` | 10 | budget | data box RAM ring |
-| `REP_DATA_BATCH_US`, `REP_DATA_SILENCE_MS`, `REP_DATA_WAIT_US` | 5, 0.6, 300 | budget | data tier timers (silence = 6 `DATA_HB` periods, §5.7) |
+| `REP_DATA_BATCH_US`, `REP_DATA_SILENCE_MS`, `REP_DATA_WAIT_US` | 5, 1, 300 | budget | data tier timers (silence > `DATA_HB` period + hop jitter 0.90, §5.7) |
 | `REP_CLIENT_RETAIN_MS` | 100 | budget | client retention of sent packets (04) |
 | `REP_DELTA_MS` | 1 | budget | Simplex Δ (`t_l` 2 ms, `t_a` 3 ms) |
 | `REP_MAX_HDRS_PER_PROPOSAL`, `REP_MAX_SEAL_RANGE` | 16, 64 | budget | proposal range caps |
