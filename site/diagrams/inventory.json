@@ -393,7 +393,7 @@
    "asciiIndex": 26,
    "hash": "f060f3b03a70",
    "heading": "8.8 Auction mode (engine side; 08-epochs.md owns the rule)",
-   "line": 2212,
+   "line": 2217,
    "ascii": "Continuous ──Control(Auction)──► Auction ──Control(Frozen)──► Frozen ──Uncross × m──► Continuous\n     │                              ▲\n     └──Control(Halted)──► Halted ──┘ (Control(Auction); a halt ends by auction)"
   }
  ],

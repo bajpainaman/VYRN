@@ -649,3 +649,89 @@ pub(crate) fn next_level<S: BookSource>(
     }
     None
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    //! 05 §4.3 `pred_pos` walk of `replace_ok`, on chains built directly in a `MemBook`.
+    use super::State;
+    use crate::MAX_LANES;
+    use crate::key::{OrderFlags, Side, Stp, Tif};
+    use crate::mem::{MemBook, MemOrder};
+    use vyrn_types::{LaneId, LaneSeq, Nanos, SessionId, Tick};
+
+    const L: LaneId = LaneId(0);
+    const CSTAR: LaneSeq = LaneSeq(5);
+
+    fn flags(tif: Tif) -> OrderFlags {
+        OrderFlags::new(Side::Sell, tif, false, Stp::None)
+    }
+
+    /// An order created at `seq0` with `tif`, then replaced at each of `seqs` (each copying
+    /// its predecessor's TIF). Returns the book and the slots, oldest first.
+    fn chain(tif: Tif, seq0: u64, seqs: &[u64]) -> (MemBook, Vec<u32>) {
+        let mut m = MemBook::new(1);
+        let o = MemOrder {
+            flags: flags(tif),
+            tick: Tick(110),
+            qty: 10,
+            seq: LaneSeq(seq0),
+            ts: Nanos(seq0),
+            acct_ix: 1,
+            session: SessionId(1),
+            client_tag: 1,
+        };
+        let mut s = vec![m.new_slot(L, &o)];
+        for (i, q) in seqs.iter().enumerate() {
+            let old = *s.last().unwrap();
+            let qty = 9u32.saturating_sub(u32::try_from(i).unwrap());
+            s.push(m.replace_slot(L, old, LaneSeq(*q), Nanos(*q), Tick(110), qty));
+        }
+        (m, s)
+    }
+
+    fn ok(m: &MemBook, slot: u32) -> (bool, bool) {
+        let mut st = State::new(1, 16, 16, [0; MAX_LANES]);
+        st.adead[0] = CSTAR;
+        let v = crate::BookSource::slot(m, L, slot).unwrap();
+        (st.replace_ok(m, 0, slot, &v), st.link_fault.get())
+    }
+
+    #[test]
+    fn the_walk_crosses_two_replaces_after_c_star_to_the_auction_only_position() {
+        // Original AO at 1, replaced at 3 (≤ C*), then at 7 and 8 (> C*). From 8 the walk
+        // passes 7 (after C*) and stops at 3: auction-only at C*, so refused. A walk that
+        // stops after one hop reads 7, which is after C*, and would accept.
+        let (m, s) = chain(Tif::AuctionOnly, 1, &[3, 7, 8]);
+        assert_eq!(
+            crate::BookSource::slot(&m, L, s[3]).unwrap().pred_pos(),
+            s[2]
+        );
+        assert_eq!(ok(&m, s[3]), (false, false));
+    }
+
+    #[test]
+    fn the_position_at_c_star_decides_not_the_root() {
+        // As above, but the replace at 3 made the order Day: the order lived through the
+        // uncross, so the replace at 8 is accepted although the root is auction-only.
+        let (mut m, s) = chain(Tif::AuctionOnly, 1, &[3, 7, 8]);
+        m.slot_mut(L, s[1]).unwrap().flags = flags(Tif::Day);
+        assert_eq!(ok(&m, s[3]), (true, false));
+    }
+
+    #[test]
+    fn an_order_created_after_c_star_is_not_ended_at_it() {
+        let (m, s) = chain(Tif::AuctionOnly, 6, &[7, 8]);
+        assert_eq!(ok(&m, s[2]), (true, false));
+    }
+
+    #[test]
+    fn a_pred_pos_into_another_order_faults() {
+        let (mut m, s) = chain(Tif::AuctionOnly, 1, &[7]);
+        // Point the replace at a slot of a different order (its own root is itself).
+        let stray = m.replace_slot(L, s[0], LaneSeq(4), Nanos(4), Tick(110), 8);
+        m.slot_mut(L, stray).unwrap().root = stray;
+        m.slot_mut(L, s[1]).unwrap().ins_ts = 10 | (u64::from(stray) << 32);
+        assert!(ok(&m, s[1]).1, "link_fault");
+    }
+}
