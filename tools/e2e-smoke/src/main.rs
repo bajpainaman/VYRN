@@ -218,8 +218,9 @@
 //!   without that count, none. A hole given up fails. `--tap-order-loss N` relays the tap's order
 //!   socket and drops every N-th datagram, retransmits included; `replay` then also needs the
 //!   relay to have dropped and the tap to have repaired at least one frame. Before the box stops,
-//!   the tap drains: it Nacks past its last frame of each substream every retry until a probe
-//!   brings nothing and no frame is held, as a hole at the tail has no later frame to show it
+//!   the tap drains: it Nacks past its last frame of each substream every retry until 3 probes
+//!   in a row bring nothing and no frame is held (one lost probe or reply must not end it,
+//!   Vercel r4617432122), as a hole at the tail has no later frame to show it
 //!   (Codex r4617210353); the box ignores seqs it has not framed yet. At `--tap-order-loss 3`,
 //!   4 of 4 runs without the drain readied 21 to 37 of about 125 blocks, and 4 of 4 with it
 //!   passed. The replay line
@@ -953,6 +954,9 @@ fn data_tap(
     })
 }
 
+/// R18: tail probes in a row that must bring nothing before the tap counts as drained.
+const TAP_QUIET_PROBES: u32 = 3;
+
 /// What the tap's order repair did (R18): Nacks sent, holes given up, `NackTooOld`s received,
 /// and frames that only a retransmit delivered.
 #[derive(Default)]
@@ -966,8 +970,8 @@ struct TapRepair {
 /// The order frames the tap received, until `stop`, in `frame_seq` order. With `nack` (the
 /// box's CTRL, and the port the box has for the tap) the tap repairs its holes as a path-A replica does (R18, 07 §4.10); without it
 /// the frames stay in arrival order. Once `drain` is set, while the box still runs, the tap
-/// also Nacks past its last frame of each substream, every retry, until a probe brings nothing
-/// and no frame is held, then sends on `drained`: a hole at the tail has no later frame to
+/// also Nacks past its last frame of each substream, every retry, until [`TAP_QUIET_PROBES`]
+/// probes in a row bring nothing and no frame is held, then sends on `drained`: a hole at the tail has no later frame to
 /// show it (Codex r4617210353), and the box ignores seqs it has not framed yet.
 fn tap(
     sock: UdpSocket,
@@ -998,6 +1002,8 @@ fn tap(
         // The last frame handed on per substream; the tap's one substream when none came yet.
         let mut last: BTreeMap<vyrn_replica::paths::Key, u64> = BTreeMap::from([((0, 0, 0, 0), 0)]);
         let mut probed: Option<(u64, BTreeMap<vyrn_replica::paths::Key, u64>)> = None;
+        // Probes in a row that brought nothing; one lost probe or reply must not end the drain.
+        let mut quiet = 0u32;
         let mut sent_drained = false;
         while !stop.load(Ordering::Acquire) {
             let got = sock.recv(&mut buf).ok().and_then(|k| buf.get(..k));
@@ -1056,7 +1062,10 @@ fn tap(
                 .as_ref()
                 .is_none_or(|(at, _)| now.saturating_sub(*at) >= timers.retry_ns);
             if drain.load(Ordering::Acquire) && !sent_drained && due {
-                if probed.as_ref().is_some_and(|(_, l)| *l == last) && ps.held_min() == u64::MAX {
+                let still =
+                    probed.as_ref().is_some_and(|(_, l)| *l == last) && ps.held_min() == u64::MAX;
+                quiet = if still { quiet.saturating_add(1) } else { 0 };
+                if quiet >= TAP_QUIET_PROBES {
                     sent_drained = drained.send(()).is_ok();
                     continue;
                 }
