@@ -105,6 +105,7 @@ jobs:
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_reject_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_reject_vectors.out"
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_log_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_log_vectors.out"
           python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_admin_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_admin_vectors.out"
+          python3 -I "$GITHUB_WORKSPACE/tests/golden/vyrn_data_vectors.py" | diff - "$GITHUB_WORKSPACE/tests/golden/vyrn_data_vectors.out"
       - name: the independent trace decoder rewrites the trace-dump vectors unchanged (11 §8.3)
         run: |
           python3 -I tools/trace-dump/fixtures-src/make.py

@@ -9,6 +9,8 @@ description = "The data tier: stores packets by PktHash, fans out, answers fetch
 
 [dependencies]
 vyrn-types = { workspace = true }
+vyrn-crypto = { workspace = true }
+vyrn-wire = { workspace = true }
 vyrn-log = { workspace = true }
 vyrn-nic = { workspace = true }
 commonware-p2p = { workspace = true }

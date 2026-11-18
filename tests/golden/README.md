@@ -9,6 +9,7 @@ enough to regenerate the protocol files.
 | `vyrn_proto_vectors.py`, `.out` | 18 request and response packets that a conforming implementation must build byte for byte and accept (04 §11) | the script is the one printed in 04 §11; `.out` is its output |
 | `vyrn_reject_vectors.py`, `.out` | 45 validly tagged packets whose layout v1 must refuse, each with its verdict (04 §3.1 V1/V9, §3.3 M2/M3, §6.1, §12 VR1/VR3), and 4 `Reject RATE_LIMIT` records with 10's bucket ids 8–11 (04 §9.1) | written for this repository from those tables |
 | `vyrn_admin_vectors.py`, `.out` | 2 BASE-mode admin frames, `OpenSessionReq` and `OpenSessionResp`, that an implementation must build and accept, and 8 it must refuse (04 §4.4) | written for this repository from the §4.4 tables |
+| `vyrn_data_vectors.py`, `.out` | 5 data frames (07 §5.3) to build and accept and 13 to refuse, 3 fetch requests and 9 refusals, and 5 dedupe-window sequences (07 §5.2 step 3) | written for this repository from the layouts in `crates/vyrn-data/src/lib.rs` |
 | `siphash.txt` | SipHash-2-4, 64 lengths (the packet MAC, 01 §4) | [veorq/SipHash](https://github.com/veorq/SipHash) `vectors.h` at `32d0676`, `vectors_sip64` |
 | `blake3_test_vectors.json` | BLAKE3 hash, keyed hash and `derive_key` (01 §4) | [BLAKE3-team/BLAKE3](https://github.com/BLAKE3-team/BLAKE3) `test_vectors/test_vectors.json` at `657284b`, byte for byte |
 | `ed25519-edge.txt` | Ed25519 edge cases with ZIP-215 verdicts (spec/11-build.md §2.5) | [novifinancial/ed25519-speccheck](https://github.com/novifinancial/ed25519-speccheck) `cases.json` at `6551933`; verdicts from the Zebra row of its README |
@@ -26,6 +27,7 @@ cd /tmp
 python3 -I "$REPO/tests/golden/vyrn_proto_vectors.py"  | diff - "$REPO/tests/golden/vyrn_proto_vectors.out"
 python3 -I "$REPO/tests/golden/vyrn_reject_vectors.py" | diff - "$REPO/tests/golden/vyrn_reject_vectors.out"
 python3 -I "$REPO/tests/golden/vyrn_admin_vectors.py"  | diff - "$REPO/tests/golden/vyrn_admin_vectors.out"
+python3 -I "$REPO/tests/golden/vyrn_data_vectors.py"   | diff - "$REPO/tests/golden/vyrn_data_vectors.out"
 ```
 
 Each command prints nothing when its file matches. CI runs them on every pull request.
