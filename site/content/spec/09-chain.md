@@ -79,7 +79,7 @@ The decisions, each stated once:
 |---|---|
 | 1 µs, as a maximum | The chain adds one SipHash (`tag_seq`, inside 14.2's 45 ns per packet) and a gate flag read to the lane. Item ops are capped per lane per block (§4.6). A gate halt answers every packet with `Reject BOOK_HALTED` within the 1 µs. Nothing waits on a validator. |
 | 1B msgs/s on one book | Sized at `WL-REF`: 145.5M packets/s (02 §5.2). `tag_com` costs ~3 cores per validator box, hashing ~5 (§5.1, §9.2). |
-| 10 ms finality for every accepted order | §4.8: ≤ 8.11 ms from block start with one fault, and the gate halts the book before it issues a fill that the model cannot finalize. |
+| 10 ms finality for every accepted order | §4.8: ≤ 9.84 ms from block start with a leader fault (9.81 scheme 1; the data-box fault and the gate depth are pending 01 §14.20 PQ-13, PQ-14), and the gate halts the book before it issues a fill that the model cannot finalize. |
 | The 8 h move | The committee is the 5 nodes of the epoch's home (§2.1). Keys, schedule and committee keys are fixed 4 epochs ahead (§2.3, §2.4, §3.1). |
 | 5 validators | `N_CHAIN = 5`, `Q_CHAIN = 4`, 3 Rust and 2 Vx (§2.1). The sequencer box never votes (01 §14.4). |
 
@@ -700,8 +700,10 @@ Consequences:
 
 - At most D = 8 closed blocks plus the open one, ≤ 9 ms of order stream, are ever unfinalized.
   That bounds every fill that a failover could revert (`07-replication.md`).
-- With at most `F` faults and the metro within its delay bound, the gate never binds: the worst case
-  is 8.11 ms from block start to the certificate (§4.8), against 9.00. A halt therefore means that the network has
+- **Pending ruling (01 §14.20 PQ-14).** With at most `F` faults and the metro within its delay
+  bound, the gate is meant never to bind. The worst case is now 9.84 ms from block start to the
+  certificate (§4.8), against 9.00, because §4.8 now budgets the next-proposal wait; the 8.11 ms
+  below predates that row. A halt therefore means that the network has
   left its bound or that more than `F` operators failed (01 §14.0 fact 3). The fills already issued
   (≤ 8 blocks) are on a quorum before any response (`INV-FRAME-FIRST`) and finalize when the network
   recovers. B-CHN-3 checks that the gate never binds with ≤ 1 injected fault (§19).
@@ -742,20 +744,23 @@ delay bound of the model (01 §14.0 fact 3):
 | One frame repair | 0.00 | 0.20, in parallel with the data lag: `verify` waits for the later of the two |
 | `verify` completion | 0.10 | |
 | `tag_com` of the last payload, exclusion list | 0.05 | 20 ns per packet, incremental; keys precomputed (§5.4) |
+| Wait for the next proposal | 1.73 | 07 §6.6; 1.65 under scheme 1, where the next leader fixes its range when the previous proposal reaches it (07 §6.3) |
 | Hops 2–4: proposal, notarize, finalize → `Q_CHAIN` at every voter and at the sequencer | 2.45 | |
 | Vote signature checks | 0.10 | 0.15 under scheme 1 (hybrid, 01 §14.20): the ML-DSA parts run in parallel with the batched Ed25519 parts |
-| **No fault** | **5.31** | was 4.85 with F1 data homes; 6.11 under scheme 1 (+0.05 vote checks, +0.75 because the leader signs its proposal after its `verify`, since the proposal carries `excl_root`; 07 §6.5a) |
-| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **8.11** | the sequencer never leads, so a leader fault is a member fault; under scheme 1, 8.91 (margin 0.09 ms to the 9.00 ms gate of `FIN_GATE_BLOCKS` = 8, accepted by PQ-9, 01 §14.20; PQ-10 and PQ-11 are open) |
-| or a data box redirect (07 §5.7, 3 ms in place of 0.71) | **7.60** | |
+| **No fault** | **7.04** | 5.31 before the next-proposal row (01 §14.20 PQ-10); 7.01 under scheme 1 (+0.05 vote checks, −0.08 wait). The leader pre-signs with the empty-exclusion `excl_root` (PQ-11, 07 §6.5a), so no signature follows its `verify` unless a client caused an exclusion (§5.7) |
+| One nullified view (a byzantine or dead leader, `t_l` 2 ms + 1 hop) | +2.80 → **9.84** | the sequencer never leads, so a leader fault is a member fault; 9.81 under scheme 1. Past the 9.00 ms gate of `FIN_GATE_BLOCKS` = 8: **pending ruling** (01 §14.20 PQ-14) |
+| or a data box redirect (07 §5.7, 3.80 on top of the 0.71) | **pending ruling** | 10.84 (10.81 scheme 1) with today's redirect; 01 §14.20 PQ-13 |
 | or the sequencer is the fault | 07 failover; its seal must be final ≤ 9 ms after the last frame | |
 
 The gate counts closed blocks (§4.6): block h must be final before block h + 9 opens, 9.00 ms
-after h starts, so the margin is 0.89 ms in the worst one-fault case. With the old count (h final
+after h starts. With the next-proposal row the leader-fault case is past that by 0.84 ms (0.81
+under scheme 1), so the gate depth is pending 01 §14.20 PQ-14; before the row the margin was
+0.89 ms. With the old count (h final
 before h + 8 opens, 8.00 ms) the data home outside F1 would leave −0.11 ms and halt the book at
 every leader fault, which is why the count changed. The order is sent ≤ 0.05 ms before its
 `rx_ts` (the client is in F1), and the finality notice reaches it ≤ 0.05 ms after the
-certificate, so **every accepted order is final ≤ 8.21 ms after it is sent (9.01 ms under scheme 1), within
-`FINALITY_MAX_MS` = 10**. The order's `tag_com` verdict, and so whether its fills stand or are
+certificate, so **every accepted order is final ≤ 9.94 ms after it is sent with a leader fault
+(9.91 ms under scheme 1), within `FINALITY_MAX_MS` = 10**; the data-box case is pending PQ-13. The order's `tag_com` verdict, and so whether its fills stand or are
 busted, is part of the same final block. The TESLA schedule adds nothing to this path: members
 derive every `K_com` before its interval (§5.4), and disclosure (§5.10) comes seconds after
 finality.
@@ -1019,6 +1024,14 @@ fn exclusion_list(st: &ChainState, blk: &BookBlock, pay: &Payloads) -> Exclusion
 - **`SESSION_DEAD`:** once a packet of a session is excluded, every later packet of that session in
   the book group's order stream is excluded too. This makes the bust (§5.9) cover everything the
   session did after its first bad packet, without trusting the sequencer to stop in time.
+- **What an exclusion costs the view (scheme 1, 01 §14.20 PQ-11).** The leader and the voters
+  pre-sign the notarize with the `excl_root` of empty lists (07 §6.5a). A range with an exclusion
+  makes each of them sign late, ≤ `PQ_SIGN_MAX_US` = 0.75 ms after its `verify`, so that view's
+  finality is ≤ 7.76 ms from block start instead of 7.01. Only a client causes an exclusion, and
+  its first one closes the session and seizes its bond (§5.9): **a client forces late signatures
+  only at the price of one bonded session** (≥ `CHN_SESSION_BOND_MIN`), for the views up to its
+  suspension (§5.8, ≤ 1 ms). The late signature is not in the 07 §6.6 one-fault sum: a client
+  exclusion in the same view as a member fault would reach 9.81 + 0.75 = 10.56 ms. [Likely]
 
 ### 5.8 TagFault and suspension
 
@@ -1061,7 +1074,7 @@ order was sent (§4.8). Its fate is fixed at that moment: the exclusion list of 
 the order's packet is final with it, and that block is the fill's own block or an earlier one. No
 later event can bust a final fill whose packets passed `tag_com`. A bust only executes a verdict that
 is already final, and only for fills against a packet that failed `tag_com`: a misbehaving client,
-or the indistinguishable case below. **Timing (bound):** the bad packet's block h is final ≤ 8.11 ms after it
+or the indistinguishable case below. **Timing (bound; 8.11 ms predates the 07 §6.6 next-proposal row, pending 01 §14.20 PQ-14):** the bad packet's block h is final ≤ 8.11 ms after it
 starts, so the bust ops apply and the `Bust` records leave ≤ 9.11 ms after h starts, ≤ 9.16 ms after
 the bad packet was sent, and within the 10 ms. A bust that affects more than
 `CHN_ITEM_OPS_PER_BLOCK` accounts on one lane finishes one block later per 16 accounts.
@@ -1426,7 +1439,7 @@ With f = 1 the fault is either the sequencer or someone else, never both (bounds
 
 | Case | Path | Bound |
 |---|---|---|
-| Honest sequencer, one other fault | client → members δ, hint → sequencer δ, verify 0.04; then the block's finality ≤ 8.11 (§4.8) | **final ≤ 9.75 ms after send** |
+| Honest sequencer, one other fault | client → members δ, hint → sequencer δ, verify 0.04; then the block's finality ≤ 8.11 (§4.8; 9.84 with the next-proposal row, pending 01 §14.20 PQ-14) | **final ≤ 9.75 ms after send** (11.48 with the row) |
 | Honest sequencer, every hint lost (outside the model: 4 members relay it) | to leaders δ, proposal ≤ 1.6, notarized +1.65, boundary ≤ 1, finality 5.31 | final ≤ 10.4 ms |
 | Censoring sequencer (the fault) | included ≤ 2.4 ms (every leader is honest); deadline `act(C, b)` ≤ 10.4 ms; then failover and finality | **final ≤ ~10.4 + `FAILOVER_TARGET_MS` + `FINALITY_MAX_MS` ≈ 41 ms** |
 

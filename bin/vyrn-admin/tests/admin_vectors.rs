@@ -51,7 +51,7 @@ fn the_json_form_is_the_out_form() {
 #[test]
 fn every_admin_vector_gets_its_verdict() {
     let v = vectors();
-    assert_eq!(v.len(), 10, "A01, A02, B01–B08");
+    assert_eq!(v.len(), 12, "A01, A02, B01–B10");
     for (id, name, verdict, raw) in &v {
         assert_eq!(frame_len(raw), Some(raw.len()), "{id}: len prefix");
         let got = decode(raw);

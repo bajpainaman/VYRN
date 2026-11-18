@@ -590,12 +590,17 @@ order-entry path:
   are refused.
 - **Post-quantum binding (from `E_pq`, 01 §14.20 H).** TLS authenticates both sides with Ed25519
   only, which a quantum attacker can forge. So before any other frame, each side sends `PqBind`
-  (type 0x0002 client → `vyrn-admin`, 0x8003 `vyrn-admin` → client). Its body is a scheme-1 hybrid
+  (type 0x0002 client → `vyrn-admin`, 0x8004 `vyrn-admin` → client; 0x8003 is `DataTierStatus`). Its body is a scheme-1 hybrid
   signature (2,484 B) over `derive_key("vyrn v1 admin bind", exporter ‖ [side])`, where
   `exporter` is the connection's TLS exporter value for label `"EXPORTER-vyrn-admin-bind"`, empty
-  context, 32 bytes (RFC 8446 §7.5), and `side` is 0 for the client and 1 for `vyrn-admin`. The
-  client's hybrid key is in a non-critical extension of its client certificate. `vyrn-admin`'s
-  key is in the CA bundle that clients pin. Until both binds verify, `vyrn-admin` processes no
+  context, 32 bytes (RFC 8446 §7.5), and `side` is 0 for the client and 1 for `vyrn-admin`.
+  **The client's hybrid key is pinned in its account record**, never read from its certificate:
+  the exchange records it when it issues the account's client certificate and at every key
+  change, through the same operator path (10), and `vyrn-admin` verifies the client's `PqBind`
+  against that record alone. A certificate extension that names a key is ignored. So a forged
+  Ed25519 certificate for the account, carrying a key the attacker holds, fails the bind: the
+  certificate's authenticity rests on a classical signature, the pinned key does not (#145 P1,
+  reading). `vyrn-admin`'s key is in the CA bundle that clients pin. Until both binds verify, `vyrn-admin` processes no
   `OpenSessionReq` and sends no keys. The binding ties the post-quantum signature to this TLS
   session, so a forged Ed25519 certificate alone gets no keys. Cost: one hybrid signature and one
   verification per connection, ≤ 2 ms of a ≤ 50 ms open.
@@ -604,7 +609,9 @@ order-entry path:
 - `vyrn-admin` implements the admin messages (`11-build.md`). This chapter fixes their fields,
   and the tables after the structs fix their bytes. `tests/golden/vyrn_admin_vectors.out` holds
   an `OpenSessionReq` and an `OpenSessionResp` built from these tables, and frames a receiver
-  must refuse.
+  must refuse. B09 and B10 keep the two server push types apart: a 12-byte body under the
+  server `PqBind` type 0x8004 and a 2,484-byte body under `DataTierStatus` 0x8003 are both
+  refused for length (VR1).
 
 ```rust
 struct OpenSessionReq {
@@ -639,8 +646,9 @@ struct BoxKeys {
 field), `type` u16, then the body. All integers are little-endian, like 01 §6. `SocketAddrV4` is 4 bytes of IPv4 address in network order, then the
 port u16 little-endian. A receiver rejects a frame with a nonzero reserved byte, an unknown
 `type`, or a `len` that does not match the body (VR1). Types: 0x0001 `OpenSessionReq`,
-0x8001 `OpenSessionResp`, 0x8002 `KeyBundle` push, 0x8003 `DataTierStatus` push (below), 0x80FF
-`Error` (body: a 01 §6.5 reason u16, reserved u16, detail u32).
+0x0002 `PqBind` (client, body 2,484 B), 0x8001 `OpenSessionResp`, 0x8002 `KeyBundle` push, 0x8003
+`DataTierStatus` push (below), 0x8004 `PqBind` (server, body 2,484 B), 0x80FF `Error` (body: a 01
+§6.5 reason u16, reserved u16, detail u32). Bit 15 set means `vyrn-admin` → client.
 
 **`DataTierStatus` (reading, delegated ruling).** `vyrn-admin` pushes it to each session it
 affects when Q replicas mark a data box down or up (07 §5.7). Body, 12 bytes: `epoch` u32 | `seq`
