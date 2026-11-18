@@ -1757,7 +1757,14 @@ carries its label.
     only when it holds the step's frames from both paths (§8.2), and `flags.bit2` stays 1. An
     observer without path B does not start. A block held `REP_PATH_DOWN_MS` (07 §4.9) for a
     frame one path lost is reported (`DURABLE_WAIT`) and stays held: repair (07 §4.10) is not
-    built yet, and the drop copy waits rather than send a record it cannot attest. \[Likely\]
+    built yet, and the drop copy waits rather than send a record it cannot attest. Once
+    `OBS_MAX_UNFINAL` blocks wait, the observer prints `DURABLE_FAULT` and stops replay for the
+    rest of the run: it does not resume when the frame arrives later, and its queued blocks
+    release their payloads without being replayed. Its drop copy is then rebuilt from the
+    finalized log (03 §7). Only frames the order core accepted count toward a block's mark, and
+    a frame is passed by both paths only once it has been handed on, so the copy handed on is
+    always compared with the first copy kept. The sequencer reports a refused path B send
+    (`PATH_B_DOWN`) and keeps trading on path A (07 §4.9). \[Likely\]
 
 Not rebuilt yet: every case `SinkStream` leaves `Unsupported` (§7.9).
 

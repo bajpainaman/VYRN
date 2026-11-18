@@ -400,6 +400,7 @@ where
                         replicas,
                         replicas_b,
                         path_b: Vec::new(),
+                        path_b_down: false,
                         src: ip,
                         k_out,
                         epoch16,
@@ -1103,6 +1104,8 @@ struct StreamCore<T: TxRing> {
     /// Path B's replicas, and the buffer their `PATH_B` copy is built in.
     replicas_b: Vec<SocketAddrV4>,
     path_b: Vec<u8>,
+    /// A path B send failed and has not succeeded since (`PATH_B_DOWN` printed once).
+    path_b_down: bool,
     src: Ipv4Addr,
     k_out: Vec<(SessionId, [u8; 16])>,
     epoch16: u16,
@@ -1322,8 +1325,17 @@ impl<T: TxRing> StreamCore<T> {
             if let Some(b) = self.path_b.get_mut(FLAGS_AT) {
                 *b = FrameFlags::PATH_B;
             }
+            // Path B is the redundant copy: trading continues on path A alone (07 §4.9), so a
+            // refused B send is reported, not returned.
             for r in &self.replicas_b {
-                send(&mut self.order_tx, self.src, dst(r), &self.path_b)?;
+                match send(&mut self.order_tx, self.src, dst(r), &self.path_b) {
+                    Ok(()) => self.path_b_down = false,
+                    Err(e) if !self.path_b_down => {
+                        self.path_b_down = true;
+                        println!("PATH_B_DOWN {r}: {e}");
+                    }
+                    Err(_) => {}
+                }
             }
         }
         Ok(())

@@ -990,17 +990,21 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
                 }
                 return;
             }
-            match Self::join(&mut self.join, &mut self.replay).check(b) {
-                Err(DataErr::Missing { session, pkt_seq }) => {
-                    let to = self.sources.due(session, pkt_seq, now);
-                    fetch::send_key(&self.repair, session, pkt_seq, &to);
-                    return;
-                }
-                Ok(()) => source.valid(h),
-                Err(_) => {
-                    source.invalid_from(h);
-                    println!("DATA_FAULT height={}", h.0);
-                    self.replay_dead = true;
+            // A gated observer that stopped replaying (`DURABLE_FAULT` and the like) attests
+            // nothing more: its blocks release their payloads without waiting for them.
+            if !(self.replay_dead && durable.is_some()) {
+                match Self::join(&mut self.join, &mut self.replay).check(b) {
+                    Err(DataErr::Missing { session, pkt_seq }) => {
+                        let to = self.sources.due(session, pkt_seq, now);
+                        fetch::send_key(&self.repair, session, pkt_seq, &to);
+                        return;
+                    }
+                    Ok(()) => source.valid(h),
+                    Err(_) => {
+                        source.invalid_from(h);
+                        println!("DATA_FAULT height={}", h.0);
+                        self.replay_dead = true;
+                    }
                 }
             }
             let Some((b, _)) = self.pending.pop_front() else {
@@ -1153,8 +1157,10 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     let mut faulted = false;
     let mut stalled = false;
     let mut paths = rxs[1].is_some().then(|| Paths::new(ctx.0, ctx.1, ctx.2));
-    // The newest frame handed to the order core per substream: a block's mark is its value
-    // when the block becomes ready (`report` queues it), not at the end of the poll.
+    // Gated observer only: the newest frame the order core accepted per substream. A block's
+    // mark is its value when the block becomes ready (`report` queues it), not at the end of
+    // the poll. A frame the core refuses (another tenure's, out of order) is not in it.
+    let track = gate && paths.is_some();
     let mut frontier: std::collections::BTreeMap<vyrn_replica::paths::Key, u64> =
         std::collections::BTreeMap::new();
     while !stop.load(Ordering::Acquire) {
@@ -1171,10 +1177,13 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                 stats.frames.fetch_add(1, Ordering::Relaxed);
                 let mut on = |payload: &[u8]| {
                     delivered += 1;
-                    if let Some((key, q)) = vyrn_replica::paths::frame_key(payload) {
+                    let r = core.on_frame(payload, now());
+                    if track
+                        && !matches!(r, Err(FrameErr::OutOfOrder))
+                        && let Some((key, q)) = vyrn_replica::paths::frame_key(payload)
+                    {
                         frontier.insert(key, q);
                     }
-                    let r = core.on_frame(payload, now());
                     report(
                         &mut core,
                         r,
@@ -1184,7 +1193,7 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                         source,
                         data.as_mut(),
                     );
-                    if let Some(d) = data.as_mut() {
+                    if let Some(d) = data.as_mut().filter(|_| track) {
                         for x in d.pending.iter_mut().filter(|x| x.1.is_none()) {
                             x.1 = Some(frontier.iter().map(|(k, q)| (*k, *q)).collect());
                         }
