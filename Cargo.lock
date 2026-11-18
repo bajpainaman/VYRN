@@ -3562,7 +3562,9 @@ dependencies = [
  "thiserror",
  "vyrn-crypto",
  "vyrn-epoch",
+ "vyrn-log",
  "vyrn-types",
+ "vyrn-wire",
 ]
 
 [[package]]
