@@ -1,0 +1,82 @@
+# vyrn-sim invariant checker vectors (spec/11-build.md §6.4, crates/vyrn-sim/src/check.rs).
+#
+# A case starts with `case <name>`, lists observations one per line, and ends with
+# `expect ok` or `expect <CHECK> <index>` (0-based index of the first observation that breaks
+# CHECK). Observations:
+#   step <id> <n_fills> [lane:seq,...]   a step record and its changed cut entries
+#   snap <bid> <ask|none>                the BBO snapshot (bid 0 = no bid)
+#   pkt <session> <pkt_seq> <shed 0|1>   a PacketRecord
+#   busy <session> <pkt_seq>             the lane shed this packet (BUSY for every message)
+#   resp <session> <resp_seq>            a response packet; resp_seq 0 = out of stream
+
+case cut_monotone
+step 1 0 0:3,1:2
+step 2 0 0:3
+step 3 1 0:5,1:2
+expect ok
+
+case cut_moves_back
+step 1 0 0:3,1:2
+step 2 0 1:4
+step 3 0 0:2
+expect INV-CUT-MONO 2
+
+case cut_lanes_are_independent
+step 1 0 1:9
+step 2 0 0:1
+expect ok
+
+case fill_cap_boundary
+step 1 64
+expect ok
+
+case fill_cap_exceeded
+step 1 64
+step 2 65
+expect STEP-FILL-CAP 1
+
+case uncrossed_and_one_sided
+snap 99 100
+snap 0 100
+snap 99 none
+snap 0 none
+expect ok
+
+case locked_book
+snap 99 100
+snap 100 100
+expect INV-UNCROSSED 1
+
+case crossed_book
+snap 101 100
+expect INV-UNCROSSED 0
+
+case shed_logged
+pkt 5 3 1
+busy 5 3
+expect ok
+
+case shed_not_logged
+pkt 5 3 0
+busy 5 3
+expect SHED-LOGGED 1
+
+case shed_other_session
+pkt 6 3 1
+busy 5 3
+expect SHED-LOGGED 1
+
+case session_order
+resp 5 1
+resp 6 1
+resp 5 2
+resp 5 0
+resp 5 4
+expect ok
+
+case session_repeat
+resp 5 1
+resp 5 2
+resp 6 7
+resp 5 2
+expect SESSION-ORDER 3

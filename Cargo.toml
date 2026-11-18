@@ -31,6 +31,8 @@ vyrn-epoch = { path = "crates/vyrn-epoch" }
 vyrn-replica = { path = "crates/vyrn-replica" }
 vyrn-chain = { path = "crates/vyrn-chain" }
 vyrn-md = { path = "crates/vyrn-md" }
+# Test-only (§1.4): tools/sim-swarm drives it.
+vyrn-sim = { path = "crates/vyrn-sim" }
 
 # Tier E: engine crates may use these.
 blake3 = "=1.8.7"
