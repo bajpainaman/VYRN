@@ -390,25 +390,25 @@
   {
    "asciiIndex": 7,
    "heading": "4.1 Cores and rings",
-   "line": 615,
+   "line": 626,
    "ascii": " half A: lanes 0–24 (cores 8–32)                  CCD 0\n ┌──────────────┐ R_pkt[l], R_hash8[l]           ┌──────────────────────────────────────────┐\n │ lane l       ├───────────────────────────────►│ core 4  stream-A                         │\n │  parse, MAC, │                                │  CTPIO → port A.a, port B.a; sfence      │\n │  risk,       │                                │  released[A]; LaneCut[l ∈ A]             │\n │  classify,   │                                │  block close, signer, HEADER, fence, gate│\n │  encode O,   │ half B: lanes 25–48            ├──────────────────────────────────────────┤\n │  AcctTake,   │ (cores 33–49, pool 56–62)      │ core 7  stream-B                         │\n │  hash batch  ├───────────────────────────────►│  CTPIO → port A.b, port B.b; sfence      │\n └──────┬───────┘                                │  released[B]; LaneCut[l ∈ B]; fence      │\n        │ R_hash32[l]                            └──────▲───────────────▲───────────────────┘\n        └────────────────► core 50 order hasher ◄───────┼─ frame rings  │ R_step (+ need, marks)\n ┌──────────────┐ R_step: one writer, three cursors ────┴───────────────┘\n │ core 2  BBO  │ R_fill_X: fills tagged (s, need_A, need_B), X = the TX core of the recipient's port\n │  step s      ├──────► core 3 TX-A, core 5 TX-B, core 0 TX-C\n └──────────────┘        wait: released[A] ≥ need_A(s) and released[B] ≥ need_B(s), then CTPIO fill\n lanes: every response of op q waits for LaneCut[l].cut ≥ q (written by l's stream core after sfence)"
   },
   {
    "asciiIndex": 9,
    "heading": "5.2 Ingest pipeline",
-   "line": 1060,
+   "line": 1071,
    "ascii": " RX queue (RSS by session) ─► parse header ─► MAC check ─► dedupe ─► full BLAKE3 ─► store ─► fan-out\n   ~12 cores at peak          16 B            K_seq (BASE)  (session,   32 B kept    RAM ring   data frames\n                                              K_com (CHAIN) pkt_seq)    pkt_hash=8   + index    to replicas"
   },
   {
    "asciiIndex": 15,
    "heading": "7.6 Catch-up from snapshot plus log",
-   "line": 2020,
+   "line": 2031,
    "ascii": " t0 ── subscribe to live frames + data; verify and vote at once (votes need no history) ──────────►\n  │\n  ├─ fetch the newest snapshot ≤ the newest RootCert (local NVMe, else peers via REPAIR, else archive)\n  ├─ verify it (§7.5)\n  ├─ fetch finalized blocks snapshot.height+1 .. live, striped by height across all peers\n  │     (block record + cert, §8.2), verify certs and roots, write them to the local journal\n  ├─ replay at max speed; buffer live input; live input already counts toward votes\n  └─ replay lag ≤ REP_LIVE_LAG_MS (10 ms): the replica joins root votes and is \"caught up\""
   },
   {
    "asciiIndex": 16,
    "heading": "8.2 Block journal",
-   "line": 2075,
+   "line": 2086,
    "ascii": "REP_BlockRecord   (4 KiB aligned, on drive h mod 12)\n  off size field\n    0   8  magic \"PBBLK001\"         8 8 height        16 4 epoch     20 1 tenure   21 1 kind (0 normal, 1 seal)\n   22   2  reserved                24 190 BlockHeader (§3.10)\n  214   4  order_len              218 4 hash_len       222 4 data_len 226 4 n_unavail  230 26 reserved\n  256   …  order bytes │ pkt_hash list (8 B × records) │ data bytes (O-order; self-delimiting by count)\n           │ unavailable (session, pkt_seq) list │ pad to 4 KiB"
   }
  ],

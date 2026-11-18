@@ -601,3 +601,36 @@ fn verdict_starts_at_the_tenure() {
     assert_eq!(core.verdict(Height(0), Height(3)), Verdict::Pending);
     assert_eq!(core.verdict(Height(4), Height(5)), Verdict::Pending);
 }
+
+/// Codex #213: `on_frame_at` runs the `REP_E_HASHLAG` deadlines at the caller's `now` (the
+/// oldest frame it still holds), not at the frame's receive time, so a frame received late
+/// does not fault a record whose timely HashRun is held behind a gap; a HashRun is still
+/// checked against its own lane at its own receive time.
+#[test]
+fn deadlines_wait_for_held_frames_but_a_late_hash_run_still_faults() {
+    let key = vyrn_crypto::ed25519::public_key(&SEED);
+    let run = |late_frame_rx: u64, hash_rx: u64, at: bool| {
+        let (a, b) = good_steps();
+        let (mut t, ev) = block0(0, a, b);
+        let mut core: OrderCore<N, View> = OrderCore::new(layout(), View(key)).unwrap();
+        for e in &ev {
+            if let Ev::Frame(rx, f) = e {
+                core.on_frame(f, *rx).unwrap();
+            }
+        }
+        let late = t.b(&order(false, vec![mark(2, [2, 0])]));
+        let hash = t.a(&hash_run(0, 0x1111));
+        // The held HashRun was received at 60 ns.
+        let r = if at {
+            core.on_frame_at(&late, late_frame_rx, 60)
+        } else {
+            core.on_frame(&late, late_frame_rx)
+        };
+        r.and_then(|()| core.on_frame_at(&hash, hash_rx, hash_rx.min(60)))
+            .map_err(|e| format!("{e:?}"))
+    };
+    // B's record waits on its own HashRun from 100 ns; by 2 ms both lanes are past 1 ms.
+    assert!(run(2_000_000, 60, false).unwrap_err().contains("HashLag"));
+    assert_eq!(run(2_000_000, 60, true), Ok(()));
+    assert!(run(500, 1_000_001, true).unwrap_err().contains("HashLag"));
+}

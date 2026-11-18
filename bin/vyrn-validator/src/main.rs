@@ -1401,6 +1401,10 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
+/// The most frames `order_thread` holds back for its next poll behind a full burst; past it a
+/// frame goes to the core at once.
+const CARRY_MAX: usize = 4 * RX_BURST;
+
 /// `rxs`: path A's ORDER queue and, with `order_port_b`, path B's. With both, frames go through
 /// [`Paths`] (07 §4.9); with `gate` (an observer) a block replays only once its frames are held
 /// from both (10 §8.2).
@@ -1420,6 +1424,9 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
     let t0 = Instant::now();
     let now = || u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let mut bursts = [[RxPkt::empty(); RX_BURST]; 2];
+    // Frames held back to the next poll behind a full burst, and one poll's receive order.
+    let mut carry: Vec<(u64, usize, Vec<u8>)> = Vec::new();
+    let mut order: Vec<(u64, u8, usize, usize)> = Vec::with_capacity(2 * RX_BURST + CARRY_MAX);
     let mut faulted = false;
     let mut stalled = false;
     // Two paths, or path A alone with `[repair]` (reorder and gap repair, 07 §4.9).
@@ -1446,7 +1453,8 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         // their frames go to the core in receive order, so a late frame on one path cannot
         // advance the deadlines past a timely HashRun still unread on the other. A path whose
         // burst came back full may hold more unread frames, none received before its last one
-        // read: the time given to the core is capped there.
+        // read: the other path's frames received after that wait, copied, for the next poll
+        // (at most `CARRY_MAX`), and are merged in receive order there.
         let mut n = [0usize; 2];
         for (rx, (b, n)) in rxs.iter_mut().zip(bursts.iter_mut().zip(&mut n)) {
             if let Some(rx) = rx {
@@ -1461,27 +1469,39 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
             .min()
             .unwrap_or(u64::MAX);
         k += n[0] + n[1];
-        let (mut i, mut j) = (0usize, 0usize);
-        while i < n[0] || j < n[1] {
-            let a = bursts[0].get(i).filter(|_| i < n[0]).map(at_of);
-            let b = bursts[1].get(j).filter(|_| j < n[1]).map(at_of);
-            let (pi, p) = match (a, b) {
-                (Some(x), Some(y)) if y < x => (1, &bursts[1][j]),
-                (Some(_), _) => (0, &bursts[0][i]),
-                _ => (1, &bursts[1][j]),
+        let carried = std::mem::take(&mut carry);
+        // (receive time, 0 for a carried frame else 1, source, index): carried frames first on
+        // a tie, as they were read earlier; the source is 2 for `carried`, else the path.
+        order.clear();
+        order.extend((0..carried.len()).map(|c| (carried[c].0, 0u8, 2usize, c)));
+        for (pi, (b, &m)) in bursts.iter().zip(&n).enumerate() {
+            order.extend(
+                b.iter()
+                    .take(m)
+                    .enumerate()
+                    .map(|(x, p)| (at_of(p), 1, pi, x)),
+            );
+        }
+        order.sort_unstable();
+        for &(at, _, src, x) in &order {
+            let (pi, bytes) = match (src, carried.get(x)) {
+                (2, Some(c)) => (c.1, c.2.as_slice()),
+                _ => (
+                    src,
+                    rxs.get(src)
+                        .and_then(Option::as_ref)
+                        .zip(bursts.get(src).and_then(|b| b.get(x)))
+                        .map_or(&[][..], |(rx, p)| rx.bytes(p)),
+                ),
             };
-            if pi == 0 {
-                i += 1;
-            } else {
-                j += 1;
+            if at > cap && carry.len() < CARRY_MAX {
+                carry.push((at, pi, bytes.to_vec()));
+                continue;
             }
-            let (Some(rx), path) = (rxs[pi].as_ref(), [RepPath::A, RepPath::B][pi]) else {
+            let path = if pi == 0 { RepPath::A } else { RepPath::B };
+            let Ok(f) = frame::parse(bytes) else {
                 continue;
             };
-            let Ok(f) = frame::parse(rx.bytes(p)) else {
-                continue;
-            };
-            let at = at_of(p).min(cap);
             // The sequencer's answer to a Nack for frames its ring no longer holds.
             if let (Some(t), Some(ps)) = (NackTooOld::decode(f.payload), paths.as_mut()) {
                 rep_stats[2] = rep_stats[2].saturating_add(1);
@@ -1489,9 +1509,11 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
                 continue;
             }
             stats.frames.fetch_add(1, Ordering::Relaxed);
+            // Deadlines stop at the oldest frame `Paths` holds behind a gap (07 §3.7).
+            let hm = paths.as_ref().map_or(u64::MAX, Paths::held_min);
             let mut on = |payload: &[u8], at: u64| {
                 delivered += 1;
-                let r = core.on_frame(payload, at);
+                let r = core.on_frame_at(payload, at, at.min(hm));
                 if track
                     && !matches!(r, Err(FrameErr::OutOfOrder))
                     && let Some((key, q)) = vyrn_replica::paths::frame_key(payload)
@@ -1541,7 +1563,8 @@ fn order_thread<const N: usize, R: RxRing, D: RxRing>(
         // them): the deadlines `on_frame` would have checked (REP_E_HASHLAG), whatever the data
         // queue is doing.
         if delivered == 0 {
-            let r = core.tick(now());
+            let hm = paths.as_ref().map_or(u64::MAX, Paths::held_min);
+            let r = core.tick(now().min(hm).min(carry.first().map_or(u64::MAX, |c| c.0)));
             report(
                 &mut core,
                 r,

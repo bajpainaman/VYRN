@@ -267,6 +267,14 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
 
     /// Takes one frame of either substream, received at `now`.
     pub fn on_frame(&mut self, bytes: &[u8], now: u64) -> Result<(), FrameErr> {
+        self.on_frame_at(bytes, now, now)
+    }
+
+    /// [`OrderCore::on_frame`] for a frame received at `rx`, with the `REP_E_HASHLAG` deadlines
+    /// run at `now` (at most `rx`): the receive time of the oldest frame the caller has received
+    /// and not yet handed over, such as one held behind a gap, so a record whose timely HashRun
+    /// is held is not called late. A HashRun is still checked against its own lane at `rx`.
+    pub fn on_frame_at(&mut self, bytes: &[u8], rx: u64, now: u64) -> Result<(), FrameErr> {
         // Deadlines first: a HashRun that arrives late must not clear the record it is late for.
         self.tick(now)?;
         let id = match FrameHeader::parse(bytes) {
@@ -287,7 +295,7 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
             Err(e) => return Err(self.raise(id, FaultKind::Decode(e))),
         };
         let sender = frame.header.sender;
-        if let Err(kind) = self.apply(id, sender, frame.body, now) {
+        if let Err(kind) = self.apply(id, sender, frame.body, rx) {
             return Err(self.raise(id, kind));
         }
         let closed = self.subs.get_mut(s).map(|x| x.dec.take_closed());
@@ -332,7 +340,7 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
             Body::Hash(sections) => {
                 for sec in sections {
                     if let Section::HashRun { lane, entries } = sec {
-                        self.hash_run(id.stream, lane, &entries)?;
+                        self.hash_run(id.stream, lane, &entries, now)?;
                     }
                 }
             }
@@ -464,7 +472,9 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
         stream: u8,
         lane: LaneId,
         entries: &[(LaneSeq, PktHash)],
+        rx: u64,
     ) -> Result<(), FaultKind> {
+        let max = self.hashlag_max;
         let sub = self
             .subs
             .get_mut(usize::from(stream))
@@ -474,6 +484,15 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
             .lanes
             .get_mut(i)
             .ok_or(FaultKind::Decode(RepErr::Half))?;
+        // A HashRun late for its lane's oldest record, at its own receive time: the global
+        // deadline (`tick`) may trail it while older frames are still held (`on_frame_at`).
+        if let Err(l) = check_hashlag(core::slice::from_ref(st), lane.0, rx, max) {
+            return Err(FaultKind::HashLag {
+                lane: l.lane,
+                lane_seq: l.rec.lane_seq,
+                waited: l.waited,
+            });
+        }
         for &(seq, hash) in entries {
             let a = st.on_hash(seq, hash).map_err(FaultKind::Lane)?;
             let part = sub

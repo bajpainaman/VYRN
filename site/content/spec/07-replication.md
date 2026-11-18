@@ -363,10 +363,13 @@ bound runs from each frame's `rx_ts`, the kernel's receive time (`SO_TIMESTAMPNS
 kernel_udp, 06 §6.6), not from when the order thread gets to the frame, so time a frame waits
 in the socket queue behind a stalled thread does not count. Both paths' frames reach the order
 core in receive order, so a late frame on one path does not advance the deadlines past a timely
-HashRun still unread on the other; while a path's burst is full, the time given to the core is
-capped at its last frame read, as its unread frames came later. A frame that fills a gap (§4.9)
-counts as received no later than the earliest frame held behind it, and each held frame keeps
-its own time. The observer's 200 ms stays until
+HashRun still unread on the other. While a path's burst is full, the other path's frames
+received after its last frame read wait for the next poll (each keeps its own time), as that
+path's unread frames came before them. A frame that fills a gap (§4.9) counts as received no
+later than the earliest frame held behind it, and each held frame keeps its own time. The
+deadlines run at most up to the oldest frame still held behind a gap or waiting for the next
+poll, so a timely HashRun among them is not counted late; a HashRun is still checked against its
+own lane at its own receive time. The observer's 200 ms stays until
 loaded DEV runs show it within the voters' bound. A stuck HashRun still fails the observer.
 \[DEV only\]
 

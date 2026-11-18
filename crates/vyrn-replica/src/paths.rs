@@ -180,6 +180,8 @@ pub struct Paths {
     /// delivery-gap repair only.
     two: bool,
     subs: BTreeMap<Key, Sub>,
+    /// The receive times of every held frame, with their counts (for [`Paths::held_min`]).
+    held_at: BTreeMap<u64, u32>,
     /// Datagrams refused by the receive context or [`SUBS_MAX`].
     pub refused: u64,
     /// Copies of frames already handed on, per path.
@@ -206,6 +208,7 @@ impl Paths {
             senders,
             two: true,
             subs: BTreeMap::new(),
+            held_at: BTreeMap::new(),
             refused: 0,
             dups: [0; 2],
             mismatched: [0; 2],
@@ -216,6 +219,12 @@ impl Paths {
     pub fn one_path(mut self) -> Self {
         self.two = false;
         self
+    }
+
+    /// The receive time of the oldest frame held behind a gap (`u64::MAX`: none). Deadlines
+    /// that run on receive time must not pass it: the frame may be a timely HashRun (07 §3.7).
+    pub fn held_min(&self) -> u64 {
+        self.held_at.first_key_value().map_or(u64::MAX, |(t, _)| *t)
     }
 
     /// One datagram from `path`; `deliver` gets every frame now due, in `frame_seq` order. A
@@ -276,11 +285,19 @@ impl Paths {
         } else if q > s.next {
             if s.hold.len() < HOLD_MAX {
                 s.hold.insert(q, (frame.to_vec(), at));
+                let c = self.held_at.entry(at).or_default();
+                *c = c.saturating_add(1);
             }
         } else {
             s.next = s.next.saturating_add(1);
             let mut run = Vec::new();
             while let Some(f) = s.hold.remove(&s.next) {
+                if let Some(c) = self.held_at.get_mut(&f.1) {
+                    *c = c.saturating_sub(1);
+                    if *c == 0 {
+                        self.held_at.remove(&f.1);
+                    }
+                }
                 run.push(f);
                 s.next = s.next.saturating_add(1);
             }
@@ -462,7 +479,9 @@ mod tests {
         p.rx_at(Path::A, &frame(0, 1), 10, &mut d);
         p.rx_at(Path::A, &frame(0, 4), 40, &mut d);
         p.rx_at(Path::A, &frame(0, 3), 30, &mut d);
+        assert_eq!(p.held_min(), 30, "3 and 4 are held");
         p.rx_at(Path::A, &frame(0, 2), 900, &mut d);
+        assert_eq!(p.held_min(), u64::MAX, "nothing is held");
         p.rx_at(Path::A, &frame(0, 5), 950, &mut d);
         assert_eq!(out, [(1, 10), (2, 30), (3, 30), (4, 40), (5, 950)]);
     }
