@@ -1044,10 +1044,16 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   one is shed) and a Cancel that took effect ends its order. **[Reading, 5]** As in
   `Bbo::apply_deps`, a dependency's record index is the source's minus its LaneSeq distance
   (spec follow-up F2: `FwdDep` has no message index), not the message's own index.
-  **[Reading, 5]** A Join dependency that a visible level crosses at the source's cut matches
-  before the source and ends the step, the rest continuing in `CONT` steps (`Bbo::join_dep`);
-  the client stops there with `PBV_E_UNSUPPORTED` (item 5b). So does a Cancel dependency whose
-  order's Join is applied but past the cut, which the client's book has not seen.
+  A Join dependency that a visible level crosses at the source's cut (item 5b) matches first, at
+  that cut, as `Bbo::join_dep` does: a post-only one ends with `Reject POST_ONLY_WOULD_CROSS`;
+  otherwise it sweeps with the step's cap (D14), its taker records in the deps packet, and rests
+  any open quantity (`Ack`). One that traded or ended ends the step. The next step is a `CONT`
+  step of the same source at the same cut: a capped sweep resumes, then the remaining
+  dependencies run, their records in a continuation deps packet (`resp_seq` 0), and the
+  source's entry checks and first sweep run in the step its dependencies finish in (its packet
+  still takes `resp_seq` + 1). **[Reading, 5]** A Cancel dependency whose order's Join is applied
+  but past the cut, which the client's book has not seen, stops with `PBV_E_UNSUPPORTED`. None
+  of the first 149 swarm seeds reaches it.
 - *Rescan batch takers (2).* The batch taker runs as `Bbo::rescan_finish` does. It must be
   live just after its key, or it is skipped with no status event; an auction-only taker is not
   live outside an uncross. A post-only taker that a visible level crosses ends with a batch
@@ -1106,15 +1112,14 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   boundary, before the Reduce settles, and a Reduce keeps its predecessor's leg. Replace (3b)
   makes the second one observable.
 - *Gap list (the plan).* What `RustReplay` replays and the Vx client does not yet
-  (1, Uncross and Seal, 2, Rescan batch takers that trade, and 5, in-packet dependencies, are
-  done). With 5 the client fully replays 142 of the first 149 sim-swarm seeds (under each
-  seed's generated fault schedule), up from 3; the other 7 stop with `PBV_E_UNSUPPORTED` at a
-  crossing Join dependency (5b), and none differs.
+  (1, Uncross and Seal, 2, Rescan batch takers that trade, and 5 and 5b, in-packet dependencies
+  with crossing Join dependencies, are done). The client fully replays all of the first 149
+  sim-swarm seeds, each under its generated fault schedule (3 before 5, 142 after it);
+  `vx_golden.rs`'s `the_vx_client_replays_the_swarm_seeds` requires that, with no
+  `PBV_E_UNSUPPORTED` allowance, and runs in the CI `vx` job.
   3. Replace (keep and new priority); CancelAll (3a) is done.
   4. STP that triggers (currently `PBV_E_UNSUPPORTED` in a forwarded or batch sweep and the FOK
      dry run).
-  5b. A Join dependency that crosses at the source's cut (`Bbo::join_dep`'s sweep and its
-     `CONT` steps).
   6. `engine.client` wiring in `vyrn-validator` (nothing constructs `VxReplay` today).
   7. Then a write-up of what a Vx default (`engine.client = vx`) needs; the default stays `rust`.
 - *Pooled lanes (`AcctTake`, 05 §6.9, 07 §7.1).* `pbv_config` byte 48 is the pool mask,
