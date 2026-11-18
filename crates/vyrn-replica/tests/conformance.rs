@@ -51,8 +51,8 @@ impl EpochView for View {
     fn seq_key(&self, sender: u8) -> Option<PubKey> {
         (sender == 0).then_some(self.0)
     }
-    fn fence(&self) -> Option<Height> {
-        None
+    fn fenced(&self, _: Height) -> bool {
+        false
     }
 }
 
@@ -375,6 +375,34 @@ fn vectors() -> Vec<Vector> {
         about: "A delivers step 2 before B delivers step 1: step 1 keeps A's TenureStart half-cut",
         events: ev,
         expect: vec!["cuts 0.0.2.0 3.0.2.0".into()],
+    });
+
+    let mut t = Two::new();
+    let mut ts = tenure_start();
+    ts.prev_cut = vec![LaneSeq(3), LaneSeq(0)];
+    let ev = vec![Ev::Frame(
+        0,
+        t.b(&Body::Order {
+            tenure_start: Some(ts),
+            sections: vec![bind(2, 9)],
+        }),
+    )];
+    out.push(Vector {
+        name: "tenure_cut_beyond_base",
+        about: "S2 at the base: B's TenureStart sets lane 2's cut to 3 but its next_lane_seq to 1",
+        events: ev,
+        expect: vec![fault("REP_E_CUT", 1, 1)],
+    });
+
+    let (a, b) = good_steps();
+    let (mut t, mut ev) = block0(0, a, b);
+    ev.push(Ev::Frame(200, t.a(&order(false, vec![mark(3, [3, 0])]))));
+    ev.push(Ev::Frame(300, t.b(&order(false, vec![mark(3, [2, 0])]))));
+    out.push(Vector {
+        name: "missing_step",
+        about: "both marks close block 0 at step 3, but no substream carried step 3",
+        events: ev,
+        expect: vec![fault("DECODE", 1, 2)],
     });
 
     let (a, b) = good_steps();

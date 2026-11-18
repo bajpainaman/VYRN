@@ -196,6 +196,12 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
         })
     }
 
+    /// The epoch view, to update in place: an epoch's own fence certifies after its order
+    /// core has started (`ActiveEpoch::set_fence`), and the next `verdict` sees it.
+    pub fn view_mut(&mut self) -> &mut V {
+        &mut self.view
+    }
+
     /// The fault that stopped this core, if any.
     pub const fn fault(&self) -> Option<&Fault> {
         self.fault.as_ref()
@@ -215,10 +221,7 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
     /// bytes, steps and header passed) and no fence or fault covers it, `Invalid` when a fault or
     /// fence does, `Pending` otherwise.
     pub fn verdict(&self, first: Height, last: Height) -> Verdict {
-        if first > last
-            || self.view.fence().is_some_and(|f| last > f)
-            || self.fault.is_some_and(|f| last >= f.height)
-        {
+        if first > last || self.view.fenced(last) || self.fault.is_some_and(|f| last >= f.height) {
             return Verdict::Invalid;
         }
         // Heights before this tenure's first block were never decoded here.
@@ -345,6 +348,17 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
         let sub = self.subs.get_mut(usize::from(id.stream)).ok_or(tenure)?;
         if sub.started {
             return Err(tenure);
+        }
+        // A half-cut cannot start beyond its lanes' decoded prefixes (S2 at the tenure base).
+        for ((l, c), base) in (sub.first_lane..).zip(&ts.prev_cut).zip(&ts.lanes) {
+            let prefix = LaneSeq(base.next_lane_seq.0.saturating_sub(1));
+            if *c > prefix {
+                return Err(FaultKind::Step(StepErr::CutBeyondPrefix {
+                    lane: LaneId(l),
+                    cut: *c,
+                    prefix,
+                }));
+            }
         }
         sub.lanes = ts.lanes.iter().map(LaneState::from_base).collect();
         sub.cut.clone_from(&ts.prev_cut);
@@ -490,29 +504,38 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
                 return Ok(());
             };
             let h = self.next_height;
-            let Some(&(header, hid)) = self.headers.get(&h) else {
-                return Ok(());
-            };
             let mut halves = Vec::new();
+            let mut hashed = true;
             for sub in &self.subs {
                 match sub.parts.get(&h) {
                     Some(Part {
                         half: Some(hb),
-                        missing: 0,
+                        missing,
                         ..
-                    }) => halves.push(hb),
+                    }) => {
+                        halves.push(hb);
+                        hashed &= *missing == 0;
+                    }
                     _ => return Ok(()),
                 }
             }
             let last_step = halves.first().map_or(StepId(0), |b| b.last_step);
             if halves.iter().any(|b| b.last_step != last_step) {
-                return Err((Some(hid), FaultKind::Decode(RepErr::Mark)));
+                return Err((None, FaultKind::Decode(RepErr::Mark)));
             }
+            // Both halves are closed, and vyrn-log refuses a step at or below a mark's
+            // `last_step` after the mark, so a step the merger still lacks can never arrive.
             let merged_through = self
                 .merger
                 .as_ref()
                 .map_or(0, |m| m.next_step().0.saturating_sub(1));
             if merged_through < last_step.0 {
+                return Err((None, FaultKind::Decode(RepErr::Step)));
+            }
+            let Some(&(header, hid)) = self.headers.get(&h) else {
+                return Ok(());
+            };
+            if !hashed {
                 return Ok(());
             }
             let fail = |e| Err((Some(hid), FaultKind::Header(e)));
@@ -531,9 +554,13 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
                 return fail(HeaderErr::OrderRoot);
             }
             let mut lanes = Vec::new();
-            for sub in &mut self.subs {
+            let mut split = 0;
+            for (i, sub) in self.subs.iter_mut().enumerate() {
                 if let Some(p) = sub.parts.remove(&h) {
                     lanes.extend(p.recs);
+                }
+                if i == 0 {
+                    split = lanes.len();
                 }
             }
             let mut steps = Vec::new();
@@ -546,6 +573,7 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
             self.ready.push_back(BlockInputs {
                 header,
                 lanes,
+                split,
                 steps,
             });
         }
