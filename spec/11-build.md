@@ -990,8 +990,8 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   argument of `pbv_lane_run` is a `uint32_t`.
 - *Output rings.* One per lane and one for fill TX packets; each slot holds exactly the bytes the
   output hash takes, so the shell hashes without decoding.
-- *Subset.* New (Day, IOC, FOK, post-only, auction-only), Cancel, Reduce, CancelAll, Heartbeat and
-  ResendReq (no LaneSeq), `SHED` records (replayed from the record alone, so their slots carry
+- *Subset.* New (Day, IOC, FOK, post-only, auction-only), Cancel, Reduce, Replace, CancelAll,
+  Heartbeat and ResendReq (no LaneSeq), `SHED` records (replayed from the record alone, so their slots carry
   no payload, 05 §18 Q17), and Cross, Improve, Shed, Idle, Depletion, Control, Rescan, Uncross and Seal steps.
   Anything else stops with `PBV_E_UNSUPPORTED` rather than guess, so a v1 Vx validator halts on
   it instead of diverging silently; the gap list below is the plan that closes it.
@@ -1029,6 +1029,35 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   `AcctKill` path is exercised; the client treats both paths the same. A barrier only changes
   what a forwarded op's dependencies are; `the_vx_client_replays_in_packet_dependencies` (item
   5) is the test a mutant without it fails.
+- *Replace (3b, 04 §6.5, 05 §2.3, #210).* The lane resolves a Replace as `vyrn-lane` does: the
+  wrong side is `SIDE_MISMATCH`, a same-tick smaller Replace is a Reduce (keep priority, the
+  predecessor's leg), and any other Replace is a new-priority version with its own leg that is
+  checked, FIFO-assigned and routed like a New. A forwarded or dependency Replace carries its
+  predecessor's total. The BBO applies it as `Bbo::entry_checks` does: `TOO_LATE` unless
+  `replace_ok` (not killed, not filled to the predecessor's total, not finished before it, and
+  not auction-only at the latest C\* through each predecessor's position, `State::ao_at`); a
+  new total at or below the fills finishes the order (`Out FINISHED`, the lane's `CancelAck` of
+  the old open); otherwise the old version ends at the Replace's key. A refused Replace
+  (`BOOK_HALTED`, `AUCTION_PHASE`, `TOO_LATE`, `BUSY`) leaves the old version current
+  (`revert_replace`). When the new version takes effect the old version's leg is released and
+  the new leg is trued up by the predecessor's fills (`end_replaced`, `true_up`). A Replace
+  that moves an order out of a forwarded op's range is a pass barrier, and an in-range one is a
+  dependency. Per #210, a Replace admitted after C\* of an order that was auction-only at C\*
+  settles `TOO_LATE` with the `Out AUCTION` detail and never trades, while a Replace of an order
+  that left auction-only before the freeze is accepted. **[Reading, 3b]** The BBO stages a
+  Replace admitted after C\* while frozen and applies it when the uncross ends, decided against
+  the new `adead`, because the uncross matches at C\*, where the old version is in effect; a
+  second staged Replace of the same order, or a Replace whose order still has a forwarded op
+  queued, stops with `PBV_E_UNSUPPORTED`. `tests/replay.rs` covers local, forwarded and
+  dependency Replaces, the barrier, the #210 freeze race (`Sim`, the uncross before and after
+  the BBO sees the Replace), a Replace the BBO refuses `BOOK_HALTED`, and fills the lane has not
+  seen (refused `TOO_LATE`, finished). Mutation check: releasing only the current version's leg,
+  dropping `ao_at`, the staging, the revert, the barrier, the dependency or the dead-leg open
+  each fails a test. Four survive, recorded as #211 did: the `finished` branch is equivalent to
+  the taker path ending an open-0 version, `filled < pt` adds nothing in these scripts, where an
+  order filled to its predecessor's total already has `fin` set before the Replace, and skipping the predecessor-leg release or the true-up changes only
+  risk reservations, which the harness's limits (`max_open` 1,000, credit 2^40 and 2^60) never
+  reach.
 - *In-packet dependencies (5).* The lane's `forward` builds the list as `vyrn-lane` does: every
   earlier unapplied, not explicit Join or Cancel of another order in range of the forwarded op
   becomes explicit, and the op's `resp_seq` advances by 2. Each one is an `OP_DEP` op-log entry
@@ -1108,16 +1137,15 @@ reading recorded with the PR that built it (`vx/abi/pbv.h` holds the exact layou
   `vyrn-lane` does since #202. `tests/replay.rs` drives that script live over `vyrn_cut::Sim`,
   so the lane admits the Reduce before it sees the freeze and the BBO runs the uncross before it
   sees the Reduce. A client that tests the current version fails it. Holding the `Out` under the
-  current version, or releasing only its leg, still passes: the `Out` flushes at the uncross
-  boundary, before the Reduce settles, and a Reduce keeps its predecessor's leg. Replace (3b)
-  makes the second one observable.
+  current version still passes: the `Out` flushes at the uncross boundary, before the Reduce
+  settles. Releasing only its leg fails the Replace (3b) freeze test, since a Replace has its
+  own leg.
 - *Gap list (the plan).* What `RustReplay` replays and the Vx client does not yet
-  (1, Uncross and Seal, 2, Rescan batch takers that trade, and 5 and 5b, in-packet dependencies
+  (1, Uncross and Seal, 2, Rescan batch takers that trade, 3, Replace and CancelAll, and 5 and 5b, in-packet dependencies
   with crossing Join dependencies, are done). The client fully replays all of the first 149
   sim-swarm seeds, each under its generated fault schedule (3 before 5, 142 after it);
   `vx_golden.rs`'s `the_vx_client_replays_the_swarm_seeds` requires that, with no
   `PBV_E_UNSUPPORTED` allowance, and runs in the CI `vx` job.
-  3. Replace (keep and new priority); CancelAll (3a) is done.
   4. STP that triggers (currently `PBV_E_UNSUPPORTED` in a forwarded or batch sweep and the FOK
      dry run).
   6. `engine.client` wiring in `vyrn-validator` (nothing constructs `VxReplay` today).
