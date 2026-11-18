@@ -156,8 +156,8 @@ jobs:
       - run: cargo build --locked --release -p vyrn-seq -p vyrn-validator -p vyrn-data-box -p vyrn-md -p e2e-smoke
       - name: 4 validators with finality, an observer and vyrn-dropcopy, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke)
         run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dropcopy --dev-hashlag-us 20000 --strict-hashlag --workload tools/e2e-smoke/wl-smoke-nocross.toml
-      - name: 4 validators with finality, the tap's data and order sockets losing every 25th frame, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R14, R18)
-        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 20000 --strict-hashlag --tap-loss 25 --tap-order-loss 25 --workload tools/e2e-smoke/wl-smoke-nocross.toml
+      - name: 4 validators with finality, the tap's data and order sockets losing every 25th frame, 89 copies 2 never reaching the data box, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R14, R18, R19)
+        run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 20000 --strict-hashlag --tap-loss 25 --tap-order-loss 25 --copy2-gap 89 --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: 4 validators with finality, keyed data box, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R7)
         run: timeout 300 target/release/e2e-smoke --validators 4 --wait-s 30 --seq-cpus 0,1 --validator-cpus 2,3 --data --finality --dev-hashlag-us 20000 --strict-hashlag --keyed --workload tools/e2e-smoke/wl-smoke-nocross.toml
       - name: 4 validators with finality, keyed data box on 2 ingest shards, WL-SMOKE-NOCROSS seed 1 (tools/e2e-smoke R7, R10)

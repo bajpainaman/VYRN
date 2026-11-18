@@ -1170,10 +1170,11 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
     }
 
     /// Item 3 for the pending blocks, in height order: a block whose payloads are all joined
-    /// passes or contradicts; a missing payload waits. A payload still missing
-    /// `REP_DATA_WAIT_US` after it was first seen missing is fetched by key, from each of 07
-    /// §5.5's sources in turn (`fetch.rs`), so a lost RANGE request or reply, or a data box that
-    /// lacks it, does not stall the queue.
+    /// passes or contradicts; a missing payload waits. While the front block misses one, every
+    /// payload the pending blocks miss (up to `fetch::FETCH_KEYS_MAX`) is fetched by key once it
+    /// has been missing `REP_DATA_WAIT_US`, from each of 07 §5.5's sources in turn, each key on
+    /// its own timer (`fetch.rs`, reading (j)), so a lost RANGE request or reply, or a data box
+    /// that lacks a burst, does not stall the queue.
     ///
     /// With `durable` (an observer), a block also waits until every frame through its [`Mark`]
     /// arrived on both paths (10 §8.2), so the drop copy's `flags.bit2` holds.
@@ -1212,9 +1213,35 @@ impl<const N: usize, R: RxRing> DataRx<N, R> {
             // nothing more: its blocks release their payloads without waiting for them.
             if !(self.replay_dead && durable.is_some()) {
                 match Self::join(&mut self.join, &mut self.replay).check(b) {
-                    Err(DataErr::Missing { session, pkt_seq }) => {
-                        let to = self.sources.due(session, pkt_seq, now);
-                        fetch::send_key(&self.repair, session, pkt_seq, &to);
+                    Err(DataErr::Missing { .. }) => {
+                        // Every key the pending blocks miss escalates at once (07 §5.5, `fetch.rs`
+                        // reading (j)), so a burst lost at the data box reaches source 3 while
+                        // the sequencer still retains it.
+                        let join = Self::join(&mut self.join, &mut self.replay);
+                        self.sources.begin_round();
+                        let missing = self
+                            .pending
+                            .iter()
+                            .flat_map(|(b, _)| &b.lanes)
+                            .filter_map(|r| match r {
+                                LaneRec::Pkt(p)
+                                    if p.flags & (PacketFlags::ADVANCE | PacketFlags::SHED)
+                                        == 0
+                                        && matches!(
+                                            join.resolve(p),
+                                            Err(DataErr::Missing { .. })
+                                        ) =>
+                                {
+                                    Some((p.session, p.pkt_seq))
+                                }
+                                _ => None,
+                            })
+                            .take(fetch::FETCH_KEYS_MAX);
+                        for (session, pkt_seq) in missing {
+                            let to = self.sources.due(session, pkt_seq, now);
+                            fetch::send_key(&self.repair, session, pkt_seq, &to);
+                        }
+                        self.sources.end_round();
                         return;
                     }
                     Ok(()) => source.valid(h),

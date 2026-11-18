@@ -1,11 +1,15 @@
 //! Fetching a missing payload from its three sources (07 §5.5), and serving peers' fetches.
 //!
-//! **Escalation** ([`Sources`], reading (b), accepted). A payload the front pending block still
-//! misses `REP_DATA_WAIT_US` = 300 µs after it was first seen missing is fetched by key from
-//! source 1, every configured data box (no session-to-data-home map yet). Each further
-//! `REP_DATA_WAIT_US` without it moves to the next source: 2, one peer replica in round-robin
-//! order (`PeerDataFetch`), then 3, the sequencer's repair port (`SeqDataReq`), then back to 1.
-//! A source that is not configured is skipped.
+//! **Escalation** ([`Sources`], reading (b), accepted). A payload a pending block still misses
+//! `REP_DATA_WAIT_US` = 300 µs after it was first seen missing is fetched by key from source 1,
+//! every configured data box (no session-to-data-home map yet). Each further `REP_DATA_WAIT_US`
+//! without it moves to the next source: 2, one peer replica in round-robin order
+//! (`PeerDataFetch`), then 3, the sequencer's repair port (`SeqDataReq`), then back to 1. A
+//! source that is not configured is skipped. Every missing key has its own escalation, so a
+//! burst of lost packets reaches source 3 within one escalation, not one after another: the
+//! sequencer retains a packet only `REP_SEQ_PKT_RETAIN_MS` = 50 ms (07 §5.5, reading (j)).
+//! A round ([`Sources::begin_round`], [`Sources::end_round`]) asks at most [`FETCH_KEYS_MAX`]
+//! keys and forgets the keys it no longer names.
 //!
 //! **`PeerDataFetch`** (reading (a), accepted). The request is the same KEY fetch as `DataFetch`
 //! and `SeqDataReq`. A replica answers on its data port, so `[[data.peer]]` lists the peers'
@@ -51,6 +55,8 @@ pub const PEER_KEEP: usize = 16_384;
 /// `REP_SEQ_DATA_MAX_PPS`, reused as each replica's peer-serving rate (reading (d)).
 const PEER_MAX_PPS: u64 = 50_000;
 const BURST_NS: u64 = 10_000_000;
+/// Missing keys one round of [`Sources`] escalates at once (reading (j)).
+pub const FETCH_KEYS_MAX: usize = 1024;
 const SEC: u64 = 1_000_000_000;
 
 /// Fetches sent and served, printed at exit as `FETCH box=<n> peer=<n> seq=<n>
@@ -81,14 +87,16 @@ enum Stage {
     Seq,
 }
 
-/// The fetch sources and the escalation of the one missing key the front block waits for.
+/// The fetch sources and the escalation of each missing key the pending blocks wait for.
 pub struct Sources {
     boxes: Vec<Target>,
     peers: Vec<Target>,
     seq: Option<Target>,
     next_peer: usize,
-    /// The missing key, the stage asked last (`None`: not asked yet), and since when.
-    missing: Option<((SessionId, u32), Option<Stage>, u64)>,
+    /// Per missing key: the stage asked last (`None`: not asked yet), since when, and the round
+    /// that last named it.
+    missing: BTreeMap<(SessionId, u32), (Option<Stage>, u64, u64)>,
+    round: u64,
     pub counts: Counts,
 }
 
@@ -99,7 +107,8 @@ impl Sources {
             peers,
             seq,
             next_peer: 0,
-            missing: None,
+            missing: BTreeMap::new(),
+            round: 0,
             counts: Counts::default(),
         }
     }
@@ -135,14 +144,29 @@ impl Sources {
         }
     }
 
-    /// The front block misses `(session, pkt_seq)` at `now`: the targets to KEY-fetch it from
+    /// Starts a round of [`Sources::due`] calls.
+    pub fn begin_round(&mut self) {
+        self.round = self.round.wrapping_add(1);
+    }
+
+    /// Ends a round: keys it did not name (joined, or released) are forgotten.
+    pub fn end_round(&mut self) {
+        let r = self.round;
+        self.missing.retain(|_, x| x.2 == r);
+    }
+
+    /// A pending block misses `(session, pkt_seq)` at `now`: the targets to KEY-fetch it from
     /// now, empty while the current source still has time.
     pub fn due(&mut self, session: SessionId, pkt_seq: u32, now: u64) -> Vec<Target> {
         let key = (session, pkt_seq);
-        let (last, at) = match self.missing {
-            Some((k, last, at)) if k == key => (last, at),
-            _ => {
-                self.missing = Some((key, None, now));
+        let round = self.round;
+        let (last, at) = match self.missing.get_mut(&key) {
+            Some(x) => {
+                x.2 = round;
+                (x.0, x.1)
+            }
+            None => {
+                self.missing.insert(key, (None, now, round));
                 return Vec::new();
             }
         };
@@ -162,7 +186,7 @@ impl Sources {
         else {
             return Vec::new();
         };
-        self.missing = Some((key, Some(stage), now));
+        self.missing.insert(key, (Some(stage), now, round));
         match stage {
             Stage::Boxes => {
                 self.counts.boxes = self.counts.boxes.saturating_add(1);
@@ -429,6 +453,28 @@ mod tests {
         let mut s = Sources::new(Vec::new(), Vec::new(), None);
         assert!(s.due(k, 1, 0).is_empty());
         assert!(s.due(k, 1, w).is_empty());
+    }
+
+    /// Missing keys escalate side by side, so a burst reaches the sequencer within one
+    /// escalation (reading (j)); a round forgets the keys it no longer names.
+    #[test]
+    fn missing_keys_escalate_together_and_rounds_forget_joined_ones() {
+        let mut s = Sources::new(vec![t(1)], vec![t(11)], Some(t(21)));
+        let (k, w) = (SessionId(5), REP_DATA_WAIT_NS);
+        let round = |s: &mut Sources, keys: &[u32], now: u64| {
+            s.begin_round();
+            let out: Vec<Vec<Target>> = keys.iter().map(|&q| s.due(k, q, now)).collect();
+            s.end_round();
+            out
+        };
+        assert_eq!(round(&mut s, &[1, 2, 3], 0), vec![vec![]; 3]);
+        assert_eq!(round(&mut s, &[1, 2, 3], w), vec![vec![t(1)]; 3]);
+        assert_eq!(round(&mut s, &[1, 2, 3], 2 * w), vec![vec![t(11)]; 3]);
+        // Key 2 joined: it drops out; 1 and 3 reach the sequencer at the same time.
+        assert_eq!(round(&mut s, &[1, 3], 3 * w), vec![vec![t(21)]; 2]);
+        // Key 2 missing again starts over.
+        assert_eq!(round(&mut s, &[2], 3 * w), vec![vec![]]);
+        assert_eq!(s.missing.len(), 1);
     }
 
     /// A keyed target gets the 40-byte form that opens under its key; an unkeyed one the 32.
