@@ -75,8 +75,12 @@
 //!   `XCHG_SEED`'s, the box's `BOX_XCHG`'s. The other voters and the `vyrn-seq` entries get
 //!   all-zero (low-order) keys, so they get no key: on one host every requester shares
 //!   127.0.0.1, and the box refuses two keyed requesters on one IPv4. A relay drops every
-//!   `LOSS_EVERY`-th datagram the box sends validator 0, so its RANGE and KEY fetches must be
-//!   served (`STATS` `fetch_ring_hit + fetch_log_hit + fetch_resent > 0`) for it to keep up.
+//!   `LOSS_EVERY`-th datagram the box sends validator 0 when it is a DATA frame carrying
+//!   packets, so validator 0 must repair to keep up: the box must have served sealed fetches
+//!   (`STATS` `fetch_ring_hit + fetch_log_hit + fetch_resent > 0`), at least one dropped frame
+//!   must have come back through the relay (a RANGE resend goes to the destination's address,
+//!   so only validator 0's fetch causes it; the tap's fetches share its IPv4 and count in
+//!   `STATS` too), and validator 0 must have readied every block the box closed, unstopped.
 //! - R8. `--keyed` also keys the primary `vyrn-seq` box (`SEQ_XCHG`, repl_addr 127.0.0.2) and
 //!   gives its `[repair]` `xchg`: with the box still up, `seq-repair` sends a plain KEY fetch of
 //!   the last packets sent, one sealed under validator 0's `K_fetch(0, 0, SEQ_TARGET)` and one
@@ -141,9 +145,12 @@
 //!   missing after `TAP_REASK` (20 ms) is asked for again until the run stops. `data` fails only
 //!   on a gap never repaired. Without this a single frame lost to the tap (a UDP receive
 //!   overflow while its thread is descheduled on a loaded host) failed `data` and `replay`
-//!   (`Missing`) though the box held it. *Reading* (harness): only unkeyed boxes are asked; a
-//!   keyed box would count the tap's plain fetch in `fetch_unauth` (R7, R11), and the DEV
-//!   roster gives the tap no `K_fetch`, so under `--keyed` a tap gap still fails. `--tap-loss N`
+//!   (`Missing`) though the box held it. *Reading* (harness): under `--keyed` the tap seals
+//!   its fetches with validator 0's epoch-1 `K_fetch`, as boxes key requesters by IPv4 and the
+//!   tap shares validator 0's (R7), and asks nothing before R11's move to epoch 1, so
+//!   `fetch_unauth` still counts none of them. Before this a keyed tap never asked, and CI's
+//!   R15 step (`--keyed --data-kill`) failed `replay` on one `Missing` packet that every
+//!   validator had fetched. `--tap-loss N`
 //!   relays the tap's data socket and drops every N-th datagram; `data` then also needs the
 //!   relay to have dropped and the tap to have repaired at least one frame.
 //! - R15. `--workload tools/e2e-smoke/wl-smoke-many.toml` (WL-SMOKE-MANY) is WL-SMOKE-NOCROSS
@@ -252,15 +259,15 @@
 //!   for good: the box had stored 1403 of 1500 packets, and the validators, which escalated one
 //!   key at a time, reached source 3 after it had dropped the rest (`REPAIR_STATS served=0
 //!   missed=67240`). Validators now escalate every missing key at once (`fetch.rs` reading (j)).
-//!   The tap, which replays like a replica, KEY-fetches from the unkeyed boxes and sequencer each
+//!   The tap, which replays like a replica, KEY-fetches from the boxes and sequencer each
 //!   packet the client sent that its join still lacks 2 ms on (`TAP_SEQ_WAIT`), then every 20 ms
 //!   (`TAP_REASK`) from them and one validator's data port (source 2) in turn. Re-asking every
 //!   2 ms flooded the box under load (`fetch_limited=51916`) and the tap missed a packet every
 //!   replica had; and a packet the box lost and the tap asked for after the sequencer's 50 ms is
 //!   still held by a validator that released it. Under
-//!   `--keyed` (R8) the box would refuse its plain fetch, so it does not ask, and `--copy2-gap`
-//!   is refused. *Ruled-style, as R1, for the box's count only:* `data` lets the box store fewer
-//!   than it was sent by at most its ingest socket's kernel drop count (`/proc/net/udp`, read
+//!   `--keyed` these fetches are sealed as R14's, no validator is asked (its data port would
+//!   refuse a plain fetch), and `--copy2-gap` is refused. *Ruled-style, as R1, for the box's
+//!   count only:* `data` lets the box store fewer than it was sent by at most its ingest socket's kernel drop count (`/proc/net/udp`, read
 //!   before it stops; without it, none), since a socket overflow at the box is the loss replicas
 //!   must repair; the replicas' stall is never tolerated (`validators`, `replay`). The `data` line
 //!   prints `tap_seq_asked=` and `box_sock_drops=`.
@@ -318,7 +325,7 @@ use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -468,7 +475,7 @@ struct Cli {
     #[arg(long, value_name = "N")]
     drop_path_b: Option<u64>,
     /// Relay the tap's data socket and drop every N-th datagram the data box sends it (R14;
-    /// needs --data, not --keyed): the tap must repair its gaps by RANGE fetch, as a replica
+    /// needs --data): the tap must repair its gaps by RANGE fetch, as a replica
     /// does.
     #[arg(long, value_name = "N")]
     tap_loss: Option<u64>,
@@ -979,16 +986,27 @@ const TAP_SEQ_WAIT: Duration = Duration::from_millis(2);
 /// R14: how long a gap's RANGE fetch may go unanswered before the tap asks again.
 const TAP_REASK: Duration = Duration::from_millis(20);
 
+/// `--keyed`: validator 0's epoch-1 `K_fetch` of each data box (by `src`) and of the `vyrn-seq`
+/// box, which the tap seals its fetches with (R14, R19).
+#[derive(Clone)]
+struct TapKeys {
+    boxes: Vec<[u8; 16]>,
+    seq: [u8; 16],
+}
+
 /// The tap's data socket until `stop`: every frame goes through a `DataFeed` (destination 0 of
-/// `n_boxes` boxes), and when `fetch` names the boxes' fetch addresses (unkeyed boxes, R14) a
+/// `n_boxes` boxes), and when `fetch` names the boxes' fetch addresses (R14) a
 /// gap in box `src`'s `data_seq` is fetched from `fetch[src]` by RANGE, re-asked every
-/// `TAP_REASK` until its frames arrive, as a replica does (07 §5.5 source 1).
+/// `TAP_REASK` until its frames arrive, as a replica does (07 §5.5 source 1). With `keys`
+/// (`--keyed`) every fetch is sealed under the target's key, and none is sent before `armed`
+/// (R11's move to epoch 1), so no fetch counts in `fetch_unauth`.
 fn data_tap(
     sock: UdpSocket,
     n_boxes: u8,
     fetch: Vec<SocketAddrV4>,
     seq: Option<(SocketAddrV4, Receiver<Sent>)>,
     peers: Vec<SocketAddrV4>,
+    keys: Option<(TapKeys, Arc<AtomicBool>)>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<DataTap> {
     std::thread::spawn(move || {
@@ -1006,10 +1024,24 @@ fn data_tap(
         let mut feed = DataFeed::new(BookId(BOOK), n_boxes, 0);
         // (src, data_seq) still missing → when it was last asked for.
         let mut pending: BTreeMap<(u8, u64), Instant> = BTreeMap::new();
+        // Keyed: nothing is asked before R11's move to epoch 1.
+        let armed = || keys.as_ref().is_none_or(|(_, a)| a.load(Ordering::Acquire));
+        // A fetch to `a`, plain, or sealed under `key` when keyed.
+        let send = |f: &vyrn_data::frame::Fetch, key: Option<&[u8; 16]>, a: &SocketAddrV4| {
+            let _ = match (&keys, key) {
+                (None, _) => sock.send_to(&f.encode(), a),
+                (Some(_), Some(k)) => sock.send_to(&vyrn_data::frame::seal_fetch(k, f), a),
+                (Some(_), None) => return,
+            };
+        };
+        let box_key = |src: u8| {
+            keys.as_ref()
+                .and_then(|(k, _)| k.boxes.get(usize::from(src)))
+        };
         let ask = |src: u8, from: u64, to: u64| {
-            if let Some(a) = fetch.get(usize::from(src)) {
+            if let Some(a) = fetch.get(usize::from(src)).filter(|_| armed()) {
                 let f = vyrn_data::frame::Fetch::Range { dst: 0, from, to };
-                let _ = sock.send_to(&f.encode(), a);
+                send(&f, box_key(src), a);
             }
         };
         let _ = sock.set_read_timeout(Some(Duration::from_millis(5)));
@@ -1054,25 +1086,37 @@ fn data_tap(
             // boxes (source 1), which may have repaired it, and the sequencer's retention
             // (source 3) at once, then again every TAP_REASK, adding one validator (source 2)
             // in turn, which holds what it released (07 §5.5).
-            if let Some((to, rx)) = &seq {
+            if let Some((to, rx)) = seq.as_ref().filter(|_| armed()) {
                 sent.extend(rx.try_iter().map(|(s, q, t)| ((s, q), (t, 0))));
                 sent.retain(|&(s, q), (at, asks)| {
                     if t.join.variants(s, q).next().is_some() {
                         return false;
                     }
-                    let wait = if *asks == 0 { TAP_SEQ_WAIT } else { TAP_REASK };
+                    // Keyed (R15): a first ask at TAP_SEQ_WAIT mostly finds the packet still in
+                    // a box's open frame; waiting TAP_REASK about halved the asks.
+                    let first = if keys.is_some() {
+                        TAP_REASK
+                    } else {
+                        TAP_SEQ_WAIT
+                    };
+                    let wait = if *asks == 0 { first } else { TAP_REASK };
                     if now.duration_since(*at) >= wait {
                         let f = vyrn_data::frame::Fetch::Key {
                             session: s,
                             pkt_seq: q,
                         };
-                        let f = f.encode();
                         let peer = asks
                             .checked_sub(1)
                             .and_then(|i| i.checked_rem(peers.len()))
                             .and_then(|i| peers.get(i));
-                        for a in fetch.iter().chain([to]).chain(peer) {
-                            let _ = sock.send_to(&f, a);
+                        let seq_key = keys.as_ref().map(|(k, _)| &k.seq);
+                        let boxes = fetch.iter().zip(0u8..).map(|(a, s)| (a, box_key(s)));
+                        for (a, key) in boxes.chain([(to, seq_key)]) {
+                            send(&f, key, a);
+                        }
+                        // Peers serve plain fetches only (R19); keyed runs pass none.
+                        if let Some(a) = peer {
+                            let _ = sock.send_to(&f.encode(), a);
                         }
                         t.seq_asked += 1;
                         *at = now;
@@ -1236,7 +1280,8 @@ fn tap(
 }
 
 /// A UDP relay to `127.0.0.1:port` that drops the datagrams `drop` picks by their 1-based
-/// count and bytes, until `stop`: `--keyed` (R7) drops every `LOSS_EVERY`-th,
+/// count and bytes, until `stop`: `--keyed` (R7) drops every `LOSS_EVERY`-th that is a DATA
+/// frame with packets,
 /// `--drop-path-b`/`--drop-path-a` (R12, R14) one, and `--drop-rtx` also every retransmit.
 /// `port` may be set after the relay starts (0 drops), so a node's config can name the relay
 /// before the node has bound its own port. Returns its address and, on join, how many it
@@ -1245,6 +1290,7 @@ fn relay(
     port: Arc<std::sync::atomic::AtomicU16>,
     drop: fn(u64, u64, &[u8]) -> bool,
     arg: u64,
+    refill: Option<Arc<AtomicU64>>,
     stop: Arc<AtomicBool>,
 ) -> Result<(SocketAddr, std::thread::JoinHandle<u64>), String> {
     let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
@@ -1253,6 +1299,14 @@ fn relay(
     let addr = sock.local_addr().map_err(|e| e.to_string())?;
     let h = std::thread::spawn(move || {
         let (mut n, mut dropped) = (0u64, 0u64);
+        // With `refill`: the (src, data_seq) of each DATA frame dropped, still unrefilled.
+        let mut holes = BTreeSet::new();
+        let data_key = |b: &[u8]| {
+            vyrn_data::frame::decode(b)
+                .ok()
+                .filter(|f| f.hdr.kind == vyrn_data::frame::Kind::Data)
+                .map(|f| (f.hdr.src, f.hdr.data_seq))
+        };
         let mut buf = [0u8; 65536];
         while !stop.load(Ordering::Acquire) {
             if let Ok(k) = sock.recv(&mut buf) {
@@ -1261,7 +1315,15 @@ fn relay(
                 let to = port.load(Ordering::Acquire);
                 if to == 0 || drop(n, arg, b) {
                     dropped += 1;
+                    if refill.is_some() {
+                        holes.extend(data_key(b));
+                    }
                 } else {
+                    if let Some(r) = &refill
+                        && data_key(b).is_some_and(|q| holes.remove(&q))
+                    {
+                        r.fetch_add(1, Ordering::Relaxed);
+                    }
                     let _ = sock.send_to(b, ("127.0.0.1", to));
                 }
             }
@@ -1830,8 +1892,12 @@ fn run(cli: &Cli) -> Result<bool, String> {
     if cli.drop_path_b.is_some_and(|n| n == 0) || (cli.drop_path_b.is_some() && !cli.dropcopy) {
         return Err("--drop-path-b needs --dropcopy and N >= 1".into());
     }
-    if cli.tap_loss.is_some_and(|n| n < 2) || (cli.tap_loss.is_some() && (!cli.data || cli.keyed)) {
-        return Err("--tap-loss needs --data, no --keyed, and N >= 2 (R14)".into());
+    // --data-kill: a gap of the killed box's `data_seq` can never be RANGE-repaired, so
+    // `data` would fail on it though KEY fetches recovered its packets (CodeRabbit).
+    if cli.tap_loss.is_some_and(|n| n < 2)
+        || (cli.tap_loss.is_some() && (!cli.data || cli.data_kill))
+    {
+        return Err("--tap-loss needs --data, no --data-kill, and N >= 2 (R14)".into());
     }
     if cli.tap_order_loss.is_some_and(|n| n < 2) || (cli.tap_order_loss.is_some() && !cli.finality)
     {
@@ -1927,6 +1993,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let mut nodes = Nodes(Vec::new());
     let timeout = Some(Duration::from_millis(50));
     let stop_tap = Arc::new(AtomicBool::new(false));
+    // --keyed: set once R11 moved every box to epoch 1, so the tap may seal its fetches.
+    let tap_armed = Arc::new(AtomicBool::new(false));
     // With --data, each validator's data port (07 §5.4), picked before vyrn-data starts and
     // outside the ephemeral range, so no node's port-0 bind can take it meanwhile.
     // With --finality also each validator's TCP repl port and the box's CTRL port, from the
@@ -1981,6 +2049,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // tap's data socket and every validator's data port (07 §5.1, §5.2). It starts first, so
     // the validators' configs can name its fetch address; their data ports are picked here.
     let mut relay_h = None;
+    // R7: dropped DATA frames the box resent to validator 0's relay, which only validator 0's
+    // RANGE fetch causes (the tap's resends go to the tap's own address).
+    let v0_refilled = Arc::new(AtomicU64::new(0));
     let mut tap_relay_h = None;
     let mut tap_sent: Option<std::sync::mpsc::Sender<Sent>> = None;
     let data_node = if cli.data {
@@ -1994,6 +2065,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 Arc::new(std::sync::atomic::AtomicU16::new(port)),
                 |n, every, _| n.is_multiple_of(every),
                 every,
+                None,
                 Arc::clone(&stop_tap),
             )?;
             *d = addr.to_string();
@@ -2006,8 +2078,17 @@ fn run(cli: &Cli) -> Result<bool, String> {
         {
             let (addr, h) = relay(
                 Arc::new(std::sync::atomic::AtomicU16::new(p)),
-                |n, every, _| n.is_multiple_of(every),
+                // Only DATA frames that carry packets: a dropped heartbeat needs no
+                // repair, so it could not show validator 0 repaired (CodeRabbit r4647795753).
+                |n, every, b| {
+                    n.is_multiple_of(every)
+                        && vyrn_data::frame::decode(b).is_ok_and(|f| {
+                            f.hdr.kind == vyrn_data::frame::Kind::Data
+                                && f.packets().next().is_some()
+                        })
+                },
                 LOSS_EVERY,
+                Some(Arc::clone(&v0_refilled)),
                 Arc::clone(&stop_tap),
             )?;
             *d = addr.to_string();
@@ -2046,33 +2127,32 @@ fn run(cli: &Cli) -> Result<bool, String> {
         }
         // Read from now on: the node heartbeats every destination while the validators start,
         // and an unread socket would overflow and drop the first DATA frames.
-        // R14: unkeyed boxes take the tap's plain RANGE fetches; a keyed box would count them
-        // in fetch_unauth (R7, R11), so under --keyed a tap gap is not repaired.
-        let fetch = if cli.keyed {
+        // R14: the boxes take the tap's RANGE fetches, plain, or under --keyed sealed with
+        // validator 0's key, whose IPv4 the tap shares (R7).
+        let fetch = boxes.iter().map(|b| b.fetch).collect();
+        let n = u8::try_from(boxes.len()).map_err(|e| e.to_string())?;
+        // R19: the vyrn-seq box serves the tap's KEY fetches (source 3), sealed under --keyed (R8).
+        let seq = seq_repair.map(|p| {
+            let (tx, rx) = channel();
+            tap_sent = Some(tx);
+            (SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, p), rx)
+        });
+        // R19: the validators' data ports serve the tap's plain KEY fetches as a peer's (source
+        // 2); keyed ones would not, so under --keyed none are asked.
+        let peers = if cli.keyed {
             Vec::new()
         } else {
-            boxes.iter().map(|b| b.fetch).collect()
+            val_data
+                .iter()
+                .map(|&p| SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, p))
+                .collect()
         };
-        let n = u8::try_from(boxes.len()).map_err(|e| e.to_string())?;
-        // R19: an unkeyed vyrn-seq box serves the tap's plain KEY fetches (source 3); a keyed
-        // one (R8) would count them in repair_bad, so under --keyed the tap does not ask it.
-        let seq = match (cli.keyed, seq_repair) {
-            (false, Some(p)) => {
-                let (tx, rx) = channel();
-                tap_sent = Some(tx);
-                Some((SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, p), rx))
-            }
-            _ => None,
-        };
-        // R19: the validators' data ports serve the tap's plain KEY fetches as a peer's (source
-        // 2); keyed ones would not, so under --keyed seq is None and none are asked.
-        let peers = val_data
-            .iter()
-            .map(|&p| SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, p))
-            .collect();
+        let keys = keyed
+            .and_then(|c| c.tap_fetch_keys.clone())
+            .map(|k| (k, Arc::clone(&tap_armed)));
         Some((
             boxes,
-            data_tap(sock, n, fetch, seq, peers, Arc::clone(&stop_tap)),
+            data_tap(sock, n, fetch, seq, peers, keys, Arc::clone(&stop_tap)),
         ))
     } else {
         None
@@ -2094,7 +2174,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
         } else {
             |n, k, _| n == k
         };
-        let (addr, h) = relay(Arc::clone(&port), drop, k, Arc::clone(&stop_relay))?;
+        let (addr, h) = relay(Arc::clone(&port), drop, k, None, Arc::clone(&stop_relay))?;
         Ok(Some((addr, port, h)))
     };
     let relay_a = relay_for(cli.drop_path_a, false)?;
@@ -2227,6 +2307,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
             Arc::new(std::sync::atomic::AtomicU16::new(tap_port)),
             |n, every, _| n.is_multiple_of(every),
             every,
+            None,
             Arc::clone(&stop_tap),
         )?),
         None => None,
@@ -2329,7 +2410,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let epoch_step = match (cli.keyed, data_boxes.is_empty(), vals.first()) {
         (true, false, Some(&v)) => {
             let bs: Vec<usize> = data_boxes.iter().map(|b| b.idx).chain([seq]).collect();
-            Some(rotate_epoch(&mut nodes, &rx, v, &bs, 1, wait))
+            let step = rotate_epoch(&mut nodes, &rx, v, &bs, 1, wait);
+            tap_armed.store(step.is_ok(), Ordering::Release);
+            Some(step)
         }
         _ => None,
     };
@@ -3547,9 +3630,20 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     .iter()
                     .filter_map(|k| field(&st, k)?.parse::<u64>().ok())
                     .sum();
-                if dropped == 0 || served == 0 {
+                // The tap's sealed fetches share validator 0's IPv4, so `served` counts them
+                // too (CodeRabbit r4647746776). Validator 0's own evidence: a frame the relay
+                // dropped came back to its relay, which only its RANGE fetch causes, even when
+                // the backup sent the same packets (R13); and it readied every block the box
+                // closed, unstopped (r4647830874).
+                let refilled = v0_refilled.load(Ordering::Relaxed);
+                let v0 = vals.first().and_then(|&i| nodes.0.get(i));
+                let v0_blocks = v0.map_or(0, |n| blocks(n).len());
+                let v0_whole = v0.is_some_and(|n| stopped(n).is_none())
+                    && v0_blocks == seq_blocks.len();
+                if dropped == 0 || served == 0 || refilled == 0 || !v0_whole {
                     errs.push(format!(
-                        "--keyed: the relay dropped {dropped} frames and the box served {served} sealed fetches; both must be > 0"
+                        "--keyed: the relay dropped {dropped} frames and saw {refilled} of them resent, the box served {served} sealed fetches, and validator-0 readied {v0_blocks} of {} blocks unstopped; all must be > 0 and complete",
+                        seq_blocks.len()
                     ));
                 }
             }
@@ -3737,6 +3831,8 @@ fn vote_seed(i: usize) -> [u8; 32] {
 struct Cons {
     /// `--keyed` (R8): validator 0's key to the primary `vyrn-seq` box.
     seq_fetch_key: Option<([u8; 16], [u8; 16])>,
+    /// `--keyed`: the keys the tap seals its fetches with (R14, R19).
+    tap_fetch_keys: Option<TapKeys>,
     roster: PathBuf,
     roster_hash: String,
     ctrl: SocketAddrV4,
@@ -3855,8 +3951,27 @@ impl Cons {
             )
         };
         let seq_fetch_key = keyed.then(|| Some((seq_key(0)?, seq_key(1)?))).flatten();
+        // R14, R19 under --keyed: the tap shares validator 0's IPv4, so it seals its fetches
+        // with validator 0's epoch-1 `K_fetch` of each data box and of the `vyrn-seq` box.
+        let tap_fetch_keys = seq_fetch_key.and_then(|(_, seq1)| {
+            let boxes = (0..u8::try_from(boxes).ok()?)
+                .map(|d| {
+                    r.requester_fetch_key(
+                        vyrn_epoch::FETCH_CONTEXT,
+                        &domain,
+                        Epoch(1),
+                        vyrn_types::HomeCode::Ldn,
+                        0,
+                        d,
+                        &XCHG_SEED,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(TapKeys { boxes, seq: seq1 })
+        });
         Ok(Self {
             seq_fetch_key,
+            tap_fetch_keys,
             roster,
             roster_hash: hex(&r.hash(&domain).0),
             ctrl: SocketAddrV4::new(
