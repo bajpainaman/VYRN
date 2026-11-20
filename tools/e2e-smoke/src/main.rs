@@ -75,8 +75,11 @@
 //!   `XCHG_SEED`'s, the box's `BOX_XCHG`'s. The other voters and the `vyrn-seq` entries get
 //!   all-zero (low-order) keys, so they get no key: on one host every requester shares
 //!   127.0.0.1, and the box refuses two keyed requesters on one IPv4. A relay drops every
-//!   `LOSS_EVERY`-th datagram the box sends validator 0, so its RANGE and KEY fetches must be
-//!   served (`STATS` `fetch_ring_hit + fetch_log_hit + fetch_resent > 0`) for it to keep up.
+//!   `LOSS_EVERY`-th datagram the box sends validator 0 when it is a DATA frame carrying
+//!   packets, so validator 0 must repair to keep up: the box must have served sealed fetches
+//!   (`STATS` `fetch_ring_hit + fetch_log_hit + fetch_resent > 0`), and validator 0 must have
+//!   readied every block the box closed, unstopped, since the tap's fetches share its IPv4 and
+//!   count in `STATS` too.
 //! - R8. `--keyed` also keys the primary `vyrn-seq` box (`SEQ_XCHG`, repl_addr 127.0.0.2) and
 //!   gives its `[repair]` `xchg`: with the box still up, `seq-repair` sends a plain KEY fetch of
 //!   the last packets sent, one sealed under validator 0's `K_fetch(0, 0, SEQ_TARGET)` and one
@@ -1276,7 +1279,8 @@ fn tap(
 }
 
 /// A UDP relay to `127.0.0.1:port` that drops the datagrams `drop` picks by their 1-based
-/// count and bytes, until `stop`: `--keyed` (R7) drops every `LOSS_EVERY`-th,
+/// count and bytes, until `stop`: `--keyed` (R7) drops every `LOSS_EVERY`-th that is a DATA
+/// frame with packets,
 /// `--drop-path-b`/`--drop-path-a` (R12, R14) one, and `--drop-rtx` also every retransmit.
 /// `port` may be set after the relay starts (0 drops), so a node's config can name the relay
 /// before the node has bound its own port. Returns its address and, on join, how many it
@@ -2052,7 +2056,15 @@ fn run(cli: &Cli) -> Result<bool, String> {
         {
             let (addr, h) = relay(
                 Arc::new(std::sync::atomic::AtomicU16::new(p)),
-                |n, every, _| n.is_multiple_of(every),
+                // Only DATA frames that carry packets: a dropped heartbeat needs no
+                // repair, so it could not show validator 0 repaired (CodeRabbit r4647795753).
+                |n, every, b| {
+                    n.is_multiple_of(every)
+                        && vyrn_data::frame::decode(b).is_ok_and(|f| {
+                            f.hdr.kind == vyrn_data::frame::Kind::Data
+                                && f.packets().next().is_some()
+                        })
+                },
                 LOSS_EVERY,
                 Arc::clone(&stop_tap),
             )?;
