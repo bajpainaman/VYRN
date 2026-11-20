@@ -234,6 +234,13 @@ fn tip_at(p: &Proposal, last: &BlockHeader) -> Tip {
 }
 
 impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
+    /// The `seq_key` of the headers above `parent` ([`BlockSource::seq_key_after`]).
+    fn key_after(&self, parent: Height) -> PubKey {
+        self.source
+            .seq_key_after(self.epoch, parent)
+            .unwrap_or(self.seq_key)
+    }
+
     fn accept(&self, view: u64, digest: Digest, entry: Entry) {
         let mut k = lock(&self.known);
         k.tips.insert(digest, entry);
@@ -252,7 +259,7 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
             let run = chain_after(
                 &self.source,
                 self.epoch,
-                &self.seq_key,
+                &self.key_after(parent.height),
                 parent,
                 max,
                 &self.sigs,
@@ -338,7 +345,7 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
             let walk = chain_after(
                 &self.source,
                 self.epoch,
-                &self.seq_key,
+                &self.key_after(low.height),
                 *low,
                 RECOVER_HEIGHTS,
                 &self.sigs,
@@ -384,7 +391,7 @@ impl<E: Clock + Spawner, S: BlockSource> App<E, S> {
         let run = chain_after(
             &self.source,
             self.epoch,
-            &self.seq_key,
+            &self.key_after(parent.height),
             parent,
             max,
             &self.sigs,
@@ -436,8 +443,14 @@ where
                         // none (07 §9.4). Never a kind-0 range.
                         return;
                     }
-                    let run =
-                        chain_after(&app.source, app.epoch, &app.seq_key, parent, max, &app.sigs);
+                    let run = chain_after(
+                        &app.source,
+                        app.epoch,
+                        &app.key_after(parent.height),
+                        parent,
+                        max,
+                        &app.sigs,
+                    );
                     if let Some(last) = run.last() {
                         let p = proposal_for(&app.source, app.epoch, parent, last);
                         match app

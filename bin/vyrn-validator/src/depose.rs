@@ -132,7 +132,12 @@ pub struct OrderSide {
     pub was_frozen: bool,
     /// Its TailReport went to the consensus thread in this failover.
     pub reported: bool,
-    pub sealed: bool,
+    /// The decided prefix and `next_seq`, once taken (07 §9.3).
+    pub decision: Option<(Prefix, u8)>,
+    /// The candidate seal's `unavail` length; `None` before one is built, or after `NO_SEAL`.
+    /// While it is above zero, a payload that arrives later rebuilds the candidate (Codex
+    /// r4618710713), so voters that held different payloads at the decision converge.
+    pub unavail: Option<usize>,
     /// ORDER datagrams drained unread since deposition (INV-REP-5).
     pub dropped: u64,
 }
@@ -303,10 +308,19 @@ impl Tally {
     /// A peer's `Silence` from the tail channel. Only this voter's epoch and tenure count (a
     /// signed report of another tenure is refused, never adopted); a standby's report counts
     /// toward the prefix, never toward Q (07 §9.1). A repeat refreshes its arrival time.
-    pub fn on_silence(&mut self, bytes: &[u8]) -> Result<(), String> {
+    /// `from` is the reporter index (voter, or `n + j` for `seq_order[j]`) whose p2p key
+    /// authenticated the connection the report arrived on (Codex r4618710697): a report counts
+    /// only from its own signer, so a peer cannot replay another's old Silence as fresh.
+    pub fn on_silence(&mut self, from: u8, bytes: &[u8]) -> Result<(), String> {
         let s = Silence::decode(bytes).map_err(|e| e.to_string())?;
         s.verify(&self.committee, &self.seq_order)
             .map_err(|e| e.to_string())?;
+        if s.report.reporter != from {
+            return Err(format!(
+                "reporter {} forwarded by peer {from}",
+                s.report.reporter
+            ));
+        }
         if s.report.epoch != self.epoch || s.report.tenure != self.tenure {
             return Err("another epoch or tenure".into());
         }
@@ -351,13 +365,22 @@ impl Tally {
             ));
         }
         if self.deposed && !self.decided {
-            let reports: Vec<TailReport> = self.reports.values().map(|(_, r)| r.clone()).collect();
-            let all = reports.len() >= self.committee.n();
+            let n = self.committee.n();
+            // The voters' reports decide the prefix and when it is due; the standby's (reporter
+            // `n + j`) only whether it is promotable (07 §9.3, §9.5).
+            let voters: Vec<TailReport> = self
+                .reports
+                .range(..u8::try_from(n).unwrap_or(u8::MAX))
+                .map(|(_, (_, r))| r.clone())
+                .collect();
+            let all = voters.len() >= n;
             // Never without this voter's own tail (07 §9.2 waits for every report).
-            let due = all || tail_deadline(&reports).is_some_and(|d| now_real_ns >= d);
+            let due = all || tail_deadline(&voters).is_some_and(|d| now_real_ns >= d);
             if due && self.own_in {
-                let p = prefix(&reports)?;
-                // seq_order[0] is the deposed one; no standby report yet, so none is promotable.
+                let p = prefix(&voters)?;
+                let reports: Vec<TailReport> =
+                    self.reports.values().map(|(_, r)| r.clone()).collect();
+                // seq_order[0] is the deposed one.
                 let next = next_seq(&self.committee, self.seq_order.len(), 0, &[0], &reports);
                 self.decided = true;
                 shared.st().decided = Some((p, next));
@@ -470,11 +493,46 @@ mod tests {
             .map(|i| vyrn_crypto::ed25519::public_key(&seed(i)))
             .collect();
         let seq = vyrn_crypto::ed25519::public_key(&[0x99; 32]);
+        let standby = vyrn_crypto::ed25519::public_key(&STANDBY);
         let c = Committee::new(vyrn_types::Mode::Base, keys, &[seq]).unwrap();
         (
-            Tally::new(c, vec![seq], Epoch(0), 0, 0, abort_us),
+            Tally::new(c, vec![seq, standby], Epoch(0), 0, 0, abort_us),
             Shared::default(),
         )
+    }
+
+    const STANDBY: [u8; 32] = [0x98; 32];
+
+    /// 07 §9.5: the standby (reporter `n + 1`) is never one of Q, and its promotable report
+    /// makes it `next_seq`.
+    #[test]
+    fn the_standby_names_next_seq_but_is_not_one_of_q() {
+        let (mut t, sh) = tally(1_000_000);
+        // As `vyrn-seq`'s standby sends it: no frames, promotable.
+        let r = TailReport {
+            epoch: Epoch(0),
+            tenure: 0,
+            reporter: 5,
+            held_height: Height(0),
+            tails: [Tail::default(), Tail::default()],
+            t_last_rx: 0,
+            replay_lag_us: 0,
+            promotable: true,
+        };
+        let sb = Silence::sign(0, Reason::Silence, r, &STANDBY).encode();
+        t.on_silence(5, &sb).unwrap();
+        // A voter cannot forward it either.
+        assert!(t.on_silence(1, &sb).is_err());
+        t.on_silence(1, &silence(1, 0)).unwrap();
+        t.on_silence(2, &silence(2, 0)).unwrap();
+        assert_eq!(t.poll(&sh, 0), None, "two voters and the standby are not Q");
+        t.on_silence(3, &silence(3, 0)).unwrap();
+        assert!(t.poll(&sh, 0).unwrap().starts_with("DEPOSED"));
+        sh.publish(Some(report(&tail(12), Epoch(0), 0, 0, 2)));
+        assert!(t.own(&sh, &seed(0)).is_some());
+        let line = t.poll(&sh, u64::MAX).unwrap();
+        assert!(line.contains("next_seq=1"), "{line}");
+        assert_eq!(sh.take_decision().map(|d| d.1), Some(1));
     }
 
     fn silence(from: u8, tenure: u8) -> Vec<u8> {
@@ -489,15 +547,30 @@ mod tests {
     #[allow(clippy::disallowed_methods)]
     fn stale_silence_does_not_add_up_to_a_quorum() {
         let (mut t, sh) = tally(20_000);
-        t.on_silence(&silence(1, 0)).unwrap();
-        t.on_silence(&silence(2, 0)).unwrap();
+        t.on_silence(1, &silence(1, 0)).unwrap();
+        t.on_silence(2, &silence(2, 0)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(40));
-        t.on_silence(&silence(3, 0)).unwrap();
+        t.on_silence(3, &silence(3, 0)).unwrap();
         assert_eq!(t.poll(&sh, 0), None);
         assert_eq!(sh.phase(), Phase::Live);
         // The two repeat theirs (a frozen voter does every 2 ms): now Q are fresh.
-        t.on_silence(&silence(1, 0)).unwrap();
-        t.on_silence(&silence(2, 0)).unwrap();
+        t.on_silence(1, &silence(1, 0)).unwrap();
+        t.on_silence(2, &silence(2, 0)).unwrap();
+        assert!(t.poll(&sh, 0).unwrap().starts_with("DEPOSED"));
+    }
+
+    /// Codex r4618710697: a voter's valid signed Silence that another peer forwards (a replay)
+    /// is refused and does not count toward Q.
+    #[test]
+    fn a_forwarded_silence_does_not_count() {
+        let (mut t, sh) = tally(1_000_000);
+        t.on_silence(1, &silence(1, 0)).unwrap();
+        assert!(t.on_silence(1, &silence(2, 0)).is_err());
+        assert!(t.on_silence(1, &silence(3, 0)).is_err());
+        assert_eq!(t.poll(&sh, 0), None);
+        assert_eq!(sh.phase(), Phase::Live);
+        t.on_silence(2, &silence(2, 0)).unwrap();
+        t.on_silence(3, &silence(3, 0)).unwrap();
         assert!(t.poll(&sh, 0).unwrap().starts_with("DEPOSED"));
     }
 
@@ -506,9 +579,9 @@ mod tests {
     #[test]
     fn a_report_of_another_tenure_pins_nothing() {
         let (mut t, sh) = tally(1_000_000);
-        assert!(t.on_silence(&silence(1, 5)).is_err());
+        assert!(t.on_silence(1, &silence(1, 5)).is_err());
         for v in 1..=3 {
-            t.on_silence(&silence(v, 0)).unwrap();
+            t.on_silence(v, &silence(v, 0)).unwrap();
         }
         assert!(t.poll(&sh, 0).unwrap().starts_with("DEPOSED"));
     }
@@ -519,7 +592,7 @@ mod tests {
     fn a_voter_deposed_by_its_peers_waits_for_its_own_tail() {
         let (mut t, sh) = tally(1_000_000);
         for v in 1..=3 {
-            t.on_silence(&silence(v, 0)).unwrap();
+            t.on_silence(v, &silence(v, 0)).unwrap();
         }
         assert!(t.poll(&sh, u64::MAX).unwrap().starts_with("DEPOSED"));
         assert_eq!(t.poll(&sh, u64::MAX), None);

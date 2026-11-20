@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use vyrn_bbo::{ControlCmd, Phase};
 use vyrn_consensus::ctrl::{self, Ctrl};
-use vyrn_consensus::{Gate, GateAction, Listener};
+use vyrn_consensus::{FinalityCert, Gate, GateAction, Listener};
 use vyrn_epoch::{Domain, EpoConfig, Membership};
 use vyrn_types::{Epoch, Hash, Height, HomeCode, Mode, Nanos, PubKey, Tick};
 
@@ -81,8 +81,9 @@ pub struct Finality {
 }
 
 impl Finality {
-    /// Binds the CTRL port and starts the thread. `closed` is the number of blocks the stream
-    /// thread has closed (heights start at 0).
+    /// Binds the CTRL port and starts the thread. `closed` is the tenure's first height plus the
+    /// blocks the stream thread has closed: one past the highest closed height.
+    #[allow(clippy::too_many_arguments)] // one channel per consumer of the listener
     pub fn start(
         c: &Consensus,
         home: HomeCode,
@@ -91,28 +92,9 @@ impl Finality {
         closed: Arc<dyn Fn() -> u64 + Send + Sync>,
         stop: Arc<AtomicBool>,
         nacks: std::sync::mpsc::SyncSender<crate::rtx::Req>,
+        seals: Option<std::sync::mpsc::Sender<FinalityCert>>,
     ) -> Result<Self, String> {
-        let bytes = roster_bytes(&c.roster)?;
-        let n = u8::try_from(Mode::Base.n()).unwrap_or(u8::MAX);
-        let cfg = EpoConfig {
-            epoch,
-            home,
-            t_start: Nanos(0),
-            roster_hash: Hash(hex::<32>(&c.roster_hash)?),
-            seq_order: c.seq_order.unwrap_or([n, n + 1]),
-            lane_map_hash: [Hash([0; 32]); 3],
-            n_lanes: [0; 3],
-            version: 0,
-            endpoint_hash: Hash([0; 32]),
-            flags: 0,
-            sig_scheme: 0,
-        };
-        let domain = Domain {
-            genesis_hash: Hash(hex::<32>(&c.genesis_hash)?),
-            mode: Mode::Base,
-        };
-        let (m, _) = Membership::from_roster(&cfg, &bytes, &domain, None)
-            .map_err(|e| format!("config consensus.roster: {e}"))?;
+        let (m, _) = membership(c, home, epoch)?;
         if !m.seq().iter().any(|b| b.seq_key == seq_key) {
             return Err("keys.seq is not the roster's primary or standby seq_key".into());
         }
@@ -134,6 +116,7 @@ impl Finality {
                         &stop,
                         &counts,
                         &nacks,
+                        seals.as_ref(),
                     );
                 })
                 .map_err(|e| e.to_string())?
@@ -158,6 +141,36 @@ impl Finality {
     }
 }
 
+/// The roster's membership for this box's home and epoch, with the DEV `EpoConfig` (module
+/// docs), and the roster itself.
+pub fn membership(
+    c: &Consensus,
+    home: HomeCode,
+    epoch: Epoch,
+) -> Result<(Membership, vyrn_epoch::Roster), String> {
+    let bytes = roster_bytes(&c.roster)?;
+    let n = u8::try_from(Mode::Base.n()).unwrap_or(u8::MAX);
+    let cfg = EpoConfig {
+        epoch,
+        home,
+        t_start: Nanos(0),
+        roster_hash: Hash(hex::<32>(&c.roster_hash)?),
+        seq_order: c.seq_order.unwrap_or([n, n + 1]),
+        lane_map_hash: [Hash([0; 32]); 3],
+        n_lanes: [0; 3],
+        version: 0,
+        endpoint_hash: Hash([0; 32]),
+        flags: 0,
+        sig_scheme: 0,
+    };
+    let domain = Domain {
+        genesis_hash: Hash(hex::<32>(&c.genesis_hash)?),
+        mode: Mode::Base,
+    };
+    Membership::from_roster(&cfg, &bytes, &domain, None)
+        .map_err(|e| format!("config consensus.roster: {e}"))
+}
+
 fn listen(
     sock: &UdpSocket,
     mut l: Listener,
@@ -165,6 +178,7 @@ fn listen(
     stop: &AtomicBool,
     counts: &Counts,
     nacks: &std::sync::mpsc::SyncSender<crate::rtx::Req>,
+    seals: Option<&std::sync::mpsc::Sender<FinalityCert>>,
 ) {
     let mut buf = [0u8; 9216];
     let mut gate = Gate::default();
@@ -188,9 +202,23 @@ fn listen(
                 let from = match ctrl::decode(buf.get(..n).unwrap_or(&[])) {
                     Ok(Ctrl::Vote(v)) => {
                         counts.votes.fetch_add(1, Ordering::Relaxed);
-                        l.on_vote(&v).map(|c| c.map(|c| (c.view, "votes")))
+                        l.on_vote(&v).map(|c| {
+                            c.map(|c| {
+                                // Codex r4619319221: a seal finalized by Q votes counts too.
+                                if let Some(tx) = seals.filter(|_| c.seal.is_some()) {
+                                    let _ = tx.send(c.clone());
+                                }
+                                (c.view, "votes")
+                            })
+                        })
                     }
-                    Ok(Ctrl::Cert(c)) => l.on_cert(&c).map(|()| Some((c.view, "cert"))),
+                    Ok(Ctrl::Cert(c)) => l.on_cert(&c).map(|()| {
+                        // A verified seal certificate, for a standby (`standby.rs`).
+                        if let Some(tx) = seals.filter(|_| c.seal.is_some()) {
+                            let _ = tx.send(c.clone());
+                        }
+                        Some((c.view, "cert"))
+                    }),
                     Err(_) => Ok(None),
                 };
                 match from {

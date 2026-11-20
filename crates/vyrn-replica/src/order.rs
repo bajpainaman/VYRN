@@ -225,6 +225,11 @@ impl<const N: usize, V: EpochView> OrderCore<N, V> {
         })
     }
 
+    /// The layout this core decodes.
+    pub const fn layout(&self) -> Layout {
+        self.layout
+    }
+
     /// The epoch view, to update in place: an epoch's own fence certifies after its order
     /// core has started (`ActiveEpoch::set_fence`), and the next `verdict` sees it.
     pub fn view_mut(&mut self) -> &mut V {

@@ -38,6 +38,17 @@ pub struct Config {
     /// Optional: the finality listener (`finality.rs`).
     #[serde(default)]
     pub consensus: Option<Consensus>,
+    /// Optional, DEV: this box is the standby, `seq_order[1]` (07 §9.5, `standby.rs`).
+    #[serde(default)]
+    pub standby: Option<Standby>,
+}
+
+/// `[standby]`: the box waits as the standby until a seal names it, then sequences tenure 1.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Standby {
+    /// Where it listens on the voters' commonware-p2p network: its roster `repl_addr`.
+    pub repl: std::net::SocketAddr,
 }
 
 /// `SeqDataReq` service (07 §5.5 source 3, `repair.rs`). Omitted: the box retains nothing.
@@ -204,6 +215,14 @@ pub struct DevSession {
     pub k_out: String,
     pub quote: u64,
     pub base: u64,
+    /// The session id's generation (default 1). DEV: a promoted standby opens the next one,
+    /// so its sessions start at `pkt_seq` 1 (07 §9.5 reading, no resend dedupe yet).
+    #[serde(default = "d_generation")]
+    pub generation: u16,
+}
+
+fn d_generation() -> u16 {
+    1
 }
 
 pub fn hex<const N: usize>(s: &str) -> Result<[u8; N], String> {
@@ -265,6 +284,12 @@ impl Config {
         }
         if self.cores.pin && (self.cores.engine.is_none() || self.cores.stream.is_none()) {
             return bad("cores.pin", "needs both cores.engine and cores.stream");
+        }
+        if self.standby.is_some() && self.consensus.is_none() {
+            return bad(
+                "standby",
+                "needs [consensus]: the seal reaches it as a finality certificate",
+            );
         }
         if !matches!(self.cores.seal.as_str(), "abort" | "count" | "off") {
             return bad("cores.seal", "must be abort, count or off");

@@ -5,7 +5,7 @@
 //! **Invocation.** `e2e-smoke [--bin-dir DIR] [--validators K] [--packets P] [--rate R]
 //! [--seed S] [--wait-s T] [--seq-cpus L] [--validator-cpus L] [--strict-hashlag] [--finality]
 //! [--data] [--dropcopy] [--two-path] [--drop-path-b N] [--keyed] [--data-shards N] [--data-kill]
-//! [--kill-voter] [--restart-voter] [--restart-immediate] [--restart-hashlag-us US]`. `DIR` holds `vyrn-seq`, `vyrn-validator`, (with `--data`) `vyrn-data` and (with
+//! [--kill-voter] [--restart-voter] [--restart-immediate] [--restart-hashlag-us US] [--kill-seq]`. `DIR` holds `vyrn-seq`, `vyrn-validator`, (with `--data`) `vyrn-data` and (with
 //! `--dropcopy`) `vyrn-dropcopy` (default: this binary's directory). Exit 0 when every enabled check passes, 1 when one fails,
 //! 2 when the run could not start. Every wait has a deadline of `T` seconds (default 30): the
 //! harness never blocks on a child, a socket or a pipe without one, and kills every child it
@@ -36,6 +36,7 @@
 //! | `failover` | with `--data-kill` (R13): the home data box is killed mid-run, the validators reach Q `DataDown`s and REDIRECT, the backup admits a sealed one and redirects every session, and every session moves copy 2; SKIP without it |
 //! | `voter-restart` | with `--restart-voter` (R17): the killed victim restarts from its own config and journal without `--fresh` (no `FRESH_JOURNAL` line), and no node reports a `VOTER_FAULT` naming its voter index (unproven: no injected equivocation, R17). `validators`, `replica-out` and `finality` hold it, as `validator-<n−1>r`, to every block and `FINAL` through the end; SKIP without it |
 //! | `voter-kill` | with `--kill-voter` (R16): at half the packets, once it has finalized a height, the last validator is killed; its blocks were the box's, and the box finalizes through the block holding the first packet sent after the victim was reaped (cut after it died), with the `n − 1` left. `finality` then needs the box and every running validator through the last block, with Q of the whole committee; SKIP without it |
+//! | `seq-failover` | with `--kill-seq` (R20): a standby `vyrn-seq` waits; at half the packets the primary is killed; every validator deposes it, the seal finalizes with `next_seq = 1` (kind 1, `PROMOTED next_seq=1`) at every validator and at the standby (`SEAL_FINAL ... next_seq=1`), and the standby's tenure 1 starts right above the seal and is `FINAL` at the standby and every validator through its last block, each of its blocks `Valid` at every validator; SKIP without it |
 //! | `data` | with `--data`: the client sends copy 2 of every packet to a `vyrn-data` node (07 §5.1), whose `DATA`/`DATA_HB` frames reach the tap through `vyrn_replica::DataFeed`; the node stores every packet sent (`STATS stored`), `bad_mac`, `events_dropped` and `events_unprinted` are 0 with no `EVENT` line, the feed has no rejected frame and no gap left unrepaired (R14), and that join is the one `replay` reads; SKIP without `--data` |
 //!
 //! **Readings** (the spec does not settle these; PR body):
@@ -208,6 +209,21 @@
 //!   no injected equivocation, so a `VOTER_FAULT` path that never fires would pass it vacuously;
 //!   proving it needs a DEV signing hook in vyrn-validator's voter that signs a second
 //!   `Notarize` for another payload in one view.
+//! - R20. `--kill-seq` (needs `--finality --data`, at least 4 validators; not with `--kill-voter`,
+//!   `--data-kill`, `--dropcopy`, `--keyed` or `--two-path`): sequencer failover with a standby
+//!   (07 §9.1–9.5). The roster's `seq_order[1]` is a second `vyrn-seq` (`STANDBY_SEED`) with
+//!   `[standby]` on a picked repl port, its own CTRL port in every validator's `observers`; every
+//!   validator has both seq keys and DEV `[failover]` timers (`KILL_SEQ_SILENCE_US`, 200 ms, and a
+//!   2 s abort window); the primary heartbeats every 20 ms so an idle stream is not silence. At
+//!   half the packets the harness SIGKILLs the primary, waits for the standby's `READY` (the seal
+//!   finalized and named it), and sends the rest to the standby's lanes. *DEV, labelled:* the
+//!   client is redirected by the harness, not by a `SeqChange` (not wired), and resends nothing;
+//!   a packet the primary took but did not frame before it died is lost to the book. The
+//!   standby's engine starts from its config, not from the prefix (07 §9.5 replays it; follow-up),
+//!   so the replicas stop replaying at the seal (`REPLAY_STOP`): what diverges is (1) the seal
+//!   block's own records, which no replica replays (they come in no `BlockInputs`), and (2) every
+//!   session's `resp_seq`, which restarts in the standby's fresh engine. `seq`, `validators`,
+//!   `replay`, `replica-out` and `finality` are about one box and SKIP; `seq-failover` is the gate.
 //! - R18. The tap repairs its own ORDER holes, as a path-A replica does (07 §4.9, §4.10): with
 //!   `--finality` (the box's CTRL port) its thread runs `vyrn_replica::Paths` (one path) and
 //!   Nacks each hole with R14's DEV timers and 8 tries. Without it the tap keeps arrival order.
@@ -330,6 +346,11 @@ use vyrn_wire::{ReqHeader, Request, Response, encode_request};
 
 const WORKLOAD: &str = include_str!("../wl-smoke.toml");
 const SEQ_SEED: [u8; 32] = [0x42; 32];
+/// `--kill-seq` (R20): the standby `vyrn-seq`'s seed, its validators' DEV silence bound and the
+/// primary's DEV heartbeat.
+const STANDBY_SEED: [u8; 32] = [0x43; 32];
+const KILL_SEQ_SILENCE_US: u64 = 200_000;
+const KILL_SEQ_HEARTBEAT_US: u64 = 20_000;
 /// `--keyed` (R7): validator 0's X25519 secret and the box's.
 const XCHG_SEED: [u8; 32] = [0x5a; 32];
 const BOX_XCHG: [u8; 32] = [0x6b; 32];
@@ -485,6 +506,11 @@ struct Cli {
     /// was leading when it died (R17): its journal is replayed mid-view.
     #[arg(long)]
     restart_immediate: bool,
+    /// Run a standby vyrn-seq and kill the primary at half the packets (R20; needs --finality,
+    /// --data and at least 4 validators): the seal must finalize naming the standby, and its
+    /// tenure must finalize through the end.
+    #[arg(long)]
+    kill_seq: bool,
 }
 
 fn main() -> ExitCode {
@@ -585,6 +611,48 @@ fn workload(cli: &Cli) -> Result<(Vec<Sess>, Vec<Pkt>), String> {
         });
     }
     Ok((sessions.into_values().collect(), pkts))
+}
+
+/// R20: packets `from..` re-addressed to generation 2 of their session, numbered from 1 per
+/// session and re-MACed under the same `K_seq` (DEV): the sessions the standby opens.
+fn to_generation_2(sessions: &[Sess], pkts: &mut [Pkt], from: usize) -> Result<Vec<Sess>, String> {
+    let gen2 = |id: SessionId| {
+        vyrn_wire::session_id(vyrn_wire::session_slot(id), vyrn_wire::session_lane(id), 2)
+            .ok_or("generation 2 session id")
+    };
+    let mut next: BTreeMap<u32, u32> = BTreeMap::new();
+    for p in pkts.iter_mut().skip(from) {
+        let s = sessions
+            .iter()
+            .find(|x| x.id == p.session)
+            .ok_or("packet session")?;
+        let req = Request::parse(&p.bytes).map_err(|e| format!("packet: {e:?}"))?;
+        let msgs = req
+            .msgs()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("message: {e:?}"))?;
+        let id = gen2(p.session)?;
+        let n = next.entry(id.0).or_insert(0);
+        *n += 1;
+        let hdr = ReqHeader::new(id, *n, 0, BookId(BOOK), false);
+        let mut buf = [0u8; vyrn_types::MAX_REQ_PAYLOAD];
+        let len = encode_request(&mut buf, hdr, &msgs, &s.k_seq, None).ok_or("re-encode")?;
+        p.session = id;
+        p.pkt_seq = *n;
+        p.bytes = buf.get(..len).unwrap_or_default().to_vec();
+    }
+    sessions
+        .iter()
+        .map(|x| {
+            Ok(Sess {
+                id: gen2(x.id)?,
+                lane: x.lane,
+                acct: x.acct,
+                k_seq: x.k_seq,
+                k_out: x.k_out,
+            })
+        })
+        .collect()
 }
 
 // ----- child processes -----
@@ -1388,8 +1456,20 @@ impl Report {
     fn skip(name: &str, why: &str) {
         println!("CHECK {name} SKIP {why}");
     }
+    /// [`Report::check`], or SKIP for `why`.
+    fn check_or_skip(&mut self, why: Option<&str>, name: &str, r: Result<String, String>) {
+        match why {
+            Some(w) => Self::skip(name, w),
+            None => self.check(name, r),
+        }
+    }
 }
 
+/// R20: why the one-box checks skip under --kill-seq.
+const R20_SKIP: &str = "--kill-seq: two boxes, two tenures (R20); seq-failover is the gate";
+
+/// The `vyrn-seq` DEV config; with `standby` (R20) the standby's, which has its own CTRL port and
+/// `[standby]`, and no `[repair]`.
 fn seq_config(
     dir: &Path,
     order: &[String],
@@ -1397,6 +1477,7 @@ fn seq_config(
     sessions: &[Sess],
     cons: Option<&Cons>,
     repair: Option<u16>,
+    standby: bool,
 ) -> Result<PathBuf, String> {
     let mut s = format!(
         r#"schema = 1
@@ -1436,31 +1517,51 @@ seq = "env:VYRN_E2E_SEQ_SEED"
     );
     for x in sessions {
         s.push_str(&format!(
-            "\n[[dev_session]]\nlane = {}\nslot = {}\naccount = {}\nk_seq = \"{}\"\nk_out = \"{}\"\nquote = {QUOTE}\nbase = {BASE}\n",
+            "\n[[dev_session]]\nlane = {}\nslot = {}\ngeneration = {}\naccount = {}\nk_seq = \"{}\"\nk_out = \"{}\"\nquote = {QUOTE}\nbase = {BASE}\n",
             x.lane,
             vyrn_wire::session_slot(x.id),
+            vyrn_wire::session_generation(x.id),
             x.acct,
             hex(&x.k_seq),
             hex(&x.k_out)
         ));
     }
+    // R20: the primary heartbeats, so the voters' silence clock reads only a dead box.
+    if !standby && cons.is_some_and(|c| c.standby.is_some()) {
+        s = s.replacen(
+            "block_ms = 5\n",
+            &format!("block_ms = 5\nheartbeat_us = {KILL_SEQ_HEARTBEAT_US}\n"),
+            1,
+        );
+    }
     if let Some(c) = cons {
+        let ctrl = match (standby, c.standby) {
+            (true, Some((_, ctrl))) => ctrl,
+            _ => c.ctrl,
+        };
         s.push_str(&format!(
             "\n[consensus]\nctrl = \"{}\"\nroster = \"{}\"\nroster_hash = \"{}\"\ngenesis_hash = \"{}\"\n",
-            c.ctrl,
+            ctrl,
             c.roster.display(),
             c.roster_hash,
             hex(&[0; 32])
         ));
     }
     // --data: `SeqDataReq` (07 §5.5 source 3) on a picked port the validators' configs name.
-    if let Some(port) = repair {
+    if let (true, Some((repl, _))) = (standby, cons.and_then(|c| c.standby)) {
+        s.push_str(&format!("\n[standby]\nrepl = \"{repl}\"\n"));
+    }
+    if let Some(port) = repair.filter(|_| !standby) {
         s.push_str(&format!("\n[repair]\nport = {port}\n"));
         if cons.is_some_and(|c| c.seq_fetch_key.is_some()) {
             s.push_str("xchg = \"env:VYRN_E2E_SEQ_XCHG\"\n");
         }
     }
-    let p = dir.join("seq.toml");
+    let p = dir.join(if standby {
+        "seq-standby.toml"
+    } else {
+        "seq.toml"
+    });
     std::fs::write(&p, s).map_err(|e| e.to_string())?;
     Ok(p)
 }
@@ -1508,7 +1609,15 @@ fn validator_config(
     silence_us: Option<u64>,
     repair: Option<Rep>,
 ) -> Result<PathBuf, String> {
-    let key = hex(&vyrn_crypto::ed25519::public_key(&SEQ_SEED));
+    let mut key = hex(&vyrn_crypto::ed25519::public_key(&SEQ_SEED));
+    // R20: the standby's key is `seq_keys[1]`, the sender of tenure 1's frames.
+    let standby = cons.and_then(|c| c.standby);
+    if standby.is_some() {
+        key = format!(
+            "{key}\", \"{}",
+            hex(&vyrn_crypto::ed25519::public_key(&STANDBY_SEED))
+        );
+    }
     let data_port = data.and_then(|(_, ps, _)| ps.get(i).copied()).unwrap_or(0);
     // The vote key resolves only with [consensus]; without it the handle is read and unused.
     let vote = if cons.is_some() {
@@ -1523,7 +1632,12 @@ fn validator_config(
     };
     // DEV: a larger hashlag bound, or keyed fetches to peers whose roster keys are unusable
     // (R8: only validator 0 has a real xchg_key), which only a DEV validator sends unsealed.
-    let dev = if hashlag_us.is_some() || keyed || silence_us.is_some() || repair.is_some() {
+    let dev = if hashlag_us.is_some()
+        || keyed
+        || silence_us.is_some()
+        || repair.is_some()
+        || standby.is_some()
+    {
         "dev = true\n"
     } else {
         ""
@@ -1594,6 +1708,7 @@ seq_keys = ["{key}"]
         // Finalize votes and certificates go to the box and, with --dropcopy, the observer.
         let observers = std::iter::once(c.ctrl)
             .chain(c.obs)
+            .chain(c.standby.map(|(_, ctrl)| ctrl))
             .map(|a| format!("\"{a}\""))
             .collect::<Vec<_>>()
             .join(", ");
@@ -1617,6 +1732,12 @@ seq_keys = ["{key}"]
         if let Some(p) = rp.order_b_as {
             s.push_str(&format!("order_b_as = {p}\n"));
         }
+    }
+    // R20: the voter's side of failover, with DEV timers for an unpinned host.
+    if standby.is_some() && observer.is_none() {
+        s.push_str(&format!(
+            "\n[failover]\nsilence_us = {KILL_SEQ_SILENCE_US}\nabort_us = 2000000\n"
+        ));
     }
     let p = dir.join(format!("validator-{i}.toml"));
     std::fs::write(&p, s).map_err(|e| e.to_string())?;
@@ -1749,6 +1870,18 @@ fn run(cli: &Cli) -> Result<bool, String> {
     if cli.restart_voter && (!cli.kill_voter || cli.two_path) {
         return Err("--restart-voter needs --kill-voter and no --two-path (R17)".into());
     }
+    if cli.kill_seq
+        && (!cli.finality
+            || !cli.data
+            || n_val < 4
+            || cli.kill_voter
+            || cli.data_kill
+            || cli.dropcopy
+            || cli.keyed
+            || cli.two_path)
+    {
+        return Err("--kill-seq needs --finality, --data and at least 4 validators, and none of --kill-voter, --data-kill, --dropcopy, --keyed, --two-path (R20)".into());
+    }
     if cli.data_kill && !cli.keyed {
         return Err("--data-kill needs --keyed: the REDIRECTs it checks are sealed (R13)".into());
     }
@@ -1761,7 +1894,25 @@ fn run(cli: &Cli) -> Result<bool, String> {
             .ok_or("binary directory")?
             .to_path_buf(),
     };
-    let (sessions, pkts) = workload(cli)?;
+    let (sessions, mut pkts) = workload(cli)?;
+    // R20: the second half goes to the standby's generation-2 sessions.
+    let sessions2 = if cli.kill_seq {
+        let half = pkts.len() / 2;
+        to_generation_2(&sessions, &mut pkts, half)?
+    } else {
+        Vec::new()
+    };
+    let all_sessions: Vec<Sess> = sessions
+        .iter()
+        .chain(&sessions2)
+        .map(|x| Sess {
+            id: x.id,
+            lane: x.lane,
+            acct: x.acct,
+            k_seq: x.k_seq,
+            k_out: x.k_out,
+        })
+        .collect();
     println!(
         "WORKLOAD packets={} sessions={} seed={} rate={}",
         pkts.len(),
@@ -1784,7 +1935,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // With --dropcopy also the observer's data and CTRL ports and vyrn-dropcopy's TCP port.
     let want = if cli.data { n_val + 1 } else { 0 }
         + if cli.finality { n_val + 1 } else { 0 }
-        + if cli.dropcopy { 3 } else { 0 };
+        + if cli.dropcopy { 3 } else { 0 }
+        + if cli.kill_seq { 2 } else { 0 };
     let mut picked = data_ports(want)?;
     let val_data: Vec<u16> = if cli.data {
         picked.drain(..n_val).collect()
@@ -1802,9 +1954,22 @@ fn run(cli: &Cli) -> Result<bool, String> {
         Vec::new()
     };
     let lo = |p: u16| SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, p);
+    // R20: the standby's repl (TCP) and CTRL (UDP) ports.
+    let standby_ports: Option<(SocketAddrV4, SocketAddrV4)> = if cli.kill_seq {
+        let p: Vec<u16> = picked.drain(..2).collect();
+        Some((lo(p[0]), lo(p[1])))
+    } else {
+        None
+    };
     let obs_ctrl = dc_ports.get(1).map(|p| lo(*p));
     let cons = if cli.finality {
-        let mut c = Cons::new(&dir, &picked, cli.keyed, if cli.data_kill { 2 } else { 1 })?;
+        let mut c = Cons::new(
+            &dir,
+            &picked,
+            cli.keyed,
+            if cli.data_kill { 2 } else { 1 },
+            standby_ports,
+        )?;
         c.obs = obs_ctrl;
         Some(c)
     } else {
@@ -1854,7 +2019,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
         // R13: with --data-kill a backup box (`src = 1`) with the same destinations.
         let mut boxes = Vec::new();
         for src in 0..if cli.data_kill { 2u8 } else { 1 } {
-            let cfg = data_config(&dir, &dests, &sessions, keyed, cli.data_shards, src)?;
+            let cfg = data_config(&dir, &dests, &all_sessions, keyed, cli.data_shards, src)?;
             let mut c = command(&bin_dir.join("vyrn-data"), cli.seq_cpus.as_deref());
             c.arg("--config").arg(cfg).arg("--stop-on-stdin-eof");
             let name = format!("vyrn-data-{src}");
@@ -2075,14 +2240,42 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
     let cl_recv = cl_sock.try_clone().map_err(|e| e.to_string())?;
 
-    let cfg = seq_config(&dir, &order, &order_b, &sessions, cons.as_ref(), seq_repair)?;
+    let cfg = seq_config(
+        &dir,
+        &order,
+        &order_b,
+        &sessions,
+        cons.as_ref(),
+        seq_repair,
+        false,
+    )?;
     let mut c = command(&bin_dir.join("vyrn-seq"), cli.seq_cpus.as_deref());
     c.arg("--config")
         .arg(cfg)
         .arg("--stop-on-stdin-eof")
         .env("VYRN_E2E_SEQ_SEED", hex(&SEQ_SEED))
         .env("VYRN_E2E_SEQ_XCHG", hex(&SEQ_XCHG));
-    let seq = nodes.spawn("vyrn-seq", &mut c, &tx)?;
+    let mut seq = nodes.spawn("vyrn-seq", &mut c, &tx)?;
+    // R20: the standby, sending to every validator but not the tap (its tenure is not the tap's).
+    let standby = if cli.kill_seq {
+        let to = order.get(..order.len().saturating_sub(1)).unwrap_or(&[]);
+        let cfg = seq_config(&dir, to, &[], &sessions2, cons.as_ref(), None, true)?;
+        let mut c = command(&bin_dir.join("vyrn-seq"), cli.seq_cpus.as_deref());
+        c.arg("--config")
+            .arg(cfg)
+            .arg("--stop-on-stdin-eof")
+            .env("VYRN_E2E_SEQ_SEED", hex(&STANDBY_SEED));
+        let i = nodes.spawn("vyrn-seq-standby", &mut c, &tx)?;
+        nodes.wait(
+            &rx,
+            Instant::now() + wait,
+            "vyrn-seq-standby STANDBY",
+            |ns| ns.get(i).is_some_and(|n| line(n, "STANDBY ").is_some()),
+        )?;
+        Some(i)
+    } else {
+        None
+    };
     // R17: the victim's restart needs a sender for its lines.
     let tx_restart = cli.restart_voter.then(|| tx.clone());
     drop(tx);
@@ -2090,7 +2283,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     nodes.wait(&rx, Instant::now() + wait, "vyrn-seq READY", |ns| {
         ns.get(seq).is_some_and(|n| line(n, &ready).is_some())
     })?;
-    let lane_addrs: Vec<SocketAddrV4> = nodes
+    let mut lane_addrs: Vec<SocketAddrV4> = nodes
         .0
         .get(seq)
         .and_then(|n| line(n, &ready))
@@ -2113,7 +2306,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let cl_h = client(
         cl_recv,
         Arc::clone(&stop_cl),
-        sessions.iter().map(|x| (x.id.0, x.k_seq)).collect(),
+        all_sessions.iter().map(|x| (x.id.0, x.k_seq)).collect(),
         redir_tx,
     );
     let stop_dc = Arc::new(AtomicBool::new(false));
@@ -2151,6 +2344,10 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // validator's node index and what the box had finalized then.
     let kill_voter_at = cli.kill_voter.then_some(pkts.len() / 2);
     let mut voter_killed: Option<(usize, Option<u64>)> = None;
+    // R20 (--kill-seq): at half the packets the primary is killed; the rest go to the standby
+    // once it is READY. The primary's node index.
+    let kill_seq_at = standby.map(|_| pkts.len() / 2);
+    let mut seq_killed: Option<usize> = None;
     let mut barrier_pkt: Option<(u32, u32)> = None;
     // R17: the restarted victim's node index.
     let restart_at = cli.restart_voter.then_some(if cli.restart_immediate {
@@ -2227,6 +2424,71 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     .map_err(|e| format!("kill vyrn-data-0: {e}"))?;
             }
             killed = Some((k, Instant::now()));
+        }
+        if let (true, Some(sb)) = (kill_seq_at == Some(k), standby) {
+            let paused = Instant::now();
+            // The standby's report must reach every voter before the failover can name it
+            // (07 §9.5); voters join the p2p network only once block 0 arrives.
+            nodes.wait(
+                &rx,
+                paused + wait,
+                "STANDBY_HEARD at every validator",
+                |ns| {
+                    vals.iter().all(|&v| {
+                        ns.get(v)
+                            .is_some_and(|n| line(n, "STANDBY_HEARD").is_some())
+                    })
+                },
+            )?;
+            if let Some(n) = nodes.0.get_mut(seq) {
+                n.child
+                    .kill()
+                    .map_err(|e| format!("kill {}: {e}", n.name))?;
+                n.child
+                    .wait()
+                    .map_err(|e| format!("reap {}: {e}", n.name))?;
+            }
+            seq_killed = Some(seq);
+            nodes
+                .wait(&rx, paused + wait, "vyrn-seq-standby READY", |ns| {
+                    ns.get(sb).is_some_and(|n| line(n, &ready).is_some())
+                })
+                .map_err(|e| {
+                    // Why no promotion: each node's failover lines.
+                    let why: Vec<String> = nodes
+                        .0
+                        .iter()
+                        .flat_map(|n| {
+                            n.lines
+                                .iter()
+                                .filter(|l| {
+                                    [
+                                        "DEPOSED", "SEAL", "RESEAL", "NO_SEAL", "PROMOTED",
+                                        "STANDBY",
+                                    ]
+                                    .iter()
+                                    .any(|p| l.starts_with(p))
+                                        || (l.starts_with("FINAL ") && l.contains("kind=1"))
+                                })
+                                .map(move |l| format!("{}: {l}", n.name))
+                        })
+                        .collect();
+                    format!("{e}; failover lines: {why:?}")
+                })?;
+            lane_addrs = nodes
+                .0
+                .get(sb)
+                .and_then(|n| line(n, &ready))
+                .ok_or("standby READY")?
+                .split(',')
+                .map(|a| a.parse().map_err(|e| format!("lane address {a}: {e}")))
+                .collect::<Result<_, String>>()?;
+            println!(
+                "KILL_SEQ at_packet={k} standby_ready_ms={}",
+                paused.elapsed().as_millis()
+            );
+            seq = sb;
+            t0 += paused.elapsed();
         }
         if kill_voter_at == Some(k) {
             let paused = Instant::now();
@@ -2396,10 +2658,13 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 &pkts,
             )
         });
-    // R18: the tap repairs its tail while the box can still retransmit it.
-    tap_drain.store(true, Ordering::Release);
-    if tap_drained.recv_timeout(wait).is_err() {
-        println!("WARN the tap's ORDER tail did not drain within {wait:?} (R18)");
+    // R18: the tap repairs its tail while the box can still retransmit it. R20: the box it
+    // repairs from is dead.
+    if seq_killed.is_none() {
+        tap_drain.store(true, Ordering::Release);
+        if tap_drained.recv_timeout(wait).is_err() {
+            println!("WARN the tap's ORDER tail did not drain within {wait:?} (R18)");
+        }
     }
     let seq_ok = nodes.stop(seq, &rx, Instant::now() + wait)?;
     // The data node flushes its open frames on stop. R13: the home box was killed, so the
@@ -2564,8 +2829,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let got = cl_h.join().map_err(|_| "client thread")?;
 
     let mut rep = Report(true);
+    let r20 = seq_killed.map(|_| R20_SKIP);
     let field_n = |k: &str| field(&stats, k).and_then(|v| v.parse::<u64>().ok());
-    rep.check("seq", {
+    rep.check_or_skip(r20, "seq", {
         let records = field_n("records");
         let sv = field_n("seal_violations");
         if !seq_ok {
@@ -2597,7 +2863,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
         None => Report::skip("seq-repair", "off (enable with --keyed, R8)"),
     }
 
-    rep.check("validators", {
+    rep.check_or_skip(r20, "validators", {
         let mut errs = Vec::new();
         if let Err(e) = &reached {
             errs.push(e.clone());
@@ -2672,7 +2938,8 @@ fn run(cli: &Cli) -> Result<bool, String> {
     let mut dc_inproc = Vec::new();
     let mut resp_times = Vec::new();
     let mut resp_lost: Vec<(u32, u32)> = Vec::new();
-    rep.check(
+    rep.check_or_skip(
+        r20,
         "replay",
         (|| {
             let mut core: OrderCore<LANES, View> = OrderCore::new(
@@ -2858,7 +3125,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
         .collect();
     // With --data every validator replays, so this check always runs: a validator with no
     // out= at all, or a REPLAY_FAULT, fails it rather than skipping it.
-    if replaying.is_empty() {
+    if let Some(w) = r20 {
+        Report::skip("replica-out", w);
+    } else if replaying.is_empty() {
         Report::skip(
             "replica-out",
             "no validator prints out= (validators replay only with --data)",
@@ -2923,7 +3192,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
         });
     }
 
-    if cli.finality {
+    if let Some(w) = r20 {
+        Report::skip("finality", w);
+    } else if cli.finality {
         rep.check("finality", {
             let n = vals.len();
             let target = fin_target.unwrap_or(0);
@@ -3092,6 +3363,97 @@ fn run(cli: &Cli) -> Result<bool, String> {
             }
         }),
         None => Report::skip("voter-restart", "off (enable with --restart-voter, R17)"),
+    }
+    // R20: the seal named the standby and its tenure finalized through the end.
+    match seq_killed {
+        Some(_) => rep.check("seq-failover", {
+            let mut errs = Vec::new();
+            for r in [&reached, &fin_wait, &fin_tail] {
+                if let Err(e) = r {
+                    errs.push(e.clone());
+                }
+            }
+            let sb = nodes.0.get(seq).ok_or("standby")?;
+            let hs = line(sb, "SEAL_FINAL ")
+                .filter(|l| field(l, "next_seq") == Some("1"))
+                .and_then(|l| field(l, "height")?.parse::<u64>().ok());
+            if hs.is_none() {
+                errs.push("the standby saw no seal naming it (SEAL_FINAL next_seq=1)".into());
+            }
+            if !seq_ok {
+                errs.push(format!("the standby did not exit cleanly: {stats}"));
+            }
+            let tenure1 = seq_blocks.len();
+            if tenure1 < 2 {
+                errs.push(format!("tenure 1 closed {tenure1} blocks"));
+            }
+            if let (Some(hs), Some(first)) = (hs, seq_blocks.first())
+                && first.0 != hs + 1
+            {
+                errs.push(format!("tenure 1 starts at {}, the seal is {hs}", first.0));
+            }
+            if seq_blocks.windows(2).any(|w| w[1].0 != w[0].0 + 1 || w[1].1 != w[0].2 + 1) {
+                errs.push("tenure 1's heights or steps are not contiguous".into());
+            }
+            if finals(sb).last().copied() < fin_target {
+                errs.push(format!(
+                    "the standby's listener did not finalize through {fin_target:?}"
+                ));
+            }
+            for &i in &vals {
+                let Some(n) = nodes.0.get(i) else { continue };
+                if let Some(f) = stopped(n) {
+                    errs.push(format!("{}: {f}", n.name));
+                }
+                if line(n, "DEPOSED ").is_none() {
+                    errs.push(format!("{}: no DEPOSED", n.name));
+                }
+                let promoted = line(n, "PROMOTED ")
+                    .filter(|l| field(l, "next_seq") == Some("1"))
+                    .and_then(|l| field(l, "above")?.parse::<u64>().ok());
+                if promoted.is_none() || promoted != hs {
+                    errs.push(format!(
+                        "{}: PROMOTED next_seq=1 above {promoted:?}, the standby's seal {hs:?}",
+                        n.name
+                    ));
+                }
+                let sealed = n.lines.iter().any(|l| {
+                    l.strip_prefix("FINAL ").is_some_and(|f| {
+                        field(f, "kind") == Some("1")
+                            && field(f, "height").and_then(|h| h.parse().ok()) == hs
+                    })
+                });
+                if !sealed {
+                    errs.push(format!("{}: no kind-1 FINAL at the seal {hs:?}", n.name));
+                }
+                let theirs = blocks(n);
+                for b in &seq_blocks {
+                    match theirs.iter().find(|x| x.0 == *b) {
+                        Some(x) if field(x.1, "verdict") == Some("Valid") => {}
+                        Some(x) => errs.push(format!("{}: {}", n.name, x.1)),
+                        None => {
+                            errs.push(format!("{}: no tenure-1 block {}", n.name, b.0));
+                            break;
+                        }
+                    }
+                }
+                if finals(n).last().copied() < top {
+                    errs.push(format!("{}: not FINAL through {top:?}", n.name));
+                }
+            }
+            if errs.is_empty() {
+                Ok(format!(
+                    "seal at {} named the standby (next_seq=1); tenure 1 heights {}..={} FINAL at the standby and {} validators",
+                    hs.unwrap_or(0),
+                    seq_blocks.first().map_or(0, |b| b.0),
+                    top.unwrap_or(0),
+                    vals.len()
+                ))
+            } else {
+                Err(errs.join("; "))
+            }
+        }),
+        None => Report::skip("seq-failover", "off (enable with --kill-seq, R20)"),
     }
     // R14: validator 0 lost one path A frame and repair filled it (`finality` above checks it
     // still finalized through the last block).
@@ -3380,13 +3742,21 @@ struct Cons {
     ctrl: SocketAddrV4,
     /// --dropcopy: the observer's CTRL address.
     obs: Option<SocketAddrV4>,
+    /// --kill-seq (R20): the standby's repl and CTRL addresses.
+    standby: Option<(SocketAddrV4, SocketAddrV4)>,
 }
 
 impl Cons {
     /// `ports`: `n` TCP repl ports, then the box's CTRL port (`data_ports`).
     /// `keyed` (R7): validator 0 and data box 0 get real X25519 keys, every other entry none.
     /// `boxes` (R13): the data boxes of the home, each with its own key.
-    fn new(dir: &Path, ports: &[u16], keyed: bool, boxes: usize) -> Result<Self, String> {
+    fn new(
+        dir: &Path,
+        ports: &[u16],
+        keyed: bool,
+        boxes: usize,
+        standby: Option<(SocketAddrV4, SocketAddrV4)>,
+    ) -> Result<Self, String> {
         let (repl, ctrl) = ports.split_at(ports.len().saturating_sub(1));
         let n = repl.len();
         use vyrn_epoch::{Addr, DataBox, Domain, Home, Roster, SeqEntry, Voter};
@@ -3418,16 +3788,22 @@ impl Cons {
         // R8: the primary box gets a real key, so its `[repair]` serves only sealed fetches. Its
         // repl_addr is 127.0.0.2, so the data box, which keys requesters by IPv4, keeps one
         // keyed requester on 127.0.0.1 (validator 0).
-        let mut seq: Vec<SeqEntry> = [seq_key, [0x77; 32]]
+        // R20: with --kill-seq the second entry is the standby, on its repl port.
+        let second = match standby {
+            Some(_) => vyrn_crypto::ed25519::public_key(&STANDBY_SEED),
+            None => [0x77; 32],
+        };
+        let second_port = standby.map_or(0, |(r, _)| r.port());
+        let mut seq: Vec<SeqEntry> = [(seq_key, 0), (second, second_port)]
             .iter()
             .zip(1u8..)
-            .map(|(k, f)| SeqEntry {
+            .map(|((k, port), f)| SeqEntry {
                 facility: f,
                 node_key: k.to_vec(),
                 seq_key: k.to_vec(),
                 xchg_key: vec![if keyed { 0 } else { 0x66 }; 32],
                 client_addr: addr(0),
-                repl_addr: addr(0),
+                repl_addr: addr(*port),
             })
             .collect();
         if keyed && let Some(s0) = seq.first_mut() {
@@ -3488,6 +3864,7 @@ impl Cons {
                 *ctrl.first().ok_or("ctrl port")?,
             ),
             obs: None,
+            standby,
         })
     }
 }

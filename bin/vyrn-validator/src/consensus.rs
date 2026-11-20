@@ -89,6 +89,12 @@ struct Held {
     /// `depose.rs`) once it holds one.
     deposed: bool,
     seal: Option<Seal>,
+    /// Headers of candidates a `RESEAL` replaced: a seal Simplex already proposed may still
+    /// finalize, and the standby needs its header (Vercel r4619446790).
+    superseded: Vec<BlockHeader>,
+    /// A finalized seal at this height named a standby (07 §9.5): its `seq_key` signs every
+    /// header above it, and the tenure is live again.
+    promoted: Option<(u64, PubKey)>,
 }
 
 /// The voter's [`BlockSource`]. The order thread writes it; Simplex reads it. `default()` is
@@ -147,9 +153,45 @@ impl Source {
 
     /// This voter's seal candidate (07 §9.4).
     pub fn set_seal(&self, seal: Seal) {
-        if let Some(mut h) = self.held() {
-            h.seal = Some(seal);
+        if let Some(mut h) = self.held()
+            && let Some(old) = h.seal.replace(seal)
+        {
+            h.superseded.push(old.header);
         }
+    }
+
+    /// The header of this voter's current or a replaced seal candidate whose `header_hash`
+    /// is `hash`.
+    pub fn seal_header(&self, hash: Hash) -> Option<BlockHeader> {
+        let h = self.held()?;
+        h.seal
+            .iter()
+            .map(|s| &s.header)
+            .chain(&h.superseded)
+            .find(|x| header_hash(x) == hash)
+            .cloned()
+    }
+
+    /// The seal finalized at `height` with `next_seq` naming `seq_key`'s box (07 §9.5): the
+    /// deposed tenure's leftovers above it go, and headers above it are checked under the
+    /// promoted box's key. The order thread reads it ([`Source::promoted`]) to open the tenure.
+    pub fn promote(&self, height: Height, seq_key: PubKey) {
+        if let Some(mut h) = self.held() {
+            h.headers.retain(|&x, _| x <= height.0);
+            h.valid.retain(|&x| x <= height.0);
+            if h.invalid_from.is_some_and(|f| f > height.0) {
+                h.invalid_from = None;
+            }
+            h.deposed = false;
+            h.seal = None;
+            h.superseded.clear();
+            h.promoted = Some((height.0, seq_key));
+        }
+    }
+
+    /// The seal height and promoted `seq_key`, once [`Source::promote`] ran.
+    pub fn promoted(&self) -> Option<(u64, PubKey)> {
+        self.held()?.promoted
     }
 
     /// Nothing at or above `height` may be voted for (a fault, or a data root that differs).
@@ -186,6 +228,13 @@ impl BlockSource for Source {
 
     fn seal(&self, _: Epoch) -> Option<Seal> {
         self.held()?.seal.clone()
+    }
+
+    fn seq_key_after(&self, _: Epoch, parent: Height) -> Option<PubKey> {
+        self.held()?
+            .promoted
+            .filter(|&(at, _)| parent.0 >= at)
+            .map(|(_, k)| k)
     }
 
     fn deposed(&self, _: Epoch) -> bool {
@@ -233,6 +282,9 @@ pub struct Plan {
     pub seq_key: PubKey,
     /// `seq_order`'s `seq_key`s, primary first (07 §9.5): who may report a tail.
     pub seq_order: Vec<PubKey>,
+    /// `seq_order[1]` as a non-voting peer of the voters' network, when its roster `repl_addr`
+    /// has a port: its TailReport reaches the voters on the tail channel only (07 §9.5).
+    pub standby: Option<net::Standby>,
     pub epoch: Epoch,
     pub observers: Vec<SocketAddr>,
     pub timeouts: Timeouts,
@@ -466,6 +518,17 @@ impl Plan {
             node_seed,
             seq_key: membership.seq()[0].seq_key,
             seq_order: membership.seq().iter().map(|b| b.seq_key).collect(),
+            standby: membership.seq().get(1).and_then(|b| {
+                let e = roster
+                    .home(home)
+                    .seq
+                    .iter()
+                    .find(|e| e.seq_key.as_slice() == b.seq_key.as_slice())?;
+                (e.repl_addr.port != 0).then(|| net::Standby {
+                    seq_key: b.seq_key,
+                    addr: sock(e.repl_addr),
+                })
+            }),
             epoch,
             observers: s.observers.clone(),
             timeouts,
@@ -566,6 +629,7 @@ pub fn run(
             plan.node_seed,
             plan.repl_addr(),
             &plan.peers,
+            plan.standby,
         )
         .map_err(|e| e.to_string())?;
         let (vcfg, mut out) = vyrn_consensus::voter::config(
@@ -598,6 +662,11 @@ pub fn run(
             )
         });
         let mut own: Option<Vec<u8>> = None;
+        // The standby's first accepted report (07 §9.5), printed once.
+        let mut heard = false;
+        // The seal header for the promoted standby, and how many more times to send it.
+        let mut to_standby: Option<(Vec<u8>, u32)> = None;
+        let mut standby_at = std::time::Instant::now();
         let mut resent = std::time::Instant::now();
         let send = |b: &[u8]| {
             for a in &plan.observers {
@@ -609,6 +678,17 @@ pub fn run(
         let period = if fo.is_some() { 1 } else { 5 };
         let mut tick = tokio::time::interval(Duration::from_millis(period));
         while !stop.load(Ordering::Acquire) {
+            // Every 50 ms, 20 times: the standby keeps the first whose hash is the cert's.
+            if let Some((b, left)) = to_standby.as_mut()
+                && standby_at.elapsed() >= Duration::from_millis(50)
+            {
+                tail.send_standby(b.clone());
+                standby_at = std::time::Instant::now();
+                *left = left.saturating_sub(1);
+                if *left == 0 {
+                    to_standby = None;
+                }
+            }
             if let (Some(t), Some((_, shared))) = (tally.as_mut(), fo.as_ref()) {
                 if let Some(b) = t.own(shared, &plan.vote_seed) {
                     println!("SILENCE_SENT epoch={} voter={me}", plan.epoch.0);
@@ -634,16 +714,52 @@ pub fn run(
                 }
             }
             tokio::select! {
-                Some((_, b)) = tail.recv(), if tally.is_some() => {
-                    if let Some(t) = tally.as_mut()
-                        && let Err(e) = t.on_silence(&b)
+                Some((from, b)) = tail.recv() => {
+                    // Codex r4618710697: attributed to the voter whose node_key authenticated
+                    // the connection, never to whoever signed the bytes.
+                    // The standby is reporter `n + 1`, `seq_order[1]` (07 §9.3).
+                    let n = plan.peers.len();
+                    let from = plan
+                        .peers
+                        .iter()
+                        .position(|p| p.vote_key == from)
+                        .or_else(|| plan.standby.filter(|s| s.seq_key == from).map(|_| n + 1))
+                        .and_then(|i| u8::try_from(i).ok());
+                    let r = match (tally.as_mut(), from) {
+                        (Some(t), Some(from)) => Some((from, t.on_silence(from, &b))),
+                        _ => None,
+                    };
+                    if let Some((from, Ok(()))) = r
+                        && usize::from(from) == n + 1
+                        && !heard
                     {
+                        heard = true;
+                        println!("STANDBY_HEARD");
+                    }
+                    if let Some((_, Err(e))) = r {
                         println!("SILENCE_REFUSED {e}");
                     }
                 }
                 Some(c) = out.certs.recv() => {
                     send(&ctrl::encode_cert(&c));
                     source.finalized(c.proposal.last_height);
+                    // 07 §9.5: the seal names the next sequencer; its tenure opens above the
+                    // seal. *Gap*: one failover per run; tenure 1 has no silence detection.
+                    if let Some(x) = c.seal.as_ref()
+                        && let Some(k) = plan.seq_order.get(usize::from(x.next_seq))
+                        && source.promoted().is_none()
+                    {
+                        if let Some(s) = source.seal_header(c.proposal.last_hash) {
+                            let h = vyrn_log::block::encode_header(&s).to_vec();
+                            to_standby = Some((h, 20));
+                        }
+                        source.promote(c.proposal.last_height, *k);
+                        tally = None;
+                        println!(
+                            "PROMOTED next_seq={} tenure={} above={}",
+                            x.next_seq, x.next_tenure, c.proposal.last_height.0
+                        );
+                    }
                     println!(
                         "FINAL height={} view={} first={} kind={} sigs={}",
                         c.proposal.last_height.0,
@@ -703,5 +819,14 @@ mod seal_tests {
         assert_eq!(s.check_seal(Epoch(0), &seal), Verdict::Valid);
         s.invalid_from(Height(6));
         assert_eq!(s.check_seal(Epoch(0), &seal), Verdict::Invalid);
+
+        // Vercel r4619446790: a RESEAL replaces the candidate, but the replaced one may be
+        // the seal that finalizes, so its header is still found for the standby.
+        let mut late = seal.clone();
+        late.header.data_root = Hash([4; 32]);
+        s.set_seal(late.clone());
+        assert_eq!(s.seal_header(header_hash(&seal.header)), Some(seal.header));
+        assert_eq!(s.seal_header(header_hash(&late.header)), Some(late.header));
+        assert_eq!(s.seal_header(Hash([9; 32])), None);
     }
 }
