@@ -77,9 +77,10 @@
 //!   127.0.0.1, and the box refuses two keyed requesters on one IPv4. A relay drops every
 //!   `LOSS_EVERY`-th datagram the box sends validator 0 when it is a DATA frame carrying
 //!   packets, so validator 0 must repair to keep up: the box must have served sealed fetches
-//!   (`STATS` `fetch_ring_hit + fetch_log_hit + fetch_resent > 0`), and validator 0 must have
-//!   readied every block the box closed, unstopped, since the tap's fetches share its IPv4 and
-//!   count in `STATS` too.
+//!   (`STATS` `fetch_ring_hit + fetch_log_hit + fetch_resent > 0`), at least one dropped frame
+//!   must have come back through the relay (a RANGE resend goes to the destination's address,
+//!   so only validator 0's fetch causes it; the tap's fetches share its IPv4 and count in
+//!   `STATS` too), and validator 0 must have readied every block the box closed, unstopped.
 //! - R8. `--keyed` also keys the primary `vyrn-seq` box (`SEQ_XCHG`, repl_addr 127.0.0.2) and
 //!   gives its `[repair]` `xchg`: with the box still up, `seq-repair` sends a plain KEY fetch of
 //!   the last packets sent, one sealed under validator 0's `K_fetch(0, 0, SEQ_TARGET)` and one
@@ -324,7 +325,7 @@ use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -1289,6 +1290,7 @@ fn relay(
     port: Arc<std::sync::atomic::AtomicU16>,
     drop: fn(u64, u64, &[u8]) -> bool,
     arg: u64,
+    refill: Option<Arc<AtomicU64>>,
     stop: Arc<AtomicBool>,
 ) -> Result<(SocketAddr, std::thread::JoinHandle<u64>), String> {
     let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
@@ -1297,6 +1299,14 @@ fn relay(
     let addr = sock.local_addr().map_err(|e| e.to_string())?;
     let h = std::thread::spawn(move || {
         let (mut n, mut dropped) = (0u64, 0u64);
+        // With `refill`: the (src, data_seq) of each DATA frame dropped, still unrefilled.
+        let mut holes = BTreeSet::new();
+        let data_key = |b: &[u8]| {
+            vyrn_data::frame::decode(b)
+                .ok()
+                .filter(|f| f.hdr.kind == vyrn_data::frame::Kind::Data)
+                .map(|f| (f.hdr.src, f.hdr.data_seq))
+        };
         let mut buf = [0u8; 65536];
         while !stop.load(Ordering::Acquire) {
             if let Ok(k) = sock.recv(&mut buf) {
@@ -1305,7 +1315,15 @@ fn relay(
                 let to = port.load(Ordering::Acquire);
                 if to == 0 || drop(n, arg, b) {
                     dropped += 1;
+                    if refill.is_some() {
+                        holes.extend(data_key(b));
+                    }
                 } else {
+                    if let Some(r) = &refill
+                        && data_key(b).is_some_and(|q| holes.remove(&q))
+                    {
+                        r.fetch_add(1, Ordering::Relaxed);
+                    }
                     let _ = sock.send_to(b, ("127.0.0.1", to));
                 }
             }
@@ -2031,6 +2049,9 @@ fn run(cli: &Cli) -> Result<bool, String> {
     // tap's data socket and every validator's data port (07 §5.1, §5.2). It starts first, so
     // the validators' configs can name its fetch address; their data ports are picked here.
     let mut relay_h = None;
+    // R7: dropped DATA frames the box resent to validator 0's relay, which only validator 0's
+    // RANGE fetch causes (the tap's resends go to the tap's own address).
+    let v0_refilled = Arc::new(AtomicU64::new(0));
     let mut tap_relay_h = None;
     let mut tap_sent: Option<std::sync::mpsc::Sender<Sent>> = None;
     let data_node = if cli.data {
@@ -2044,6 +2065,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                 Arc::new(std::sync::atomic::AtomicU16::new(port)),
                 |n, every, _| n.is_multiple_of(every),
                 every,
+                None,
                 Arc::clone(&stop_tap),
             )?;
             *d = addr.to_string();
@@ -2066,6 +2088,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
                         })
                 },
                 LOSS_EVERY,
+                Some(Arc::clone(&v0_refilled)),
                 Arc::clone(&stop_tap),
             )?;
             *d = addr.to_string();
@@ -2151,7 +2174,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
         } else {
             |n, k, _| n == k
         };
-        let (addr, h) = relay(Arc::clone(&port), drop, k, Arc::clone(&stop_relay))?;
+        let (addr, h) = relay(Arc::clone(&port), drop, k, None, Arc::clone(&stop_relay))?;
         Ok(Some((addr, port, h)))
     };
     let relay_a = relay_for(cli.drop_path_a, false)?;
@@ -2284,6 +2307,7 @@ fn run(cli: &Cli) -> Result<bool, String> {
             Arc::new(std::sync::atomic::AtomicU16::new(tap_port)),
             |n, every, _| n.is_multiple_of(every),
             every,
+            None,
             Arc::clone(&stop_tap),
         )?),
         None => None,
@@ -3607,15 +3631,18 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     .filter_map(|k| field(&st, k)?.parse::<u64>().ok())
                     .sum();
                 // The tap's sealed fetches share validator 0's IPv4, so `served` counts them
-                // too (CodeRabbit r4647746776): validator 0 must also have readied every block
-                // the box closed, unstopped, which it can only do by repairing its losses.
+                // too (CodeRabbit r4647746776). Validator 0's own evidence: a frame the relay
+                // dropped came back to its relay, which only its RANGE fetch causes, even when
+                // the backup sent the same packets (R13); and it readied every block the box
+                // closed, unstopped (r4647830874).
+                let refilled = v0_refilled.load(Ordering::Relaxed);
                 let v0 = vals.first().and_then(|&i| nodes.0.get(i));
                 let v0_blocks = v0.map_or(0, |n| blocks(n).len());
                 let v0_whole = v0.is_some_and(|n| stopped(n).is_none())
                     && v0_blocks == seq_blocks.len();
-                if dropped == 0 || served == 0 || !v0_whole {
+                if dropped == 0 || served == 0 || refilled == 0 || !v0_whole {
                     errs.push(format!(
-                        "--keyed: the relay dropped {dropped} frames, the box served {served} sealed fetches and validator-0 readied {v0_blocks} of {} blocks unstopped; all must be > 0 and complete",
+                        "--keyed: the relay dropped {dropped} frames and saw {refilled} of them resent, the box served {served} sealed fetches, and validator-0 readied {v0_blocks} of {} blocks unstopped; all must be > 0 and complete",
                         seq_blocks.len()
                     ));
                 }
