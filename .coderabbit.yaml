@@ -1,9 +1,10 @@
 # CodeRabbit is turned off for this repository: no automatic reviews,
-# no review status messages or commit status check, and no automatic chat replies.
+# no review status messages, check run or commit status, and no automatic chat replies.
 reviews:
   auto_review:
     enabled: false
   review_status: false
+  review_progress: false
   commit_status: false
 chat:
   auto_reply: false
