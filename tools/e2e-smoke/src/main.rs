@@ -1870,8 +1870,12 @@ fn run(cli: &Cli) -> Result<bool, String> {
     if cli.drop_path_b.is_some_and(|n| n == 0) || (cli.drop_path_b.is_some() && !cli.dropcopy) {
         return Err("--drop-path-b needs --dropcopy and N >= 1".into());
     }
-    if cli.tap_loss.is_some_and(|n| n < 2) || (cli.tap_loss.is_some() && !cli.data) {
-        return Err("--tap-loss needs --data and N >= 2 (R14)".into());
+    // --data-kill: a gap of the killed box's `data_seq` can never be RANGE-repaired, so
+    // `data` would fail on it though KEY fetches recovered its packets (CodeRabbit).
+    if cli.tap_loss.is_some_and(|n| n < 2)
+        || (cli.tap_loss.is_some() && (!cli.data || cli.data_kill))
+    {
+        return Err("--tap-loss needs --data, no --data-kill, and N >= 2 (R14)".into());
     }
     if cli.tap_order_loss.is_some_and(|n| n < 2) || (cli.tap_order_loss.is_some() && !cli.finality)
     {
@@ -3590,9 +3594,17 @@ fn run(cli: &Cli) -> Result<bool, String> {
                     .iter()
                     .filter_map(|k| field(&st, k)?.parse::<u64>().ok())
                     .sum();
-                if dropped == 0 || served == 0 {
+                // The tap's sealed fetches share validator 0's IPv4, so `served` counts them
+                // too (CodeRabbit r4647746776): validator 0 must also have readied every block
+                // the box closed, unstopped, which it can only do by repairing its losses.
+                let v0 = vals.first().and_then(|&i| nodes.0.get(i));
+                let v0_blocks = v0.map_or(0, |n| blocks(n).len());
+                let v0_whole = v0.is_some_and(|n| stopped(n).is_none())
+                    && v0_blocks == seq_blocks.len();
+                if dropped == 0 || served == 0 || !v0_whole {
                     errs.push(format!(
-                        "--keyed: the relay dropped {dropped} frames and the box served {served} sealed fetches; both must be > 0"
+                        "--keyed: the relay dropped {dropped} frames, the box served {served} sealed fetches and validator-0 readied {v0_blocks} of {} blocks unstopped; all must be > 0 and complete",
+                        seq_blocks.len()
                     ));
                 }
             }
